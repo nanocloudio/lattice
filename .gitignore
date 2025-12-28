@@ -1,0 +1,8 @@
+.vscode
+Cargo.lock
+.context/
+target
+tools/*/target
+tools/*/Cargo.lock
+certs
+data
