@@ -1,0 +1,365 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lattice Memcached Wire Protocol Definition",
+  "description": "Memcached ASCII and binary protocol surface definition for Lattice",
+  "version": "0.1.0",
+  "protocol": {
+    "name": "Memcached",
+    "transport": "TCP",
+    "tls_supported": true,
+    "default_port": 11211,
+    "versions": ["ASCII", "Binary"]
+  },
+  "protocol_detection": {
+    "description": "Protocol is auto-detected from first byte",
+    "binary_magic": "0x80",
+    "ascii": "Any ASCII letter"
+  },
+  "commands": {
+    "storage": {
+      "set": {
+        "status": "supported",
+        "format": {
+          "ascii": "set <key> <flags> <exptime> <bytes> [noreply]\\r\\n<data>\\r\\n",
+          "binary": "opcode 0x01"
+        },
+        "linearizable": false,
+        "notes": "Always overwrites existing key"
+      },
+      "add": {
+        "status": "supported",
+        "format": {
+          "ascii": "add <key> <flags> <exptime> <bytes> [noreply]\\r\\n<data>\\r\\n",
+          "binary": "opcode 0x02"
+        },
+        "linearizable": false,
+        "notes": "Store only if key doesn't exist"
+      },
+      "replace": {
+        "status": "supported",
+        "format": {
+          "ascii": "replace <key> <flags> <exptime> <bytes> [noreply]\\r\\n<data>\\r\\n",
+          "binary": "opcode 0x03"
+        },
+        "linearizable": false,
+        "notes": "Store only if key exists"
+      },
+      "append": {
+        "status": "supported",
+        "format": {
+          "ascii": "append <key> <flags> <exptime> <bytes> [noreply]\\r\\n<data>\\r\\n",
+          "binary": "opcode 0x0e"
+        },
+        "linearizable": false,
+        "notes": "Append data to existing value"
+      },
+      "prepend": {
+        "status": "supported",
+        "format": {
+          "ascii": "prepend <key> <flags> <exptime> <bytes> [noreply]\\r\\n<data>\\r\\n",
+          "binary": "opcode 0x0f"
+        },
+        "linearizable": false,
+        "notes": "Prepend data to existing value"
+      },
+      "cas": {
+        "status": "supported",
+        "format": {
+          "ascii": "cas <key> <flags> <exptime> <bytes> <cas_token> [noreply]\\r\\n<data>\\r\\n",
+          "binary": "Uses CAS field in header"
+        },
+        "linearizable": true,
+        "notes": "Check-and-set; requires LIN-BOUND"
+      }
+    },
+    "retrieval": {
+      "get": {
+        "status": "supported",
+        "format": {
+          "ascii": "get <key>*\\r\\n",
+          "binary": "opcode 0x00"
+        },
+        "linearizable": false,
+        "notes": "Retrieve one or more keys"
+      },
+      "gets": {
+        "status": "supported",
+        "format": {
+          "ascii": "gets <key>*\\r\\n",
+          "binary": "opcode 0x00 (CAS returned)"
+        },
+        "linearizable": false,
+        "notes": "Get with CAS token for subsequent cas command"
+      },
+      "gat": {
+        "status": "supported",
+        "format": {
+          "ascii": "gat <exptime> <key>*\\r\\n",
+          "binary": "opcode 0x1d"
+        },
+        "linearizable": false,
+        "notes": "Get and touch (update expiration)"
+      },
+      "gats": {
+        "status": "supported",
+        "format": {
+          "ascii": "gats <exptime> <key>*\\r\\n",
+          "binary": "opcode 0x1d (CAS returned)"
+        },
+        "linearizable": false,
+        "notes": "Get and touch with CAS token"
+      }
+    },
+    "deletion": {
+      "delete": {
+        "status": "supported",
+        "format": {
+          "ascii": "delete <key> [noreply]\\r\\n",
+          "binary": "opcode 0x04"
+        },
+        "linearizable": false
+      }
+    },
+    "arithmetic": {
+      "incr": {
+        "status": "supported",
+        "format": {
+          "ascii": "incr <key> <value> [noreply]\\r\\n",
+          "binary": "opcode 0x05"
+        },
+        "linearizable": true,
+        "notes": "Requires LIN-BOUND; wraps at 64-bit boundary"
+      },
+      "decr": {
+        "status": "supported",
+        "format": {
+          "ascii": "decr <key> <value> [noreply]\\r\\n",
+          "binary": "opcode 0x06"
+        },
+        "linearizable": true,
+        "notes": "Requires LIN-BOUND; floors at 0"
+      }
+    },
+    "touch": {
+      "touch": {
+        "status": "supported",
+        "format": {
+          "ascii": "touch <key> <exptime> [noreply]\\r\\n",
+          "binary": "opcode 0x1c"
+        },
+        "linearizable": false,
+        "notes": "Update key expiration without retrieving"
+      }
+    },
+    "stats": {
+      "stats": {
+        "status": "supported",
+        "format": {
+          "ascii": "stats [type]\\r\\n",
+          "binary": "opcode 0x10"
+        },
+        "linearizable": false,
+        "notes": "Returns server statistics; tenant-scoped"
+      }
+    },
+    "other": {
+      "flush_all": {
+        "status": "supported",
+        "format": {
+          "ascii": "flush_all [delay] [noreply]\\r\\n",
+          "binary": "opcode 0x08"
+        },
+        "linearizable": false,
+        "notes": "Tenant-scoped, not global"
+      },
+      "version": {
+        "status": "supported",
+        "format": {
+          "ascii": "version\\r\\n",
+          "binary": "opcode 0x0b"
+        },
+        "linearizable": false,
+        "notes": "Returns Lattice version"
+      },
+      "quit": {
+        "status": "supported",
+        "format": {
+          "ascii": "quit\\r\\n",
+          "binary": "opcode 0x07"
+        },
+        "linearizable": false
+      },
+      "noop": {
+        "status": "supported",
+        "format": {
+          "binary": "opcode 0x0a"
+        },
+        "linearizable": false,
+        "notes": "Binary protocol only; used to flush quiet operations"
+      },
+      "verbosity": {
+        "status": "supported",
+        "format": {
+          "ascii": "verbosity <level> [noreply]\\r\\n"
+        },
+        "linearizable": false,
+        "notes": "Accepted but no-op in Lattice"
+      }
+    }
+  },
+  "binary_opcodes": {
+    "Get": "0x00",
+    "Set": "0x01",
+    "Add": "0x02",
+    "Replace": "0x03",
+    "Delete": "0x04",
+    "Increment": "0x05",
+    "Decrement": "0x06",
+    "Quit": "0x07",
+    "Flush": "0x08",
+    "GetQ": "0x09",
+    "Noop": "0x0a",
+    "Version": "0x0b",
+    "GetK": "0x0c",
+    "GetKQ": "0x0d",
+    "Append": "0x0e",
+    "Prepend": "0x0f",
+    "Stat": "0x10",
+    "SetQ": "0x11",
+    "AddQ": "0x12",
+    "ReplaceQ": "0x13",
+    "DeleteQ": "0x14",
+    "IncrementQ": "0x15",
+    "DecrementQ": "0x16",
+    "QuitQ": "0x17",
+    "FlushQ": "0x18",
+    "AppendQ": "0x19",
+    "PrependQ": "0x1a",
+    "Touch": "0x1c",
+    "GAT": "0x1d",
+    "GATQ": "0x1e",
+    "SaslListMechs": "0x20",
+    "SaslAuth": "0x21",
+    "SaslStep": "0x22",
+    "GATK": "0x23",
+    "GATKQ": "0x24"
+  },
+  "binary_status_codes": {
+    "NoError": "0x0000",
+    "KeyNotFound": "0x0001",
+    "KeyExists": "0x0002",
+    "ValueTooLarge": "0x0003",
+    "InvalidArguments": "0x0004",
+    "ItemNotStored": "0x0005",
+    "DeltaBadval": "0x0006",
+    "AuthenticationError": "0x0008",
+    "AuthenticationContinue": "0x0009",
+    "UnknownCommand": "0x0081",
+    "OutOfMemory": "0x0082"
+  },
+  "ascii_responses": {
+    "STORED": "Value stored successfully",
+    "NOT_STORED": "add/replace condition failed",
+    "EXISTS": "CAS conflict",
+    "NOT_FOUND": "Key does not exist",
+    "DELETED": "Key deleted successfully",
+    "TOUCHED": "Key expiration updated",
+    "OK": "Generic success",
+    "ERROR": "Unknown error",
+    "CLIENT_ERROR": "Client sent invalid request",
+    "SERVER_ERROR": "Internal server error"
+  },
+  "exptime_handling": {
+    "description": "Expiration time interpretation",
+    "zero": "Never expires",
+    "less_than_30_days": "Relative seconds from now",
+    "greater_or_equal_30_days": "Absolute Unix timestamp",
+    "threshold_seconds": 2592000
+  },
+  "flags_handling": {
+    "description": "32-bit client-defined flags",
+    "stored_with_value": true,
+    "returned_on_retrieval": true,
+    "server_interpretation": "none"
+  },
+  "cas_handling": {
+    "description": "Check-and-set token handling",
+    "token_source": "mod_revision from KvRecord",
+    "token_size": "64-bit",
+    "unique_per_version": true
+  },
+  "unsupported_commands": {
+    "slabs": {
+      "commands": ["slabs reassign", "slabs automove"],
+      "reason": "Lattice uses different memory model"
+    },
+    "lru_crawler": {
+      "commands": ["lru_crawler enable", "lru_crawler disable", "lru_crawler metadump"],
+      "reason": "Lattice uses deterministic TTL, not LRU"
+    }
+  },
+  "error_mapping": {
+    "dirty_epoch": {
+      "ascii": "SERVER_ERROR routing epoch changed",
+      "binary_status": "0x0086",
+      "recovery": "Refresh routing and retry"
+    },
+    "linearizability_unavailable": {
+      "ascii": "SERVER_ERROR linearizability unavailable",
+      "binary_status": "0x0086",
+      "recovery": "Retry or accept eventual consistency"
+    },
+    "throttle_envelope": {
+      "ascii": "SERVER_ERROR rate limit exceeded",
+      "binary_status": "0x0085",
+      "recovery": "Backoff and retry"
+    }
+  },
+  "compatibility": {
+    "memcached_version": "1.6.x",
+    "client_libraries": [
+      {
+        "language": "Python",
+        "library": "pylibmc",
+        "status": "compatible",
+        "notes": "ASCII and binary protocols tested"
+      },
+      {
+        "language": "Python",
+        "library": "python-memcached",
+        "status": "compatible",
+        "notes": "ASCII protocol tested"
+      },
+      {
+        "language": "Node.js",
+        "library": "memcached",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      },
+      {
+        "language": "PHP",
+        "library": "memcached",
+        "status": "compatible",
+        "notes": "Binary protocol recommended"
+      },
+      {
+        "language": "Ruby",
+        "library": "dalli",
+        "status": "compatible",
+        "notes": "Binary protocol tested"
+      },
+      {
+        "language": "Java",
+        "library": "spymemcached",
+        "status": "compatible",
+        "notes": "Binary protocol recommended"
+      },
+      {
+        "language": "C/C++",
+        "library": "libmemcached",
+        "status": "compatible",
+        "notes": "Both protocols tested"
+      }
+    ]
+  }
+}

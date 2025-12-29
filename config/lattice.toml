@@ -60,13 +60,71 @@ insecure = true
 # Default tenant for unauthenticated requests (development only)
 default_tenant = "default"
 
-# Redis listener (future)
-# [listeners.redis]
-# bind = "0.0.0.0:6379"
+# Redis listener (RESP2/RESP3 protocol)
+[listeners.redis]
+# Bind address (Redis-compatible port)
+bind = "0.0.0.0:6379"
 
-# Memcached listener (future)
-# [listeners.memcached]
-# bind = "0.0.0.0:11211"
+# Enable Redis listener (set to false to disable)
+enabled = false
+
+# Allow insecure (plaintext) connections for development/testing
+insecure = true
+
+# TLS configuration (recommended for production)
+# tls_chain_path = "certs/redis-server.crt"
+# tls_key_path = "certs/redis-server.key"
+
+# Default tenant for unauthenticated Redis connections
+default_tenant = "default"
+
+# Protocol version: "resp2", "resp3", or "auto" (negotiate via HELLO)
+protocol_version = "auto"
+
+# Maximum pipeline depth (commands queued before response required)
+max_pipeline_depth = 256
+
+# Connection idle timeout in milliseconds (0 = no timeout)
+idle_timeout_ms = 0
+
+# Enable Pub/Sub support (requires additional memory per connection)
+pubsub_enabled = true
+
+# Maximum subscriptions per connection
+max_subscriptions = 1000
+
+# Memcached listener (ASCII and Binary protocols)
+[listeners.memcached]
+# Bind address (Memcached-compatible port)
+bind = "0.0.0.0:11211"
+
+# Enable Memcached listener (set to false to disable)
+enabled = false
+
+# Allow insecure (plaintext) connections for development/testing
+insecure = true
+
+# TLS configuration (recommended for production)
+# tls_chain_path = "certs/memcached-server.crt"
+# tls_key_path = "certs/memcached-server.key"
+
+# Default tenant for unauthenticated Memcached connections
+default_tenant = "default"
+
+# Protocol detection: "auto" (detect from first byte), "ascii", or "binary"
+protocol_mode = "auto"
+
+# Maximum value size in bytes (Memcached default is 1MB)
+max_value_size = 1048576
+
+# Connection idle timeout in milliseconds (0 = no timeout)
+idle_timeout_ms = 0
+
+# Enable SASL authentication
+sasl_enabled = false
+
+# SASL mechanisms (when sasl_enabled = true)
+# sasl_mechanisms = ["PLAIN"]
 
 # =============================================================================
 # Durability Configuration

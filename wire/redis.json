@@ -1,0 +1,505 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lattice Redis Wire Protocol Definition",
+  "description": "Redis RESP2/RESP3 protocol surface definition for Lattice",
+  "version": "0.1.0",
+  "protocol": {
+    "name": "Redis RESP",
+    "transport": "TCP",
+    "tls_supported": true,
+    "default_port": 6379,
+    "versions": ["RESP2", "RESP3"]
+  },
+  "commands": {
+    "strings": {
+      "GET": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false,
+        "notes": "Snapshot read by default"
+      },
+      "SET": {
+        "status": "supported",
+        "args": ["key", "value"],
+        "options": ["EX", "PX", "EXAT", "PXAT", "NX", "XX", "KEEPTTL", "GET"],
+        "linearizable": "conditional",
+        "notes": "NX/XX options require LIN-BOUND"
+      },
+      "SETNX": {
+        "status": "supported",
+        "args": ["key", "value"],
+        "linearizable": true,
+        "notes": "Alias for SET NX"
+      },
+      "SETEX": {
+        "status": "supported",
+        "args": ["key", "seconds", "value"],
+        "linearizable": false
+      },
+      "PSETEX": {
+        "status": "supported",
+        "args": ["key", "milliseconds", "value"],
+        "linearizable": false
+      },
+      "MGET": {
+        "status": "supported",
+        "args": ["key..."],
+        "linearizable": false,
+        "notes": "All keys must be in same KPG"
+      },
+      "MSET": {
+        "status": "supported",
+        "args": ["key", "value..."],
+        "linearizable": false,
+        "notes": "All keys must be in same KPG"
+      },
+      "GETEX": {
+        "status": "supported",
+        "args": ["key"],
+        "options": ["EX", "PX", "EXAT", "PXAT", "PERSIST"],
+        "linearizable": true
+      },
+      "GETDEL": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": true
+      },
+      "APPEND": {
+        "status": "supported",
+        "args": ["key", "value"],
+        "linearizable": true
+      },
+      "STRLEN": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false
+      },
+      "INCR": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": true
+      },
+      "DECR": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": true
+      },
+      "INCRBY": {
+        "status": "supported",
+        "args": ["key", "increment"],
+        "linearizable": true
+      },
+      "DECRBY": {
+        "status": "supported",
+        "args": ["key", "decrement"],
+        "linearizable": true
+      },
+      "INCRBYFLOAT": {
+        "status": "supported",
+        "args": ["key", "increment"],
+        "linearizable": true
+      },
+      "GETRANGE": {
+        "status": "supported",
+        "args": ["key", "start", "end"],
+        "linearizable": false
+      },
+      "SETRANGE": {
+        "status": "supported",
+        "args": ["key", "offset", "value"],
+        "linearizable": true
+      }
+    },
+    "keys": {
+      "DEL": {
+        "status": "supported",
+        "args": ["key..."],
+        "linearizable": false,
+        "notes": "All keys must be in same KPG"
+      },
+      "UNLINK": {
+        "status": "supported",
+        "args": ["key..."],
+        "linearizable": false,
+        "notes": "Synchronous in Lattice (same as DEL)"
+      },
+      "EXISTS": {
+        "status": "supported",
+        "args": ["key..."],
+        "linearizable": false
+      },
+      "TYPE": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false,
+        "notes": "Always returns 'string' in current version"
+      },
+      "KEYS": {
+        "status": "supported",
+        "args": ["pattern"],
+        "linearizable": false,
+        "notes": "Full keyspace scan - use with caution"
+      },
+      "SCAN": {
+        "status": "supported",
+        "args": ["cursor"],
+        "options": ["MATCH", "COUNT", "TYPE"],
+        "linearizable": false
+      },
+      "EXPIRE": {
+        "status": "supported",
+        "args": ["key", "seconds"],
+        "linearizable": false
+      },
+      "PEXPIRE": {
+        "status": "supported",
+        "args": ["key", "milliseconds"],
+        "linearizable": false
+      },
+      "EXPIREAT": {
+        "status": "supported",
+        "args": ["key", "timestamp"],
+        "linearizable": false
+      },
+      "PEXPIREAT": {
+        "status": "supported",
+        "args": ["key", "timestamp"],
+        "linearizable": false
+      },
+      "TTL": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false
+      },
+      "PTTL": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false
+      },
+      "PERSIST": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false
+      },
+      "EXPIRETIME": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false
+      },
+      "PEXPIRETIME": {
+        "status": "supported",
+        "args": ["key"],
+        "linearizable": false
+      },
+      "RENAME": {
+        "status": "supported",
+        "args": ["key", "newkey"],
+        "linearizable": true,
+        "notes": "Both keys must be in same KPG"
+      },
+      "RENAMENX": {
+        "status": "supported",
+        "args": ["key", "newkey"],
+        "linearizable": true,
+        "notes": "Both keys must be in same KPG"
+      },
+      "COPY": {
+        "status": "supported",
+        "args": ["source", "destination"],
+        "options": ["REPLACE"],
+        "linearizable": false,
+        "notes": "Both keys must be in same KPG; DB option ignored"
+      },
+      "TOUCH": {
+        "status": "supported",
+        "args": ["key..."],
+        "linearizable": false,
+        "notes": "No-op in Lattice (no LRU tracking)"
+      },
+      "RANDOMKEY": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false
+      },
+      "DBSIZE": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false,
+        "notes": "Returns key count for tenant"
+      },
+      "OBJECT": {
+        "status": "partial",
+        "subcommands": {
+          "ENCODING": {"status": "supported", "notes": "Returns 'raw' or 'embstr'"},
+          "FREQ": {"status": "unsupported"},
+          "IDLETIME": {"status": "unsupported"},
+          "REFCOUNT": {"status": "supported", "notes": "Always returns 1"}
+        }
+      }
+    },
+    "connection": {
+      "PING": {
+        "status": "supported",
+        "args": ["message?"],
+        "linearizable": false
+      },
+      "ECHO": {
+        "status": "supported",
+        "args": ["message"],
+        "linearizable": false
+      },
+      "QUIT": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false
+      },
+      "SELECT": {
+        "status": "supported",
+        "args": ["index"],
+        "linearizable": false,
+        "notes": "Accepted but ignored; Lattice uses tenants"
+      },
+      "AUTH": {
+        "status": "supported",
+        "args": ["username?", "password"],
+        "linearizable": false,
+        "notes": "Maps to tenant authentication"
+      },
+      "HELLO": {
+        "status": "supported",
+        "args": ["protover?"],
+        "options": ["AUTH", "SETNAME"],
+        "linearizable": false,
+        "notes": "RESP3 protocol negotiation"
+      },
+      "RESET": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false
+      },
+      "CLIENT": {
+        "status": "partial",
+        "subcommands": {
+          "SETNAME": {"status": "supported"},
+          "GETNAME": {"status": "supported"},
+          "ID": {"status": "supported"},
+          "LIST": {"status": "supported"},
+          "INFO": {"status": "supported"},
+          "KILL": {"status": "partial", "notes": "Admin only"},
+          "PAUSE": {"status": "supported"},
+          "UNPAUSE": {"status": "supported"},
+          "REPLY": {"status": "supported"}
+        }
+      }
+    },
+    "server": {
+      "INFO": {
+        "status": "supported",
+        "args": ["section?"],
+        "linearizable": false,
+        "notes": "Includes Lattice-specific sections"
+      },
+      "TIME": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false,
+        "notes": "Uses committed tick time"
+      },
+      "DEBUG": {
+        "status": "partial",
+        "subcommands": {
+          "SLEEP": {"status": "supported"},
+          "OBJECT": {"status": "partial"}
+        },
+        "notes": "Disabled in production"
+      },
+      "CONFIG": {
+        "status": "partial",
+        "subcommands": {
+          "GET": {"status": "partial", "notes": "Read-only subset"},
+          "SET": {"status": "partial", "notes": "Client-local settings only"}
+        }
+      },
+      "MEMORY": {
+        "status": "partial",
+        "subcommands": {
+          "USAGE": {"status": "supported"},
+          "STATS": {"status": "supported"},
+          "DOCTOR": {"status": "unsupported"}
+        }
+      },
+      "SLOWLOG": {
+        "status": "supported",
+        "subcommands": {
+          "GET": {"status": "supported"},
+          "LEN": {"status": "supported"},
+          "RESET": {"status": "supported"}
+        }
+      }
+    },
+    "transactions": {
+      "MULTI": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false
+      },
+      "EXEC": {
+        "status": "supported",
+        "args": [],
+        "linearizable": "conditional",
+        "notes": "LIN-BOUND required with WATCH"
+      },
+      "DISCARD": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false
+      },
+      "WATCH": {
+        "status": "supported",
+        "args": ["key..."],
+        "linearizable": true,
+        "notes": "Requires LIN-BOUND for CAS semantics"
+      },
+      "UNWATCH": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false
+      }
+    },
+    "pubsub": {
+      "SUBSCRIBE": {
+        "status": "supported",
+        "args": ["channel..."],
+        "linearizable": false,
+        "notes": "Messages not persisted"
+      },
+      "PSUBSCRIBE": {
+        "status": "supported",
+        "args": ["pattern..."],
+        "linearizable": false
+      },
+      "UNSUBSCRIBE": {
+        "status": "supported",
+        "args": ["channel..."],
+        "linearizable": false
+      },
+      "PUNSUBSCRIBE": {
+        "status": "supported",
+        "args": ["pattern..."],
+        "linearizable": false
+      },
+      "PUBLISH": {
+        "status": "supported",
+        "args": ["channel", "message"],
+        "linearizable": false,
+        "notes": "Fire-and-forget; no persistence"
+      },
+      "PUBSUB": {
+        "status": "supported",
+        "subcommands": {
+          "CHANNELS": {"status": "supported"},
+          "NUMSUB": {"status": "supported"},
+          "NUMPAT": {"status": "supported"}
+        }
+      }
+    },
+    "cluster": {
+      "CLUSTER": {
+        "status": "partial",
+        "subcommands": {
+          "SLOTS": {"status": "supported", "notes": "Returns single slot"},
+          "NODES": {"status": "supported", "notes": "Single node info"},
+          "INFO": {"status": "supported"},
+          "KEYSLOT": {"status": "supported", "notes": "Always returns 0"}
+        },
+        "notes": "Compatibility mode only"
+      },
+      "READONLY": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false,
+        "notes": "Enables snapshot reads on replicas"
+      },
+      "READWRITE": {
+        "status": "supported",
+        "args": [],
+        "linearizable": false,
+        "notes": "Requires leader"
+      }
+    }
+  },
+  "unsupported_commands": {
+    "data_structures": {
+      "category": "Not in v0.1 scope",
+      "commands": ["HGET", "HSET", "HDEL", "HGETALL", "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "SADD", "SREM", "SMEMBERS", "ZADD", "ZREM", "ZRANGE", "XADD", "XREAD", "XRANGE"]
+    },
+    "scripting": {
+      "category": "Security and determinism concerns",
+      "commands": ["EVAL", "EVALSHA", "SCRIPT", "FUNCTION"]
+    },
+    "cluster_management": {
+      "category": "Managed by Lattice control plane",
+      "commands": ["CLUSTER ADDSLOTS", "CLUSTER DELSLOTS", "CLUSTER FAILOVER", "CLUSTER MEET", "CLUSTER REPLICATE", "CLUSTER RESET"]
+    },
+    "replication": {
+      "category": "Managed by Lattice",
+      "commands": ["REPLICAOF", "SLAVEOF", "PSYNC", "SYNC"]
+    }
+  },
+  "error_mapping": {
+    "dirty_epoch": {
+      "redis_error": "MOVED",
+      "message_template": "MOVED 0 {correct_host}:{correct_port}",
+      "recovery": "Redirect to correct node"
+    },
+    "linearizability_unavailable": {
+      "redis_error": "CLUSTERDOWN",
+      "message_template": "CLUSTERDOWN The cluster is down - linearizability unavailable",
+      "recovery": "Retry or use READONLY mode"
+    },
+    "cross_slot": {
+      "redis_error": "CROSSSLOT",
+      "message_template": "CROSSSLOT Keys in request don't hash to the same slot",
+      "recovery": "Ensure all keys in same KPG"
+    },
+    "wrong_type": {
+      "redis_error": "WRONGTYPE",
+      "message_template": "WRONGTYPE Operation against a key holding the wrong kind of value"
+    }
+  },
+  "compatibility": {
+    "redis_version": "7.0.x",
+    "client_libraries": [
+      {
+        "language": "Python",
+        "library": "redis-py",
+        "status": "compatible",
+        "notes": "Basic string operations tested"
+      },
+      {
+        "language": "Node.js",
+        "library": "ioredis",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      },
+      {
+        "language": "Rust",
+        "library": "redis-rs",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      },
+      {
+        "language": "Go",
+        "library": "go-redis",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      },
+      {
+        "language": "Java",
+        "library": "Jedis",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      }
+    ]
+  }
+}

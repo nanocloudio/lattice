@@ -7,6 +7,8 @@
     "namespaces": {
       "lattice.kv": "Key-value store metrics",
       "lattice.adapter.etcd": "etcd adapter metrics",
+      "lattice.adapter.redis": "Redis adapter metrics",
+      "lattice.adapter.memcached": "Memcached adapter metrics",
       "lattice.quota": "Quota and rate limiting metrics",
       "lattice.lin_bound": "LIN-BOUND linearizability metrics",
       "lattice.cp": "Control plane metrics",
@@ -184,6 +186,142 @@
         "description": "Total bytes received",
         "labels": ["listener"],
         "unit": "bytes"
+      },
+      {
+        "name": "lattice_adapter_redis_requests_total",
+        "type": "counter",
+        "description": "Total Redis adapter requests",
+        "labels": ["command", "tenant_id", "status"],
+        "unit": "requests"
+      },
+      {
+        "name": "lattice_adapter_redis_errors_total",
+        "type": "counter",
+        "description": "Total Redis adapter errors",
+        "labels": ["command", "error_type", "tenant_id"],
+        "unit": "errors"
+      },
+      {
+        "name": "lattice_adapter_redis_request_duration_seconds",
+        "type": "histogram",
+        "description": "Redis adapter request duration",
+        "labels": ["command", "tenant_id"],
+        "unit": "seconds",
+        "buckets": [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+      },
+      {
+        "name": "lattice_adapter_redis_connections_total",
+        "type": "gauge",
+        "description": "Active Redis connections",
+        "labels": ["protocol_version"],
+        "unit": "connections"
+      },
+      {
+        "name": "lattice_adapter_redis_pipeline_depth",
+        "type": "histogram",
+        "description": "Redis pipeline depth (commands per batch)",
+        "labels": ["tenant_id"],
+        "unit": "commands",
+        "buckets": [1, 2, 4, 8, 16, 32, 64, 128, 256]
+      },
+      {
+        "name": "lattice_adapter_redis_pubsub_channels",
+        "type": "gauge",
+        "description": "Active Pub/Sub channels",
+        "labels": ["tenant_id"],
+        "unit": "channels"
+      },
+      {
+        "name": "lattice_adapter_redis_pubsub_patterns",
+        "type": "gauge",
+        "description": "Active Pub/Sub patterns",
+        "labels": ["tenant_id"],
+        "unit": "patterns"
+      },
+      {
+        "name": "lattice_adapter_redis_pubsub_messages_total",
+        "type": "counter",
+        "description": "Total Pub/Sub messages published",
+        "labels": ["tenant_id"],
+        "unit": "messages"
+      },
+      {
+        "name": "lattice_adapter_redis_transactions_total",
+        "type": "counter",
+        "description": "Total Redis transactions",
+        "labels": ["tenant_id", "status"],
+        "unit": "transactions"
+      },
+      {
+        "name": "lattice_adapter_redis_watch_keys_total",
+        "type": "gauge",
+        "description": "Total keys being watched",
+        "labels": ["tenant_id"],
+        "unit": "keys"
+      },
+      {
+        "name": "lattice_adapter_memcached_requests_total",
+        "type": "counter",
+        "description": "Total Memcached adapter requests",
+        "labels": ["command", "tenant_id", "status"],
+        "unit": "requests"
+      },
+      {
+        "name": "lattice_adapter_memcached_errors_total",
+        "type": "counter",
+        "description": "Total Memcached adapter errors",
+        "labels": ["command", "error_type", "tenant_id"],
+        "unit": "errors"
+      },
+      {
+        "name": "lattice_adapter_memcached_request_duration_seconds",
+        "type": "histogram",
+        "description": "Memcached adapter request duration",
+        "labels": ["command", "tenant_id"],
+        "unit": "seconds",
+        "buckets": [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+      },
+      {
+        "name": "lattice_adapter_memcached_connections_total",
+        "type": "gauge",
+        "description": "Active Memcached connections",
+        "labels": ["protocol"],
+        "unit": "connections"
+      },
+      {
+        "name": "lattice_adapter_memcached_get_hits_total",
+        "type": "counter",
+        "description": "Total get cache hits",
+        "labels": ["tenant_id"],
+        "unit": "hits"
+      },
+      {
+        "name": "lattice_adapter_memcached_get_misses_total",
+        "type": "counter",
+        "description": "Total get cache misses",
+        "labels": ["tenant_id"],
+        "unit": "misses"
+      },
+      {
+        "name": "lattice_adapter_memcached_bytes_read_total",
+        "type": "counter",
+        "description": "Total bytes read by Memcached adapter",
+        "labels": ["tenant_id"],
+        "unit": "bytes"
+      },
+      {
+        "name": "lattice_adapter_memcached_bytes_written_total",
+        "type": "counter",
+        "description": "Total bytes written by Memcached adapter",
+        "labels": ["tenant_id"],
+        "unit": "bytes"
+      },
+      {
+        "name": "lattice_adapter_memcached_cas_badval_total",
+        "type": "counter",
+        "description": "Total CAS operations with mismatched token",
+        "labels": ["tenant_id"],
+        "unit": "operations"
       }
     ]
   },
