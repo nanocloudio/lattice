@@ -1,0 +1,150 @@
+# =============================================================================
+# Lattice Configuration Reference
+# =============================================================================
+#
+# This is a fully-commented reference configuration for Lattice.
+# Copy this file and modify as needed for your deployment.
+#
+# Configuration can be overridden via CLI flags:
+#   --log-level <LEVEL>      Override telemetry.log_level
+#   --storage-dir <PATH>     Override paths.storage_dir
+#   --metrics-bind <ADDR>    Override telemetry.metrics_bind
+#   --grpc-bind <ADDR>       Override listeners.grpc.bind
+
+# =============================================================================
+# Control Plane Configuration
+# =============================================================================
+[control_plane]
+# Mode: "embedded" (single-node) or "external" (connect to CP-Raft cluster)
+mode = "embedded"
+
+# CP-Raft endpoints (required for external mode)
+# endpoints = ["http://cp1.example.com:19000", "http://cp2.example.com:19000"]
+
+# Cache TTL for tenant manifests and routing metadata (seconds)
+cache_ttl_seconds = 5
+
+# Embedded mode HTTP API bind address
+embedded_http_bind = "127.0.0.1:19000"
+
+# Embedded mode Raft bind address
+embedded_raft_bind = "127.0.0.1:19001"
+
+# Bootstrap tenants for embedded mode (creates tenants on first startup)
+# [[control_plane.bootstrap_tenants]]
+# tenant_id = "default"
+# tenant_kpg_count = 1
+# adapters = ["etcd"]
+
+# =============================================================================
+# Listener Configuration
+# =============================================================================
+[listeners]
+
+# gRPC listener for etcd v3 API
+[listeners.grpc]
+# Bind address (etcd-compatible port)
+bind = "0.0.0.0:2379"
+
+# Allow insecure (plaintext) connections for development/testing.
+# WARNING: Do NOT use in production! Set to false and configure TLS.
+insecure = true
+
+# TLS configuration (recommended for production)
+# tls_chain_path = "certs/server.crt"
+# tls_key_path = "certs/server.key"
+
+# mTLS client CA (enables client certificate authentication)
+# client_ca_path = "certs/ca.crt"
+
+# Default tenant for unauthenticated requests (development only)
+default_tenant = "default"
+
+# Redis listener (future)
+# [listeners.redis]
+# bind = "0.0.0.0:6379"
+
+# Memcached listener (future)
+# [listeners.memcached]
+# bind = "0.0.0.0:11211"
+
+# =============================================================================
+# Durability Configuration
+# =============================================================================
+[durability]
+# Durability mode:
+#   "strict"      - fsync each write (highest durability)
+#   "group-fsync" - batch fsyncs for higher throughput
+durability_mode = "strict"
+
+# Commit visibility:
+#   "durable_only" - reads only see durably committed data
+#   "committed"    - reads may see committed but not yet durable data
+commit_visibility = "durable_only"
+
+# Quorum size for write acknowledgment (1 = no replication)
+quorum_size = 1
+
+# This replica's unique identifier
+replica_id = "local"
+
+# Peer replica addresses for replication
+# peer_replicas = ["node2.example.com:19001", "node3.example.com:19001"]
+
+# =============================================================================
+# Telemetry Configuration
+# =============================================================================
+[telemetry]
+# Prometheus metrics endpoint bind address
+metrics_bind = "0.0.0.0:9090"
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+# =============================================================================
+# Tenant Defaults
+# =============================================================================
+[tenants]
+# Default number of KPGs (Key-Value Partition Groups) per tenant
+tenant_kpg_count = 1
+
+# Default lease TTL in milliseconds (used when client doesn't specify)
+lease_ttl_default_ms = 60000
+
+# Maximum lease TTL in milliseconds (client requests clamped to this)
+lease_ttl_max_ms = 600000
+
+# Watch stream idle timeout in milliseconds
+watch_idle_timeout_ms = 300000
+
+# Deterministic tick emission period (controls TTL evaluation granularity)
+expiry_scan_period_ms = 1000
+
+# Auth/principal cache TTL in milliseconds
+auth_cache_ttl_ms = 30000
+
+# =============================================================================
+# Filesystem Paths
+# =============================================================================
+[paths]
+# Storage directory for WAL segments and snapshots
+storage_dir = "data"
+
+# CP certificate bundle path (for external mode with mTLS)
+# cp_certs = "certs/cp-ca.crt"
+
+# Telemetry catalog path (for metrics schema validation)
+# telemetry_catalog = "telemetry/catalog.json"
+
+# =============================================================================
+# Disaster Recovery Configuration
+# =============================================================================
+[dr]
+# Enable periodic snapshot export for disaster recovery
+export_enabled = false
+
+# Export interval in seconds
+# export_interval_seconds = 3600
+
+# Export destination path
+# export_path = "/backup/lattice"

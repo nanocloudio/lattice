@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lattice etcd v3 Wire Protocol Definition",
+  "description": "etcd v3 gRPC API surface definition for Lattice",
+  "version": "0.1.0",
+  "protocol": {
+    "name": "etcd v3",
+    "transport": "gRPC",
+    "tls_required": true,
+    "mtls_required_production": true,
+    "min_tls_version": "1.2"
+  },
+  "services": {
+    "KV": {
+      "package": "etcdserverpb",
+      "rpcs": {
+        "Range": {
+          "status": "supported",
+          "request": "RangeRequest",
+          "response": "RangeResponse",
+          "streaming": false,
+          "linearizable": true,
+          "notes": "serializable=true uses snapshot-only mode"
+        },
+        "Put": {
+          "status": "supported",
+          "request": "PutRequest",
+          "response": "PutResponse",
+          "streaming": false,
+          "linearizable": false,
+          "notes": "Quorum-durable before success"
+        },
+        "DeleteRange": {
+          "status": "supported",
+          "request": "DeleteRangeRequest",
+          "response": "DeleteRangeResponse",
+          "streaming": false,
+          "linearizable": false,
+          "notes": "Quorum-durable before success"
+        },
+        "Txn": {
+          "status": "supported",
+          "request": "TxnRequest",
+          "response": "TxnResponse",
+          "streaming": false,
+          "linearizable": true,
+          "notes": "Single-KPG only; cross-shard rejected"
+        },
+        "Compact": {
+          "status": "partial",
+          "request": "CompactionRequest",
+          "response": "CompactionResponse",
+          "streaming": false,
+          "linearizable": false,
+          "notes": "Per-KPG compaction only"
+        }
+      }
+    },
+    "Watch": {
+      "package": "etcdserverpb",
+      "rpcs": {
+        "Watch": {
+          "status": "supported",
+          "request": "WatchRequest (stream)",
+          "response": "WatchResponse (stream)",
+          "streaming": true,
+          "linearizable": true,
+          "notes": "start_revision=0 requires LIN-BOUND"
+        }
+      }
+    },
+    "Lease": {
+      "package": "etcdserverpb",
+      "rpcs": {
+        "LeaseGrant": {
+          "status": "supported",
+          "request": "LeaseGrantRequest",
+          "response": "LeaseGrantResponse",
+          "streaming": false,
+          "linearizable": false
+        },
+        "LeaseRevoke": {
+          "status": "supported",
+          "request": "LeaseRevokeRequest",
+          "response": "LeaseRevokeResponse",
+          "streaming": false,
+          "linearizable": false
+        },
+        "LeaseKeepAlive": {
+          "status": "supported",
+          "request": "LeaseKeepAliveRequest (stream)",
+          "response": "LeaseKeepAliveResponse (stream)",
+          "streaming": true,
+          "linearizable": false
+        },
+        "LeaseTimeToLive": {
+          "status": "supported",
+          "request": "LeaseTimeToLiveRequest",
+          "response": "LeaseTimeToLiveResponse",
+          "streaming": false,
+          "linearizable": false
+        },
+        "LeaseLeases": {
+          "status": "supported",
+          "request": "LeaseLeasesRequest",
+          "response": "LeaseLeasesResponse",
+          "streaming": false,
+          "linearizable": false
+        }
+      }
+    },
+    "Auth": {
+      "package": "etcdserverpb",
+      "rpcs": {
+        "AuthEnable": {
+          "status": "unsupported",
+          "notes": "Auth always enabled in production"
+        },
+        "AuthDisable": {
+          "status": "unsupported",
+          "notes": "Auth always enabled in production"
+        },
+        "Authenticate": {
+          "status": "partial",
+          "request": "AuthenticateRequest",
+          "response": "AuthenticateResponse",
+          "streaming": false,
+          "linearizable": false,
+          "notes": "Basic password auth only"
+        },
+        "UserAdd": {
+          "status": "partial",
+          "request": "AuthUserAddRequest",
+          "response": "AuthUserAddResponse",
+          "streaming": false,
+          "linearizable": false,
+          "notes": "Minimal subset"
+        },
+        "UserGet": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "UserList": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "UserDelete": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "UserChangePassword": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "UserGrantRole": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "UserRevokeRole": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "RoleAdd": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "RoleGet": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "RoleList": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "RoleDelete": {
+          "status": "partial",
+          "notes": "Minimal subset"
+        },
+        "RoleGrantPermission": {
+          "status": "partial",
+          "notes": "Prefix-based permissions only"
+        },
+        "RoleRevokePermission": {
+          "status": "partial",
+          "notes": "Prefix-based permissions only"
+        }
+      }
+    },
+    "Cluster": {
+      "package": "etcdserverpb",
+      "rpcs": {
+        "MemberAdd": {
+          "status": "unsupported",
+          "notes": "Managed by CP-Raft"
+        },
+        "MemberRemove": {
+          "status": "unsupported",
+          "notes": "Managed by CP-Raft"
+        },
+        "MemberUpdate": {
+          "status": "unsupported",
+          "notes": "Managed by CP-Raft"
+        },
+        "MemberList": {
+          "status": "unsupported",
+          "notes": "Use Lattice admin API"
+        },
+        "MemberPromote": {
+          "status": "unsupported",
+          "notes": "Managed by CP-Raft"
+        }
+      }
+    },
+    "Maintenance": {
+      "package": "etcdserverpb",
+      "rpcs": {
+        "Alarm": {
+          "status": "unsupported",
+          "notes": "Use Lattice admin API"
+        },
+        "Status": {
+          "status": "unsupported",
+          "notes": "Use /readyz and /healthz"
+        },
+        "Defragment": {
+          "status": "unsupported",
+          "notes": "Automatic compaction"
+        },
+        "Hash": {
+          "status": "unsupported"
+        },
+        "HashKV": {
+          "status": "unsupported"
+        },
+        "Snapshot": {
+          "status": "unsupported",
+          "notes": "Use Lattice CLI: lattice snapshot export"
+        },
+        "MoveLeader": {
+          "status": "unsupported",
+          "notes": "Use Lattice admin API"
+        },
+        "Downgrade": {
+          "status": "unsupported"
+        }
+      }
+    },
+    "Election": {
+      "package": "v3electionpb",
+      "rpcs": {
+        "Campaign": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        },
+        "Proclaim": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        },
+        "Leader": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        },
+        "Observe": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        },
+        "Resign": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        }
+      }
+    },
+    "Lock": {
+      "package": "v3lockpb",
+      "rpcs": {
+        "Lock": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        },
+        "Unlock": {
+          "status": "unsupported",
+          "notes": "Not implemented in v0.1"
+        }
+      }
+    }
+  },
+  "error_mapping": {
+    "dirty_epoch": {
+      "grpc_code": "FAILED_PRECONDITION",
+      "grpc_code_value": 9,
+      "message_template": "routing epoch changed (expected: {expected}, observed: {observed})",
+      "recovery": "Refresh routing metadata and retry"
+    },
+    "linearizability_unavailable": {
+      "grpc_code": "UNAVAILABLE",
+      "grpc_code_value": 14,
+      "message_template": "linearizability unavailable: {reason}",
+      "reasons": [
+        "NotLeader",
+        "ReadIndexFailed",
+        "ControlPlaneUnavailable",
+        "StrictFallback",
+        "ProofMismatch"
+      ],
+      "recovery": "Retry with exponential backoff or use serializable mode"
+    },
+    "txn_cross_shard_unsupported": {
+      "grpc_code": "FAILED_PRECONDITION",
+      "grpc_code_value": 9,
+      "message_template": "TxnCrossShardUnsupported: transaction spans multiple KPGs",
+      "recovery": "Redesign key schema to co-locate keys or split transaction"
+    },
+    "throttle_envelope": {
+      "grpc_code": "RESOURCE_EXHAUSTED",
+      "grpc_code_value": 8,
+      "message_template": "rate limit exceeded for tenant {tenant_id}",
+      "recovery": "Backoff and retry; consider increasing quota"
+    },
+    "key_not_found": {
+      "grpc_code": "NOT_FOUND",
+      "grpc_code_value": 5,
+      "message_template": "key not found",
+      "recovery": "N/A"
+    },
+    "permission_denied": {
+      "grpc_code": "PERMISSION_DENIED",
+      "grpc_code_value": 7,
+      "message_template": "permission denied for {operation} on {key}",
+      "recovery": "Check RBAC configuration"
+    },
+    "revision_compacted": {
+      "grpc_code": "OUT_OF_RANGE",
+      "grpc_code_value": 11,
+      "message_template": "revision {revision} has been compacted",
+      "recovery": "Use a more recent revision"
+    }
+  },
+  "command_allowlist": {
+    "description": "Commands allowed per tenant (configured in CP-Raft manifest)",
+    "default_allowed": [
+      "Range",
+      "Put",
+      "DeleteRange",
+      "Txn",
+      "Watch",
+      "LeaseGrant",
+      "LeaseRevoke",
+      "LeaseKeepAlive",
+      "LeaseTimeToLive",
+      "LeaseLeases"
+    ],
+    "admin_only": [
+      "Compact",
+      "UserAdd",
+      "UserDelete",
+      "RoleAdd",
+      "RoleDelete",
+      "RoleGrantPermission",
+      "RoleRevokePermission"
+    ]
+  },
+  "compatibility": {
+    "etcd_version": "3.5.x",
+    "api_version": "3",
+    "client_libraries": [
+      {
+        "language": "Go",
+        "library": "go.etcd.io/etcd/client/v3",
+        "status": "compatible",
+        "notes": "Use WithSerializable() for snapshot-only reads"
+      },
+      {
+        "language": "Python",
+        "library": "etcd3",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      },
+      {
+        "language": "Java",
+        "library": "jetcd",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      },
+      {
+        "language": "Rust",
+        "library": "etcd-client",
+        "status": "compatible",
+        "notes": "Basic operations tested"
+      }
+    ]
+  }
+}

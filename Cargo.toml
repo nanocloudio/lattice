@@ -1,0 +1,103 @@
+[workspace]
+members = [
+    ".",
+    "tools/telemetry_guard",
+    "tools/wire_lint",
+]
+
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Lattice Authors <eng@nanocloud.local>"]
+description = "Lattice - Raft-backed multi-protocol key-value overlay built atop Clustor"
+default-run = "lattice"
+
+[lib]
+name = "lattice"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[features]
+default = ["tcp-tls", "telemetry", "grpc"]
+tcp-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+grpc = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:http-body-util", "dep:http-body"]
+admin-http = ["clustor/admin-http"]
+snapshot-crypto = ["clustor/snapshot-crypto"]
+net = ["clustor/net"]
+telemetry = ["dep:tracing", "dep:tracing-subscriber"]
+interop = []
+
+[dependencies]
+# Error handling: anyhow for top-level, thiserror for internal enums
+anyhow = "1.0.95"
+thiserror = "2.0.17"
+
+# Serialization: serde for derive, serde_json for config/API, bincode for binary formats
+serde = { version = "1.0.228", features = ["derive"] }
+# preserve_order needed for stable JSON output in diagnostics
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+bincode = "1.3.3"
+
+# Time: chrono only for RFC3339 timestamps in CLI output; disable heavy defaults
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+
+# Async runtime: Tokio is the sole runtime
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "time", "net", "macros", "signal", "sync", "io-util", "fs"] }
+
+# Core framework: Clustor provides Raft, durability, control-plane, and networking
+clustor = { path = "../clustor", features = ["admin-http", "snapshot-crypto", "net", "async-net"] }
+
+# Telemetry (optional): tracing for structured logging
+tracing = { version = "0.1.40", optional = true }
+tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter", "json", "time"], optional = true }
+
+# gRPC (optional): tonic for etcd v3 gRPC surface
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+prost-types = { version = "0.13", optional = true }
+http-body-util = { version = "0.1", optional = true }
+http-body = { version = "1.0", optional = true }
+
+# TLS (optional): rustls for TCP/TLS listeners
+rustls = { version = "0.21.12", optional = true, default-features = false, features = [
+    "dangerous_configuration",
+    "tls12",
+] }
+tokio-rustls = { version = "0.24.1", optional = true }
+rustls-pemfile = { version = "1.0.4", optional = true }
+
+# HTTP client: reqwest for forward-plane and telemetry fetching
+reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+# CLI: clap for argument parsing
+clap = { version = "4.5.20", features = ["derive"] }
+
+# Config: toml for configuration file parsing
+toml = "0.8.19"
+
+# Utilities
+bytes = "1.8.0"
+bitflags = { version = "2.6.0", features = ["serde"] }
+uuid = { version = "1.10.0", features = ["v4"] }
+twox-hash = "1.6.3"
+futures = "0.3.31"
+parking_lot = "0.12"
+base64 = "0.22.1"
+libc = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+tempfile = "3.23.0"
+futures = "0.3.31"
+futures-util = "0.3.31"
+which = "6.0.3"
+rcgen = { version = "0.13", features = ["pem"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"

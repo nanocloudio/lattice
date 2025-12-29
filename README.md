@@ -273,4 +273,164 @@ Readiness:
 - **Performance & sizing** – `docs/performance.md` maps L1 server-side latency targets (≤10 ms p99 in-AZ from ingress receipt to WAL quorum durability for single-key writes under healthy conditions) to metrics and alerts.
 - **Conformance** – `docs/interop.md` captures adapter compatibility limits and test suites; it must include explicit failure expectations under LIN-BOUND.
 
-Lattice inherits Clustor’s guardrails for consensus, durability, snapshots, read gates, strict fallback, and security. Keep CP manifests and routing epochs authoritative, treat LIN-BOUND failures as correctness signals (not transient noise), and ensure every adapter surface remains a pure translation layer over the single KV state machine.
+Lattice inherits Clustor's guardrails for consensus, durability, snapshots, read gates, strict fallback, and security. Keep CP manifests and routing epochs authoritative, treat LIN-BOUND failures as correctness signals (not transient noise), and ensure every adapter surface remains a pure translation layer over the single KV state machine.
+
+---
+
+## Quick Start
+
+### Build
+
+```bash
+# Clone and build
+cd lattice
+make build
+
+# Run tests
+make test
+
+# Check linting
+make lint
+```
+
+### Development Mode
+
+```bash
+# Initialize development environment
+lattice init --dev
+
+# Start with example config
+lattice start --config config/lattice.toml
+```
+
+### Production Deployment
+
+See [Deployment Guide](docs/deployment.md) for full instructions.
+
+```bash
+# Build release binary
+make build-release
+
+# Start with production config
+lattice start --config /etc/lattice/lattice.toml
+```
+
+---
+
+## Implementation Status
+
+### v0.1.0 Feature Checklist
+
+#### Core Infrastructure
+- [x] Configuration parsing and validation
+- [x] Deterministic time (Tick) utilities
+- [x] Runtime lifecycle management
+- [x] Error types with adapter mapping
+
+#### Control Plane Integration
+- [x] CP-Raft API types
+- [x] Cache agent with freshness semantics
+- [x] Routing table and epoch validation
+- [x] Capability and feature gate registry
+- [x] Placement tracking
+
+#### KPG Runtime
+- [x] KV state machine (MVCC)
+- [x] Apply loop with CAS-FENCE
+- [x] Revision utilities
+- [x] Lease management
+- [x] Watch stream state
+- [x] Idempotency support
+
+#### LIN-BOUND Semantics
+- [x] can_linearize predicate
+- [x] ReadIndex fencing
+- [x] Fail-closed behavior
+- [x] Strict fallback coupling
+
+#### Deterministic TTL
+- [x] Tick WAL entries
+- [x] Key expiration evaluation
+- [x] Lease deadline enforcement
+- [x] Expiration queue
+
+#### etcd v3 Adapter
+- [x] gRPC service setup
+- [x] Range (Get) - linearizable and serializable
+- [x] Put/Delete operations
+- [x] Transactions (single-KPG)
+- [x] Watch streams
+- [x] Lease lifecycle
+- [x] Auth (minimal subset)
+
+#### Networking
+- [x] TLS/mTLS configuration
+- [x] Security manager
+- [x] gRPC listener
+- [x] Backpressure integration
+
+#### Operations
+- [x] Version gates and feature flags
+- [x] Metrics registry (Prometheus format)
+- [x] Health and readiness probes
+- [x] Telemetry (structured logging)
+- [x] Audit logging
+- [x] Disaster recovery support
+
+#### CLI
+- [x] Argument parsing
+- [x] Start/init/inspect commands
+- [x] Snapshot export/import
+- [x] Version information
+
+### Not Implemented (Future)
+
+- [ ] Redis adapter (RESP2/RESP3)
+- [ ] Memcached adapter (ASCII/binary)
+- [ ] Cross-KPG transactions
+- [ ] Cross-KPG linearizable ranges
+- [ ] Election/Lock services
+- [ ] Lua scripting
+
+---
+
+## Testing
+
+```bash
+# Run all tests
+make test
+
+# Run specific test file
+cargo test --test adapters
+
+# Run conformance tests
+make interop
+
+# Run with verbose output
+cargo test -- --nocapture
+```
+
+### Test Coverage
+
+| Component | Tests |
+|-----------|-------|
+| Unit tests (lib) | 140 |
+| Adapter tests | 38 |
+| Control plane tests | 6 |
+| Core tests | 58 |
+| KPG tests | 54 |
+| Interop tests | 63 |
+| Network tests | 108 |
+| Ops tests | 49 |
+| Integration tests | 77 |
+
+---
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Run `make lint` and `make test`
+4. Submit a pull request
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

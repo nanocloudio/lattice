@@ -1,0 +1,2 @@
+# Minimal rustfmt configuration - use Rust defaults with minor adjustments
+edition = "2021"

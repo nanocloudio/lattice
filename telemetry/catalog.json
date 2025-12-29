@@ -1,0 +1,322 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lattice Telemetry Catalog",
+  "description": "Metrics, traces, and logs schema for Lattice KV Store",
+  "version": "0.1.0",
+  "metrics": {
+    "namespaces": {
+      "lattice.kv": "Key-value store metrics",
+      "lattice.adapter.etcd": "etcd adapter metrics",
+      "lattice.quota": "Quota and rate limiting metrics",
+      "lattice.lin_bound": "LIN-BOUND linearizability metrics",
+      "lattice.cp": "Control plane metrics",
+      "lattice.raft": "Raft consensus metrics",
+      "lattice.network": "Network and connection metrics"
+    },
+    "definitions": [
+      {
+        "name": "lattice_kv_revision",
+        "type": "gauge",
+        "description": "Current KV revision (commit index)",
+        "labels": ["kpg_id", "tenant_id"],
+        "unit": "revision"
+      },
+      {
+        "name": "lattice_kv_compaction_floor_revision",
+        "type": "gauge",
+        "description": "Compaction floor revision",
+        "labels": ["kpg_id", "tenant_id"],
+        "unit": "revision"
+      },
+      {
+        "name": "lattice_kv_key_count",
+        "type": "gauge",
+        "description": "Number of keys in the KV store",
+        "labels": ["kpg_id", "tenant_id"],
+        "unit": "keys"
+      },
+      {
+        "name": "lattice_ttl_expiry_queue_depth",
+        "type": "gauge",
+        "description": "Number of keys pending expiration",
+        "labels": ["kpg_id"],
+        "unit": "keys"
+      },
+      {
+        "name": "lattice_watch_active_streams",
+        "type": "gauge",
+        "description": "Number of active watch streams",
+        "labels": ["kpg_id", "tenant_id"],
+        "unit": "streams"
+      },
+      {
+        "name": "lattice_lease_active_leases",
+        "type": "gauge",
+        "description": "Number of active leases",
+        "labels": ["kpg_id", "tenant_id"],
+        "unit": "leases"
+      },
+      {
+        "name": "lattice_adapter_etcd_requests_total",
+        "type": "counter",
+        "description": "Total etcd adapter requests",
+        "labels": ["operation", "tenant_id", "status"],
+        "unit": "requests"
+      },
+      {
+        "name": "lattice_adapter_etcd_errors_total",
+        "type": "counter",
+        "description": "Total etcd adapter errors",
+        "labels": ["operation", "error_type", "tenant_id"],
+        "unit": "errors"
+      },
+      {
+        "name": "lattice_adapter_etcd_request_duration_seconds",
+        "type": "histogram",
+        "description": "etcd adapter request duration",
+        "labels": ["operation", "tenant_id"],
+        "unit": "seconds",
+        "buckets": [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+      },
+      {
+        "name": "lattice_lin_bound_can_linearize",
+        "type": "gauge",
+        "description": "Whether linearizable operations are available (1=yes, 0=no)",
+        "labels": ["kpg_id"],
+        "unit": "boolean"
+      },
+      {
+        "name": "lattice_lin_bound_failures_total",
+        "type": "counter",
+        "description": "Total LIN-BOUND failures",
+        "labels": ["reason", "kpg_id"],
+        "unit": "failures"
+      },
+      {
+        "name": "lattice_quota_throttle_total",
+        "type": "counter",
+        "description": "Total requests throttled by quota",
+        "labels": ["tenant_id", "quota_type"],
+        "unit": "requests"
+      },
+      {
+        "name": "lattice_quota_tokens_remaining",
+        "type": "gauge",
+        "description": "Remaining quota tokens",
+        "labels": ["tenant_id", "quota_type"],
+        "unit": "tokens"
+      },
+      {
+        "name": "lattice_dirty_epoch_total",
+        "type": "counter",
+        "description": "Total routing epoch mismatches",
+        "labels": ["tenant_id"],
+        "unit": "mismatches"
+      },
+      {
+        "name": "lattice_cp_cache_state",
+        "type": "gauge",
+        "description": "Control plane cache state (0=fresh, 1=cached, 2=stale, 3=expired)",
+        "labels": [],
+        "unit": "state"
+      },
+      {
+        "name": "lattice_cp_cache_age_seconds",
+        "type": "gauge",
+        "description": "Age of control plane cache",
+        "labels": [],
+        "unit": "seconds"
+      },
+      {
+        "name": "lattice_raft_leader",
+        "type": "gauge",
+        "description": "Whether this node is the Raft leader (1=yes, 0=no)",
+        "labels": ["kpg_id"],
+        "unit": "boolean"
+      },
+      {
+        "name": "lattice_raft_proposals_total",
+        "type": "counter",
+        "description": "Total Raft proposals",
+        "labels": ["kpg_id"],
+        "unit": "proposals"
+      },
+      {
+        "name": "lattice_raft_proposal_duration_seconds",
+        "type": "histogram",
+        "description": "Raft proposal duration",
+        "labels": ["kpg_id"],
+        "unit": "seconds",
+        "buckets": [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+      },
+      {
+        "name": "lattice_replication_lag_seconds",
+        "type": "gauge",
+        "description": "Replication lag from leader",
+        "labels": ["kpg_id", "follower_id"],
+        "unit": "seconds"
+      },
+      {
+        "name": "lattice_wal_write_latency_seconds",
+        "type": "histogram",
+        "description": "WAL write latency",
+        "labels": ["kpg_id"],
+        "unit": "seconds",
+        "buckets": [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+      },
+      {
+        "name": "lattice_network_connections_total",
+        "type": "gauge",
+        "description": "Total active network connections",
+        "labels": ["listener"],
+        "unit": "connections"
+      },
+      {
+        "name": "lattice_network_bytes_sent_total",
+        "type": "counter",
+        "description": "Total bytes sent",
+        "labels": ["listener"],
+        "unit": "bytes"
+      },
+      {
+        "name": "lattice_network_bytes_received_total",
+        "type": "counter",
+        "description": "Total bytes received",
+        "labels": ["listener"],
+        "unit": "bytes"
+      }
+    ]
+  },
+  "traces": {
+    "spans": [
+      {
+        "name": "lattice.request",
+        "description": "Top-level request span",
+        "attributes": [
+          {"name": "tenant_id", "type": "string"},
+          {"name": "operation", "type": "string"},
+          {"name": "kpg_id", "type": "string"},
+          {"name": "revision", "type": "int64"}
+        ]
+      },
+      {
+        "name": "lattice.raft.propose",
+        "description": "Raft proposal span",
+        "attributes": [
+          {"name": "kpg_id", "type": "string"},
+          {"name": "entry_size", "type": "int64"}
+        ]
+      },
+      {
+        "name": "lattice.apply",
+        "description": "Apply loop processing span",
+        "attributes": [
+          {"name": "kpg_id", "type": "string"},
+          {"name": "log_index", "type": "int64"},
+          {"name": "entry_type", "type": "string"}
+        ]
+      },
+      {
+        "name": "lattice.watch.deliver",
+        "description": "Watch event delivery span",
+        "attributes": [
+          {"name": "watch_id", "type": "string"},
+          {"name": "event_count", "type": "int64"},
+          {"name": "revision", "type": "int64"}
+        ]
+      }
+    ]
+  },
+  "logs": {
+    "levels": ["error", "warn", "info", "debug", "trace"],
+    "fields": [
+      {"name": "timestamp", "type": "rfc3339", "required": true},
+      {"name": "level", "type": "string", "required": true},
+      {"name": "message", "type": "string", "required": true},
+      {"name": "target", "type": "string", "required": false},
+      {"name": "span_id", "type": "string", "required": false},
+      {"name": "trace_id", "type": "string", "required": false},
+      {"name": "tenant_id", "type": "string", "required": false},
+      {"name": "kpg_id", "type": "string", "required": false},
+      {"name": "operation", "type": "string", "required": false}
+    ],
+    "structured_events": [
+      {
+        "event": "lin_bound_failure",
+        "fields": ["reason", "kpg_id", "operation"]
+      },
+      {
+        "event": "routing_epoch_mismatch",
+        "fields": ["expected_epoch", "observed_epoch", "tenant_id"]
+      },
+      {
+        "event": "lease_expired",
+        "fields": ["lease_id", "key_count", "kpg_id"]
+      },
+      {
+        "event": "watch_created",
+        "fields": ["watch_id", "key_range", "start_revision"]
+      },
+      {
+        "event": "watch_cancelled",
+        "fields": ["watch_id", "reason"]
+      },
+      {
+        "event": "snapshot_completed",
+        "fields": ["kpg_id", "revision", "size_bytes", "duration_ms"]
+      },
+      {
+        "event": "leader_elected",
+        "fields": ["kpg_id", "node_id", "term"]
+      },
+      {
+        "event": "auth_failure",
+        "fields": ["principal", "reason", "client_ip"]
+      }
+    ]
+  },
+  "audit": {
+    "events": [
+      {
+        "type": "auth.login",
+        "severity": "info",
+        "fields": ["principal", "client_ip", "success"]
+      },
+      {
+        "type": "auth.logout",
+        "severity": "info",
+        "fields": ["principal", "session_duration"]
+      },
+      {
+        "type": "auth.permission_denied",
+        "severity": "warn",
+        "fields": ["principal", "operation", "key", "required_permission"]
+      },
+      {
+        "type": "policy.user_created",
+        "severity": "info",
+        "fields": ["actor", "target_user"]
+      },
+      {
+        "type": "policy.role_created",
+        "severity": "info",
+        "fields": ["actor", "role_name", "permissions"]
+      },
+      {
+        "type": "policy.permission_granted",
+        "severity": "info",
+        "fields": ["actor", "target_user", "role_name"]
+      },
+      {
+        "type": "dr.snapshot_exported",
+        "severity": "info",
+        "fields": ["kpg_id", "revision", "destination"]
+      },
+      {
+        "type": "dr.snapshot_imported",
+        "severity": "info",
+        "fields": ["kpg_id", "revision", "source"]
+      }
+    ]
+  }
+}
