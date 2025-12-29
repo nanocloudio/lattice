@@ -23,9 +23,11 @@ name = "lattice"
 path = "src/main.rs"
 
 [features]
-default = ["tcp-tls", "telemetry", "grpc"]
+default = ["tcp-tls", "telemetry", "grpc", "redis"]
 tcp-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 grpc = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:http-body-util", "dep:http-body"]
+redis = []
+memcached = []
 admin-http = ["clustor/admin-http"]
 snapshot-crypto = ["clustor/snapshot-crypto"]
 net = ["clustor/net"]

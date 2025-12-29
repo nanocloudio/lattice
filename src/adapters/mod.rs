@@ -31,10 +31,8 @@
 //!
 //! Currently implemented:
 //! - [`etcd`] - etcd v3 gRPC adapter
-//!
-//! Future adapters (designed for but not implemented):
-//! - Redis RESP2/RESP3 adapter
-//! - Memcached ASCII/binary adapter
+//! - [`redis`] - Redis RESP2/RESP3 adapter
+//! - [`memcached`] - Memcached ASCII/binary adapter
 
 use crate::control::routing::RoutingTable;
 use crate::core::error::LatticeResult;
@@ -46,6 +44,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub mod etcd;
+pub mod memcached;
+pub mod redis;
+pub mod tcp;
 
 /// Request context propagated through adapter processing.
 ///
