@@ -1,0 +1,51 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# MySQL/MariaDB wire connector (RFC database foundation §14.3).
+#
+# The counterpart to pg_edge_anchor. It owns MySQL's handshake,
+# capabilities, authentication negotiation, text flow, session variables,
+# dialect surface, error mapping and RESULT ENCODING — and owns nothing
+# else. Statement text goes to `relational_executor` and typed values
+# come back, so the two connectors cannot drift apart about what a
+# statement means.
+#
+# The split is visible in one line of rendering: a boolean is `1`/`0`
+# here and `t`/`f` on the PostgreSQL port, and neither is a special case
+# because the executor never produced text at all.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_SQL_REQUEST out to relational_executor.mysql_in.
+[[ports]]
+name = "sql_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_SQL_RESPONSE in from relational_executor.mysql_out.
+[[ports]]
+name = "sql_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["sessions", "queries", "rows_sent", "errors", "net_errors"]

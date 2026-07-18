@@ -1,0 +1,32 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+timer_class      = "wall_clock"
+
+[[ports]]
+name         = "net_in"
+direction    = "input"
+content_type = "NetProto"
+buffer_size  = 2048
+
+[[ports]]
+name         = "net_out"
+direction    = "output"
+content_type = "NetProto"
+buffer_size  = 2048
+max_record   = 1600
+
+[[ports]]
+name         = "status_out"
+index        = 1
+direction    = "output"
+content_type = "TextPlain"
+buffer_size  = 2048
+
+[[resources]]
+requires_contract = "channel"
+access            = "read"
+
+[observability]
+exempt = "MySQL connector; throughput is observed at the network provider"

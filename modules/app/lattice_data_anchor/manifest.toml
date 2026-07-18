@@ -1,0 +1,74 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# The storage-side terminator of the internal `lattice.data` surface
+# (RFC §14.8, §14.10, §26 phase 9).
+#
+# This is NOT a client-facing protocol anchor. Its peer is a
+# `lattice_data_client` in ANOTHER graph — separated compute — and the
+# bytes on the wire are the `data_surface.rs` request/response frames,
+# not RESP or the Postgres wire protocol. Everything it does is stated
+# in §14.10's one sentence: "terminate the internal multiplexed data
+# surface and admit requests into range routing."
+#
+# Continuity class: `drain_only`. The surface is multiplexed and every
+# response carries its own `request_id`, so the peer demultiplexes and
+# the anchor never has to preserve per-connection response order. That
+# is why there is no reorder ring here and one in `redis_edge_anchor`:
+# RESP has nothing to correlate with but arrival order.
+#
+# Owns:
+#   - TCP bind + accept (NET_CMD_BIND → NET_MSG_BOUND → NET_MSG_ACCEPTED)
+#   - Frame reassembly across TCP segment boundaries
+#   - Admission (`data_surface::admit_request`) and typed refusal
+#   - Translation to MSG_KV_REQUEST, and MSG_KV_RESPONSE back to a
+#     typed `DataResponse`
+#
+# Does NOT own: sessions, routing cache, retries, cancellation,
+# continuation. §14.9 puts all five in the data CLIENT. An operation
+# that needs one of them is refused by name, never approximated.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+# NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST envelopes out to kv_request_router's
+# `internal_data_in`, stamped PROTO_INTERNAL_DATA.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_RESPONSE envelopes in from kv_request_router's `compute_out`.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Adapter events out to adapter_metrics.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = [
+  "frames",
+  "forwarded",
+  "admission_refusals",
+  "unsupported_refusals",
+  "net_errors",
+  "inflight_full",
+]

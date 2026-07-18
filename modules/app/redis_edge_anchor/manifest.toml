@@ -1,0 +1,83 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# RESP2/RESP3 stream anchor for Redis-compatible clients. Built on the
+# stream-anchor pattern (`stream_anchor_core` is not yet promoted as a
+# foundation core; this module owns its own NET_CMD_* state machine
+# directly, the same way foundation/http does today).
+#
+# Continuity class: `drain_only`. Sticky routing is an optimisation,
+# not a semantic guarantee. CAS-style correctness arrives from
+# kv_state_worker revision fences, not from connection continuity.
+#
+# Owns:
+#   - TCP bind + accept (NET_CMD_BIND → NET_MSG_BOUND → NET_MSG_ACCEPTED)
+#   - Per-connection slot table with RESP2 parser state
+#   - Pipelining order (responses written in request order per slot)
+#   - MULTI/EXEC queueing (per spec: in-anchor session state)
+#   - PUBSUB session state (durable publish still routes through kv_out)
+#   - AUTH / HELLO / SELECT / QUIT (session metadata)
+#   - Drain semantics on graph stop
+#
+# Cleartext bytes from foundation/ip (or TLS-terminated from
+# foundation/tls). On bcm2712, foundation/ip's `net_out` connects here.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+# NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST envelopes out to kv_request_router for any command
+# that isn't handled inline (GET, SET, DEL, INCR, … and the rest).
+# Carries `[corr_id:u64 LE][protocol:u8=0x02][tenant_id:u32 LE]
+# [conn_id:u8][consistency:u8][op:u8][body_len:u16 LE][body…]`.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_RESPONSE envelopes in from kv_request_router. The anchor
+# looks up the originating slot by `corr_id`, RESP-encodes the
+# response, and ships it on `net_out`.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Auth requests (HELLO / AUTH) → auth_manager.
+[[ports]]
+name = "auth_request"
+direction = "output"
+content_type = "OctetStream"
+
+# Auth decisions from auth_manager.
+[[ports]]
+name = "auth_decision"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-tenant disconnect signals from quota_manager (noisy neighbour).
+[[ports]]
+name = "disconnect"
+direction = "input"
+content_type = "OctetStream"
+
+# Adapter events out to adapter_metrics.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["commands", "forwarded", "net_errors", "auth_failures"]

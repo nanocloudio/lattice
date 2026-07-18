@@ -1,0 +1,273 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Adapter-neutral ingress router. Converts etcd/Redis/Memcached
+# requests into internal KV envelopes, validates `tenant` and
+# `kv_epoch`, checks adapter policies / feature gates, requests
+# epoch-stamped route plans from `control_plane`, and decides
+# whether adapter semantics allow using those plans. Dirty-epoch
+# rejection becomes graph-visible here rather than library-local.
+
+# Per-protocol ingress from each edge anchor.
+[[ports]]
+name = "etcd_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "redis_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "memcached_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "memcached_udp_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Control-plane inputs.
+[[ports]]
+name = "route_plan"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cp_proof"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "quota_decision"
+direction = "input"
+content_type = "OctetStream"
+
+# Routed commands out to the deterministic worker.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Routed control out to watch_registry / lease_manager.
+[[ports]]
+name = "watch_ctrl"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lease_ctrl"
+direction = "output"
+content_type = "OctetStream"
+
+# Responses back to each anchor.
+[[ports]]
+name = "etcd_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "redis_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "memcached_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "memcached_udp_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Worker responses joined back into the router.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# Phase 7 consensus bridge: write KV_COMMANDs get mirrored here as
+# MSG_CLIENT_PROPOSAL envelopes shaped for clustor's `gateway.client_requests`
+# input (`[conn_id:u8][kv_command_payload]`). Leaving this port unwired
+# falls back to the direct router→worker path (Phase 1 behaviour).
+[[ports]]
+name = "proposal_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Linearizable-read fence (Phase 5, RFC §1.3). Reads classified
+# linearizable (envelope consistency REQ_LINEARIZABLE, or ALL reads via
+# param `lin_reads: 1` for benches) are stashed router-side and a
+# MSG_CLIENT_READ_REQUEST [corr_id] fence is submitted here → wire to
+# `consensus.read`. Unwired = every read stays on the direct
+# snapshot path (Phase 1 behaviour).
+[[ports]]
+name = "lin_read_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Fence releases: wire from `consensus.applied`. Carries
+# MSG_CLIENT_READ_RESPONSE (release the stashed read to the worker),
+# MSG_CLIENT_REJECT_INTERNAL (LIN-BOUND fail-closed: drop the stash),
+# and per-entry MSG_CLIENT_RESPONSE write acks (filtered out here —
+# lattice write responses ride the worker path).
+[[ports]]
+name = "read_release"
+direction = "input"
+content_type = "OctetStream"
+
+# Phase-3 ROUTING (RFC database foundation §11.2/§11.4): bounded
+# MAP_UPDATE_V1 slot-binding batches (see modules/common/partition_map.rs)
+# advancing the router's hash-slot map at runtime. Unknown versions and
+# malformed frames drop fail-closed (counted + one-shot log). Unwired =
+# the static single-partition default map stands (like the other
+# optional control inputs: route_plan / cp_proof / quota_decision).
+[[ports]]
+name = "map_update"
+direction = "input"
+content_type = "OctetStream"
+
+# ── Internal KV callers ───────────────────────────────────────────────
+#
+# Modules inside the graph that issue KV requests on their OWN behalf
+# rather than for a connected client: watch_fanout backfilling a resume
+# window, and the relational executor reading catalog and table rows.
+#
+# They get their own request/response port pairs for the same reason the
+# client protocols do — the router routes a reply by the protocol byte
+# of its request, so two internal callers sharing one port pair would
+# have their replies delivered to whichever one that byte maps to.
+# Requests arrive stamped PROTO_INTERNAL_WATCH / PROTO_INTERNAL_SQL.
+[[ports]]
+name = "internal_watch_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "internal_sql_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Range supervisor (Phase 4). The only ingress allowed to carry
+# KV_OP_TARGETED (explicit partition addressing for split bootstrap).
+[[ports]]
+name = "internal_lifecycle_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Phase 6 index-backfill worker (PROTO_INTERNAL_JOB).
+[[ports]]
+name = "internal_job_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Phase 9 `lattice_data_anchor` (PROTO_INTERNAL_DATA): compute that
+# lives in another graph, admitted through the internal data surface.
+# Replies leave on `compute_out`, shared with `internal_sql_in` — the
+# outputs are at fluxor's 16-port cap. The router refuses at init if
+# both are wired, because a graph has exactly one compute placement.
+[[ports]]
+name = "internal_data_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Gateway reject feedback (`gateway.responses`). The gateway refuses a
+# proposal BEFORE assigning it a correlation id — a NOT_LEADER check
+# precedes `next_corr_id` — so its reject names only the conn. Without
+# this edge the rejection is dropped and every refused write waits out
+# the 5s inflight sweep instead of failing in milliseconds. The 16th
+# and LAST input slot.
+[[ports]]
+name = "gateway_reject"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "internal_watch_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Replies to whichever compute ingress this graph wired: the in-graph
+# relational executor (PROTO_INTERNAL_SQL) or the remote data anchor
+# (PROTO_INTERNAL_DATA). Exactly one, enforced at init.
+[[ports]]
+name = "compute_out"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Ordered multi-range partitions (Phase 3, RFC §11) ────────────────
+#
+# routing_mode 2 addresses two statically provisioned partitions:
+# partition p's worker commands leave on the p-th kv port and its
+# proposals on the p-th proposal port. Index 0 aliases the classic
+# `kv_out` / `proposal_out` above, so single-partition graphs change
+# nothing. Unwired = the partition is unreachable, which the router
+# refuses at init if the range map binds it. Two, not more: fluxor
+# caps outputs at 16 and wider fan-out is §11.6 dense hosting.
+[[ports]]
+name = "kv1_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal1_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Replies to the range supervisor (PROTO_INTERNAL_LIFECYCLE).
+[[ports]]
+name = "internal_lifecycle_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Replies to the index-backfill worker (PROTO_INTERNAL_JOB). The 16th
+# and LAST output slot — fluxor caps outputs at 16.
+[[ports]]
+name = "internal_job_out"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+# `map_generation` is gauge-shaped but monotonic (generations never
+# decrease), so the counter emit contract holds.
+[observability]
+metrics = [
+    "routed",
+    "rejects",
+    "lin_reads",
+    "range0_writes",
+    "range1_writes",
+    "range0_busiest_key_percent",
+    "stale_route_rejects",
+    "map_generation",
+    "map_update_drops",
+    "cross_range_rejects",
+    "fence_timeouts",
+    # Ops answered fail-closed because no completion signal arrived. On
+    # a healthy cluster this stays zero; a rising count means requests
+    # are reaching a node that cannot commit them, most often a
+    # follower.
+    "inflight_timeouts",
+    # Writes failed FAST because the gateway said NOT_LEADER. Zero on a
+    # leader. Compare with inflight_timeouts: refusals landing there
+    # instead of here mean the gateway_reject wire is down.
+    "not_leader_rejects",
+    # Cross-partition transaction helping: helps started on TXN_PENDING
+    # replies with a remote home, and helps whose carried decision was
+    # applied. The gap is homes still legitimately pending.
+    "helps_started",
+    "helps_resolved",
+]

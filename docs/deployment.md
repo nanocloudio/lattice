@@ -1,311 +1,173 @@
 # Lattice Deployment Guide
 
-This document covers production deployment of Lattice, including configuration, TLS setup, and operational considerations.
+This document covers deploying Lattice. A Lattice node is **not** a standalone
+binary — it is a `fluxor run` over a graph config that composes Lattice's
+protocol/KV modules onto the Clustor Raft / WAL / snapshot substrate. Deploying
+therefore means building the PIC modules, choosing a graph config in `configs/`,
+and launching each node with `fluxor run`.
 
 ## Prerequisites
 
-- Linux x86_64 or ARM64 host
-- Rust 1.75+ (for building from source)
-- Valid TLS certificates (mTLS required in production)
-- Network access to clustor control plane nodes
+- Toolchain as pinned by `rust-toolchain.toml` (channel `stable`, with the
+  `aarch64-unknown-none` bare-metal target and `rust-src`/`rustfmt`/`clippy`).
+  Do not track a separate MSRV — `rust-toolchain.toml` is authoritative.
+- A working `fluxor` CLI whose wire ABI matches `fluxor.toml [required]`
+  (`fluxor = { abi = 1 }`).
+- For bare-metal nodes: an aarch64 target board. The shipped bare-metal configs
+  target `bcm2712` (Raspberry Pi 5), netbooted onto the rig (see the bare-metal
+  configs and `standards/rig.md`).
 
 ## Building
 
+The lifecycle is delegated to `fluxor` verbs via the `Makefile`:
+
 ```bash
-# Development build
-make build
-
-# Release build with optimizations
-make build-release
-
-# Run tests
-make test
-
-# Check formatting and lints
-make lint
+make build      # fluxor build  — stages the SDK, builds modules + host crates
+make test       # fluxor test
+make lint       # fluxor lint
+make ci         # fluxor ci     — full gate (module build, lints, wire/catalog)
 ```
+
+Build the PIC module artifacts (`.fmod` ELFs) for a hardware target:
+
+```bash
+fluxor modules build --target bcm2712   # bcm2712 silicon = Pi 5 board
+```
+
+The build targets are declared in `fluxor.toml [ci].targets` (currently
+`bcm2712`). After editing anything under `modules/`, rebuild the `.fmod`s —
+`fluxor build` alone does not recompile the PIC modules.
 
 ## Configuration
 
-Lattice uses TOML configuration files. See `config/lattice.toml` for a complete reference.
+There is no `lattice.toml`. A node's configuration **is** a fluxor graph YAML in
+`configs/`. Each file declares the target platform, the scheduler tick, the set
+of enabled modules (protocol anchors, KV worker, Clustor substrate modules), and
+the wiring between them. Knobs live per-module under `params:`.
 
-### Minimal Configuration
+Representative configs:
 
-```toml
-[control_plane]
-mode = "clustor"
-endpoints = ["https://cp1:2379", "https://cp2:2379", "https://cp3:2379"]
-cache_ttl_seconds = 300
+| Config | Shape |
+| ------ | ----- |
+| `configs/single-replicated-lattice.yaml` | Single-node host bring-up: Redis edge → Raft → WAL → apply (`voter_count: 1`). |
+| `configs/bare-metal-pi5.yaml` | Bare-metal Pi 5 twin of the above; durability rides the real `nvme` → `fat32` → WAL storage stack. |
+| `configs/multi-3node.yaml` | 3-node cluster template with per-node placeholders (see [Multi-Node](#multi-node)). |
+| `configs/single.yaml` | Single node with a `tls`-terminated transport in front of the edge anchors. |
 
-[listeners.grpc]
-bind = "0.0.0.0:2379"
-tls_chain_path = "/etc/lattice/tls/server.crt"
-tls_key_path = "/etc/lattice/tls/server.key"
-client_ca_path = "/etc/lattice/tls/ca.crt"
+### Real knobs (cite the config, don't invent)
 
-[durability]
-mode = "quorum"
-quorum_size = 2
+These are the knobs actually present in the shipped graph YAML. Read the file
+before relying on any of them; the examples below are copied from
+`configs/single-replicated-lattice.yaml` and `configs/bare-metal-pi5.yaml`.
 
-[paths]
-data_dir = "/var/lib/lattice/data"
-wal_dir = "/var/lib/lattice/wal"
-```
+- **Platform / pacing** — top-level `target:` (`linux` for host, `pi5` for
+  bare-metal) and `tick_us:` (scheduler cadence; on the Pi 5 this is the
+  dominant latency lever — see the tuning notes inline in `bare-metal-pi5.yaml`).
+- **Edge enablement + ports** — which protocol anchor modules are listed under
+  `modules:` (e.g. `redis_edge_anchor`), and the router's `listen_port` /
+  read classification (`lin_reads`), `replicated`.
+- **Durability** (`durability` module `params:`) — `fsync_mode`,
+  `group_window_ms`, `group_max_pending`, `fence_depth`, `segment_bytes`,
+  `voter_count`, `partition_id`; bare-metal adds `root_path`, `skip_replay`.
+- **Consensus** (`consensus` module) — `self_id`, `voter_count`,
+  `heartbeat_interval_ms`.
+- **Peer topology** (`peer_router` module) — `self_id`, `peer_count`,
+  `listen_port`, `peerN_port` / `peerN_host`.
+- **Observability HTTP** (`operations` module) — `listen_port` for the
+  `/metrics` + `/readyz` surface, `emit_interval_ms`.
 
-### Configuration Sections
+The durable write path these configs wire is: Redis edge anchor →
+`kv_request_router` → `gateway` → `consensus` (Raft append → `durability` WAL →
+quorum → commit) → `lattice_apply_bridge` → `kv_state_worker` → response. HA,
+quorum, leadership, and snapshots are all provided by the Clustor substrate
+modules (`consensus`, `durability`, `admission`, `control_plane`, `operations`,
+`gateway`, `peer_router`), not by Lattice code.
 
-#### Control Plane
+## Multi-Node
 
-```toml
-[control_plane]
-# Mode: "standalone" for development, "clustor" for production
-mode = "clustor"
+`configs/multi-3node.yaml` uses `__SELF_ID__`, `__REDIS_PORT__`, `__HTTP_PORT__`,
+`__LISTEN_PORT__`, and `__PEER*_PORT__`/`__PEER*_HOST__` placeholders. The fluxor
+template renderer fills these per node before launching `fluxor run` — the
+placeholder set and CI-render defaults are declared in `fluxor.toml
+[ci.templates]` (those defaults exist to pass the render gate; they are not the
+production values). Each of the three nodes runs the same rendered config with
+its own identity and peer list, and the substrate forms a `voter_count: 3`
+quorum.
 
-# CP-Raft endpoints
-endpoints = ["https://cp1:2379", "https://cp2:2379", "https://cp3:2379"]
+## Transport Security (TLS / mTLS)
 
-# Cache TTL for CP data (manifests, routing, policies)
-cache_ttl_seconds = 300
-
-# Grace period before treating cached data as stale
-cache_grace_ms = 30000
-```
-
-#### Listeners
-
-```toml
-[listeners.grpc]
-# Bind address for etcd v3 gRPC
-bind = "0.0.0.0:2379"
-
-# TLS configuration (required in production)
-tls_chain_path = "/etc/lattice/tls/server.crt"
-tls_key_path = "/etc/lattice/tls/server.key"
-client_ca_path = "/etc/lattice/tls/ca.crt"
-
-# Minimum TLS version
-min_tls_version = "1.2"
-
-# Maximum concurrent connections
-max_connections = 10000
-
-# Connection idle timeout
-idle_timeout_ms = 300000
-```
-
-#### Durability
-
-```toml
-[durability]
-# Mode: "sync", "quorum", "async"
-mode = "quorum"
-
-# Quorum size for quorum mode
-quorum_size = 2
-
-# fsync policy
-fsync_policy = "always"
-```
-
-#### Tenants
-
-```toml
-[tenants]
-# Default tenant for connections without explicit tenant ID
-default_tenant = "default"
-
-# Per-tenant QPS limits
-default_qps_limit = 1000
-
-# Per-tenant bytes/second limits
-default_bytes_limit = 104857600
-
-# Lease TTL bounds
-lease_ttl_default_ms = 60000
-lease_ttl_max_ms = 86400000
-```
-
-#### Telemetry
-
-```toml
-[telemetry]
-# Enable metrics export
-enabled = true
-
-# Prometheus metrics endpoint
-metrics_bind = "0.0.0.0:9090"
-
-# Log level: error, warn, info, debug, trace
-log_level = "info"
-
-# JSON log output
-json_logs = true
-```
-
-## TLS Setup
-
-Lattice requires mTLS for production deployments.
-
-### Generate CA and Certificates
-
-```bash
-# Generate CA
-openssl genrsa -out ca.key 4096
-openssl req -new -x509 -days 3650 -key ca.key -out ca.crt \
-    -subj "/CN=Lattice CA"
-
-# Generate server certificate
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr \
-    -subj "/CN=lattice.example.com"
-openssl x509 -req -days 365 -in server.csr \
-    -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out server.crt \
-    -extfile <(printf "subjectAltName=DNS:lattice.example.com,DNS:localhost,IP:127.0.0.1")
-
-# Generate client certificate
-openssl genrsa -out client.key 2048
-openssl req -new -key client.key -out client.csr \
-    -subj "/CN=client@example.com"
-openssl x509 -req -days 365 -in client.csr \
-    -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out client.crt
-```
-
-### Certificate Rotation
-
-Lattice monitors certificate files for changes and reloads automatically. To rotate certificates:
-
-1. Generate new certificates
-2. Replace certificate files atomically (rename)
-3. Lattice detects change and reloads within 30 seconds
+Transport security is a foundation `tls` module composed into the graph, not a
+config file section. `configs/single.yaml` wires the fluxor `tls` foundation
+module in front of the edge anchors (`tls.clear_out` → anchor, anchor →
+`tls.cipher_out`), so etcd/Redis traffic is TLS-terminated before it reaches the
+protocol anchor. The replicated example configs do not enable `tls`; add the
+module and its wiring (as in `single.yaml`) for a TLS-terminated deployment.
 
 ## Running
 
-### Systemd Service
-
-Create `/etc/systemd/system/lattice.service`:
-
-```ini
-[Unit]
-Description=Lattice Key-Value Store
-After=network.target
-
-[Service]
-Type=simple
-User=lattice
-Group=lattice
-ExecStart=/usr/local/bin/lattice start --config /etc/lattice/lattice.toml
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Container
+Bring up a single node:
 
 ```bash
-docker run -d \
-    --name lattice \
-    -p 2379:2379 \
-    -p 9090:9090 \
-    -v /etc/lattice:/etc/lattice:ro \
-    -v /var/lib/lattice:/var/lib/lattice \
-    lattice:latest start --config /etc/lattice/lattice.toml
+fluxor run configs/single-replicated-lattice.yaml
 ```
+
+For bare-metal, the node is netbooted onto the rig rather than run locally
+(see the boot/drive/scrape commands documented inline at the top of
+`configs/bare-metal-pi5.yaml`, and `standards/rig.md`).
+
+There is no systemd unit, no container image, and no `lattice start` /
+`/usr/local/bin/lattice` — a node is exactly the `fluxor run` process over a
+graph config.
 
 ## Verifying Deployment
 
-### Health Check
+The `operations` module owns the HTTP surface. With a config that binds it
+(e.g. `operations.listen_port: 19090`):
 
 ```bash
-# Liveness
-curl -k https://localhost:2379/healthz
+# Readiness — reports the tenant routing-epoch cache age, adapter enablement
+# states, and a digest of the active tenant manifest.
+curl http://<host>:19090/readyz
 
-# Readiness (includes CP cache status)
-curl -k https://localhost:2379/readyz
+# Metrics
+curl http://<host>:19090/metrics
 ```
 
-### Metrics
+On bare-metal, telemetry is also observable over `log_net` UDP in addition to
+the `/metrics` HTTP endpoint (see `configs/bare-metal-pi5.yaml`).
 
-```bash
-# Prometheus metrics
-curl http://localhost:9090/metrics
-```
+## Observability
 
-### etcd Client Test
-
-```bash
-# Using etcdctl with mTLS
-ETCDCTL_API=3 etcdctl \
-    --endpoints=https://localhost:2379 \
-    --cacert=/etc/lattice/tls/ca.crt \
-    --cert=/etc/lattice/tls/client.crt \
-    --key=/etc/lattice/tls/client.key \
-    put foo bar
-
-ETCDCTL_API=3 etcdctl \
-    --endpoints=https://localhost:2379 \
-    --cacert=/etc/lattice/tls/ca.crt \
-    --cert=/etc/lattice/tls/client.crt \
-    --key=/etc/lattice/tls/client.key \
-    get foo
-```
+- Lattice metrics live in the dotted namespaces `lattice.kv.*`,
+  `lattice.adapter.<name>.*`, `lattice.quota.*`, plus inherited `clustor.*`
+  metrics. The authoritative list is `telemetry/catalog.json` and the
+  specification's [observability](specification.md#observability) section. Do
+  not rely on metric names not present there.
+- The catalog is validated in CI by `tools/ci/telemetry_guard`.
 
 ## Troubleshooting
 
-### Common Issues
+### LIN-BOUND / strict-fallback failures
 
-#### LIN-BOUND Failures
+If linearizable operations fail (e.g. Redis `GET` → `-CLUSTERDOWN`), the node's
+CP cache is stale/expired or no ReadIndex authority is available. This is the
+inherited Clustor strict-fallback behavior (see the specification's
+[control plane](specification.md#control-plane) and
+[read semantics](specification.md#read-semantics-and-lin-bound) sections).
+Restore control-plane freshness; the cache refreshes automatically.
 
-If operations fail with `UNAVAILABLE` and "linearizability unavailable":
+### Write path wedges after a restart
 
-1. Check CP-Raft connectivity: `curl https://cp1:2379/health`
-2. Verify CP cache is not stale: check `lattice_cp_cache_state` metric
-3. Check if node is leader: only leaders can serve linearizable reads
-
-#### Routing Epoch Mismatch
-
-If operations fail with `FAILED_PRECONDITION` and "routing epoch changed":
-
-1. Client is using stale routing information
-2. Retry with updated routing metadata
-3. Check for recent CP-Raft manifest updates
-
-#### Watch Stream Disconnects
-
-If watches disconnect frequently:
-
-1. Check network stability
-2. Verify `watch_idle_timeout_ms` configuration
-3. Enable progress notifications: `progress_notify=true`
-
-### Logs
-
-```bash
-# View logs with systemd
-journalctl -u lattice -f
-
-# Log levels
-lattice start --config /etc/lattice/lattice.toml --log-level debug
-```
-
-### Metrics to Monitor
-
-| Metric | Description | Alert Threshold |
-|--------|-------------|-----------------|
-| `lattice_lin_bound_can_linearize` | LIN-BOUND availability | < 1 for > 30s |
-| `lattice_cp_cache_state` | CP cache freshness | != Fresh for > 60s |
-| `lattice_adapter_etcd_requests_total` | Request rate | Varies |
-| `lattice_adapter_etcd_errors_total` | Error rate | > 1% of requests |
-| `lattice_kv_revision` | Current revision | Stalled growth |
-| `lattice_watch_active_streams` | Active watches | Capacity planning |
-| `lattice_lease_active_leases` | Active leases | Capacity planning |
+A durable node replays its WAL on boot. The `durability.replay_complete` →
+`consensus.wal_replay_complete` handoff must be wired or the apply pipeline
+stalls after replay — see the inline note in
+`configs/single-replicated-lattice.yaml`. On the perf rig, stale `.WAL`
+segments from prior runs accumulate (no FS delete); `skip_replay: 1` starts
+fresh for measurement (never for crash-recovery scenarios).
 
 ## See Also
 
-- [High Availability](high_availability.md) - HA deployment patterns
-- [Performance](performance.md) - Tuning and latency targets
-- [Interoperability](interop.md) - etcd client compatibility
+- [High Availability](high_availability.md) — HA topologies and failure modes
+- [Performance](performance.md) — latency/throughput targets and measurement
+- [Specification](specification.md) — KV semantics, observability, DR
+- [Interoperability](interop.md) — etcd/Redis/Memcached client compatibility

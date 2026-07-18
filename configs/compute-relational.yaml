@@ -1,0 +1,115 @@
+# Lattice: the separated-compute COMPUTE graph (RFC §14.9, §26 phase 9).
+#
+# Phase 9's acceptance asks for "one relational compute graph against one
+# remote durable range". This is that graph. It holds no data, no KV
+# engine, no state store and no Raft — a `psql` connects to it, and every
+# key it touches lives in another process.
+#
+#   foundation/linux_net    TCP (client-facing, and the dial out)
+#   pg_edge_anchor          v3 wire
+#   mysql_edge_anchor       MySQL wire
+#   relational_executor     parse + bind + execute → KV ops
+#   lattice_data_client     KV ops → lattice.data frames → the storage graph
+#
+# Compare with `configs/single-relational.yaml`, the COMBINED placement.
+# The difference is two wiring lines: where `relational_executor.kv_out`
+# goes, and where its replies come from. The executor is not recompiled,
+# not reconfigured, and cannot tell — which is what makes §30's question
+# ("are the two histories equivalent?") answerable, because the layer
+# under test is identical in both.
+#
+# `lattice_data_client` dials `server_ip:server_port`, where a
+# `lattice_data_anchor` is listening — see
+# `configs/single-data-surface.yaml` (memory) or
+# `configs/single-replicated-data-surface.yaml` (durable, and the one
+# Phase 9's "durable range" means).
+#
+# `index_backfill` is NOT here. It is a storage-side job worker that
+# consumes fenced change streams; running it in compute would put a
+# writer on the far side of a link it does not own. It stays in the
+# storage graph.
+#
+# Run the storage graph first, then:
+#   fluxor run configs/compute-relational.yaml
+#   psql -h 127.0.0.1 -p 5432 -U lattice -d lattice
+
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+# anchor ↔ executor and executor ↔ data client are bidirectional pairs.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: pg_edge_anchor
+    params:
+      listen_port: 5432
+  - name: mysql_edge_anchor
+    params:
+      listen_port: 3306
+  - name: relational_executor
+  - name: lattice_data_client
+    params:
+      # 127.0.0.1 as the packed 32-bit address (0x7F000001) — the same
+      # spelling every other config uses. The storage graph's anchor.
+      server_ip: 2130706433
+      server_port: 7432
+      # The route this client addresses. A configured stand-in for the
+      # routing cache §14.9 will own — see the module header for why
+      # that is a named gap rather than a silent one.
+      range_id: 1
+      range_generation: 1
+      session_id: 1
+      session_epoch: 1
+      database_id: 1
+      # Additional storage replicas (§30's three-replica range). A peer
+      # exists iff its port is non-zero; the client talks to one peer
+      # at a time and rotates on typed NOT_LEADER evidence or on
+      # disconnect — it never fans out. Single-storage deployments
+      # leave these at 0.
+      server2_ip: 2130706433
+      server2_port: 0
+      server3_ip: 2130706433
+      server3_port: 0
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: pg_edge_anchor.net_in
+  - from: pg_edge_anchor.net_out
+    to: linux_net.net_in
+
+  - from: linux_net.net_out
+    to: mysql_edge_anchor.net_in
+  - from: mysql_edge_anchor.net_out
+    to: linux_net.net_in
+
+  # The data client DIALS out over the same provider the anchors accept
+  # on. It is the only module here that originates a connection.
+  - from: linux_net.net_out
+    to: lattice_data_client.net_in
+  - from: lattice_data_client.net_out
+    to: linux_net.net_in
+
+  # ── Connector ↔ executor ────────────────────────────────────────
+  - from: pg_edge_anchor.sql_out
+    to: relational_executor.pg_in
+  - from: relational_executor.pg_out
+    to: pg_edge_anchor.sql_in
+  - from: mysql_edge_anchor.sql_out
+    to: relational_executor.mysql_in
+  - from: relational_executor.mysql_out
+    to: mysql_edge_anchor.sql_in
+
+  # ── Executor ↔ data client ──────────────────────────────────────
+  #
+  # These two lines ARE the separation. In the combined graph they read
+  # `kv_request_router.internal_sql_in` and `kv_request_router.compute_out`;
+  # the envelopes crossing them are byte-identical either way.
+  - from: relational_executor.kv_out
+    to: lattice_data_client.kv_in
+  - from: lattice_data_client.kv_out
+    to: relational_executor.kv_in

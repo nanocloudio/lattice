@@ -1,320 +1,115 @@
 # Lattice Performance Guide
 
-This document covers performance characteristics, latency targets, tuning recommendations, and metrics interpretation for Lattice.
+This document covers performance characteristics, the one sourced latency
+target, tuning knobs that actually exist in the graph configs, and how
+performance is measured.
 
-## Latency Targets
+## Latency target
 
-### L1 Server-Side Latency
+The one authoritative figure is the L1 latency target from the specification:
+≤10 ms p99 in-AZ server-side latency, measured from edge ingress receipt to WAL
+quorum durability for single-key writes under healthy conditions. It excludes
+client RTT, includes adapter parsing and authorization, and applies to durable
+writes only — snapshot-only reads do not wait for WAL and are not subject to it.
 
-Target: **≤10ms p99** for single-key writes under healthy conditions.
+This is a planning target, not a measured guarantee. The binding requirements
+are the durability and gating rules in the specification.
 
-This measures from ingress receipt to WAL quorum durability acknowledgment.
+## Throughput and latency planning targets
 
-| Operation | p50 Target | p99 Target | Notes |
-|-----------|------------|------------|-------|
-| Put (single key) | ≤2ms | ≤10ms | Quorum-durable |
-| Get (linearizable) | ≤1ms | ≤5ms | Includes ReadIndex |
-| Get (serializable) | ≤0.5ms | ≤2ms | Local read |
-| Delete (single key) | ≤2ms | ≤10ms | Quorum-durable |
-| Txn (single KPG) | ≤3ms | ≤15ms | CAS-FENCE + mutations |
-| Watch event | ≤1ms | ≤5ms | Event delivery latency |
-| Lease grant | ≤2ms | ≤10ms | Quorum-durable |
-| Lease keepalive | ≤2ms | ≤10ms | Quorum-durable |
+These are planning targets, not measured results. Real numbers come from the
+perf harness (below). Per `standards/rig.md` conventions, a number from any
+single run is a floor, not a prediction; the Pi 5 also throttles roughly 2× when
+hot, so a cool-boot burst and a sustained run differ. Treat the tables below as
+design goals to validate.
 
-### Network Latency Assumptions
+### Single-key write latency (planning target)
 
-- In-AZ: ≤0.5ms RTT
-- Cross-AZ: ≤2ms RTT
-- Cross-region: 20-100ms RTT (impacts quorum latency)
+| Operation | p99 target |
+| --------- | ---------- |
+| Put / Delete (single key, quorum-durable) | ≤10 ms (the L1 target) |
+| Linearizable Get | measure; see harness |
+| Snapshot-only Get | measure; not subject to L1 |
 
-## Throughput Characteristics
+Anything not tied to the sourced L1 figure above should be measured, not
+quoted. The inline tuning notes in `configs/bare-metal-pi5.yaml` record actual
+rig-observed numbers (e.g. SET p99 ~9.76 ms at `tick_us: 1000`) with their
+provenance — read those rather than repeating round numbers here.
 
-### Single Node
+## Tuning Knobs (real config params)
 
-| Metric | Typical | Maximum |
-|--------|---------|---------|
-| Writes/sec | 10,000 | 50,000 |
-| Reads/sec (linearizable) | 20,000 | 100,000 |
-| Reads/sec (serializable) | 50,000 | 200,000 |
-| Watches (active) | 10,000 | 100,000 |
-| Leases (active) | 10,000 | 100,000 |
+All tuning is done in the fluxor graph YAML. There is no `[runtime]`, `[raft]`,
+`[batching]`, `[network]`, `[paths]`, or `[listeners.grpc]` config — those
+sections do not exist. The knobs that do exist (see
+`configs/bare-metal-pi5.yaml`, which carries the measured rationale inline):
 
-### Cluster (3-node)
+### Scheduler pacing — `tick_us`
 
-| Metric | Typical | Maximum |
-|--------|---------|---------|
-| Writes/sec (cluster) | 10,000 | 50,000 |
-| Reads/sec (distributed) | 50,000 | 200,000 |
+The dominant latency lever on constrained targets. On the Pi 5, dropping
+`tick_us` from 3000 → 1000 cut PING/GET/SET latency ~3× and brought SET p99
+under the ≤10 ms L1 target. Sub-1 ms ticks were tried and reverted — the WAL
+fsync step (~375–950 µs) cannot fit a 500 µs cadence. See the inline notes.
 
-Write throughput is bounded by leader capacity and quorum latency.
+### Durability (`durability` module `params:`)
 
-## Tuning Recommendations
+- `fsync_mode` — per-entry (0) vs group (1). Group fsync is kept: equal latency,
+  higher write-throughput ceiling, durability intact (fsync-before-ack).
+- `group_window_ms` / `group_max_pending` — batch window and depth. On NVMe,
+  `group_window_ms: 0` (flush every poll) beat a nonzero window on both p50/p99
+  and throughput ceiling.
+- `fence_depth` — in-flight async fsync fences. Paired with the rate-classed
+  `consensus.log_append → durability.entries` edge, this lifted durable-write
+  throughput from ~1050 to ~3900/s.
+- `segment_bytes` — WAL segment size; larger segments make rotation
+  (synchronous snapshot-persist) rarer, keeping p99 clean.
 
-### CPU
+### Consensus (`consensus` module) — `heartbeat_interval_ms`, `voter_count`.
 
-- Use at least 4 cores for production
-- Pin Raft threads to dedicated cores for latency consistency
-- Monitor `lattice_cpu_usage` for saturation
+### Storage stack (bare-metal) — the `nvme` (`queue_depth`) and `fat32` modules
+provide the FS contract the WAL writes through.
 
-```toml
-[runtime]
-raft_thread_count = 2
-apply_thread_count = 2
-```
+### Rate classing
 
-### Memory
+The `consensus.log_append → durability.entries` wiring edge carries
+`rate: transaction`. Without it the WAL entry-pump gets a zero byte-grant and
+processes one entry per tick regardless of backlog — the single biggest
+throughput cliff. This is a wiring attribute, not a config section.
 
-- Allocate sufficient memory for working set + indexes
-- Monitor `lattice_memory_usage_bytes`
-- Consider key count and average value size
+## Measurement
 
-**Sizing formula:**
-```
-Memory = (key_count * avg_key_size) + (key_count * 100 bytes overhead) + (active_watches * 1KB)
-```
+Real numbers are produced by the shadow-tracked perf harness and the host-side
+load generator. There is no `lattice benchmark` command or standalone benchmark
+binary.
 
-Example: 1M keys @ 100 bytes = ~200MB for indexes
+- **`perf/run_l1.sh`** — L1 single-node durable baseline. Brings up one node on
+  `configs/single-replicated-lattice.yaml` (real Redis → Raft → disk-WAL → apply,
+  `voter_count: 1`) and drives it open-loop with `lattice-loadgen` across a
+  workload matrix, saving one provenance-stamped JSON per point under
+  `perf/results/`. A local run is harness-bound (driver == DUT, loopback); the
+  rig-trustworthy twin drives the Pi 5 DUT (`configs/bare-metal-pi5.yaml`) from
+  the dev host.
+- **`perf/run_l2_3node.sh`**, **`perf/run_l4_xmachine.sh`** — multi-node and
+  cross-machine scopes.
+- **`tools/load/lattice-bench`** (`lattice-loadgen`) — the off-DUT load
+  generator and `/metrics` scraper.
 
-### Storage
-
-- Use NVMe SSDs for WAL
-- Separate WAL and data volumes
-- Monitor `lattice_wal_write_latency_seconds`
-
-```toml
-[paths]
-wal_dir = "/fast-nvme/lattice/wal"
-data_dir = "/ssd/lattice/data"
-```
-
-### Network
-
-- Use dedicated network for Raft replication
-- Enable TCP keepalives
-- Monitor `lattice_network_latency_seconds`
-
-```toml
-[network]
-raft_port = 2380
-replication_buffer_size = 67108864  # 64MB
-tcp_keepalive_seconds = 30
-```
-
-## Configuration Tuning
-
-### Raft Parameters
-
-```toml
-[raft]
-# Election timeout (ms) - increase for high-latency networks
-election_timeout_min_ms = 1000
-election_timeout_max_ms = 2000
-
-# Heartbeat interval - typically election_timeout / 10
-heartbeat_interval_ms = 100
-
-# Maximum uncommitted entries
-max_uncommitted_entries = 1000
-
-# Snapshot threshold
-snapshot_entries_threshold = 100000
-```
-
-### Batching
-
-```toml
-[batching]
-# Write batching for throughput
-write_batch_size = 100
-write_batch_timeout_ms = 1
-
-# Watch event batching
-watch_batch_size = 100
-watch_batch_timeout_ms = 10
-```
-
-### Connection Pooling
-
-```toml
-[listeners.grpc]
-# Maximum connections
-max_connections = 10000
-
-# Connection queue depth
-backlog = 1024
-
-# Idle connection timeout
-idle_timeout_ms = 300000
-```
+Because `tests/`, `benches/`, and the perf scripts are shadow-tracked
+(`.git-shadow`), a plain checkout has none of them; CI's `shadow_guard.sh`
+fails rather than passing vacuously.
 
 ## Metrics Interpretation
 
-### Latency Metrics
+Lattice metrics use the dotted namespaces `lattice.kv.*`,
+`lattice.adapter.<name>.*`, `lattice.quota.*`, plus inherited `clustor.*`.
+The authoritative names, types, labels, and units are in `telemetry/catalog.json`
+and the specification's [observability](specification.md#observability) section.
+Use those; do not invent metric names.
 
-```promql
-# Write latency p99
-histogram_quantile(0.99,
-  rate(lattice_adapter_etcd_request_duration_seconds_bucket{operation="Put"}[5m]))
-
-# Read latency p99
-histogram_quantile(0.99,
-  rate(lattice_adapter_etcd_request_duration_seconds_bucket{operation="Range"}[5m]))
-```
-
-### Throughput Metrics
-
-```promql
-# Requests per second
-rate(lattice_adapter_etcd_requests_total[5m])
-
-# Error rate
-rate(lattice_adapter_etcd_errors_total[5m]) / rate(lattice_adapter_etcd_requests_total[5m])
-```
-
-### Resource Utilization
-
-```promql
-# CPU usage
-rate(process_cpu_seconds_total[5m])
-
-# Memory usage
-process_resident_memory_bytes
-
-# File descriptors
-process_open_fds
-```
-
-### Raft Metrics
-
-```promql
-# Replication lag
-lattice_replication_lag_seconds
-
-# Uncommitted entries
-lattice_raft_uncommitted_entries
-
-# Proposal rate
-rate(lattice_raft_proposals_total[5m])
-```
-
-## Performance Testing
-
-### Benchmarking
-
-Use the built-in benchmark tool:
-
-```bash
-# Write benchmark
-lattice benchmark put --keys 10000 --value-size 100 --concurrency 10
-
-# Read benchmark
-lattice benchmark get --keys 10000 --concurrency 100
-
-# Mixed workload
-lattice benchmark mixed --read-ratio 0.8 --keys 10000 --duration 60s
-```
-
-### Load Testing
-
-Using etcd's benchmark tool:
-
-```bash
-# Write test
-benchmark --endpoints=https://localhost:2379 \
-    --cert=/path/to/client.crt --key=/path/to/client.key --cacert=/path/to/ca.crt \
-    put --key-size=8 --val-size=256 --total=100000 --conns=100
-
-# Read test
-benchmark --endpoints=https://localhost:2379 \
-    --cert=/path/to/client.crt --key=/path/to/client.key --cacert=/path/to/ca.crt \
-    range /foo --total=100000 --conns=100
-```
-
-## Performance Debugging
-
-### High Latency
-
-1. **Check Raft latency**
-   ```promql
-   lattice_raft_proposal_duration_seconds
-   ```
-   - High: Network latency or follower slowness
-
-2. **Check WAL latency**
-   ```promql
-   lattice_wal_write_latency_seconds
-   ```
-   - High: Storage saturation
-
-3. **Check apply latency**
-   ```promql
-   lattice_apply_loop_duration_seconds
-   ```
-   - High: State machine bottleneck
-
-### Low Throughput
-
-1. **Check leader CPU**
-   - Leader does more work than followers
-   - Consider scaling leader resources
-
-2. **Check batch sizes**
-   - Small batches = high overhead
-   - Increase batch size/timeout
-
-3. **Check network bandwidth**
-   ```promql
-   rate(lattice_network_bytes_sent_total[5m])
-   ```
-
-### Memory Growth
-
-1. **Check key count**
-   ```promql
-   lattice_kv_key_count
-   ```
-
-2. **Check watch count**
-   ```promql
-   lattice_watch_active_streams
-   ```
-
-3. **Check compaction**
-   ```promql
-   lattice_kv_compaction_floor_revision
-   ```
-   - Stalled: Historical data accumulating
-
-## Capacity Planning
-
-### Storage Sizing
-
-```
-WAL size = write_rate * retention_period * 2 (safety margin)
-Data size = key_count * (avg_key_size + avg_value_size + 100 bytes overhead)
-Snapshot size ≈ Data size (compressed)
-```
-
-### Memory Sizing
-
-```
-Base memory: 500MB
-Per 1M keys: 200MB
-Per 10K watches: 10MB
-Per 10K leases: 10MB
-Safety margin: 2x
-```
-
-### Connection Sizing
-
-```
-Connections per client: 1-10 (pooled)
-Maximum connections: 10,000-100,000 (depends on memory)
-File descriptors: connections * 2 + 1000 (headroom)
-```
+Scrape the `operations` module's `/metrics` endpoint (its `listen_port`, e.g.
+`19090`) to read them; the catalog is CI-validated by `tools/ci/telemetry_guard`.
 
 ## See Also
 
-- [Deployment Guide](deployment.md) - Configuration reference
-- [High Availability](high_availability.md) - HA tuning
-- [Specification](specification.md) - Protocol details
+- [Deployment Guide](deployment.md) — build + config reference
+- [High Availability](high_availability.md) — HA tuning and failure modes
+- [Specification](specification.md) — observability, protocol details

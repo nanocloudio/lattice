@@ -1,0 +1,38 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Online index backfill worker (RFC database foundation §26 Phase 6).
+#
+# Polls the catalog for indexes at SchemaPhase::Backfilling, walks the
+# table's existing rows in bounded pages, writes their index entries
+# through the canonical KV path, persists its cursor per page in
+# KS_RELATIONAL_JOB (resumable across a crash), and flips the
+# descriptor to Public when the span is exhausted. Writers maintain a
+# Backfilling index inside their own transactions, so backfill +
+# maintenance together cover every row exactly like a stop-the-world
+# build would — without stopping the world.
+
+# Replies from kv_request_router.internal_job_out.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST to kv_request_router.internal_job_in.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+#   0 indexed    entries written by backfill (maintenance not counted)
+#   1 published  indexes flipped to Public
+#   2 errors     faulted sub-operations (retried from the durable cursor)
+metrics = ["indexed", "published", "errors"]

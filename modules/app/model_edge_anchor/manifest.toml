@@ -1,0 +1,44 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Graph, search, and vector capabilities over one RESP surface (RFC
+# database foundation §14.18–§14.21, Phase 8). Three SEPARATE semantic
+# sets compiled into three model keyspaces; nothing shared between
+# them but byte foundations (§14.15). GRAPH.EDGE writes BOTH adjacency
+# postings in one transaction; SEARCH.INDEX writes every posting in
+# one transaction; VECTOR.SIM is EXACT k-nearest (squared L2) and its
+# reply says so — §14.21's label honesty on the wire.
+#
+# Router pairing: POSITIONAL pair #2 ("memcached_*" names) stamped
+# PROTO_MEMCACHED — all sixteen router outputs are allocated and a
+# model composition has no memcached anchor.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["sessions", "commands", "errors"]

@@ -1,0 +1,76 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# The compute-side originator of the internal `lattice.data` surface
+# (RFC §14.8, §14.9, §26 phase 9).
+#
+# It is a DROP-IN FOR THE ROUTER, seen from compute. `relational_executor`
+# and the model workers already speak MSG_KV_REQUEST / MSG_KV_RESPONSE
+# to `kv_request_router`; this module accepts exactly those envelopes,
+# carries them to a remote storage graph as `lattice.data` frames, and
+# hands back exactly those envelopes — fence tail included.
+#
+# That is the whole point. §30 asks whether combined and separated
+# placements produce equivalent histories, and the cleanest way to make
+# that answerable is for the thing above the boundary not to be able to
+# tell which side of it it is on. Same executor, same envelopes, one
+# wiring change.
+#
+# It is also the first module here that DIALS rather than binds
+# (NET_CMD_CONNECT), because its peer is a storage graph, not a client.
+#
+# Owns, per §14.9: multiplexing and fence validation. See the module
+# header for what it deliberately does NOT own yet, and why each of
+# those is a named gap rather than a silent one.
+#
+# It never calls Clustor and never opens a state-store handle.
+
+# Cleartext bytes from foundation/ip.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+# NET_CMD_CONNECT / NET_CMD_SEND / NET_CMD_CLOSE to foundation/ip.
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST envelopes in from compute (relational_executor, a
+# model worker) — the same port shape `kv_request_router` presents.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_KV_RESPONSE envelopes back to compute, carrying the fence tail
+# built from the remote graph's `DataResponse`.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Adapter events out to adapter_metrics.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Declaration order IS the id contract (id N = the Nth name); the
+# emitter in module_step passes values in this exact order.
+[observability]
+metrics = [
+  "requests",
+  "responses",
+  "dials",
+  "disconnects",
+  "inflight_full",
+  "stale_fences",
+  "refusals",
+  # Peer rotations: zero in steady state, one per leader change.
+  "rotations",
+]

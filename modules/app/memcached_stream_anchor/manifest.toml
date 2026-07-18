@@ -1,0 +1,42 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Memcached ASCII/binary TCP anchor. Owns command framing, CAS-token
+# exposure (= mod_revision), and idle connection management. Built on
+# the stream-anchor pattern (`stream_anchor_core` not yet promoted).
+# Continuity class: drain_only (CAS correctness comes from the worker's
+# revision fencing, not from connection continuity).
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "routed_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["cmd_get", "cmd_set", "total_connections"]

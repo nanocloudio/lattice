@@ -1,0 +1,86 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# The shared relational execution engine (RFC database foundation §14.2,
+# §14.5). Compiles typed relational operations into bounded Lattice KV
+# reads, ordered scans, and writes.
+#
+# One executor serves BOTH connectors. §14.2 makes the intermediate
+# representation, the catalogs, name resolution, binding, planning and
+# execution shared modules rather than per-connector ones, and §14.3
+# forbids a connector from introducing its own table format or catalog of
+# record. Two executors would satisfy the letter of that and break its
+# intent: they would eventually disagree about what a statement means for
+# a given schema, and nothing would surface the disagreement.
+#
+# Owns:
+#   - statement parse + bind (via modules/common/sql_core.rs)
+#   - the relational catalog: table descriptors and the name index
+#   - table-id allocation
+#   - row and primary-key encoding (via modules/common/relational.rs)
+#   - the per-statement execution state machine, one KV round trip per
+#     cooperative step
+#
+# Does NOT own:
+#   - wire protocol, authentication, session variables, error-code
+#     mapping, or result FORMATTING — all connector concerns per §14.3
+#   - durability. Every write leaves here as a KV request and acquires
+#     its durability from the same Raft + WAL path a Redis SET takes.
+
+# Statements in from pg_edge_anchor.
+[[ports]]
+name = "pg_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Statements in from mysql_edge_anchor.
+[[ports]]
+name = "mysql_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_KV_RESPONSE pages back from kv_request_router.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Results out to pg_edge_anchor.
+[[ports]]
+name = "pg_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Results out to mysql_edge_anchor.
+[[ports]]
+name = "mysql_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST out to kv_request_router.internal_sql_in, stamped
+# PROTO_INTERNAL_SQL so replies come back on this module's own port pair
+# rather than a client protocol's.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = [
+    "statements",
+    "rows_returned",
+    "rows_written",
+    "errors",
+    "queue_rejects",
+]

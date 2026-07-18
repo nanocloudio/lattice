@@ -1,0 +1,43 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+timer_class      = "wall_clock"
+
+# NetProto pair to the network provider (ip on embedded, linux_net on linux).
+[[ports]]
+name         = "net_in"
+direction    = "input"
+content_type = "NetProto"
+buffer_size  = 2048
+
+# Structured Redis command: [nargs:u8] then per arg [len:u16 LE][bytes]. The
+# module owns RESP encoding, so upstream sends args, not wire bytes.
+[[ports]]
+name         = "request_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[[ports]]
+name         = "net_out"
+direction    = "output"
+content_type = "NetProto"
+buffer_size  = 2048
+max_record   = 1600
+
+# The reply value (bulk data, simple-string, integer digits, or error text).
+[[ports]]
+name         = "reply_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[[resources]]
+requires_contract = "channel"
+access            = "read"
+
+[observability]
+exempt = "Redis connector; throughput is observed at the network provider"

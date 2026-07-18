@@ -1,0 +1,57 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Durable lease state owner. Maintains
+# `LeaseID -> LeaseState{ttl_ms, granted_at_ms, keepalive_deadline_ms,
+# attached_keys[], epoch}`. Processes grant/revoke/keepalive, emits
+# committed keepalive responses, and fences stale keepalive streams
+# by `session_epoch`.
+
+[[ports]]
+# `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved
+# port name (it collides with the kernel-allocated control channel
+# passed to every module's `module_new`). See standards/fluxor-modules.md.
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Deterministic ticks from ttl_scheduler.
+[[ports]]
+name = "tick"
+direction = "input"
+content_type = "OctetStream"
+
+# Cluster-wide placement epoch events from substrate
+# `control_plane.epoch_events`. MSG_PLACEMENT_EPOCH_EVENT bumps
+# `session_epoch` on every active lease so keepalive frames in flight
+# under the old epoch can be filtered by the anchor.
+[[ports]]
+name = "in_epoch_events"
+direction = "input"
+content_type = "OctetStream"
+
+# State responses out to etcd_edge_anchor.
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+
+# Lease-attached-key revokes out to kv_state_worker.
+[[ports]]
+name = "revoke"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["grants", "revokes", "expiries"]

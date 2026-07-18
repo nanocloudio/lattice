@@ -1,0 +1,168 @@
+# Lattice project config consumed by the `fluxor` CLI. See
+# ~/Development/nanocloudio/standards/{ci,fluxor-modules,tests,lints,dependencies}.md
+# for the schema each table belongs to.
+
+# Project identity (standards/dependencies.md §2.1). Required for
+# `fluxor publish`; downstream projects reference lattice by this
+# name. Version is held on the 0.x pre-release line until the
+# protocol surface stabilises (etcd anchor + watch/lease services
+# are still stubs — see Phasing in the README).
+[project]
+name    = "lattice"
+version = "0.0.1"
+
+# Cross-project dependencies (standards/dependencies.md §2.2).
+# `fluxor` supplies the kernel, ABI, SDK source crates, and the
+# foundation fmod palette (linux_net, tls, ip, …). `clustor` supplies
+# the Raft / WAL / placement substrate that lattice modules attach
+# to (consensus, consensus, control_plane, …). Resolution goes
+# through the local OCI store (`$FLUXOR_STORE`, default
+# `~/.local/share/fluxor/store`); digest pins live in fluxor.lock.
+# Workspace membership (`~/.fluxor/workspace.toml`) supports
+# sibling-checkout iteration — see standards/dependencies.md §6.
+[dependencies]
+fluxor  = "0.0.1"
+# Protocol modules (http, ws_stream, rtp, websocket) live in wave since the
+# extraction; fluxor's copy is now `http_edge` (workload-ingress variant).
+wave   = "0.0.1"
+clustor = "0.0.1"
+
+[ci]
+# Module targets to build in CI phase 3. Lattice ships to high-throughput
+# server environments first (pi5-class and bare-metal ARM64); rp2350 is
+# omitted until the protocol surface can be slimmed down for embedded.
+targets = ["bcm2712"]
+
+[ci.cargo]
+# No root cargo manifest — it was retired along with `crates/lattice-common`
+# (the cores live in `modules/common` and are `#[path]`-mounted, not linked),
+# matching wave/spectra. The consequences, and where each is covered:
+#   * phases 1.1/1.2 see no root `Cargo.toml` and fmt-check + clippy the PIC
+#     module sources DIRECTLY — a gain, since `modules/**` was linted by neither.
+#   * phase 2 is omitted (no root workspace); the host-side suites in
+#     `tests/harness` run via phase 4's built-in `cargo-test (harness)`, which
+#     `host_tools_crate` points at.
+#   * the three standalone `tools/*` crates, and the wire_lint / telemetry_guard
+#     gates, are built and run by `tools/ci/host_crates.sh` in `[ci.test]`.
+# No `[[ci.lints.exemption]]`: the opt-in audit matches exemptions against
+# workspace-member PATHS and is moot without a root manifest — each standalone
+# crate (`tools/load/lattice-bench`, the two `tools/ci/*`, `tests/harness`)
+# carries its own `[lints]` mirror or the lenient defaults.
+host_tools_crate = "tests/harness"
+
+[ci.hygiene]
+# Tiers where inline tests are banned. `modules/**` is no_std PIC and
+# can't host a std test harness. `tools/**` are host-side helpers and
+# follow the strict default. `src/**` does not exist in lattice; the
+# legacy tokio-based crate was removed in the standards-adoption pass
+# (git history is preserved — recover with `git log --follow src/...`).
+forbid_inline_tests = ["modules", "tools"]
+mode                = "strict"
+max_inline_lines    = 80
+
+# Structured exemptions. Every row carries a `rule` discriminator so an
+# inline-tests waiver doesn't accidentally also silence
+# `allow-without-reason`. See standards/tests.md §3.
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/replica_facade.rs"
+rule   = "inline-tests"
+reason = "dual-target host facade: same file compiles into the no_std module ELFs and is pulled into host-side cargo test via #[path]. The #[cfg(test)] block is gated away from the no_std build."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/collections.rs"
+rule   = "inline-tests"
+reason = "dual-target host collections: same file compiles into the no_std module ELFs (RingBuf, InflightTable) and is pulled into host-side cargo test via #[path]. The #[cfg(test)] block is gated away from the no_std build."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/kv_store.rs"
+rule   = "inline-tests"
+reason = "dual-target KV state machine: same file compiles into the no_std module ELF (kv_state_worker) and is pulled into tests/integration_kv.rs via #[path]. The #[cfg(any(test, feature = \"host-decoders\"))] gates host-only helpers (alloc::vec::Vec decoders) off the no_std build."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/etcd_codec.rs"
+rule   = "inline-tests"
+reason = "dual-target etcd codec (HTTP/2 + HPACK + gRPC + protobuf subset): same file will compile into the no_std module ELF (etcd_edge_anchor, currently a stub) and is pulled into tests/integration_etcd.rs via #[path]. The #[cfg(test)] block carries the host-side frame/varint/protobuf round-trip tests."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/watch_hub.rs"
+rule   = "inline-tests"
+reason = "dual-target watch state facade: same file compiles into the no_std module ELFs (watch_registry + watch_fanout) and is pulled into tests/integration_watch.rs via #[path]. The #[cfg(test)] block carries event-matching, replay-plan, and retention-floor tests."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/mysql_server_codec.rs"
+rule   = "inline-tests"
+reason = "dual-target MySQL/MariaDB SERVER-side codec: same file compiles into the no_std mysql_edge_anchor ELF and is pulled into tests/integration_mysql_server_codec.rs via #[path]. The #[cfg(test)] block carries packet framing, sequence numbering, length-encoded-integer boundaries, handshake layout, type mapping and error-number tests — the sequence number and the 0xFB/0xFC/0xFD/0xFE prefix overlaps are the two things that silently desync a session when wrong."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/pg_server_codec.rs"
+rule   = "inline-tests"
+reason = "dual-target PostgreSQL SERVER-side codec: same file compiles into the no_std pg_edge_anchor ELF and is pulled into tests/integration_pg_server_codec.rs via #[path]. The #[cfg(test)] block carries framing, startup-parse, type-OID, value-rendering and SQLSTATE tests — the message-length convention (counts itself, not the type byte) and the NULL-vs-empty distinction are the two things that silently corrupt a session when wrong."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/sql_exec.rs"
+rule   = "inline-tests"
+reason = "dual-target SQL execution wire: same file compiles into the no_std relational_executor / pg_edge_anchor / mysql_edge_anchor ELFs and is pulled into tests/integration_sql_exec.rs via #[path]. The #[cfg(test)] block carries key-composition and request/response codec tests — the keyspace prefix and the typed-cell encoding are boundaries all three modules must agree on byte for byte."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/sql_core.rs"
+rule   = "inline-tests"
+reason = "dual-target SQL front end: same file compiles into the no_std relational_executor ELF and is pulled into tests/integration_sql_core.rs via #[path]. The #[cfg(test)] block carries lexer, parser, and binder tests — the parser is shared between the pg and mysql connectors precisely so the two cannot disagree about what a statement means, and these tests are where that agreement is pinned."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/watch_replay.rs"
+rule   = "inline-tests"
+reason = "dual-target watch-replay codec: same file compiles into the no_std watch_fanout ELF and is pulled into tests/integration_watch_replay.rs via #[path]. The #[cfg(test)] block carries plan-decode, span-bound, page-walk, and frame-shape tests — the frame builder is shared with the live path precisely so a replayed event and a streamed one cannot diverge."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/ttl_scheduler.rs"
+rule   = "inline-tests"
+reason = "dual-target deterministic expiry queue: same file compiles into the no_std module ELFs (ttl_scheduler + lease_manager) and is pulled into tests/integration_ttl.rs via #[path]. The #[cfg(test)] block carries sort-on-insert, drain-due, and replay-safety tests."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/auth_table.rs"
+rule   = "inline-tests"
+reason = "dual-target principal table: same file compiles into the no_std auth_manager ELF and is mounted into tests/integration_phase6b.rs via #[path]. The #[cfg(test)] block carries lookup / decide / overflow tests."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/quota_bucket.rs"
+rule   = "inline-tests"
+reason = "dual-target per-tenant token bucket: same file compiles into the no_std quota_manager ELF and is mounted into tests/integration_phase6b.rs via #[path]. The #[cfg(test)] block carries refill / drain / strike-disconnect tests."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/compaction_floor.rs"
+rule   = "inline-tests"
+reason = "dual-target per-kpg compaction-floor aggregator: same file compiles into the no_std compaction_coordinator ELF and is mounted into tests/integration_phase6b.rs via #[path]. The #[cfg(test)] block carries min-of-sources / dedupe-emit tests."
+
+[[ci.hygiene.exemption]]
+path   = "modules/common/metrics_rollup.rs"
+rule   = "inline-tests"
+reason = "dual-target counter rollup table: same file compiles into the no_std adapter_metrics ELF and is mounted into tests/integration_phase6b.rs via #[path]. The #[cfg(test)] block carries find-or-alloc / snapshot-encode tests."
+
+[ci.test]
+# CI phase 3.5 project gates, in order:
+#   1. shadow_guard.sh — shadow-checkout hard-fail (standards/test-tracking.md
+#      §7): tests/, benches/, examples/, perf/ are shadow-tracked in
+#      .git-shadow/, so a primary-only checkout has zero files there and the
+#      test phases would pass vacuously. The guard fails CI instead.
+#   2. host_crates.sh — with no root workspace, nothing else fmt/clippy/builds
+#      the three standalone tools/* crates, and the wire_lint / telemetry_guard
+#      catalog gates (formerly only in the Makefile) would never run.
+scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh"]
+
+[ci.templates]
+# Lattice's graph configs use `__SELF_ID__` / `__LISTEN_PORT__` /
+# `__PEER*_ADDR__` placeholders for the multi-3node template; the
+# template renderer fills them per node before launching `fluxor run`.
+# The defaults below let the CI template-render gate pass — they are
+# *not* the production values used when actually launching a node.
+dir  = "configs"
+vars = { SELF_ID = "0", LISTEN_PORT = "6379", REDIS_PORT = "6379", DATA_PORT = "6380", LIN_READS = "0", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", PEER0_ADDR = "127.0.0.1:7000", PEER1_ADDR = "127.0.0.1:7001", PEER2_ADDR = "127.0.0.1:7002", PEER0_HOST = "127.0.0.1", PEER1_HOST = "127.0.0.1", PEER2_HOST = "127.0.0.1", HTTP_PORT = "19090", WAL_DIR = "/tmp/lattice/0/wal", SNAP_DIR = "/tmp/lattice/0/snap" }
+
+[required]
+# Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps only
+# when fluxor's `modules/sdk/wire.rs::ABI_VERSION` changes (module
+# headers / channel hints / contract ids break). The installed `fluxor`
+# CLI must implement this exact ABI version.
+# See standards/fluxor-modules.md §5.
+fluxor = { abi = 1 }

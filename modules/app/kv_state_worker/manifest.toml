@@ -1,0 +1,217 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Deterministic KPG KV state machine. Owns `revision`,
+# `create_revision`, `mod_revision`, `version`, CAS fences,
+# compare/then/else evaluation, put/delete/range execution,
+# `prev_kv` generation, error-mapping inputs, and snapshot
+# import/export of KV records. Lattice's main `session.worker`-class
+# core even for short request/response operations because all stable
+# state lives here.
+#
+# State-store provider (RFC database foundation §6/§30): the
+# `state_store` param selects the physical materialization provider at
+# graph construction — 0 = bounded in-memory table (default), 1 = the
+# ordered disk provider over the Fluxor FS contract. The `fs` resource
+# claim below is a capability GRANT (required for the runtime contract
+# gate when `state_store = 1`); it does not force an FS provider into
+# memory-only compositions — graphs without one build and run
+# unchanged, exactly as durability's volatile variant does.
+
+#
+# ⚠ STEP DEADLINE — REQUIRED IN ANY BARE-METAL `state_store = 1` GRAPH.
+# With `state_store = 1` this module performs the longest synchronous
+# storage action in the graph: the watermark flush writes the WHOLE
+# memtable (up to `MEMTABLE_FLUSH_WATERMARK` = 384 records, ~1.7 MB),
+# creates a fresh run file, rewrites the manifest and fsyncs — all
+# inside ONE `module_step`. It is the one action in `disk_maintenance`
+# that is NOT bounded per step.
+#
+# A module that declares no `step_deadline_us` runs on the kernel
+# default of 2000 us (burst 16000 us), and a step timeout under the
+# DEFAULT `fault_policy` does not skip the step — `can_restart()` is
+# false for anything but `restart`, so the kernel TERMINATES the
+# module. One overlong flush and the worker is gone: no heartbeat, no
+# command drain, every counter frozen at its pre-flush value. On host
+# the flush is a page-cache write and this never fires; on
+# FAT32-over-NVMe it is milliseconds to tens of milliseconds.
+#
+# So any bare-metal disk composition MUST give this module the same
+# treatment `durability` already gets for its WAL fsync, e.g.
+#
+#   - name: kv_state_worker
+#     params: { state_store: 1, root_path: 1 }
+#     step_deadline_us: 12000
+#     step_deadline_burst_us: 16000
+#     fault_policy: skip
+#
+# Note the burst is capped by the config validator at 16 x tick_us, so
+# at tick_us = 1000 the values above are the CEILING, not a preference.
+# If `ms=` on the end line reaches it, the flush has outgrown what a
+# deadline can cover and must be chunked across steps the way `compact`
+# already is.
+#
+# `[kvw] disk flush begin` / `[kvw] disk flush end ok=N ms=M` bracket
+# the call: a capture ending on `begin` with no `end` is this fault,
+# and `ms=` on a healthy boot is what to size the deadline from.
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+# Routed commands from kv_request_router (already epoch-validated).
+[[ports]]
+name = "commands"
+direction = "input"
+content_type = "OctetStream"
+
+# Lin-bound read permit from substrate read_gate.
+[[ports]]
+name = "read_permit"
+direction = "input"
+content_type = "OctetStream"
+
+# Quorum durability proof from substrate durability, and the COMMITTED
+# MVCC GC floor (`MSG_GC_FLOOR_COMMITTED`, RFC §18 / §21 invariant 13)
+# once the compaction_coordinator's proposal has been through
+# consensus. Envelope type discriminates; a floor record arriving
+# anywhere else is ignored, because only a committed one may authorize
+# physical reclamation.
+[[ports]]
+name = "durability"
+direction = "input"
+content_type = "OctetStream"
+
+# Lease-driven revoke from lease_manager.
+[[ports]]
+name = "lease_revoke"
+direction = "input"
+content_type = "OctetStream"
+
+# TTL-driven expiry from ttl_scheduler.
+[[ports]]
+name = "expire"
+direction = "input"
+content_type = "OctetStream"
+
+# Cluster-wide placement epoch events from substrate
+# `control_plane.epoch_events`. MSG_PLACEMENT_EPOCH_EVENT updates
+# the worker's notion of the current cluster_epoch; new sessions
+# created after a bump observe the advanced epoch. The worker doesn't
+# fence ongoing applies (commands carry their own epoch in the
+# envelope head and are rejected by the router before they reach
+# the worker if stale).
+[[ports]]
+name = "in_epoch_events"
+direction = "input"
+content_type = "OctetStream"
+
+# Applied responses to the router.
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+
+# Mutation events for watch_registry / watch_fanout.
+[[ports]]
+name = "mutations"
+direction = "output"
+content_type = "OctetStream"
+
+# Retention claims to compaction_coordinator: this worker's §18
+# ACTIVE-READ claim (`MSG_RETENTION_CLAIM`), republished on a cadence
+# so that going quiet BLOCKS floor advancement instead of permitting it.
+[[ports]]
+name = "compaction_floor"
+direction = "output"
+content_type = "OctetStream"
+
+# Snapshot interfaces — substrate durability drives import/export.
+[[ports]]
+name = "snapshot_import"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_export"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope metrics emitted on `metrics` at a ~1 s WALL-CLOCK cadence
+# (NOT a step cadence — see the emitter's docs: a step cadence goes
+# silent exactly when a step blocks, which is the failure you most need
+# to see). Declaration order IS the id contract (id N = the Nth name);
+# the emitter in module_step passes values in this exact order.
+#
+# ids 0-2 are monotonic counters (METRIC_COUNTER). ids 3-13 are the disk
+# state-store diagnostic block, added so a wedged worker is readable from
+# a `/metrics` scrape when the request path is timing out (rig.md §5).
+# APPEND ONLY — never renumber, ids are a wire contract.
+#
+# Counters (METRIC_COUNTER, monotonic):
+#   9  disk_flush_attempts   incremented BEFORE the flush call
+#   10 disk_flush_completions incremented AFTER it returns Ok
+#   11 disk_flush_failures   incremented after it returns a hard Err
+#   12 disk_flush_backpressure flush refused (capture/install/compact busy
+#                             or run set full) — no I/O was attempted
+#   13 disk_cmd_flush_faults in-command `make_room` flush faults
+#                             (DiskMaterializer, separate from maintenance)
+#   14 disk_fence_aborts     snapshot/install/compaction exclusion fences
+#                             force-released by the starvation watchdog.
+#                             NON-ZERO IS ALWAYS A BUG UPSTREAM: the store
+#                             recovered, but something failed to finish.
+#
+# `attempts > completions + failures + backpressure` means a flush was
+# ENTERED and never returned — the module is blocked inside the FS
+# provider. That is the single most diagnostic relation in this block.
+#
+# Gauges (METRIC_UPDOWN, current state):
+#   3 disk_phase        0=RECOVERING 1=SERVING 2=QUARANTINED
+#   4 disk_degraded_steps consecutive maintenance steps without progress
+#   5 disk_hard_faults  consecutive hard faults (budget: 64 → quarantine)
+#   6 disk_last_errno   ABSOLUTE VALUE of the backend's last raw errno,
+#                       which is always <= 0. Metrics are unsigned, so the
+#                       sign is dropped: 0 = no error, 11 = E_AGAIN (-11),
+#                       2 = ENOENT, 5 = EIO, 28 = ENOSPC, 38 = ENOSYS.
+#   7 disk_mem_count    memtable occupancy (flush watermark 384 of 512)
+#   8 disk_run_count    live run files (compaction trigger at 16)
+#  17 cfg_state_store   EFFECTIVE `state_store` param as parsed by the
+#                       module (0=memory 1=disk). rig.md §7a: report what
+#                       was applied, never what the config intended. A
+#                       config that says `state_store: 1` while this reads
+#                       0 IS the bug. Emitted in BOTH modes.
+#  18 cfg_root_path     EFFECTIVE `root_path` param (0=`kv/` subdir,
+#                       1=8.3 names at the FS root). Same rule.
+#  19 cfg_store_id      EFFECTIVE `store_id` param (0=`kv/`, N=`kvN/`;
+#                       multi-range graphs run one worker per range).
+[observability]
+metrics = [
+    "applied",
+    "reads",
+    "snapshot_chunks",
+    "disk_phase",
+    "disk_degraded_steps",
+    "disk_hard_faults",
+    "disk_last_errno",
+    "disk_mem_count",
+    "disk_run_count",
+    "disk_flush_attempts",
+    "disk_flush_completions",
+    "disk_flush_failures",
+    "disk_flush_backpressure",
+    "disk_cmd_flush_faults",
+    "disk_fence_aborts",
+    "gc_floor_commits",
+    "gc_claims_published",
+    "cfg_state_store",
+    "cfg_root_path",
+    "cfg_store_id",
+]

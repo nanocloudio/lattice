@@ -1,0 +1,284 @@
+# Lattice L4 — Pi 5 bare-metal as VOTER 0 of a 3-voter quorum over the
+# REAL network (task #15/#18).
+#
+# This is the multi-3node.yaml consensus graph (real raft replication +
+# quorum-fsync + snapshots + read fence) retargeted to the Pi 5:
+#   - target: pi5 (netboots via `fluxor rig run --rig pi5-a`)
+#   - transport is bare-metal `ip` (not host `linux_net`); the raft peer
+#     lane rides it cross-machine to the two host voters
+#   - WAL durability rides the real nvme→fat32 stack (bare-metal-pi5's
+#     tuning), so commit latency here is DUT-attributable, not harness
+#
+# Topology (driver = this host 192.168.1.10):
+#   voter 0 = Pi 5   192.168.1.9  peer :7000  redis :6379  http :19090
+#   voter 1 = host  192.168.1.10 peer :7001  redis :6380  http :19091
+#   voter 2 = host  192.168.1.10 peer :7002  redis :6381  http :19092
+# The two host voters run configs/multi-3node.yaml rendered with
+# PEER0_HOST=192.168.1.9 (see perf/run_l4_xmachine.sh).
+#
+# Drive the LEADER's redis port (grep n*.log / DUT log_net for
+# `[raft] st r=L`). Real quorum over the wire → DUT_ATTRIBUTABLE.
+#
+# NB (task #23): all mutations (PUT/DELETE/INCR/DECR/APPEND/PREPEND/
+# MSET/CAS/FLUSH/TXN) now route through consensus and replicate.
+
+target: pi5
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+
+module_search_paths:
+  - ../deps/clustor/modules/app
+  - ./modules/app
+
+modules:
+  # ── Bare-metal storage stack (provides the FS contract WAL uses) ─
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    path: /
+    clean_root: 1
+    init_free_hint: 20000
+    clear_free_region: 4096
+
+  # ── Lattice edge + KV ───────────────────────────────────────────
+  - name: redis_edge_anchor
+    params:
+      listen_port: 6379
+  - name: kv_request_router
+    params:
+      # Snapshot (DIRECT) reads; mixed pipelining is safe now that the
+      # anchor reorder buffer + per-key barrier (task #17) preserve
+      # per-conn FIFO and read-your-writes.
+      lin_reads: 0
+      # Declares that this graph replicates writes through Raft. Checked
+      # against the `proposal_out` wiring at init: if that edge is missing
+      # the module refuses to start, instead of silently serving every
+      # write on the direct local path. See the router's `replicated` param.
+      replicated: 1
+  - name: kv_state_worker
+  - name: lattice_apply_bridge
+
+  # ── Clustor client-proposal pipeline ────────────────────────────
+  - name: peer_router
+    params:
+      self_id: 0
+      peer_count: 3
+      listen_port: 7000
+      peer0_port: 7000
+      peer1_port: 7001
+      peer2_port: 7002
+      # Voter 0 is the Pi 5; peers 1 and 2 are host voters on the LAN.
+      peer0_host: 127.0.0.1
+      peer1_host: 192.168.1.10
+      peer2_host: 192.168.1.10
+  - name: gateway
+    params:
+      self_id: 0
+  - name: admission
+  - name: control_plane
+  - name: consensus
+    params:
+      self_id: 0
+      voter_count: 3
+      heartbeat_interval_ms: 150
+      # Real-network jitter margin (the Pi 5 is dedicated, but cross-machine
+      # RTT + a host under load can delay heartbeats past the 1000 ms
+      # default and churn elections). 4000 mirrors the L2 rig fix (#22).
+      election_timeout_ms: 4000
+      proposal_batch_timeout_ms: 1
+      peer_count: 3
+  - name: durability
+    # Real-NVMe tail headroom (from bare-metal-pi5): the 2000 µs default
+    # trips on FS_FSYNC tails and wedges the nvme queue; skip = fail closed
+    # on a true timeout instead of freezing the pipeline.
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+    params:
+      fsync_mode: 1
+      group_window_ms: 0
+      group_max_pending: 8
+      # Bare-metal FAT32 has no mkdir; write segments at the FS root with
+      # 8.3 names (<p:1hex><seq:7hex>.WAL).
+      root_path: 1
+      # Fresh log each boot for the throughput sweep. ⚠ OMIT (set 0) for a
+      # crash-recovery L4 run — those must replay. Durability within a run
+      # is unchanged (append/fsync path identical).
+      skip_replay: 1
+      segment_bytes: 4194304
+      self_id: 0
+      voter_count: 3
+      partition_id: 0
+
+  # ── Observability: metric fan-in + HTTP /metrics ────────────────
+  - name: adapter_metrics
+  - name: operations
+    params:
+      emit_interval_ms: 250
+      listen_port: 19090
+
+wiring:
+  # ── nvme block device ↔ fat32 filesystem ────────────────────────
+  - from: nvme.blocks
+    to: fat32.blocks
+  - from: fat32.block_writes
+    to: nvme.requests
+
+  # ── Transport: ip ↔ peer_router (raft peer lane, cross-machine) ──
+  # ip.net_out fans (auto-tee) to peer_router + redis_anchor + operations.
+  # Min-space gated: size each consumer ring to 256 KiB so no slow/idle
+  # consumer stalls the whole fan-out (the multi-node wedge).
+  - from: ip.net_out
+    to: peer_router.net_in
+    buffer_bytes: 262144
+  - from: peer_router.net_out
+    to: ip.net_in
+
+  # ── Lattice edge: anchor ↔ ip ↔ router ──────────────────────────
+  - from: ip.net_out
+    to: redis_edge_anchor.net_in
+    buffer_bytes: 262144
+  - from: redis_edge_anchor.net_out
+    to: ip.net_in
+  - from: redis_edge_anchor.kv_out
+    to: kv_request_router.redis_in
+  - from: kv_request_router.redis_out
+    to: redis_edge_anchor.kv_in
+
+  # ── Inbound peer traffic (peer_router demux) ────────────────────
+  - from: peer_router.peer_rx
+    to: consensus.ack
+  - from: peer_router.raft_rpc
+    to: consensus.rpc
+
+  # ── Outbound peer traffic ───────────────────────────────────────
+  - from: consensus.rpc_out
+    to: peer_router.peer_tx
+  - from: consensus.net_out
+    to: peer_router.repl_tx
+
+  # ── Proposal ingress: router → gateway → consensus ─────────────
+  - from: kv_request_router.proposal_out
+    to: gateway.client_requests
+  # Reject feedback: the gateway refuses a proposal BEFORE assigning it
+  # a correlation id (NOT_LEADER precedes next_corr_id), and without
+  # this edge that refusal is dropped and the write waits out the 5s
+  # inflight sweep instead of failing in milliseconds.
+  - from: gateway.responses
+    to: kv_request_router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control_plane.routing
+    to: gateway.placement
+
+  - from: consensus.lag_signal
+    to: admission.lag
+
+  # ── Apply path: committed entries → KV worker → response ────────
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker.commands
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in
+
+  # ── Linearizable-read fence (Phase 5 ReadIndex) ─────────────────
+  - from: kv_request_router.lin_read_out
+    to: consensus.read
+  - from: consensus.applied
+    to: kv_request_router.read_release
+  - from: admission.permits
+    to: consensus.read_permits
+
+  # ── Clustor persistence (WAL → fat32 → nvme via FS contract) ────
+  - from: consensus.log_append
+    to: durability.entries
+  # A restarted replica reads its replayed log bodies back out of the
+  # local WAL: replay restores the log, so raft log-matching succeeds and
+  # the leader never re-ships those entries. Without this pair the apply
+  # pipeline stalls at the first gap. Shares the WAL's random-access ports
+  # with the replicator's NACK refetch of older entries; the request-id
+  # namespaces keep the replies separable.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: consensus.wal_compact
+    to: durability.compact_before
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  # Cross-node DurabilityAck fan-in (spec §10.4.1) — REQUIRED for
+  # quorum-fsync; without it commit stalls indefinitely multi-node.
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # ── Snapshots: local loop + peer transfer ───────────────────────
+  - from: consensus.retention_floor
+    to: durability.retention_floor
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
+    to: peer_router.peer_tx
+  - from: durability.app_snapshot_ctl
+    to: kv_state_worker.snapshot_import
+    rate: transaction
+  - from: kv_state_worker.snapshot_export
+    to: durability.app_snapshot_body
+    rate: transaction
+  - from: durability.metrics
+    to: operations.ingest
+
+  # ── Observability fan-in → operations → HTTP /metrics ───────────
+  - from: redis_edge_anchor.metrics
+    to: adapter_metrics.events_in
+  - from: kv_request_router.metrics
+    to: adapter_metrics.events_in
+  - from: kv_state_worker.metrics
+    to: adapter_metrics.events_in
+  - from: adapter_metrics.telemetry_out
+    to: operations.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+  - from: peer_router.metrics
+    to: operations.ingest
+
+  # ── HTTP ingress (binds :19090 on the shared ip stack) ──────────
+  - from: ip.net_out
+    to: operations.net_in
+    buffer_bytes: 262144
+  - from: operations.net_out
+    to: ip.net_in
+    rate: transaction

@@ -1,0 +1,301 @@
+# Lattice: Phase 4 ONLINE SPLIT composition (RFC database foundation
+# §12.1), on the Phase 3 two-partition durable graph.
+#
+# Boots as ONE range covering the whole keyspace on partition 0, with
+# partition 1 provisioned and EMPTY. The range_supervisor carries a
+# DECLARED split (manual execution gate, §12.4: the operator wrote it
+# here) at `[KS_RELATIONAL_TABLE][table 1][ordered(INT 2)]`, starting
+# `start_delay_ms` after boot. It then drives the §12.1 machine end to
+# end while the graph serves SQL:
+#
+#   record persisted (resumable by operation id, KS_LIFECYCLE_OP)
+#   → bulk copy of the moving span into partition 1 (TARGETED pages)
+#   → cutover barrier (writes to the span refuse retryably; reads flow)
+#   → catch-up pass → map published atomically (epoch bump) → barrier
+#   cleared → span tombstoned out of the parent.
+#
+# After the split, rows with id >= 2 route to partition 1; a SELECT *
+# is stitched across both ranges exactly as in the static 2-range
+# composition; and a kill -9 at ANY phase resumes from the durable
+# record — pre-publication phases re-run their idempotent copy,
+# published phases republish the post-split map over the router's
+# static boot map.
+#
+# Run: mkdir -p wal wal/p0001 kv kv1 && \
+#      fluxor run configs/single-relational-split.yaml
+
+target: linux
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+module_search_paths:
+  - ../deps/clustor/modules/app
+  - ./modules/app
+
+modules:
+  # ── Relational front (identical to single-relational-disk.yaml) ─
+  - name: pg_edge_anchor
+    params:
+      listen_port: 5432
+  - name: mysql_edge_anchor
+    params:
+      listen_port: 3306
+  - name: relational_executor
+
+  # ── Range supervisor: the declared split ─────────────────────────
+  - name: range_supervisor
+    params:
+      op_kind: 1
+      split_key: "80000002000000010180000002"
+      target_partition: 1
+      start_delay_ms: 6000
+      range_map: "0100010001003c00000000000000000001010101010101010101010101010101010000000001000000020000000000000100000001000000010000000001000000000000"
+
+  # ── Lattice KV core ─────────────────────────────────────────────
+  - name: kv_request_router
+    params:
+      lin_reads: 0
+      replicated: 1
+      routing_mode: 2
+      # The live map belongs to the supervisor: refuse client traffic
+      # retryably until it (re)publishes at boot. Without this, the
+      # window between a post-split restart and republication would
+      # serve routes from the pre-split boot map.
+      await_map: 1
+      # RANGE_MAP_UPDATE_V1, 2 descriptors: [MIN, split) → partition 0,
+      # [split, MAX) → partition 1. Regenerate with the layout in
+      # modules/common/partition_map.rs if the descriptor wire form or
+      # the relational key encoding changes — tests/live_relational.rs
+      # recomputes it from source and will disagree loudly.
+      range_map: "0100010001003c00000000000000000001010101010101010101010101010101010000000001000000020000000000000100000001000000010000000001000000000000"
+  - name: kv_state_worker
+    params:
+      state_store: 1
+      root_path: 0
+      store_id: 0
+  - name: kv_state_worker_p1
+    type: kv_state_worker
+    params:
+      state_store: 1
+      root_path: 0
+      store_id: 1
+  - name: lattice_apply_bridge
+  - name: lattice_apply_bridge_p1
+    type: lattice_apply_bridge
+
+  # ── Clustor partition 0 ─────────────────────────────────────────
+  - name: peer_router
+    params:
+      self_id: 0
+      peer_count: 1
+      listen_port: 9090
+      peer0_port: 9090
+  - name: gateway
+    params:
+      self_id: 0
+  - name: admission
+  - name: control_plane
+  - name: consensus
+    params:
+      self_id: 0
+      voter_count: 1
+      heartbeat_interval_ms: 150
+      partition_id: 0
+  - name: durability
+    params:
+      fsync_mode: 1
+      group_window_ms: 5
+      group_max_pending: 4
+      segment_bytes: 262144
+      self_id: 0
+      voter_count: 1
+      partition_id: 0
+
+  # ── Clustor partition 1 ─────────────────────────────────────────
+  - name: peer_router_p1
+    type: peer_router
+    params:
+      self_id: 0
+      peer_count: 1
+      listen_port: 9091
+      peer0_port: 9091
+  - name: gateway_p1
+    type: gateway
+    params:
+      self_id: 0
+  - name: consensus_p1
+    type: consensus
+    params:
+      self_id: 0
+      voter_count: 1
+      heartbeat_interval_ms: 150
+      partition_id: 1
+  - name: durability_p1
+    type: durability
+    params:
+      fsync_mode: 1
+      group_window_ms: 5
+      group_max_pending: 4
+      segment_bytes: 262144
+      self_id: 0
+      voter_count: 1
+      partition_id: 1
+
+  # ── Observability ───────────────────────────────────────────────
+  - name: adapter_metrics
+  - name: operations
+    params:
+      emit_interval_ms: 250
+      listen_port: 19090
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: pg_edge_anchor.net_in
+  - from: pg_edge_anchor.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: mysql_edge_anchor.net_in
+  - from: mysql_edge_anchor.net_out
+    to: linux_net.net_in
+
+  # ── Connector ↔ executor ────────────────────────────────────────
+  - from: pg_edge_anchor.sql_out
+    to: relational_executor.pg_in
+  - from: relational_executor.pg_out
+    to: pg_edge_anchor.sql_in
+  - from: mysql_edge_anchor.sql_out
+    to: relational_executor.mysql_in
+  - from: relational_executor.mysql_out
+    to: mysql_edge_anchor.sql_in
+
+  # ── Executor ↔ router (PROTO_INTERNAL_SQL pair) ─────────────────
+  - from: relational_executor.kv_out
+    to: kv_request_router.internal_sql_in
+  - from: kv_request_router.compute_out
+    to: relational_executor.kv_in
+
+  # ── Supervisor ↔ router ───────────────────────────────────────
+  - from: range_supervisor.kv_out
+    to: kv_request_router.internal_lifecycle_in
+  - from: kv_request_router.internal_lifecycle_out
+    to: range_supervisor.kv_in
+  - from: range_supervisor.map_out
+    to: kv_request_router.map_update
+
+  # ── Partition 0: proposals → gateway → consensus ────────────────
+  - from: kv_request_router.proposal_out
+    to: gateway.client_requests
+  # Reject feedback: the gateway refuses a proposal BEFORE assigning it
+  # a correlation id (NOT_LEADER precedes next_corr_id), and without
+  # this edge that refusal is dropped and the write waits out the 5s
+  # inflight sweep instead of failing in milliseconds.
+  - from: gateway.responses
+    to: kv_request_router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control_plane.routing
+    to: gateway.placement
+
+  # ── Partition 1: proposals → gateway_p1 → consensus_p1 ──────────
+  # One admission and one control_plane feed both gateways: credits
+  # and placement are node-scoped, the Raft state is not.
+  - from: kv_request_router.proposal1_out
+    to: gateway_p1.client_requests
+  - from: gateway_p1.proposals_tagged
+    to: consensus_p1.proposals_tagged
+  - from: consensus_p1.proposal_assigned
+    to: gateway_p1.proposal_assigned
+  - from: consensus_p1.leader_state
+    to: gateway_p1.leader_state
+  - from: admission.credits
+    to: gateway_p1.credit_supply
+  - from: control_plane.routing
+    to: gateway_p1.placement
+
+  # ── Apply paths: one per partition, one worker per range ────────
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker.commands
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in
+
+  - from: consensus_p1.committed_entries
+    to: lattice_apply_bridge_p1.committed_in
+  - from: lattice_apply_bridge_p1.kv_out
+    to: kv_state_worker_p1.commands
+  - from: kv_request_router.kv1_out
+    to: kv_state_worker_p1.commands
+  - from: kv_state_worker_p1.responses
+    to: kv_request_router.kv_in
+
+  # ── Clustor persistence, partition 0 ────────────────────────────
+  - from: consensus.log_append
+    to: durability.entries
+    rate: transaction
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: consensus.wal_compact
+    to: durability.compact_before
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # ── Clustor persistence, partition 1 ────────────────────────────
+  - from: consensus_p1.log_append
+    to: durability_p1.entries
+    rate: transaction
+  - from: consensus_p1.entry_request
+    to: durability_p1.entry_request
+    buffer_bytes: 8192
+  - from: durability_p1.entry_reply
+    to: consensus_p1.entry_reply
+    buffer_bytes: 8192
+  - from: durability_p1.replay_complete
+    to: consensus_p1.wal_replay_complete
+    rate: transaction
+  - from: durability_p1.flushed
+    to: consensus_p1.wal_flushed
+  - from: durability_p1.installed_local
+    to: consensus_p1.snapshot_installed
+  - from: consensus_p1.wal_compact
+    to: durability_p1.compact_before
+  - from: durability_p1.quorum_durable
+    to: consensus_p1.durable
+
+  # ── Observability fan-in → /metrics ─────────────────────────────
+  - from: range_supervisor.metrics
+    to: adapter_metrics.events_in
+  - from: kv_request_router.metrics
+    to: adapter_metrics.events_in
+  - from: adapter_metrics.telemetry_out
+    to: operations.ingest
+  - from: linux_net.net_out
+    to: operations.net_in
+  - from: operations.net_out
+    to: linux_net.net_in
+    rate: transaction

@@ -1,0 +1,73 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Replicated MVCC timestamp authority (RFC database foundation §10,
+# Phase 2 slice 1). Leases monotone half-open timestamp intervals to
+# transaction coordinators out of a high water that is established ONLY
+# by committed allocator records.
+#
+# The module is a bounded pump over `modules/common/mvcc.rs`: the record
+# format, the succession rules, and the reserve state machine all live
+# there and are host-tested in `tests/contract_mvcc.rs`. This manifest's
+# port wiring is the safety-relevant part — `propose_out` MUST reach the
+# consensus proposal path and `committed_state` MUST be fed from the
+# committed/applied stream of that same path. Wiring `committed_state`
+# to anything that is not durably committed breaks the module's core
+# invariant (see the header of mod.rs) and silently makes timestamps
+# re-issuable across a leadership change.
+#
+# The module holds no clock and samples none: timestamps are pure
+# logical counters (mvcc::HYBRID_NOT_ENABLED).
+
+# Lease requests from transaction coordinators.
+# MSG_TS_LEASE_REQUEST `[corr_id:u64 LE][requester:u32 LE][size:u32 LE]`
+[[ports]]
+name = "lease_request"
+direction = "input"
+content_type = "OctetStream"
+
+# Committed allocator records replayed/streamed from consensus. This is
+# the ONLY input that may advance the durable high water, and on restart
+# it is the ONLY source of the recovered position — never local state.
+# MSG_TS_LEASE `[encoded TimestampLease: 40 bytes]`
+[[ports]]
+name = "committed_state"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+# Granted intervals (and typed rejections) back to the requester.
+# MSG_TS_LEASE_GRANT  `[corr_id:u64 LE][lease:40]`
+# MSG_TS_LEASE_REJECT `[corr_id:u64 LE][reason:u8]`
+[[ports]]
+name = "lease_grant"
+direction = "output"
+content_type = "OctetStream"
+
+# High-water advance proposals into the consensus path. A proposal
+# emitted here is NOT usable until it returns on `committed_state`.
+# MSG_TS_LEASE `[encoded TimestampLease: 40 bytes]`
+[[ports]]
+name = "propose_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the
+# emitter in module_step passes values in this exact order.
+#
+# `epoch` and `high_water` are level gauges rather than rates, carried on
+# the counter channel because both are monotone non-decreasing by
+# construction — an observed regression in either is itself the alarm.
+[observability]
+metrics = ["grants", "proposals", "holds", "rejects", "epoch", "high_water"]

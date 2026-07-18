@@ -1,15 +1,26 @@
 # Lattice High Availability Guide
 
-This document covers high availability deployment patterns, readiness gates, drain orchestration, and rolling upgrade procedures for Lattice.
+This document covers high availability: topologies, readiness gates, failure
+scenarios, and rolling upgrades. Everything HA — quorum, leader election,
+failover, snapshots, DR — is provided by the **Clustor substrate modules**
+(`consensus`, `durability`, `admission`, `control_plane`, `gateway`,
+`peer_router`, `operations`) composed into the graph config, not by any
+Lattice-specific daemon or CLI. A node is a `fluxor run` over a graph config.
 
 ## Architecture Overview
 
 Lattice inherits its HA model from Clustor Raft:
 
-- **Quorum-based consensus**: 2f+1 nodes tolerate f failures
-- **Leader election**: Automatic failover on leader failure
-- **Linearizable reads**: Require leader ReadIndex confirmation
-- **Snapshot-only reads**: Available from followers (when permitted)
+- **Quorum-based consensus**: `2f+1` voters tolerate `f` failures. Voter count
+  is the `voter_count` param on the `consensus`/`durability` modules
+  (`configs/multi-3node.yaml` uses `voter_count: 3`).
+- **Leader election**: automatic failover on leader failure.
+- **Linearizable reads**: require a leader ReadIndex fence (the router's
+  `lin_reads` classification; the ReadIndex fast-path needs a real multi-voter
+  quorum).
+- **Snapshot-only reads**: served without a ReadIndex fence when explicitly
+  permitted per adapter (see the specification's
+  [read semantics](specification.md#read-semantics-and-lin-bound)).
 
 ## Deployment Topologies
 
@@ -17,313 +28,133 @@ Lattice inherits its HA model from Clustor Raft:
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Lattice 1  │    │  Lattice 2  │    │  Lattice 3  │
+│  Node 0     │    │  Node 1     │    │  Node 2     │
 │  (Leader)   │◄──►│  (Follower) │◄──►│  (Follower) │
 └─────────────┘    └─────────────┘    └─────────────┘
-       │                  │                  │
-       ▼                  ▼                  ▼
-┌─────────────────────────────────────────────────────┐
-│              Shared Storage / CP-Raft                │
-└─────────────────────────────────────────────────────┘
 ```
 
-- Tolerates 1 node failure
-- Maintains quorum with 2 nodes
-- Single AZ or cross-AZ
+Each node runs `fluxor run` over a rendered `configs/multi-3node.yaml` with its
+own `self_id` and peer list (see [deployment.md](deployment.md#multi-node)).
 
-### Five-Node Cluster (Production)
+- Tolerates 1 node failure; maintains quorum with 2 nodes.
+- `voter_count: 3` on `consensus` and `durability`.
 
-- Tolerates 2 node failures
-- Recommended for cross-region deployments
-- Higher write latency due to larger quorum
+### Five-Node Cluster (Production DR profile)
+
+- Tolerates 2 node failures (`voter_count: 5`).
+- Higher write latency due to the larger quorum. The specification recommends ≥3
+  KPG voters per tenant, and 5 for DR profiles.
 
 ## Readiness Gates
 
-Lattice exposes `/readyz` which evaluates multiple readiness conditions:
+The `operations` module exposes `/readyz` on its `listen_port`. It reports the
+tenant routing-epoch cache age, adapter enablement states, and a digest of the
+active tenant manifest used for routing (see the specification's
+[observability](specification.md#observability) section). Point your load
+balancer health check at this endpoint:
 
-### Readiness Conditions
-
-| Condition | Description | Impact if Failed |
-|-----------|-------------|------------------|
-| `cp_cache_fresh` | CP-Raft cache is not stale/expired | LIN-BOUND failures |
-| `routing_epoch_valid` | Routing epoch is current | Request rejections |
-| `leader_elected` | Raft leader exists | Write failures |
-| `can_serve_reads` | ReadIndex available | Linearizable read failures |
-| `adapters_ready` | All adapters initialized | Connection failures |
-
-### Readiness Response
-
-```json
-{
-  "ready": true,
-  "conditions": {
-    "cp_cache_fresh": true,
-    "routing_epoch_valid": true,
-    "leader_elected": true,
-    "can_serve_reads": true,
-    "adapters_ready": true
-  },
-  "manifest_digest": "sha256:abc123...",
-  "routing_epoch": 42,
-  "cache_age_seconds": 15
-}
+```
+curl http://<host>:<http_port>/readyz
 ```
 
-### Load Balancer Health Checks
-
-Configure your load balancer to use `/readyz`:
-
-```nginx
-upstream lattice {
-    server lattice1:2379;
-    server lattice2:2379;
-    server lattice3:2379;
-}
-
-server {
-    location /health {
-        proxy_pass https://lattice/readyz;
-    }
-}
-```
-
-## Drain Orchestration
-
-### Graceful Drain Procedure
-
-1. **Mark node for drain**
-   ```bash
-   lattice admin drain --node-id node1
-   ```
-
-2. **Stop accepting new connections**
-   - Load balancer health check fails
-   - Existing connections continue
-
-3. **Wait for in-flight requests**
-   - Configurable timeout (default: 30s)
-   - Watches receive cancellation
-
-4. **Transfer leadership (if leader)**
-   - Initiate leadership transfer
-   - Wait for new leader confirmation
-
-5. **Stop accepting Raft messages**
-   - Node becomes observer
-   - Quorum maintained by remaining nodes
-
-6. **Shutdown**
-   ```bash
-   lattice admin shutdown --graceful
-   ```
-
-### Drain Configuration
-
-```toml
-[admin]
-drain_timeout_seconds = 30
-leadership_transfer_timeout_seconds = 10
-shutdown_grace_period_seconds = 5
-```
-
-### Monitoring Drain Progress
-
-```bash
-# Check drain status
-lattice admin drain-status
-
-# Metrics during drain
-curl http://localhost:9090/metrics | grep lattice_drain
-```
+Route load-balancer health checks to `/readyz` so a node that has lost CP
+freshness or leadership is pulled from rotation.
 
 ## Rolling Upgrades
 
-### Pre-Upgrade Checklist
+There is no binary to swap and no `lattice admin` CLI. A rolling upgrade is a
+rebuild-and-relaunch, one node at a time, following the Clustor upgrade guidance
+in the specification's
+[disaster recovery and upgrades](specification.md#disaster-recovery-and-upgrades)
+section — drain listeners, transfer KPG leadership, upgrade, rejoin:
 
-- [ ] Verify cluster health: all nodes Ready
-- [ ] Check replication lag: `lattice_replication_lag_seconds < 1`
-- [ ] Backup current state: `lattice snapshot export`
-- [ ] Review changelog for breaking changes
-- [ ] Test upgrade in staging environment
-
-### Upgrade Procedure
-
-1. **Upgrade one node at a time**
+1. Rebuild the modules with the new code:
    ```bash
-   # Node 1
-   lattice admin drain --node-id node1
-   # Wait for drain to complete
-   systemctl stop lattice
-   # Upgrade binary
-   cp lattice-new /usr/local/bin/lattice
-   systemctl start lattice
-   # Wait for node to become Ready
-   lattice admin wait-ready --timeout 60s
+   fluxor modules build --target bcm2712
    ```
+2. Upgrade one node at a time. Stop that node's `fluxor run`, transfer
+   leadership to a peer (the substrate elects a new leader automatically when a
+   voter leaves), relaunch `fluxor run` on the upgraded node, and wait for its
+   `/readyz` to report ready before moving on.
+3. Proceed to the next node only once the cluster is back to full quorum.
 
-2. **Verify cluster health after each node**
-   ```bash
-   lattice admin cluster-status
-   ```
+Because durability is inherited from Clustor, committed data survives a node
+restart via WAL replay (see the replay handoff note in
+`configs/single-replicated-lattice.yaml`).
 
-3. **Proceed to next node only if healthy**
-
-### Rollback Procedure
-
-If an upgrade fails:
-
-1. **Stop the upgraded node**
-   ```bash
-   systemctl stop lattice
-   ```
-
-2. **Restore previous binary**
-   ```bash
-   cp lattice-backup /usr/local/bin/lattice
-   ```
-
-3. **Clear any incompatible state**
-   ```bash
-   rm -rf /var/lib/lattice/data/*
-   ```
-
-4. **Restore from snapshot**
-   ```bash
-   lattice snapshot import /backup/snapshot.db
-   ```
-
-5. **Start the node**
-   ```bash
-   systemctl start lattice
-   ```
+There is no `lattice snapshot export/import`, `lattice admin
+drain/shutdown/wait-ready/cluster-status`, or binary-swap flow. Snapshot
+export/import and DR are Clustor substrate capabilities (see Disaster Recovery
+below).
 
 ## Failure Scenarios
 
 ### Leader Failure
 
-**Symptoms:**
-- Write requests fail
-- `lattice_leader_elected` metric goes to 0
-- Linearizable reads fail
+**Symptoms:** writes and linearizable reads fail until a new leader is elected.
 
-**Recovery:**
-- Automatic leader election (typically < 1s)
-- Clients retry to new leader
-- No data loss (committed data is replicated)
+**Recovery:** automatic leader election; clients retry to the new leader. No
+data loss — committed entries are quorum-durable and replicated.
 
-**Mitigation:**
-- Use client retries with exponential backoff
-- Deploy across failure domains
+**Mitigation:** client retries with exponential backoff; deploy across failure
+domains.
 
 ### Follower Failure
 
-**Symptoms:**
-- Replication lag increases for that node
-- Cluster continues operating normally
+**Symptoms:** that follower falls behind; the cluster keeps serving on quorum.
 
-**Recovery:**
-- Node catches up on restart
-- Snapshot transfer if too far behind
+**Recovery:** the node catches up from the leader's log on restart, or via
+snapshot transfer if it is too far behind.
 
-**Mitigation:**
-- Monitor `lattice_replication_lag_seconds`
-- Alert on extended failures
+**Mitigation:** deploy across failure domains and alert on extended outages.
+(Use the replication metric documented in `telemetry/catalog.json`;
+see [performance.md](performance.md).)
 
 ### Network Partition
 
-**Symptoms:**
-- Minority partition: cannot serve requests
-- Majority partition: operates normally
+**Symptoms:** the minority partition cannot serve writes/linearizable reads; the
+majority partition operates normally.
 
-**Recovery:**
-- Partition heals
-- Minority nodes sync and rejoin
+**Recovery:** on heal, minority nodes sync and rejoin.
 
-**Mitigation:**
-- Deploy across 3+ failure domains
-- Configure appropriate election timeouts
+**Mitigation:** deploy across 3+ failure domains; tune election timeouts.
 
-### CP-Raft Unavailability
+### Control-Plane (CP-Raft) Unavailability
 
-**Symptoms:**
-- `cp_cache_fresh` goes to false
-- After grace period: LIN-BOUND failures
-- Operations fail with `UNAVAILABLE`
+**Symptoms:** the CP cache goes stale/expired; after the grace period,
+LIN-BOUND fails closed and linearizable operations are refused (Redis
+`-CLUSTERDOWN`, etc.).
 
-**Recovery:**
-- Restore CP-Raft connectivity
-- Cache refreshes automatically
+**Recovery:** restore CP-Raft connectivity; the cache refreshes automatically.
 
-**Mitigation:**
-- Deploy CP-Raft with high availability
-- Configure appropriate cache TTL and grace period
-
-## Monitoring and Alerting
-
-### Critical Alerts
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| ClusterQuorumLost | < 50% nodes healthy | Critical |
-| LeaderUnavailable | No leader for > 30s | Critical |
-| LINBOUNDFailures | Error rate > 1% | High |
-| ReplicationLag | Lag > 60s | High |
-| CPCacheStale | Cache stale > 60s | High |
-
-### Recommended Dashboards
-
-1. **Cluster Health**
-   - Leader status per node
-   - Replication lag per follower
-   - CP cache state
-
-2. **Request Performance**
-   - Request rate by operation
-   - Latency percentiles
-   - Error rates
-
-3. **Capacity**
-   - Active connections
-   - Active watches
-   - Active leases
-   - WAL segment count
+**Mitigation:** deploy CP-Raft with high availability. This strict-fallback
+behavior is inherited from Clustor (see the specification's
+[control plane](specification.md#control-plane) section).
 
 ## Disaster Recovery
 
-### Backup Strategy
+DR is performed via Clustor snapshot export/import, not a Lattice CLI:
 
-```bash
-# Export snapshot
-lattice snapshot export /backup/lattice-$(date +%Y%m%d).db
+- Under unfenced DR promotion, Lattice treats linearizable guarantees as
+  unavailable until fenced promotion completes and Clustor read gates pass.
+- Snapshot emission and import are inherited from Clustor.
 
-# Verify snapshot integrity
-lattice snapshot verify /backup/lattice-$(date +%Y%m%d).db
-```
+See the specification's
+[disaster recovery and upgrades](specification.md#disaster-recovery-and-upgrades)
+section for the normative DR and upgrade rules.
 
-### Recovery Procedure
+## Monitoring
 
-1. **Stop all nodes**
-2. **Clear data directories**
-3. **Import snapshot on one node**
-   ```bash
-   lattice snapshot import /backup/lattice-20240101.db
-   ```
-4. **Start the node as single-node cluster**
-5. **Add other nodes to cluster**
-
-### Cross-Region DR
-
-For cross-region disaster recovery:
-
-1. **Async replication** to DR region
-2. **Unfenced promotion** on failover
-   - LIN-BOUND unavailable until fenced
-3. **Fenced promotion** restores full functionality
-
-See [Disaster Recovery](deployment.md#disaster-recovery) for details.
+Alert on the metrics defined in `telemetry/catalog.json` (dotted `lattice.*`
+namespaces plus inherited `clustor.*`) and described in the specification's
+[observability](specification.md#observability) section. Do not rely on metric
+or alert names not present in the catalog. Useful signals
+include the LIN-BOUND availability gauge, CP cache state/age, replication lag,
+and per-adapter request/error counters — see the catalog for exact names.
 
 ## See Also
 
-- [Deployment Guide](deployment.md) - Initial setup
-- [Performance](performance.md) - Tuning for HA workloads
-- [Specification](specification.md) - LIN-BOUND semantics
+- [Deployment Guide](deployment.md) — build + `fluxor run` bring-up
+- [Performance](performance.md) — latency/throughput targets and measurement
+- [Specification](specification.md) — observability, DR/upgrades, LIN-BOUND
+  semantics

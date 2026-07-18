@@ -1,0 +1,48 @@
+# Lattice: the POSITIVE control for multi-cluster-domain routing (RFC
+# §11.3 / §26.5, Phase 10). Byte-for-byte `single-data-surface-foreign-
+# domain.yaml` except the router serves `local_cluster_domain = 1` —
+# which MATCHES the map's single `cluster_id = 1` range. The range is
+# therefore local, and a write/read completes normally rather than
+# redirecting. It proves the routing decision is driven by the param,
+# not by anything intrinsic to the map. `tests/live_data_surface.rs`
+# drives both.
+
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: lattice_data_anchor
+    params:
+      listen_port: 7432
+  - name: kv_request_router
+    params:
+      routing_mode: 2
+      replicated: 0
+      # This router serves cluster domain 1 — matching the map — so the range is local and served normally.
+      local_cluster_domain: 1
+      # RANGE_MAP_UPDATE_V1: one range MIN..MAX, binding cluster_id=1,
+      # partition 0. Generated via partition_map::encode_range_map_update.
+      range_map: "0100010001004a00010000000200000001111111111111111111111111111111110000000001000000020100000000000100000001000000030a0000000101000b0000000102000c0000000103000a000000"
+  - name: kv_state_worker
+
+wiring:
+  - from: linux_net.net_out
+    to: lattice_data_anchor.net_in
+  - from: lattice_data_anchor.net_out
+    to: linux_net.net_in
+
+  - from: lattice_data_anchor.kv_out
+    to: kv_request_router.internal_data_in
+  - from: kv_request_router.compute_out
+    to: lattice_data_anchor.kv_in
+
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in

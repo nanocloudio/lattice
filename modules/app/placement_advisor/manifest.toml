@@ -1,0 +1,40 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# §12.4 load-policy recommender (RFC database foundation Phase 10).
+# Surveys key counts and REPORTS what §12.4 permits saying about the
+# load. It has no port that can reach the lifecycle machinery, by
+# design: "execution remains bounded by operator policy", and an
+# advisor wired to the supervisor would turn every policy bug into a
+# topology change. Write rate and hot-key concentration are not
+# attributable to ranges in this graph yet, so they are reported as
+# UNMEASURED rather than zero — which is why this slice can recommend
+# merges and structurally cannot recommend a split.
+
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# The router's metrics port: §12.4's MEASURED load signal. Optional —
+# compositions that omit it leave the advisor on its growth-derived
+# lower bound, which still works.
+[[ports]]
+name = "signal_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["surveys", "recommendations", "keys_last_survey"]

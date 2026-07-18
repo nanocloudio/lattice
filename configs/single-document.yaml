@@ -1,0 +1,59 @@
+# Lattice: single-node DOCUMENT graph (RFC database foundation §14.16,
+# Phase 8's first capability).
+#
+# A real MongoDB driver connects on 27017 and can `insert` and `find`.
+# Documents are BSON values in the canonical KV store: the same router
+# and worker every other protocol uses, which is Phase 8's acceptance
+# rule ("authoritative mutations use canonical Lattice transactions")
+# holding structurally. A multi-document insert is ONE atomic KV
+# transaction; a duplicate _id writes nothing.
+#
+# ROUTER PAIRING, read this before touching the wiring: the router's
+# sixteen output ports are fully allocated, so the document anchor
+# uses the router's POSITIONAL pair #0 — the ports whose manifest
+# names are `etcd_in`/`etcd_out` — and stamps PROTO_ETCD on its
+# requests. The protocol byte is reply-routing state; the port names
+# are positional history. This composition has no etcd anchor, so the
+# pair is unambiguously the document anchor's.
+#
+# This is the MEMORY composition (1024-key ceiling, no history); the
+# durable variant follows single-relational-disk.yaml's pattern.
+#
+# Run: `fluxor run configs/single-document.yaml`
+# Then: `mongosh mongodb://127.0.0.1:27018` (or raw OP_MSG — see
+#        tests/live_relational.rs)
+
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: doc_edge_anchor
+    params:
+      listen_port: 27018
+  - name: kv_request_router
+  - name: kv_state_worker
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: doc_edge_anchor.net_in
+  - from: doc_edge_anchor.net_out
+    to: linux_net.net_in
+
+  # ── Anchor ↔ router: POSITIONAL pair #0 (see header) ────────────
+  - from: doc_edge_anchor.kv_out
+    to: kv_request_router.etcd_in
+  - from: kv_request_router.etcd_out
+    to: doc_edge_anchor.kv_in
+
+  # ── Router ↔ worker ─────────────────────────────────────────────
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in

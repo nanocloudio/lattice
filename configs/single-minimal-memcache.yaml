@@ -1,0 +1,52 @@
+# Lattice: single-node minimal Linux memcached smoke graph.
+#
+# Mirror of `single-minimal.yaml` but with `memcached_stream_anchor`
+# in the edge slot. Brings up enough for memcached_stream_anchor →
+# kv_request_router → kv_state_worker → kv_request_router →
+# memcached_stream_anchor round-trip to function end-to-end:
+#
+#   foundation/linux_net    TCP (port 11211)
+#   memcached_stream_anchor ASCII parse + dispatch (real)
+#   kv_request_router       envelope translation + inflight (real)
+#   kv_state_worker         real KV state machine (kv_store.rs)
+#
+# Used by `tests/loadtest_memcache.rs`. Run directly with:
+#   fluxor run --template configs/single-minimal-memcache.yaml
+
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: memcached_stream_anchor
+    params:
+      # Explicit rather than relying on the anchor's default, so a
+      # harness can rewrite it and run without owning port 11211 —
+      # same reason single-minimal.yaml declares its redis port.
+      listen_port: 11211
+  - name: kv_request_router
+  - name: kv_state_worker
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: memcached_stream_anchor.net_in
+  - from: memcached_stream_anchor.net_out
+    to: linux_net.net_in
+
+  # ── Anchor ↔ router (ingress + response) ───────────────────────
+  - from: memcached_stream_anchor.kv_out
+    to: kv_request_router.memcached_in
+  - from: kv_request_router.memcached_out
+    to: memcached_stream_anchor.routed_in
+
+  # ── Router ↔ worker (command + applied) ────────────────────────
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in

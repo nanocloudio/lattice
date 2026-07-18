@@ -1,8 +1,57 @@
-.vscode
-Cargo.lock
-.context/
-target
-tools/*/target
-tools/*/Cargo.lock
 certs
 data
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# AI
+.claude/
+.context/
+.codex
+
+# Build/test
+Cargo.lock
+/target/
+# No root cargo workspace: each standalone crate (tools/*, tests/harness) builds
+# its own target/. Unanchored to catch every one of them (matches wave/spectra).
+target/
+
+# Runtime WAL state (mutated by local runs, not source)
+/wal/
+
+# Local dev symlinks to sibling checkouts (clustor, fluxor). Resolved at
+# build time via the fluxor OCI store, not these paths — they exist only for
+# in-tree navigation, so they are never versioned (matches wave/spectra).
+/deps/
+
+# fluxor lockfile advisory-lock artifact
+/.fluxor.lock.lock
+
+# Runtime disk state-store files (kv_state_worker state_store=1 on linux)
+/kv/
+
+# Shadow-tracked (see standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote. `fuzz/` is
+# omitted until that tier exists; add it here and in
+# .git-shadow/info/exclude together if introduced. `perf/` is a
+# project-specific extra tier: its run scripts and result JSONs carry
+# throughput/latency numbers for still-unoptimised paths, which §2 keeps
+# off the shared remote — same rationale as benches/.
+/tests/
+/benches/
+/examples/
+/perf/
+/.git-shadow/
+
+# Runtime state from local runs — never source
+*.pid
+*.log
+*.tmp
+/data-test/

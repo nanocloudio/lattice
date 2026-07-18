@@ -1,0 +1,8 @@
+[toolchain]
+channel    = "stable"
+components = ["rust-src", "rustfmt", "clippy"]
+# aarch64-unknown-none is the bare-metal target for bcm2712 silicon (pi5 board)
+# PIC module ELFs produced by `make modules`. The host triple (linux
+# aarch64 on the Pi development host, x86_64 elsewhere) comes from the
+# default and runs the cargo workspace tests.
+targets = ["aarch64-unknown-none"]

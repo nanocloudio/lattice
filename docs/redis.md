@@ -43,28 +43,26 @@ let value: String = con.get("key")?;
 
 ## Supported Commands
 
+This is the complete set of commands with a handler. Anything not listed here
+returns `-ERR unknown command`. See "Not implemented" below for families that
+are commonly expected but absent.
+
 ### String Commands
 
 | Command | Status | Linearizable | Notes |
 |---------|--------|--------------|-------|
 | `GET` | Supported | No | Snapshot read by default |
-| `SET` | Supported | Conditional | NX/XX options require LIN-BOUND |
-| `SETNX` | Supported | Yes | Alias for SET NX |
-| `SETEX` | Supported | No | |
-| `PSETEX` | Supported | No | |
-| `MGET` | Supported | No | All keys must be in same KPG |
-| `MSET` | Supported | No | All keys must be in same KPG |
-| `GETEX` | Supported | Yes | |
-| `GETDEL` | Supported | Yes | |
+| `SET` | Supported | Conditional | Parses `NX`/`XX`, `EX`/`PX`, and the `GET` option |
+| `SETNX` | Supported | Yes | Store only if key does not exist |
+| `GETSET` | Supported | Yes | Set new value, return old |
 | `APPEND` | Supported | Yes | |
 | `STRLEN` | Supported | No | |
 | `INCR` | Supported | Yes | |
-| `DECR` | Supported | Yes | |
 | `INCRBY` | Supported | Yes | |
+| `DECR` | Supported | Yes | |
 | `DECRBY` | Supported | Yes | |
-| `INCRBYFLOAT` | Supported | Yes | |
-| `GETRANGE` | Supported | No | |
-| `SETRANGE` | Supported | Yes | |
+| `MGET` | Supported | No | All keys must be in same KPG |
+| `MSET` | Supported | No | All keys must be in same KPG |
 
 ### Key Commands
 
@@ -73,25 +71,17 @@ let value: String = con.get("key")?;
 | `DEL` | Supported | No | All keys must be in same KPG |
 | `UNLINK` | Supported | No | Synchronous in Lattice (same as DEL) |
 | `EXISTS` | Supported | No | |
-| `TYPE` | Supported | No | Always returns 'string' in v0.1 |
 | `KEYS` | Supported | No | Full keyspace scan - use with caution |
 | `SCAN` | Supported | No | |
-| `EXPIRE` | Supported | No | |
-| `PEXPIRE` | Supported | No | |
-| `EXPIREAT` | Supported | No | |
-| `PEXPIREAT` | Supported | No | |
-| `TTL` | Supported | No | |
-| `PTTL` | Supported | No | |
-| `PERSIST` | Supported | No | |
-| `EXPIRETIME` | Supported | No | |
-| `PEXPIRETIME` | Supported | No | |
-| `RENAME` | Supported | Yes | Both keys must be in same KPG |
-| `RENAMENX` | Supported | Yes | Both keys must be in same KPG |
-| `COPY` | Supported | No | Both keys must be in same KPG; DB option ignored |
-| `TOUCH` | Supported | No | No-op in Lattice (no LRU tracking) |
-| `RANDOMKEY` | Supported | No | |
-| `DBSIZE` | Supported | No | Returns key count for tenant |
-| `OBJECT` | Partial | No | ENCODING and REFCOUNT only |
+| `FLUSHDB` | Supported | No | Tenant-scoped, not global |
+| `FLUSHALL` | Supported | No | Tenant-scoped, not global (same as FLUSHDB) |
+
+### Time-Series Commands
+
+| Command | Status | Linearizable | Notes |
+|---------|--------|--------------|-------|
+| `TS.ADD` | Supported | Yes | Append a sample; bucket 0, disk-ordered |
+| `TS.RANGE` | Supported | No | Range scan over samples |
 
 ### Connection Commands
 
@@ -99,82 +89,73 @@ let value: String = con.get("key")?;
 |---------|--------|--------------|-------|
 | `PING` | Supported | No | |
 | `ECHO` | Supported | No | |
-| `QUIT` | Supported | No | |
+| `QUIT` | Supported | No | Closes the connection |
 | `SELECT` | Supported | No | Accepted but ignored; Lattice uses tenants |
-| `AUTH` | Supported | No | Maps to tenant authentication |
-| `HELLO` | Supported | No | RESP3 protocol negotiation |
+| `AUTH` | Supported | No | Single-password `requirepass` only (no ACL users) |
+| `HELLO` | Supported | No | RESP2/RESP3 protocol negotiation |
 | `RESET` | Supported | No | |
-| `CLIENT` | Partial | No | SETNAME, GETNAME, ID, LIST, INFO, PAUSE, UNPAUSE, REPLY |
-
-### Server Commands
-
-| Command | Status | Linearizable | Notes |
-|---------|--------|--------------|-------|
-| `INFO` | Supported | No | Includes Lattice-specific sections |
-| `TIME` | Supported | No | Uses committed tick time |
-| `DEBUG` | Partial | No | SLEEP only; disabled in production |
-| `CONFIG` | Partial | No | Read-only subset for GET |
-| `MEMORY` | Partial | No | USAGE and STATS only |
-| `SLOWLOG` | Supported | No | |
+| `CLIENT` | Supported | No | Accepted; connection-management no-op |
+| `COMMAND` | Supported | No | Accepted; minimal reply |
 
 ### Transaction Commands
 
 | Command | Status | Linearizable | Notes |
 |---------|--------|--------------|-------|
-| `MULTI` | Supported | No | |
-| `EXEC` | Supported | Conditional | LIN-BOUND required with WATCH |
+| `MULTI` | Supported | No | Queues subsequent commands |
+| `EXEC` | Supported | No | Runs the queued commands |
 | `DISCARD` | Supported | No | |
-| `WATCH` | Supported | Yes | Requires LIN-BOUND for CAS semantics |
-| `UNWATCH` | Supported | No | |
+
+`WATCH`/`UNWATCH` are not implemented — there is no optimistic-lock CAS layer on
+top of MULTI/EXEC. See "Not implemented" below.
 
 ### Pub/Sub Commands
 
 | Command | Status | Linearizable | Notes |
 |---------|--------|--------------|-------|
-| `SUBSCRIBE` | Supported | No | Messages not persisted |
-| `PSUBSCRIBE` | Supported | No | |
+| `SUBSCRIBE` | Supported | No | Acknowledged; no message delivery (no PUBLISH side) |
+| `PSUBSCRIBE` | Supported | No | Acknowledged only |
 | `UNSUBSCRIBE` | Supported | No | |
 | `PUNSUBSCRIBE` | Supported | No | |
-| `PUBLISH` | Supported | No | Fire-and-forget; no persistence |
-| `PUBSUB` | Supported | No | CHANNELS, NUMSUB, NUMPAT |
 
-### Cluster Commands
+Subscription commands are accepted and echo the standard subscribe/unsubscribe
+confirmation frames, but there is no `PUBLISH` command, so no messages are ever
+delivered. Pub/sub is a stub; use the etcd Watch API for real event streaming.
 
-| Command | Status | Linearizable | Notes |
-|---------|--------|--------------|-------|
-| `CLUSTER` | Partial | No | Compatibility mode: SLOTS, NODES, INFO, KEYSLOT |
-| `READONLY` | Supported | No | Enables snapshot reads on replicas |
-| `READWRITE` | Supported | No | Requires leader |
+## Not implemented
 
-## Unsupported Commands
+The following are commonly expected but have no handler and return
+`-ERR unknown command`.
 
-### Data Structures (Not in v0.1 scope)
+### Data structures
 
-Hash, List, Set, Sorted Set, and Stream commands are not supported in the initial release:
+Only the string type exists. Hash, List, Set, Sorted Set, and Stream commands are
+absent: `HGET`/`HSET`/`HDEL`/`HGETALL`/…, `LPUSH`/`RPUSH`/`LPOP`/`LRANGE`/…,
+`SADD`/`SREM`/`SMEMBERS`/…, `ZADD`/`ZRANGE`/…, `XADD`/`XREAD`/`XRANGE`/….
 
-- Hash: `HGET`, `HSET`, `HDEL`, `HGETALL`, etc.
-- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, etc.
-- Set: `SADD`, `SREM`, `SMEMBERS`, etc.
-- Sorted Set: `ZADD`, `ZREM`, `ZRANGE`, etc.
-- Stream: `XADD`, `XREAD`, `XRANGE`, etc.
+### TTL / expiration
 
-### Scripting (Security concerns)
+No TTL command family: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`,
+`PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETEX`, `GETDEL`, `SETEX`, `PSETEX`. The
+`EX`/`PX` options are parsed by `SET` but there is no expiry-command surface.
 
-Lua scripting is not supported due to security and determinism requirements:
+### Optimistic locking / scripting
 
-- `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION`
+`WATCH`, `UNWATCH`, `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION`.
 
-### Cluster Management (Managed by Lattice)
+### Other key/server commands
 
-Cluster topology is managed by the Lattice control plane:
+`TYPE`, `RENAME`, `RENAMENX`, `COPY`, `TOUCH`, `RANDOMKEY`, `DBSIZE`, `OBJECT`,
+`GETRANGE`, `SETRANGE`, `INCRBYFLOAT`, `INFO`, `TIME`, `CONFIG`, `DEBUG`, `MEMORY`,
+`SLOWLOG`.
 
-- `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER FAILOVER`, `CLUSTER MEET`, `CLUSTER REPLICATE`, `CLUSTER RESET`
+### Pub/sub publish and introspection
 
-### Replication (Managed by Lattice)
+`PUBLISH`, `PUBSUB`.
 
-Replication is handled internally by Lattice:
+### Cluster / replication (managed by Lattice)
 
-- `REPLICAOF`, `SLAVEOF`, `PSYNC`, `SYNC`
+`CLUSTER` (all subcommands), `READONLY`, `READWRITE`, `REPLICAOF`, `SLAVEOF`,
+`PSYNC`, `SYNC`. Topology and replication are managed by the Lattice control plane.
 
 ## Behavioral Differences
 
@@ -219,15 +200,12 @@ GET mykey
 
 # May return CLUSTERDOWN if linearizability unavailable
 INCR counter
-WATCH mykey
 ```
 
-When linearizability is unavailable, you'll receive:
+When linearizability is unavailable, you'll receive the exact string emitted by the code:
 ```
-CLUSTERDOWN The cluster is down - linearizability unavailable
+-CLUSTERDOWN no authority available for this operation
 ```
-
-Use `READONLY` mode to accept eventual consistency.
 
 ### SELECT Command
 
@@ -239,43 +217,23 @@ instead of numbered databases.
 In standard Redis, `UNLINK` is asynchronous while `DEL` is synchronous. In Lattice, both
 commands behave identically (synchronous deletion).
 
-### TOUCH Command
-
-The `TOUCH` command is a no-op in Lattice since there's no LRU eviction. Keys are only
-removed via explicit deletion or TTL expiration.
-
 ## Error Mapping
 
-| Lattice Error | Redis Error | Description |
-|---------------|-------------|-------------|
-| Routing epoch mismatch | `MOVED 0 host:port` | Redirect to correct node |
-| Linearizability unavailable | `CLUSTERDOWN` | Retry or use READONLY mode |
+| Lattice Error | Redis Error class | Exact wire string |
+|---------------|-------------------|-------------------|
+| Routing epoch advanced | `MOVED` | `-MOVED routing epoch advanced` |
+| Linearizability unavailable | `CLUSTERDOWN` | `-CLUSTERDOWN no authority available for this operation` |
 | Cross-KPG operation | `CROSSSLOT` | Ensure all keys in same KPG |
-| Type error | `WRONGTYPE` | Operation on wrong data type |
+| Type error | `WRONGTYPE` | `-WRONGTYPE Operation against a key holding the wrong kind of value` |
 
 ## Configuration
 
-Configure the Redis listener in `config/lattice.toml`:
-
-```toml
-[listeners.redis]
-bind = "0.0.0.0:6379"
-enabled = true
-insecure = true  # Set false for production
-
-# TLS (production)
-# tls_chain_path = "certs/redis-server.crt"
-# tls_key_path = "certs/redis-server.key"
-
-# Protocol and connection settings
-protocol_version = "auto"
-max_pipeline_depth = 256
-idle_timeout_ms = 0
-
-# Pub/Sub settings
-pubsub_enabled = true
-max_subscriptions = 1000
-```
+There is no `config/lattice.toml`. A node is configured by the fluxor graph YAML under
+`configs/*.yaml` (for example `configs/bare-metal-pi5-multiproto.yaml`). The Redis edge
+is the `redis_edge_anchor` module wired into the graph; its listener bind address, the
+`requirepass` password used by `AUTH`, and the router wiring are set as module parameters
+in that YAML. Pick the config that matches the target host and enable the Redis anchor
+there.
 
 ## Client Library Compatibility
 
@@ -298,5 +256,5 @@ max_subscriptions = 1000
 3. **Multi-key operations**: Ensure keys are co-located in the same KPG using hash tags to
    enable efficient multi-key operations.
 
-4. **Pub/Sub**: Messages are not persisted. Use the etcd Watch API if you need durable
-   event streaming.
+4. **Pub/Sub**: Not functional (SUBSCRIBE is acknowledged but there is no PUBLISH,
+   so no messages are delivered). Use the etcd Watch API for event streaming.

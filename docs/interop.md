@@ -8,28 +8,29 @@ Lattice implements a subset of the etcd v3 gRPC API with additional semantics fo
 
 ### Supported APIs
 
-| Service | RPC | Status | Notes |
-|---------|-----|--------|-------|
-| KV | Range | Full | Linearizable and serializable modes |
-| KV | Put | Full | All options supported |
-| KV | DeleteRange | Full | All options supported |
-| KV | Txn | Full | Single-KPG only |
-| KV | Compact | Partial | Per-KPG compaction |
-| Watch | Watch | Full | Bidirectional streaming |
-| Lease | LeaseGrant | Full | |
-| Lease | LeaseRevoke | Full | |
-| Lease | LeaseKeepAlive | Full | Bidirectional streaming |
-| Lease | LeaseTimeToLive | Full | |
-| Lease | LeaseLeases | Full | |
-| Auth | Authenticate | Partial | Basic auth only |
-| Auth | UserAdd | Partial | Minimal subset |
-| Auth | RoleAdd | Partial | Minimal subset |
+This is the complete set of gRPC methods with a handler (the `GrpcMethod` enum in the etcd
+edge anchor). Anything not listed here is unimplemented.
 
-### Unsupported APIs
+| Service | RPC | Notes |
+|---------|-----|-------|
+| KV | Range | Linearizable and serializable modes |
+| KV | Put | Unary |
+| KV | DeleteRange | Unary |
+| Watch | Watch | Server-streaming |
+| Lease | LeaseGrant | Unary |
+| Lease | LeaseRevoke | Unary |
+| Lease | LeaseKeepAlive | Bidirectional streaming |
 
-| Service | RPC | Reason |
-|---------|-----|--------|
-| Maintenance | * | Use Lattice CLI instead |
+### Not implemented
+
+| Service | RPC | Notes |
+|---------|-----|-------|
+| KV | Txn | No handler; transactions are not available over the etcd surface |
+| KV | Compact | No Compact RPC (a `COMPACTED` status may still surface on reads) |
+| Lease | LeaseTimeToLive | No handler |
+| Lease | LeaseLeases | No handler |
+| Auth | Authenticate / UserAdd / RoleAdd / … | No auth RPCs |
+| Maintenance | * | Not implemented |
 | Cluster | * | Managed by CP-Raft |
 | Election | * | Not implemented |
 | Lock | * | Not implemented |
@@ -65,30 +66,13 @@ resp, err := client.Get(ctx, "key")
 resp, err := client.Get(ctx, "key", clientv3.WithSerializable())
 ```
 
-**Important:** Lattice does not guarantee per-session monotonicity for serializable reads across requests or connections.
+Lattice does not guarantee per-session monotonicity for serializable reads across requests or connections.
 
-### Cross-Shard Transactions
+### Transactions
 
-Lattice rejects transactions that span multiple Key Partition Groups (KPGs):
-
-```go
-// This may fail with FAILED_PRECONDITION if keys hash to different KPGs
-txn := client.Txn(ctx)
-resp, err := txn.If(
-    clientv3.Compare(clientv3.Version("key1"), "=", 0),
-).Then(
-    clientv3.OpPut("key1", "value1"),
-    clientv3.OpPut("key2", "value2"), // May be in different KPG
-).Commit()
-
-if err != nil {
-    if status.Code(err) == codes.FailedPrecondition {
-        // Check for TxnCrossShardUnsupported
-    }
-}
-```
-
-**Workaround:** Design key schemas to co-locate related keys in the same KPG.
+The etcd `Txn` RPC is not implemented — there is no handler for it. Applications
+that rely on `client.Txn(...)` compare-and-swap must be redesigned around single-key
+Put/Range semantics.
 
 ### Watch Semantics
 
@@ -155,8 +139,8 @@ retryClient := clientv3retry.NewRetryClient(cli,
 ### From etcd to Lattice
 
 1. **Audit API usage**
-   - Check for unsupported APIs (Election, Lock, Maintenance)
-   - Check for cross-key transactions
+   - Check for unsupported APIs (Txn, Compact, Auth, Election, Lock, Maintenance)
+   - Rework any `Txn` compare-and-swap into single-key Put/Range flows
 
 2. **Update client configuration**
    - Update endpoints to Lattice cluster
@@ -169,10 +153,6 @@ retryClient := clientv3retry.NewRetryClient(cli,
 4. **Test serializable reads**
    - Verify monotonicity requirements
    - Consider explicit serializable mode where appropriate
-
-5. **Design for single-KPG transactions**
-   - Review key naming schemes
-   - Co-locate related keys under common prefixes
 
 ### Data Migration
 
@@ -189,61 +169,28 @@ done
 
 ## Known Limitations
 
-### v0.1 Limitations
-
-1. **No cross-KPG transactions**
-   - Transactions limited to single KPG
-   - Plan key schemas accordingly
+1. **No transactions** — the `Txn` RPC has no handler.
 
 2. **No cross-KPG linearizable ranges**
    - Linearizable range queries limited to single KPG
    - Use serializable mode for multi-KPG ranges
 
-3. **Limited auth subset**
-   - Basic authentication only
-   - Prefix-based RBAC
+3. **No authentication** — the etcd Auth RPCs (Authenticate/UserAdd/RoleAdd/…) are not
+   implemented; there is no RBAC over this surface.
 
-4. **No scripting**
-   - Lua/EVALSHA not supported
+4. **No compaction** — the `Compact` RPC is not implemented.
 
-5. **No elections/locks**
-   - etcd election/lock RPCs not implemented
+5. **No elections/locks** — etcd Election/Lock RPCs are not implemented.
 
-### Behavioral Differences Summary
-
-| Behavior | etcd | Lattice |
-|----------|------|---------|
-| Linearizable failures | May succeed with weaker consistency | Fail with UNAVAILABLE |
-| Session monotonicity | Best-effort | Not guaranteed for serializable |
-| Cross-key transactions | Always allowed | Single-KPG only |
-| Watch start=0 | Always linearizable | Requires LIN-BOUND |
-| Compaction | Global | Per-KPG |
+(See the "Behavioral Differences" section above for LIN-BOUND, serializable-read, and watch
+semantics; those are not repeated here.)
 
 ## Conformance Testing
 
-Run conformance tests to verify compatibility:
-
-```bash
-# Run Lattice conformance suite
-make interop
-
-# Specific test categories
-cargo test --test interop put_get
-cargo test --test interop txn
-cargo test --test interop watch
-cargo test --test interop lease
-```
-
-### Test Categories
-
-| Category | Description |
-|----------|-------------|
-| `put_get` | Basic CRUD operations |
-| `txn` | Transaction semantics |
-| `watch` | Watch event delivery |
-| `lease` | Lease lifecycle |
-| `lin_bound` | LIN-BOUND failure modes |
-| `error_codes` | Error response format |
+etcd conformance suites are **shadow-tracked** (they live in the git shadow tree, not the
+primary checkout — see `standards/test-tracking.md`), so there is no `tests/interop` suite
+in the working tree to invoke directly. Consult the test-tracking standard for how the
+conformance suites are staged and run.
 
 ## Error Reference
 
@@ -276,19 +223,6 @@ Causes:
 Resolution:
 - Refresh routing metadata
 - Retry request
-
-### FAILED_PRECONDITION (Cross-Shard Txn)
-
-```
-rpc error: code = FailedPrecondition desc = TxnCrossShardUnsupported
-```
-
-Causes:
-- Transaction keys span multiple KPGs
-
-Resolution:
-- Redesign key schema
-- Split into multiple transactions
 
 ## See Also
 

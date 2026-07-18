@@ -1,0 +1,60 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# PostgreSQL v3 wire connector (RFC database foundation §14.3).
+#
+# Owns, per §14.3: the wire handshake, authentication negotiation, the
+# simple query flow, session variables, the dialect surface,
+# compatibility catalogs, type aliases, error mapping, and RESULT
+# ENCODING.
+#
+# Does NOT own — and must not, per §14.3's prohibition on
+# connector-specific formats — parsing, binding, catalogs of record,
+# table formats, transaction management, or persistence. Statement text
+# goes to `relational_executor` and typed values come back; the only
+# thing this module decides about a value is how PostgreSQL spells it.
+# That boundary is why a boolean can render `t`/`f` here and `1`/`0` in
+# the MySQL connector without either one being a special case.
+#
+# Continuity class: `drain_only`. A session's variables live in the slot,
+# so a reconnect is a new session — which is what PostgreSQL clients
+# already expect.
+
+# Cleartext bytes from foundation/ip (or TLS-terminated from
+# foundation/tls).
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+# NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_SQL_REQUEST out to relational_executor.pg_in.
+[[ports]]
+name = "sql_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_SQL_RESPONSE in from relational_executor.pg_out.
+[[ports]]
+name = "sql_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["sessions", "queries", "rows_sent", "errors", "net_errors"]

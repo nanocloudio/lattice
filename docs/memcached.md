@@ -6,26 +6,13 @@ supported commands, behavioral differences, and configuration options.
 
 ## Protocol Support
 
-Lattice supports both Memcached protocol variants:
-
-- **ASCII Protocol**: Text-based protocol, human-readable, widely supported
-- **Binary Protocol**: More efficient, supports additional features like quiet operations
-
-Protocol is auto-detected from the first byte:
-- `0x80`: Binary protocol request magic
-- Any ASCII letter: ASCII protocol command
+Lattice implements the **ASCII protocol only**. There is no binary protocol support:
+no `0x80` request magic, no opcodes, no quiet operations, and no 24-byte binary header.
+Configure clients for ASCII/text mode.
 
 ## Connecting to Lattice
 
-Connect using any Memcached client library:
-
-```python
-# Python (pylibmc - binary protocol)
-import pylibmc
-mc = pylibmc.Client(['localhost:11211'], binary=True)
-mc.set('key', 'value')
-print(mc.get('key'))
-```
+Connect using any Memcached client library in ASCII/text mode:
 
 ```python
 # Python (python-memcached - ASCII protocol)
@@ -44,15 +31,11 @@ mc.set('key', 'value', 3600, (err) => {
 });
 ```
 
-```ruby
-# Ruby (dalli - binary protocol)
-require 'dalli'
-mc = Dalli::Client.new('localhost:11211')
-mc.set('key', 'value')
-puts mc.get('key')
-```
-
 ## Supported Commands
+
+This is the complete set of commands with a handler, all ASCII. Anything not
+listed here (including `cas`, `touch`, `gat`, `gats`, `noop`, `verbosity`) returns
+`ERROR`.
 
 ### Storage Commands
 
@@ -63,7 +46,6 @@ puts mc.get('key')
 | `replace` | Supported | No | Store only if key exists |
 | `append` | Supported | No | Append data to existing value |
 | `prepend` | Supported | No | Prepend data to existing value |
-| `cas` | Supported | Yes | Check-and-set; requires LIN-BOUND |
 
 **ASCII Format:**
 ```
@@ -71,37 +53,18 @@ set <key> <flags> <exptime> <bytes> [noreply]\r\n
 <data>\r\n
 ```
 
-**Binary Opcodes:**
-- `set`: 0x01
-- `add`: 0x02
-- `replace`: 0x03
-- `append`: 0x0e
-- `prepend`: 0x0f
-
 ### Retrieval Commands
 
 | Command | Status | Linearizable | Notes |
 |---------|--------|--------------|-------|
 | `get` | Supported | No | Retrieve one or more keys |
-| `gets` | Supported | No | Get with CAS token |
-| `gat` | Supported | No | Get and touch (update expiration) |
-| `gats` | Supported | No | Get and touch with CAS token |
+| `gets` | Supported | No | Get with CAS token (derived from `mod_revision`) |
 
 **ASCII Format:**
 ```
 get <key>*\r\n
 gets <key>*\r\n
-gat <exptime> <key>*\r\n
-gats <exptime> <key>*\r\n
 ```
-
-**Binary Opcodes:**
-- `get`: 0x00
-- `getq` (quiet): 0x09
-- `getk` (with key): 0x0c
-- `getkq` (quiet with key): 0x0d
-- `gat`: 0x1d
-- `gatq`: 0x1e
 
 ### Deletion Command
 
@@ -113,8 +76,6 @@ gats <exptime> <key>*\r\n
 ```
 delete <key> [noreply]\r\n
 ```
-
-**Binary Opcode:** 0x04
 
 ### Arithmetic Commands
 
@@ -129,25 +90,6 @@ incr <key> <value> [noreply]\r\n
 decr <key> <value> [noreply]\r\n
 ```
 
-**Binary Opcodes:**
-- `incr`: 0x05
-- `decr`: 0x06
-- `incrq` (quiet): 0x15
-- `decrq` (quiet): 0x16
-
-### Touch Command
-
-| Command | Status | Linearizable | Notes |
-|---------|--------|--------------|-------|
-| `touch` | Supported | No | Update key expiration without retrieving |
-
-**ASCII Format:**
-```
-touch <key> <exptime> [noreply]\r\n
-```
-
-**Binary Opcode:** 0x1c
-
 ### Other Commands
 
 | Command | Status | Linearizable | Notes |
@@ -156,48 +98,21 @@ touch <key> <exptime> [noreply]\r\n
 | `flush_all` | Supported | No | Tenant-scoped, not global |
 | `version` | Supported | No | Returns Lattice version |
 | `quit` | Supported | No | Close connection |
-| `noop` | Supported | No | Binary only; flush quiet operations |
-| `verbosity` | Supported | No | Accepted but no-op in Lattice |
 
-## Binary Protocol Details
+## Not implemented
 
-### Request Header (24 bytes)
+The following have no handler and return `ERROR`:
 
-```
-     Byte/     0       |       1       |       2       |       3       |
-        /              |               |               |               |
-       |0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|
-       +---------------+---------------+---------------+---------------+
-      0| Magic         | Opcode        | Key length                    |
-       +---------------+---------------+---------------+---------------+
-      4| Extras length | Data type     | Reserved                      |
-       +---------------+---------------+---------------+---------------+
-      8| Total body length                                             |
-       +---------------+---------------+---------------+---------------+
-     12| Opaque                                                        |
-       +---------------+---------------+---------------+---------------+
-     16| CAS                                                           |
-       |                                                               |
-       +---------------+---------------+---------------+---------------+
-```
-
-### Binary Status Codes
-
-| Code | Name | Description |
-|------|------|-------------|
-| 0x0000 | NoError | Success |
-| 0x0001 | KeyNotFound | Key does not exist |
-| 0x0002 | KeyExists | Key exists (add failed) |
-| 0x0003 | ValueTooLarge | Value exceeds size limit |
-| 0x0004 | InvalidArguments | Bad command arguments |
-| 0x0005 | ItemNotStored | replace condition failed |
-| 0x0006 | DeltaBadval | incr/decr on non-numeric value |
-| 0x0008 | AuthenticationError | SASL auth failed |
-| 0x0009 | AuthenticationContinue | SASL auth continue |
-| 0x0081 | UnknownCommand | Command not recognized |
-| 0x0082 | OutOfMemory | Server out of memory |
-| 0x0085 | Throttled | Rate limit exceeded (Lattice-specific) |
-| 0x0086 | Unavailable | Service unavailable (Lattice-specific) |
+- **`cas`** — the check-and-set write is not wired. `gets` returns a usable CAS
+  token (see "CAS" below), but no `cas` command consumes it.
+- **`touch`** — no expiration-update command (there is no TTL-command surface).
+- **`gat` / `gats`** — get-and-touch variants.
+- **Binary protocol** — no `noop`, no quiet operations, no binary opcodes or header.
+- **SASL authentication** — not supported.
+- **Slab management** (`slabs reassign`/`automove`) — Lattice uses a different
+  memory model.
+- **LRU crawler** (`lru_crawler …`) — expiry is deterministic TTL, not LRU
+  eviction.
 
 ## ASCII Protocol Responses
 
@@ -205,10 +120,8 @@ touch <key> <exptime> [noreply]\r\n
 |----------|-------------|
 | `STORED` | Value stored successfully |
 | `NOT_STORED` | add/replace condition failed |
-| `EXISTS` | CAS conflict |
 | `NOT_FOUND` | Key does not exist |
 | `DELETED` | Key deleted successfully |
-| `TOUCHED` | Key expiration updated |
 | `OK` | Generic success |
 | `ERROR` | Unknown error |
 | `CLIENT_ERROR <msg>` | Client sent invalid request |
@@ -253,40 +166,18 @@ mc.set('json_data', {'key': 'value'})  # Client sets flags automatically
 
 ## CAS (Check-and-Set)
 
-CAS tokens enable optimistic locking:
+The token returned by `gets` is derived from the `mod_revision` of the underlying
+KvRecord:
 
-```python
-# Get value with CAS token
-result = mc.gets('counter')
-value, cas_token = result
-
-# Update only if unchanged
-new_value = int(value) + 1
-success = mc.cas('counter', str(new_value), cas_token)
-
-if not success:
-    # Another client modified the value - retry
-    pass
+```
+gets counter\r\n
+VALUE counter 0 2 <cas_token>\r\n
+42\r\n
+END\r\n
 ```
 
-In Lattice, CAS tokens are derived from the `mod_revision` of the underlying KvRecord.
-
-## Unsupported Commands
-
-### Slab Management
-
-Lattice uses a different memory model than Memcached:
-
-- `slabs reassign`
-- `slabs automove`
-
-### LRU Crawler
-
-Lattice uses deterministic TTL expiration, not LRU eviction:
-
-- `lru_crawler enable`
-- `lru_crawler disable`
-- `lru_crawler metadump`
+The `cas` write that consumes the token is not implemented — issuing a `cas`
+command returns `ERROR`, so the token is informational only.
 
 ## Behavioral Differences
 
@@ -321,104 +212,66 @@ linearizability is temporarily unavailable:
 # Always succeeds (eventually consistent)
 get mykey
 
-# May return SERVER_ERROR if linearizability unavailable
+# May fail if linearizability / capacity is unavailable
 incr counter 1
-cas mykey 0 3600 5 12345
-```
-
-Error response:
-```
-SERVER_ERROR linearizability unavailable
 ```
 
 ## Error Mapping
 
-| Lattice Error | ASCII Response | Binary Status |
-|---------------|----------------|---------------|
-| Routing epoch mismatch | `SERVER_ERROR routing epoch changed` | 0x0086 |
-| Linearizability unavailable | `SERVER_ERROR linearizability unavailable` | 0x0086 |
-| Rate limit exceeded | `SERVER_ERROR rate limit exceeded` | 0x0085 |
+The ASCII adapter has **no** dedicated routing-epoch or linearizability error
+string. Those conditions surface as the generic responses below; the only
+`SERVER_ERROR` strings the memcached path emits are `backpressure`,
+`command too large`, `flush failed`, `not yet supported`, and `overflow`.
+
+| Lattice condition | ASCII response emitted today |
+|---|---|
+| Routing epoch mismatch / store failed | `NOT_STORED` |
+| Linearizability unavailable / flow-control | `SERVER_ERROR backpressure` |
+| Value/command too large | `SERVER_ERROR command too large` |
+| Unsupported command (e.g. `cas`) | `SERVER_ERROR not yet supported` / `ERROR` |
+
+Dedicated `SERVER_ERROR routing epoch changed` /
+`SERVER_ERROR linearizability unavailable` strings are described in the
+specification's [error mapping](specification.md#error-mapping) section as
+intended design, not shipped behavior.
 
 ## Configuration
 
-Configure the Memcached listener in `config/lattice.toml`:
-
-```toml
-[listeners.memcached]
-bind = "0.0.0.0:11211"
-enabled = true
-insecure = true  # Set false for production
-
-# TLS (production)
-# tls_chain_path = "certs/memcached-server.crt"
-# tls_key_path = "certs/memcached-server.key"
-
-# Protocol settings
-protocol_mode = "auto"  # "auto", "ascii", or "binary"
-max_value_size = 1048576  # 1MB default
-
-# Connection settings
-idle_timeout_ms = 0  # No timeout
-
-# SASL authentication
-sasl_enabled = false
-# sasl_mechanisms = ["PLAIN"]
-```
+There is no `config/lattice.toml`. A node is configured by the fluxor graph YAML under
+`configs/*.yaml` (for example `configs/bare-metal-pi5-multiproto.yaml`). The Memcached
+edge is the `memcached_stream_anchor` module wired into the graph; its listener bind
+address and router wiring are set as module parameters in that YAML. Pick the config that
+matches the target host and enable the Memcached anchor there.
 
 ## Client Library Compatibility
 
+Clients must be configured for the ASCII/text protocol (binary is not supported).
+
 | Language | Library | Status | Notes |
 |----------|---------|--------|-------|
-| Python | pylibmc | Compatible | ASCII and binary protocols tested |
 | Python | python-memcached | Compatible | ASCII protocol tested |
+| Python | pymemcache | Compatible | Use default text/ASCII mode |
 | Node.js | memcached | Compatible | Basic operations tested |
-| PHP | memcached | Compatible | Binary protocol recommended |
-| Ruby | dalli | Compatible | Binary protocol tested |
-| Java | spymemcached | Compatible | Binary protocol recommended |
-| C/C++ | libmemcached | Compatible | Both protocols tested |
+| PHP | memcached | Compatible | Set binary protocol OFF |
+| Ruby | dalli | Compatible | Use `protocol: :meta`/ASCII, not binary |
+| Java | spymemcached | Compatible | ASCII connection factory |
+| C/C++ | libmemcached | Compatible | ASCII mode |
 
 ## Performance Considerations
 
-1. **Binary protocol**: Use binary protocol for better performance with supported clients.
-   Binary protocol has lower parsing overhead and supports quiet operations.
+1. **Multi-get**: Use multi-key `get` to retrieve multiple keys in a single round trip.
 
-2. **Quiet operations**: Binary protocol quiet variants (getq, setq, etc.) suppress
-   responses, allowing more efficient batching.
-
-3. **Multi-get**: Use multi-key `get` to retrieve multiple keys in a single round trip.
-
-4. **CAS operations**: CAS requires linearizability (LIN-BOUND). For high-throughput
-   scenarios where eventual consistency is acceptable, use regular `set`.
-
-5. **Value size**: Keep values small. Large values increase network and storage overhead.
+2. **Value size**: Keep values small. Large values increase network and storage overhead.
    Consider chunking or using a separate blob store for large objects.
 
 ## Telemetry
 
-Lattice exposes Memcached adapter metrics via Prometheus:
+The Memcached anchor emits three module-scope counters on its `metrics` output port
+(manifest `[observability] metrics`, coarse step cadence):
 
-```
-# Request counts
-lattice_adapter_memcached_requests_total{command="get",tenant_id="...",status="success"}
-lattice_adapter_memcached_requests_total{command="set",tenant_id="...",status="success"}
+- `cmd_get` — count of `get`/`gets` commands served
+- `cmd_set` — count of storage commands served
+- `total_connections` — connections accepted
 
-# Error counts
-lattice_adapter_memcached_errors_total{command="...",error_type="...",tenant_id="..."}
-
-# Latency histograms
-lattice_adapter_memcached_request_duration_seconds{command="get",tenant_id="..."}
-
-# Cache hit/miss rates
-lattice_adapter_memcached_get_hits_total{tenant_id="..."}
-lattice_adapter_memcached_get_misses_total{tenant_id="..."}
-
-# Connection count
-lattice_adapter_memcached_connections_total{protocol="binary"}
-
-# Throughput
-lattice_adapter_memcached_bytes_read_total{tenant_id="..."}
-lattice_adapter_memcached_bytes_written_total{tenant_id="..."}
-
-# CAS conflicts
-lattice_adapter_memcached_cas_badval_total{tenant_id="..."}
-```
+The same counters are also reflected in the `stats` command's `STAT` lines. Per-key hit/miss
+and byte throughput metrics are not exported.

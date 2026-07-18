@@ -1,0 +1,87 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Owns `kv_compaction_floor_revision`, watch retention floors, and
+# application-side compaction policy. Emits generic retention-floor
+# records to the substrate compaction path so Lattice never compacts
+# away revisions required for watch replay or protocol correctness
+# while Clustor remains ignorant of the application-specific reasons
+# for those floors.
+#
+# Substrate dependency: emits to `durability.retention_floor`
+# which is the one substrate enhancement Lattice still needs upstream
+# (see .context/migration_plan.md → "Substrate enhancements needed").
+
+[[ports]]
+name = "kv_floor"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "watch_floor"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lease_floor"
+direction = "input"
+content_type = "OctetStream"
+
+# Fenced MSG_RETENTION_CLAIM records from §18 claim sources
+# (kv_state_worker's active-read claim today; watch and backup claims
+# slot into the reserved source ids later).
+[[ports]]
+name = "retention_claims"
+direction = "input"
+content_type = "OctetStream"
+
+# Committed records this module must observe rather than assume:
+#   MSG_TS_LEASE           — the timestamp allocator's COMMITTED high
+#                            water, the only safe clamp for a GC floor.
+#   MSG_GC_FLOOR_COMMITTED — the committed floor decision itself. Until
+#                            one arrives nothing may be reclaimed.
+[[ports]]
+name = "gc_committed"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "retention_floor_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_GC_FLOOR_PROPOSE → consensus. A proposal, never a decision:
+# nothing may be reclaimed until it returns on `gc_committed`.
+# APPENDED after `metrics` on purpose — output indices are a wire
+# contract and `metrics` is discovered at index 1.
+[[ports]]
+name = "gc_floor_propose"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name).
+# APPEND ONLY — never renumber.
+#   2 gc_claims     accepted MSG_RETENTION_CLAIM records
+#   3 gc_proposals  MSG_GC_FLOOR_PROPOSE records emitted
+#   4 gc_commits    MSG_GC_FLOOR_COMMITTED records that moved the floor
+#   5 gc_blocked    evaluations refused by a missing/stale claim source
+#                   or an unestablished allocator. Sustained non-zero
+#                   means GC is correctly held, not that GC is broken.
+[observability]
+metrics = [
+    "updates",
+    "floors_emitted",
+    "gc_claims",
+    "gc_proposals",
+    "gc_commits",
+    "gc_blocked",
+]

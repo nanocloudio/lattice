@@ -1,0 +1,68 @@
+# Lattice: single-node minimal Linux smoke graph (Phase 1).
+#
+# Brings up enough for redis_edge_anchor → kv_request_router →
+# kv_state_worker → kv_request_router → redis_edge_anchor round-trip
+# to function end-to-end:
+#
+#   foundation/linux_net    TCP
+#   redis_edge_anchor       RESP parse + dispatch (real)
+#   kv_request_router       envelope translation + inflight (real)
+#   kv_state_worker         deterministic stub (NOT_FOUND / OK)
+#
+# Working commands against a real redis-cli:
+#   PING                     → +PONG\r\n         (anchor inline)
+#   HELLO 2                  → resp metadata     (anchor inline)
+#   AUTH foo                 → +OK\r\n           (anchor inline stub)
+#   QUIT                     → +OK\r\n + close
+#   SET key value            → +OK\r\n           (routed → worker stub)
+#   GET key                  → $-1\r\n           (routed → worker stub)
+#   DEL key                  → $-1\r\n           (routed; semantics off — Phase 2 fixes)
+#   MULTI / EXEC / DISCARD   → in-anchor queue stubs
+#
+# Run: `fluxor run --template configs/single-minimal.yaml`
+
+target: linux
+tick_us: 1000
+
+# `platform.net = {}` activates the linux board's host net provider
+# (see `fluxor/targets/boards/linux.toml`). The `linux_net` builtin is
+# auto-injected by fluxor when the wiring references it — listing it
+# under `modules:` would be a duplicate registration.
+platform:
+  net: {}
+
+# anchor ↔ router and router ↔ worker form bidirectional pairs; the
+# scheduler's cycle-rejection guard is asking us to acknowledge that
+# explicitly.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: redis_edge_anchor
+    params:
+      # Explicit rather than relying on the anchor's default, so a
+      # harness can rewrite it and run without owning port 6379 —
+      # benchmarks and loadtests otherwise collide with anything else
+      # already listening there.
+      listen_port: 6379
+  - name: kv_request_router
+  - name: kv_state_worker
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: redis_edge_anchor.net_in
+  - from: redis_edge_anchor.net_out
+    to: linux_net.net_in
+
+  # ── Anchor ↔ router (ingress + response) ───────────────────────
+  - from: redis_edge_anchor.kv_out
+    to: kv_request_router.redis_in
+  - from: kv_request_router.redis_out
+    to: redis_edge_anchor.kv_in
+
+  # ── Router ↔ worker (command + applied) ────────────────────────
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in

@@ -1,0 +1,65 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# High-rate event fanout and batching engine for active watches.
+# Consumes mutation and progress events from the KV path, applies
+# per-watch filtering, batches updates, tracks per-stream
+# backpressure, and hands framed watch responses back to
+# `etcd_edge_anchor`.
+
+# Filtered events from watch_registry.
+[[ports]]
+name = "events_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Replay plan from watch_registry on rebind.
+[[ports]]
+name = "replay_plan"
+direction = "input"
+content_type = "OctetStream"
+
+# Framed watch responses out to etcd_edge_anchor.
+[[ports]]
+name = "frames_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Progress ack back to watch_registry.
+[[ports]]
+name = "progress"
+direction = "output"
+content_type = "OctetStream"
+
+# Backfill reads out to kv_request_router. On a MSG_WATCH_REPLAY_PLAN
+# the fanout issues MSG_KV_REQUEST envelopes carrying
+# KV_OP_SCAN_VERSIONS over the plan's key span and revision window, and
+# turns each returned version into the same MSG_WATCH_FRAME a live
+# event would have produced. Unwired in graphs without a durable
+# history provider: the fanout then counts the plan as unserviceable
+# rather than pretending it replayed.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_RESPONSE envelopes back from kv_request_router carrying
+# KV_RESULT_VERSIONS pages.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["events", "delivered", "dropped", "replayed", "replays_unserviceable"]

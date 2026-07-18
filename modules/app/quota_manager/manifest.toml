@@ -1,0 +1,55 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Per-tenant token buckets for requests and bytes, quota-overage
+# windows, throttle-reason emission, and noisy-neighbour disconnect
+# signals. Feeds the substrate `gateway` and adapter anchors
+# with protocol-specific failure behaviour.
+
+[[ports]]
+name = "cp_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-request meter from kv_request_router.
+[[ports]]
+name = "request_meter"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-byte meter from each edge anchor.
+[[ports]]
+name = "byte_meter"
+direction = "input"
+content_type = "OctetStream"
+
+# Throttle decisions out to substrate gateway.
+[[ports]]
+name = "throttle_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Disconnect signals out to anchors (noisy neighbour).
+[[ports]]
+name = "disconnect_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Per-tenant quota decision fed to kv_request_router.
+[[ports]]
+name = "quota_decision"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name).
+[observability]
+metrics = ["checks", "throttles", "disconnects"]

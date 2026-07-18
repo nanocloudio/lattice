@@ -1,0 +1,59 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Adapter-facing auth and identity translation. Consumes CP-Raft
+# principal manifests, token TTLs, prefix permissions, and adapter
+# policy gates; normalises protocol credentials and resource names
+# into generic decision requests; delegates final allow/deny/audit
+# decisions to substrate `rbac`. The application owns protocol
+# mapping; the substrate owns policy evaluation.
+
+[[ports]]
+name = "cp_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Auth requests from each anchor.
+[[ports]]
+name = "auth_request"
+direction = "input"
+content_type = "OctetStream"
+
+# Decision responses back to anchors.
+[[ports]]
+name = "auth_decision"
+direction = "output"
+content_type = "OctetStream"
+
+# Generic decision request to substrate rbac.
+[[ports]]
+name = "decision_request"
+direction = "output"
+content_type = "OctetStream"
+
+# Decision response from rbac.
+[[ports]]
+name = "decision_response"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audit"
+direction = "output"
+content_type = "OctetStream"
+
+# Module-scope telemetry (Phase 14). Output index 3 (auth_decision,
+# decision_request, audit, metrics). Wired to the observe collector; a
+# no-op emit when left unwired.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name).
+[observability]
+metrics = ["requests", "allows", "denies"]

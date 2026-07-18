@@ -1,0 +1,49 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Range lifecycle supervisor (RFC database foundation §12, Phase 4).
+#
+# Pumps ONE declared lifecycle operation through the state machines in
+# modules/common/range_lifecycle.rs. Split is driven today; merge and
+# relocation are contract-complete and refuse at init until the pump
+# grows them. The operation record persists in KS_LIFECYCLE_OP through
+# the canonical KV path (partition 0, TARGETED), so a crash resumes by
+# operation id from the durable phase — never from intentions.
+#
+# The manual execution gate (§12.4): the operation is DECLARED in the
+# graph config and starts `start_delay_ms` after boot. Automation
+# proposes (Phase 10); an operator config change executes.
+
+# Replies from kv_request_router.internal_lifecycle_out.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST to kv_request_router.internal_lifecycle_in. The only
+# ingress allowed to carry KV_OP_TARGETED.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_SPAN_BARRIER / MSG_RANGE_MAP_UPDATE to kv_request_router
+# .map_update: the cutover barrier and the atomic map publication.
+[[ports]]
+name = "map_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+#   0 phase     current SplitPhase (1..8; 8 = TombstoneRetained/done)
+#   1 copied    pairs copied into the child (bulk + catch-up)
+#   2 deleted   pairs tombstoned out of the parent
+#   3 errors    retried/refused sub-operations
+metrics = ["phase", "copied", "deleted", "errors"]

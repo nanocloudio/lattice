@@ -1,0 +1,69 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# gRPC/HTTP2 edge anchor for etcd v3 KV / Watch / Lease / Auth / Txn
+# subset. Built on the stream-anchor pattern (foundation
+# `stream_anchor_core` is not yet promoted; this module owns its own
+# NET_CMD_* state machine for now). Owns accepted TLS transport, HTTP2
+# stream table, keepalive framing, watch-stream attachment, and
+# LeaseKeepAlive stream continuity.
+
+# Encrypted transport from foundation/tls.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Routed responses from kv_request_router (KV/Txn responses).
+[[ports]]
+name = "routed_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Watch event frames from watch_fanout (already RESP-framed).
+[[ports]]
+name = "watch_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Lease keepalive state from lease_manager.
+[[ports]]
+name = "lease_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Parsed KV / Watch / Lease control envelopes out to the router /
+# watch_registry / lease_manager.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "watch_ctrl"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lease_ctrl"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["requests", "forwarded", "net_errors"]

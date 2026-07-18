@@ -1,0 +1,20 @@
+# Workspace-shared clippy configuration. Levels live in
+# Cargo.toml::[workspace.lints]; this file is for the lints that take
+# *config values* rather than levels. See standards/lints.md §6.
+
+disallowed-macros = [
+    { path = "std::println",  reason = "use the project's logger or dev_log via the SDK" },
+    { path = "std::eprintln", reason = "use the project's logger or dev_log via the SDK" },
+    # std::dbg is covered workspace-wide by clippy::dbg_macro.
+]
+
+# Cognitive / type-complexity budgets are intentionally generous —
+# Lattice's PIC modules have hand-written state machines that legitimately
+# carry many branches and tuple-y types.
+cognitive-complexity-threshold = 60
+type-complexity-threshold      = 350
+
+allow-print-in-tests    = false
+allow-dbg-in-tests      = false
+allow-unwrap-in-tests   = true
+allow-expect-in-tests   = true

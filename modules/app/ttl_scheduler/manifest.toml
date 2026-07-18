@@ -1,0 +1,52 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Deterministic expiry service. Processes committed tick entries,
+# lease deadlines, and key expiry queues. Emits revoke/delete actions
+# back into the KV path. The important property is deterministic
+# replay-safe expiry, not wall-clock convenience.
+
+# Deterministic clock ticks from substrate consensus (or a
+# replicated TTL tick emitter).
+[[ports]]
+name = "tick_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Lease deadlines from lease_manager.
+[[ports]]
+name = "lease_deadlines"
+direction = "input"
+content_type = "OctetStream"
+
+# Key expiry queue updates from kv_state_worker.
+[[ports]]
+name = "kv_expiry"
+direction = "input"
+content_type = "OctetStream"
+
+# Expire actions out to kv_state_worker.
+[[ports]]
+name = "expire_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Tick fan-out to lease_manager.
+[[ports]]
+name = "tick_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["scheduled", "expired"]

@@ -1,0 +1,49 @@
+[package]
+name = "lattice-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Off-DUT benchmark harness for lattice: open-loop per-protocol load generator (lattice-loadgen) + binary /metrics scrape→JSON (lattice-scrape). Std-only, no external deps; mirrors clustor-bench."
+
+# std-only by design: this is the driver-host tool (192.168.1.10), it never runs
+# on fluxor. Dependency-free so it builds on an offline Pi. Networking is raw
+# std::net; JSON, the RESP client, and the latency histogram are hand-rolled in
+# lib.rs (ported verbatim from clustor-bench).
+
+# Tool-shaped package: prints JSON to stdout, unwraps on arg parsing. Mirrors
+# clustor-bench's [lints] override; exempted from the workspace-lint opt-in
+# audit via [[ci.lints.exemption]] in fluxor.toml.
+[lints.rust]
+unsafe_code               = "forbid"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+unwrap_used        = "allow"
+expect_used        = "allow"
+panic              = "allow"
+print_stdout       = "allow"
+print_stderr       = "allow"
+disallowed_macros  = "allow"
+
+[lib]
+name = "lattice_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lattice-scrape"
+path = "src/bin/scrape.rs"
+
+[[bin]]
+name = "lattice-loadgen"
+path = "src/bin/loadgen.rs"
+
+[workspace]

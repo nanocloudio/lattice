@@ -1,0 +1,48 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Document-capability MongoDB-wire connector (RFC database foundation
+# §14.16, Phase 8). A real MongoDB driver connects on 27017 and can
+# `insert` and `find`; documents live in the canonical KV store through
+# the same router/consensus/durability path every other write takes.
+#
+# This anchor also EXECUTES (command → KV round trips): the capability
+# has one connector today, and the §14.2 shared-execution split is
+# triggered by a second connector — recorded in the module docs and
+# .context/phase8_document_plan.md.
+#
+# Router pairing: uses the router's POSITIONAL pair #0 ("etcd_in"/
+# "etcd_out") stamped PROTO_ETCD, because the router's 16 output ports
+# are fully allocated. A document composition has no etcd anchor; the
+# port names are positional history.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Replies from kv_request_router (positional pair #0).
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["sessions", "commands", "docs_written", "docs_returned", "errors"]

@@ -1,0 +1,31 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Consistent database backup and restore (RFC database foundation
+# §17.2, Phase 6). Drives §17.2's numbered machine over the db_ops
+# contracts: every exported record is read at ONE protected revision
+# (a backup assembled from several revisions is a set of records that
+# never existed together), a COMPACTED answer ABORTS rather than
+# shipping a partial export, and a restore refuses an incomplete
+# manifest. Artifacts live in the KV store under KS_BACKUP_ARTIFACT,
+# so they inherit the same durability and replication as the data.
+
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["records", "pages", "restored", "errors"]

@@ -1,0 +1,68 @@
+# Lattice: the separated-compute STORAGE graph (RFC §14.10, phase 9).
+#
+# This is what a storage deployment looks like when compute lives
+# somewhere else. There is no client-facing protocol anchor in it at
+# all — no RESP, no Postgres wire — because clients do not talk to this
+# graph. A `lattice_data_client` in a compute graph does, over the
+# internal `lattice.data` surface:
+#
+#   foundation/linux_net    TCP
+#   lattice_data_anchor     frame decode + admission (real)
+#   kv_request_router       envelope translation + inflight (real)
+#   kv_state_worker         the one semantic KV state machine
+#
+# Compare with `configs/single-relational.yaml`, the COMBINED placement
+# of the same thing: there, compute is `relational_executor` wired into
+# the router's `internal_sql_in`. Here it is remote and arrives through
+# `internal_data_in`. §30's equivalence proof compares the two, and the
+# router refuses at init if both ingresses are wired — a graph has
+# exactly one compute placement, and the shared `compute_out` reply port
+# has exactly one owner.
+#
+# The anchor binds 7432. Requests are `data_surface.rs` request frames
+# and replies are response frames; see `tests/live_data_surface.rs` for
+# a driver that speaks them.
+#
+# Run: `fluxor run --template configs/single-data-surface.yaml`
+
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+# anchor ↔ router and router ↔ worker form bidirectional pairs.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: lattice_data_anchor
+    params:
+      # Explicit so a test harness can rewrite it and give each test
+      # its own graph; parallel tests otherwise collide on one port.
+      listen_port: 7432
+  - name: kv_request_router
+  - name: kv_state_worker
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: lattice_data_anchor.net_in
+  - from: lattice_data_anchor.net_out
+    to: linux_net.net_in
+
+  # ── Anchor ↔ router (ingress + response) ───────────────────────
+  #
+  # `compute_out` rather than a dedicated `internal_data_out`: the
+  # router sits at fluxor's 16-output cap, and this port serves
+  # whichever compute placement the graph wired.
+  - from: lattice_data_anchor.kv_out
+    to: kv_request_router.internal_data_in
+  - from: kv_request_router.compute_out
+    to: lattice_data_anchor.kv_in
+
+  # ── Router ↔ worker (command + applied) ────────────────────────
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in

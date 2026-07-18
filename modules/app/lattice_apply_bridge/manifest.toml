@@ -1,0 +1,42 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Phase 7 — adapter between Clustor's commit pipeline and Lattice's
+# KV state machine. Subscribes to
+# `consensus.committed_entries` (MSG_COMMITTED_ENTRY: term, index,
+# body) and re-emits each entry's body as `MSG_KV_COMMAND` on
+# `kv_out`, ordered by raft commit index. The kv_state_worker reads
+# from `kv_out` exactly as it does in the single-node graph, but the
+# committed entries now arrive through the raft replication chain
+# instead of directly from kv_request_router.
+#
+# Each committed entry's body is expected to be the verbatim
+# MSG_KV_COMMAND payload that kv_request_router produces, prepended
+# by raft proposal framing (handled upstream by the gateway codec).
+#
+# For reads (linearizable GET), kv_request_router still forwards
+# straight to kv_state_worker — consensus only sequences writes.
+
+[[ports]]
+name = "committed_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["applied", "dropped", "untagged"]

@@ -1,0 +1,42 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Optional Memcached UDP datagram anchor. Handles explicit
+# source/destination metadata, stateless request/response matching,
+# and reroutable datagram service. Disabled by default in graph
+# templates (`enabled: false`) per the protocol RFC; flip on in
+# memcached-UDP-heavy deployments.
+
+[[ports]]
+name = "dgram_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "dgram_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "routed_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["requests", "forwarded", "errors"]

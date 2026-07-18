@@ -1,0 +1,324 @@
+# Lattice multi-protocol bare-metal Pi 5 — durable consensus KV serving
+# redis (:6379), memcached (:11211), and etcd (:2379) from ONE graph.
+#
+# `bare-metal-pi5.yaml` + the per-port anchor demux proven by
+# `single-multi-anchor.yaml`. Purpose: per-protocol rig benchmarks for
+# the database-foundation RFC on the same durable single-domain graph
+# (standards/rig.md §7: no execution domains).
+#
+# Bare-metal twin of `single-replicated-lattice.yaml`. Same redis →
+# raft → WAL → apply durability path, but:
+#   - target: pi5 (netboots via `fluxor rig run --rig pi5-a`)
+#   - net foundation is `ip` (bare-metal TCP/IP), not host `linux_net`
+#   - WAL durability rides the REAL storage stack:
+#       wal --FS_CONTRACT--> fat32 --block ioctls--> nvme --> NVMe device
+#     (the bare-metal counterpart of the host's linux_fs_dispatch)
+#   - observation: log_net UDP:6666 + GET 192.168.1.9:19090/metrics
+#
+# ⚠ Prerequisite: a FAT32 partition on the DUT's NVMe (fat32 `path: /`
+#   mounts it). The pi5-a rig is tagged `nvme`.
+#
+# Boot:  fluxor rig test --rig pi5-a --scenario tests/hardware/lattice_pi5_boot.toml
+# Drive: lattice-loadgen --host 192.168.1.9:6379 ...
+# Scrape: lattice-scrape --host 192.168.1.9:19090 ...
+
+target: pi5
+# TUNE (verified on cool Pi 5, rig-trustworthy, 2026-06 substrate): tick_us is
+# the dominant LATENCY lever — per-step pacing, not per-step work. 3000→1000
+# cut PING/GET/SET ~3× (SET 24→8ms, p99 9.76ms, meets the ≤10ms target).
+# RE-BASELINED 2026-07-17 substrate: ICMP 4.5→0.6ms, write ceiling 295→556/s;
+# durability step_deadline is now 12000/16000+fault_policy (see below) — the old
+# "deadline ≤ 2×tick" note is obsolete (burst deadline is a separate knob).
+# Control thermal: the Pi 5 throttles ~2× hot; short bursts from a cool boot.
+# TUNE iter (2026-07-18): tick=500 tried and REVERTED on numbers — p50s
+# halve (write 3.3ms w100) but r50 p99s regress past the ≤10ms target
+# (write p99 10.5ms): the wal fsync step is ~375–950µs and cannot fit a
+# 500µs cadence (40× MON_BUDGET_OVERRUN + 11× MON_BURST_BUDGET_ABORT on
+# module 17/18). Sub-1ms ticks need an async-fsync WAL step or a slower
+# per-domain floor for the storage modules (adaptive-tick RFC evidence).
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+
+module_search_paths:
+  - ../deps/clustor/modules/app
+  - ./modules/app
+
+modules:
+  # ── Bare-metal storage stack (provides the FS contract WAL uses) ─
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    path: /
+    # Bench clean-slate (mirrors clustor single-pi5-throughput.yaml): first
+    # create truncates the bloated root dir to one warm cluster (wipes the
+    # accumulated .WAL orphans from prior runs) and reclaims a garbage FAT
+    # span. Do NOT set where on-disk files must survive a remount.
+    clean_root: 1
+    init_free_hint: 20000
+    clear_free_region: 4096
+
+  # ── Lattice edge + KV ───────────────────────────────────────────
+  - name: redis_edge_anchor
+  - name: memcached_stream_anchor
+  - name: etcd_edge_anchor
+  - name: kv_request_router
+    params:
+      # Declares that this graph replicates writes through Raft. Checked
+      # against the `proposal_out` wiring at init: if that edge is missing
+      # the module refuses to start, instead of silently serving every
+      # write on the direct local path. See the router's `replicated` param.
+      replicated: 1
+  - name: kv_state_worker
+  - name: lattice_apply_bridge
+
+  # ── Clustor client-proposal pipeline ────────────────────────────
+  - name: peer_router
+    params:
+      self_id: 0
+      peer_count: 1
+      listen_port: 9090
+      peer0_port: 9090
+  - name: gateway
+    params:
+      self_id: 0
+  - name: admission
+  - name: control_plane
+  - name: consensus
+    params:
+      self_id: 0
+      voter_count: 1
+      heartbeat_interval_ms: 150
+  - name: durability
+    # Async durable-write path: fat32 advertises FS_CAP_FSYNC_ASYNC and the WAL
+    # uses FS_WRITE_ASYNC + FSYNC_SUBMIT/POLL (clustor rfc_async_wal_fsync), so
+    # the fsync fence doesn't block the step. Deadlines are tick=1000-sized;
+    # fault_policy skip fails closed on a true timeout rather than freezing the
+    # pipeline (a rare deep FS_FSYNC tail hits it instead of wedging the queue).
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+    params:
+      # TUNE iter 2 (REVERTED): tried fsync_mode=0 (per-entry) — gave ZERO
+      # latency change (SET−GET stayed 3.0ms) and lower throughput. That
+      # rules OUT fsync batching as the source of the ~3ms consensus delta;
+      # it does not identify what the source IS. The hop-count hypothesis
+      # ("8 extra module hops") is NOT supported — nothing in that experiment
+      # varied hop count, and fluxor's rfc_adaptive_tick.md:99 measures module
+      # count at ~0–1ms while :485 shows the ~8-hop return leg sits under
+      # MAX_PIPELINE_PASSES=12, so the pass-convergence floor is non-binding.
+      # Burst-enabling the KV modules (rfc §A2.5) was tried on this rig
+      # 2026-07-27 and BROKE the write path (SET never returns, both this
+      # config and the 4-core one) — see the memory note; it is backed out.
+      # The delta remains unattributed; isolating it needs an experiment that
+      # varies hops directly (bare-metal-pi5-min.yaml is the 3-module start).
+      # Group fsync (mode 1) is kept: equal latency, higher write-throughput
+      # ceiling, durability intact (fsync-before-ack).
+      fsync_mode: 1
+      # TUNE iter (2026-07-18), KEPT: window swept 5→2→1→0; the wall-clock
+      # batch window sat directly in every write ack. gw0 (flush every
+      # poll) is strictly better on this NVMe: write p50/p99 12.0/14.2 →
+      # 5.1/7.1 ms (w100@300), r50 write 7.0/9.1 read 4.5/6.0 — all under
+      # the ≤10 ms p99 target — AND the write ceiling went UP (~556 →
+      # ≥1067/s, driver-bound). Group batching still engages under burst
+      # via group_max_pending; the window added pure latency.
+      group_window_ms: 0
+      group_max_pending: 8
+      # Keep up to 8 async fsync-fences in flight so fsyncs pipeline instead of
+      # serialising. Paired with the rate-classed consensus→durability edge below, this
+      # lifts durable-write throughput ~1050 -> ~3900/s.
+      fence_depth: 8
+      # Bare-metal FAT32 has no mkdir → no `wal/` parent. root_path=1
+      # writes segments at the FS root with 8.3 names (<p:1hex><seq:7hex>.WAL).
+      root_path: 1
+      # Perf-rig hygiene: no shell on the DUT and no FS_DELETE in the FS
+      # contract, so .WAL segments from prior runs survive power cycles and
+      # boot replay grows per-step work run-over-run (RTT drifted 5.75→9ms
+      # across a bench series). skip_replay=1 starts fresh at segment_seq=1
+      # (FS_OPEN_CREATE truncates the old segment in place), orphaning stale
+      # segments so every boot measures the same system. Same pattern as
+      # clustor's consensus-bench-pi5-disk*.yaml. Durability within the run
+      # is unchanged (append/fsync path identical). OMIT for L4
+      # crash-recovery scenarios, which must replay.
+      skip_replay: 1
+      # TUNE (2026-07-18): 4 MiB. Each rotation runs a SYNCHRONOUS ~40 ms
+      # snapshot-persist (.SNP create+fsync on FAT32 is a cold-FS write) —
+      # at 256 KiB that fired every ~7 s under load and alone pushed r50
+      # p99 from ~6/9 ms to 23/29 ms (~1.5% of requests caught per stall).
+      # 4 MiB makes rotation ~2-minutely: p99 clean, stall visible only in
+      # p999/max. Compaction still bounds disk to ~1 segment + 1 .SNP.
+      # Substrate follow-on: make snapshot persist async to kill the stall.
+      segment_bytes: 4194304
+      self_id: 0
+      voter_count: 1
+      partition_id: 0
+  # The snapshot/compaction loop runs inside `durability`: WAL rotation
+  # triggers a snapshot, the durable manifest advances the log floor and
+  # retired segments are unlinked (superseded .SNP manifests too).
+  # CAVEAT: snapshot bodies are manifest-only today (no state-machine
+  # snapshot), so with compaction on, crash-recovery replay reconstructs
+  # only entries ≥ the compaction floor — fine here (skip_replay perf
+  # rig), NOT fine for L4 crash-recovery scenarios.
+
+  # ── Observability: metric fan-in + HTTP /metrics ────────────────
+  - name: adapter_metrics
+  - name: operations
+    params:
+      emit_interval_ms: 250
+      listen_port: 19090
+
+wiring:
+  # ── nvme block device ↔ fat32 filesystem ────────────────────────
+  - from: nvme.blocks
+    to: fat32.blocks
+  - from: fat32.block_writes
+    to: nvme.requests
+
+  # ── Lattice edge: anchor ↔ ip (bare-metal TCP) ↔ router ─────────
+  - from: ip.net_out
+    to: redis_edge_anchor.net_in
+  - from: redis_edge_anchor.net_out
+    to: ip.net_in
+  - from: redis_edge_anchor.kv_out
+    to: kv_request_router.redis_in
+  - from: kv_request_router.redis_out
+    to: redis_edge_anchor.kv_in
+  - from: ip.net_out
+    to: memcached_stream_anchor.net_in
+  - from: memcached_stream_anchor.net_out
+    to: ip.net_in
+  - from: memcached_stream_anchor.kv_out
+    to: kv_request_router.memcached_in
+  - from: kv_request_router.memcached_out
+    to: memcached_stream_anchor.routed_in
+  - from: ip.net_out
+    to: etcd_edge_anchor.net_in
+  - from: etcd_edge_anchor.net_out
+    to: ip.net_in
+  - from: etcd_edge_anchor.kv_out
+    to: kv_request_router.etcd_in
+  - from: kv_request_router.etcd_out
+    to: etcd_edge_anchor.routed_in
+
+  # ── Proposal ingress: router → gateway → consensus ─────────────
+  - from: kv_request_router.proposal_out
+    to: gateway.client_requests
+  # Reject feedback: the gateway refuses a proposal BEFORE assigning it
+  # a correlation id (NOT_LEADER precedes next_corr_id), and without
+  # this edge that refusal is dropped and the write waits out the 5s
+  # inflight sweep instead of failing in milliseconds.
+  - from: gateway.responses
+    to: kv_request_router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control_plane.routing
+    to: gateway.placement
+
+  # ── Apply path: Raft-committed entries → KV worker → response ───
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker.commands
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in
+
+  # ── Clustor persistence (WAL → fat32 → nvme via FS contract) ────
+  - from: consensus.log_append
+    to: durability.entries
+    # Rate-class the durability edge so the WAL's entry-pump gets a real
+    # per-step byte grant instead of 0. Unclassed (grant=0) forced the pump
+    # to `process_entries` exactly ONCE per step (`if grant == 0 { break; }`),
+    # capping durable-write throughput at 1 entry/tick regardless of backlog,
+    # fence depth, or cores. With a transaction grant the pump batches up to
+    # MAX_ENTRY_PUMP_RECORDS entries/step → one fsync amortises the whole batch.
+    rate: transaction
+  # A restarted replica reads its replayed log bodies back out of the
+  # local WAL: replay restores the log, so raft log-matching succeeds and
+  # the leader never re-ships those entries. Without this pair the apply
+  # pipeline stalls at the first gap. Shares the WAL's random-access ports
+  # with the replicator's NACK refetch of older entries; the request-id
+  # namespaces keep the replies separable.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  # Dedicated boot handoff: Raft must resume its index at the exact WAL
+  # replay high-water before proposal intake opens. Never multiplex this
+  # onto durability.flushed, which also fans out durability acknowledgements.
+  # (Present in every clustor config since 2ddd87f; lattice was missing it.)
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: consensus.wal_compact
+    to: durability.compact_before
+  # ── App state-machine snapshot bodies (clustor RFC §2.1) ──
+  # Without this pair a snapshot is a bare (term, index) manifest, so a
+  # replica replaying from the compaction floor cannot rebuild KV state.
+  # The worker labels each body with its own applied position, which the
+  # engine takes as the snapshot's index.
+  - from: durability.app_snapshot_ctl
+    to: kv_state_worker.snapshot_import
+    rate: transaction
+  - from: kv_state_worker.snapshot_export
+    to: durability.app_snapshot_body
+    rate: transaction
+  - from: durability.metrics
+    to: operations.ingest
+
+  # ── Observability fan-in → operations → HTTP /metrics ───────────
+  - from: redis_edge_anchor.metrics
+    to: adapter_metrics.events_in
+  - from: memcached_stream_anchor.metrics
+    to: adapter_metrics.events_in
+  - from: etcd_edge_anchor.metrics
+    to: adapter_metrics.events_in
+  - from: kv_request_router.metrics
+    to: adapter_metrics.events_in
+  - from: kv_state_worker.metrics
+    to: adapter_metrics.events_in
+  - from: adapter_metrics.telemetry_out
+    to: operations.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+  - from: peer_router.metrics
+    to: operations.ingest
+
+  # ── HTTP ingress (binds :19090 on the shared ip stack) ──────────
+  - from: ip.net_out
+    to: operations.net_in
+  - from: operations.net_out
+    to: ip.net_in
+    # ip.net_in is NetProto → edge would default to 'audio', over
+    # operations.net_out's declared rate_class_max 'transaction'.
+    # This lane only carries /metrics scrape responses — low-rate.
+    rate: transaction

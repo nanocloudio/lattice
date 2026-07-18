@@ -1,0 +1,72 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Durable watch state owner. Maintains
+# `WatchID -> WatchState{key_range, start_revision, filters,
+# progress_notify, last_sent_revision, session_epoch, anchor_binding}`.
+# Plans replay after worker movement, validates stale epochs, and
+# emits watch-attach / resume / cancel transitions as
+# `SessionCtrlV1`-class events.
+
+[[ports]]
+# `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved
+# port name (it collides with the kernel-allocated control channel
+# passed to every module's `module_new`). See standards/fluxor-modules.md.
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Committed mutation events from kv_state_worker (filter + dispatch).
+[[ports]]
+name = "mutations"
+direction = "input"
+content_type = "OctetStream"
+
+# Ack frames from the fanout module (last_sent_revision advancement).
+[[ports]]
+name = "progress"
+direction = "input"
+content_type = "OctetStream"
+
+# Cluster-wide placement epoch events from substrate
+# `control_plane.epoch_events`. Each MSG_PLACEMENT_EPOCH_EVENT
+# bumps every active watch's `session_epoch` atomically so frames in
+# flight under the old epoch can be detected and fenced by the anchor.
+# Optional — single-node graphs that don't wire `control_plane`
+# leave this unwired and the registry stays at the bootstrap epoch.
+[[ports]]
+name = "in_epoch_events"
+direction = "input"
+content_type = "OctetStream"
+
+# Replay plan emitted to fanout when a worker rebind occurs.
+[[ports]]
+name = "replay_plan"
+direction = "output"
+content_type = "OctetStream"
+
+# Retention floor declarations to compaction_coordinator.
+[[ports]]
+name = "retention"
+direction = "output"
+content_type = "OctetStream"
+
+# Forwarded events to fanout.
+[[ports]]
+name = "events_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a coarse step cadence.
+# Declaration order IS the id contract (id N = the Nth name); the emitter
+# in module_step passes values in this exact order.
+[observability]
+metrics = ["registered", "cancelled"]

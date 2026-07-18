@@ -1,0 +1,43 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Wide-column CQL connector (RFC database foundation §14.17, Phase 8).
+# A real CQL client connects on 9042; rows decompose into CELLS under
+# KS_WIDE_TABLE (one canonical KV key per column + a row marker), a
+# statement's cells commit as ONE KV transaction, and the logical cell
+# timestamp is a committed input INCR'd through consensus — never
+# sampled per replica.
+#
+# Router pairing: POSITIONAL pair #1 ("redis_in"/"redis_out") stamped
+# PROTO_REDIS — all sixteen router outputs are allocated, and a
+# wide-column composition has no redis anchor.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["sessions", "statements", "cells_written", "rows_returned", "errors"]

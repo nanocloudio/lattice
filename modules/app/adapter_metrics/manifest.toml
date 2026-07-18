@@ -1,0 +1,43 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# High-cardinality adapter observability. Tracks
+# `lin_bound.can_linearize`, `lin_bound.failed_clause`,
+# `dirty_epoch_total`, per-adapter request/error rates,
+# `watch.active_streams`, `lease.active_leases`, watch rebinds,
+# epoch transitions, and quota throttles. Translates watch/lease
+# continuity events into monitor-friendly records and forwards
+# aggregate rollups to substrate telemetry.
+
+# Multi-fan-in: every module that emits adapter events writes here.
+[[ports]]
+name = "events_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Rolled-up telemetry to substrate `telemetry`.
+[[ports]]
+name = "telemetry_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Rolled-up snapshot for substrate `http_surface` (/metrics).
+[[ports]]
+name = "http_out"
+direction = "output"
+content_type = "OctetStream"
+
+# This module's OWN module-scope operational counters (Phase 14), kept
+# separate from the app-metric rollups it aggregates on telemetry_out.
+# Output index 2 (telemetry_out, http_out, metrics). No-op when unwired.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Declaration order IS the id contract (id N = the Nth name).
+[observability]
+metrics = ["deltas_in", "snapshots_out"]
