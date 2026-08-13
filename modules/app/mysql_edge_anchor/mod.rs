@@ -84,8 +84,8 @@ mod telemetry;
 use my::relational::{LogicalType, Value};
 use my::sql_exec;
 use net_proto::{
-    NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use wire::{MSG_SQL_REQUEST, MSG_SQL_RESPONSE};
 
@@ -109,7 +109,7 @@ const MAX_CONNS: usize = 16;
 const RECV_BUF: usize = 8192;
 const SEND_BUF: usize = 32768;
 const SCRATCH_BUF: usize = 32768;
-const SLOT_FREE: u8 = 0xFF;
+const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 3306;
 const PASSWORD_MAX: usize = 64;
 
@@ -129,7 +129,7 @@ const S_CLOSING: u8 = 3;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Slot {
-    conn_id: u8,
+    conn_id: u16,
     state: u8,
     in_transaction: bool,
     /// The sequence number the NEXT reply packet must carry. Reset to
@@ -186,7 +186,7 @@ struct AnchorState {
     metrics_out: i32,
 
     phase: u8,
-    server_conn_id: u8,
+    server_conn_id: u16,
     listen_port: u16,
     password: [u8; PASSWORD_MAX],
     password_len: usize,
@@ -256,7 +256,7 @@ impl AnchorState {
         self.step_ctr = 0;
     }
 
-    fn alloc_slot(&mut self, conn_id: u8) -> Option<usize> {
+    fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
         for (i, s) in self.slots.iter_mut().enumerate() {
             if s.conn_id == SLOT_FREE {
                 *s = Slot::free();
@@ -267,7 +267,7 @@ impl AnchorState {
         None
     }
 
-    fn find_slot(&self, conn_id: u8) -> Option<usize> {
+    fn find_slot(&self, conn_id: u16) -> Option<usize> {
         self.slots.iter().position(|s| s.conn_id == conn_id)
     }
 
@@ -475,7 +475,12 @@ fn auth_ok(anchor: &AnchorState, idx: usize, payload: &[u8]) -> bool {
 fn forward_statement(anchor: &mut AnchorState, idx: usize, sql: &[u8]) {
     anchor.corr_seq = anchor.corr_seq.wrapping_add(1);
     let corr = anchor.corr_seq;
-    let conn = anchor.slots[idx].conn_id;
+    // The executor head's conn byte carries this anchor's SLOT INDEX,
+    // not the net conn id — net conn ids are u16 now and no longer fit
+    // the 1-byte field. Replies are matched by `corr`, so the byte only
+    // has to be stable for the statement's lifetime, which the slot
+    // index is.
+    let conn = idx as u8;
     let mut payload = [0u8; SCRATCH_BUF];
     let Some(n) =
         sql_exec::encode_sql_request(&mut payload, corr, sql_exec::DIALECT_MYSQL, 0, conn, sql)
@@ -821,22 +826,28 @@ unsafe fn envelope_write(
     (sys.channel_write)(chan, scratch.as_mut_ptr(), total) == total as i32
 }
 
-unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u8, data: &[u8]) -> bool {
+unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8]) -> bool {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = cmd;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
     if !data.is_empty() {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+            data.len(),
+        );
     }
     let total = NET_FRAME_HDR + payload_len;
     ((*sys).channel_write)(anchor.net_out, scratch, total) == total as i32
@@ -865,26 +876,29 @@ unsafe fn net_bind(anchor: &mut AnchorState) -> bool {
 unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
     match msg_type {
         NET_MSG_BOUND => {
-            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // BOUND payload: [conn_id:u16 LE][local_port:u16 LE].
+            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = payload[0];
+                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                     anchor.phase = PHASE_LISTENING;
                 }
-            } else if anchor.phase == PHASE_WAIT_BOUND && !payload.is_empty() {
-                anchor.server_conn_id = payload[0];
+            } else if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= NET_CONN_LEN {
+                // Single-anchor provider (no port in payload): claim
+                // the first BOUND we see.
+                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                 anchor.phase = PHASE_LISTENING;
             }
         }
         NET_MSG_ACCEPTED => {
-            if payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // ACCEPTED payload: [conn_id:u16 LE][local_port:u16 LE].
+            if payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port != anchor.listen_port {
                     return;
                 }
             }
-            if !payload.is_empty() {
-                let new_id = payload[0];
+            if let Some(new_id) = net_conn_id(payload) {
                 match anchor.alloc_slot(new_id) {
                     // MySQL is a server-speaks-first protocol: the
                     // handshake goes out on accept, before the client
@@ -897,33 +911,34 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
             }
         }
         NET_MSG_DATA => {
-            if payload.len() >= 2 {
-                let conn_id = payload[0];
-                let data = &payload[1..];
-                if let Some(idx) = anchor.find_slot(conn_id) {
-                    let slot = &mut anchor.slots[idx];
-                    let room = RECV_BUF - slot.recv_len;
-                    if data.len() > room {
-                        slot.state = S_CLOSING;
-                    } else {
-                        let at = slot.recv_len;
-                        slot.recv[at..at + data.len()].copy_from_slice(data);
-                        slot.recv_len += data.len();
-                        drain_slot(anchor, idx);
+            if payload.len() > NET_CONN_LEN {
+                if let Some(conn_id) = net_conn_id(payload) {
+                    let data = &payload[NET_CONN_LEN..];
+                    if let Some(idx) = anchor.find_slot(conn_id) {
+                        let slot = &mut anchor.slots[idx];
+                        let room = RECV_BUF - slot.recv_len;
+                        if data.len() > room {
+                            slot.state = S_CLOSING;
+                        } else {
+                            let at = slot.recv_len;
+                            slot.recv[at..at + data.len()].copy_from_slice(data);
+                            slot.recv_len += data.len();
+                            drain_slot(anchor, idx);
+                        }
                     }
                 }
             }
         }
         NET_MSG_CLOSED => {
-            if !payload.is_empty() {
-                if let Some(idx) = anchor.find_slot(payload[0]) {
+            if let Some(conn_id) = net_conn_id(payload) {
+                if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }
             }
         }
         NET_MSG_ERROR => {
-            if !payload.is_empty() {
-                if let Some(idx) = anchor.find_slot(payload[0]) {
+            if let Some(conn_id) = net_conn_id(payload) {
+                if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                     anchor.m_net_errors = anchor.m_net_errors.wrapping_add(1);
                 }

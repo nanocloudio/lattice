@@ -90,8 +90,8 @@ mod telemetry;
 
 use codec::models;
 use net_proto::{
-    NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_INCR, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_TXN,
@@ -106,7 +106,7 @@ const MAX_CONNS: usize = 8;
 const RECV_BUF: usize = 8192;
 const SEND_BUF: usize = 8192;
 const SCRATCH_BUF: usize = 16384;
-const SLOT_FREE: u8 = 0xFF;
+const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 27017;
 // NET_FRAME_HDR comes from the SDK's runtime/net.rs include.
 
@@ -153,7 +153,7 @@ const PHASE_LISTENING: u8 = 2;
 
 #[repr(C)]
 struct Slot {
-    conn_id: u8,
+    conn_id: u16,
     state: u8,
     recv: [u8; RECV_BUF],
     recv_len: usize,
@@ -192,7 +192,7 @@ struct AnchorState {
 
     listen_port: u16,
     phase: u8,
-    server_conn_id: u8,
+    server_conn_id: u16,
     slots: [Slot; MAX_CONNS],
 
     // ── The single in-flight command ────────────────────────────────
@@ -227,6 +227,12 @@ struct AnchorState {
     m_docs_returned: u64,
     m_errors: u64,
     step_ctr: u64,
+    /// dev_millis deadline for the in-flight command (0 = none). A lost
+    /// KV reply otherwise latches `d_phase` busy forever — every later
+    /// command then gets the busy refusal until reboot. Mirrors the
+    /// relational executor's statement watchdog.
+    cmd_deadline_ms: u64,
+    m_cmd_timeouts: u64,
 }
 
 impl AnchorState {
@@ -264,15 +270,17 @@ impl AnchorState {
         self.m_docs_returned = 0;
         self.m_errors = 0;
         self.step_ctr = 0;
+        self.cmd_deadline_ms = 0;
+        self.m_cmd_timeouts = 0;
     }
 
-    fn find_slot(&self, conn_id: u8) -> Option<usize> {
+    fn find_slot(&self, conn_id: u16) -> Option<usize> {
         self.slots
             .iter()
             .position(|s| s.conn_id == conn_id && s.conn_id != SLOT_FREE)
     }
 
-    fn alloc_slot(&mut self, conn_id: u8) -> Option<usize> {
+    fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
         let idx = self.slots.iter().position(|s| s.conn_id == SLOT_FREE)?;
         self.slots[idx] = Slot::free();
         self.slots[idx].conn_id = conn_id;
@@ -292,22 +300,28 @@ impl AnchorState {
 
 // ── Net plumbing (pg_edge_anchor pattern) ────────────────────────────
 
-unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u8, data: &[u8]) -> bool {
+unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8]) -> bool {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = cmd;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
     if !data.is_empty() {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+            data.len(),
+        );
     }
     let total = NET_FRAME_HDR + payload_len;
     ((*sys).channel_write)(anchor.net_out, scratch, total) == total as i32
@@ -583,12 +597,13 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, request_id: i32, body: &[
 
     // Stateful commands: one in flight, whole-anchor, like the SQL
     // executor. A second one gets a retryable server-busy error.
+    //
+    // Do NOT touch `d_slot`/`d_request` here: they belong to the
+    // in-flight command, and its KV reply is routed through them — a
+    // busy refusal that overwrote them would strand the owning
+    // connection reply-less. The busy reply below frames the refused
+    // request's id directly and leaves the in-flight routing alone.
     if anchor.d_phase != D_IDLE {
-        anchor.d_slot = idx as u8;
-        anchor.d_request = request_id;
-        // code 91 ShutdownInProgress is retryable in drivers; 262
-        // ExceededTimeLimit less so. Use 91's retry semantics? Honest
-        // minimal: return a plain error the shell shows.
         let mut b = [0u8; 128];
         if let Some(n) = codec::error_body(50, b"server busy, retry", &mut b) {
             anchor.reply[..n].copy_from_slice(&b[..n]);
@@ -611,6 +626,8 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, request_id: i32, body: &[
     anchor.d_slot = idx as u8;
     anchor.d_request = request_id;
     anchor.slots[idx].state = S_BUSY;
+    // Command watchdog: see `cmd_deadline_ms`.
+    anchor.cmd_deadline_ms = unsafe { dev_millis(&*anchor.syscalls) }.wrapping_add(10_000);
 
     match cmd {
         b"insert" | b"find" | b"delete" | b"update" => {
@@ -1346,52 +1363,56 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
 unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
     match msg_type {
         NET_MSG_BOUND => {
-            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // BOUND payload: [conn_id:u16 LE][local_port:u16 LE].
+            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = payload[0];
+                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                     anchor.phase = PHASE_LISTENING;
                 }
-            } else if anchor.phase == PHASE_WAIT_BOUND && !payload.is_empty() {
-                anchor.server_conn_id = payload[0];
+            } else if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= NET_CONN_LEN {
+                // Single-anchor provider (no port in payload): claim
+                // the first BOUND we see.
+                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                 anchor.phase = PHASE_LISTENING;
             }
         }
         NET_MSG_ACCEPTED => {
-            if payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // ACCEPTED payload: [conn_id:u16 LE][local_port:u16 LE].
+            if payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port != anchor.listen_port {
                     return;
                 }
             }
-            if !payload.is_empty() {
-                let new_id = payload[0];
+            if let Some(new_id) = net_conn_id(payload) {
                 if anchor.alloc_slot(new_id).is_none() {
                     let _ = net_send(anchor, NET_CMD_CLOSE, new_id, &[]);
                 }
             }
         }
         NET_MSG_DATA => {
-            if payload.len() >= 2 {
-                let conn_id = payload[0];
-                let data = &payload[1..];
-                if let Some(idx) = anchor.find_slot(conn_id) {
-                    let slot = &mut anchor.slots[idx];
-                    let room = RECV_BUF - slot.recv_len;
-                    if data.len() > room {
-                        slot.state = S_CLOSING;
-                    } else {
-                        let at = slot.recv_len;
-                        slot.recv[at..at + data.len()].copy_from_slice(data);
-                        slot.recv_len += data.len();
-                        drain_slot(anchor, idx);
+            if payload.len() > NET_CONN_LEN {
+                if let Some(conn_id) = net_conn_id(payload) {
+                    let data = &payload[NET_CONN_LEN..];
+                    if let Some(idx) = anchor.find_slot(conn_id) {
+                        let slot = &mut anchor.slots[idx];
+                        let room = RECV_BUF - slot.recv_len;
+                        if data.len() > room {
+                            slot.state = S_CLOSING;
+                        } else {
+                            let at = slot.recv_len;
+                            slot.recv[at..at + data.len()].copy_from_slice(data);
+                            slot.recv_len += data.len();
+                            drain_slot(anchor, idx);
+                        }
                     }
                 }
             }
         }
         NET_MSG_CLOSED | NET_MSG_ERROR => {
-            if !payload.is_empty() {
-                if let Some(idx) = anchor.find_slot(payload[0]) {
+            if let Some(conn_id) = net_conn_id(payload) {
+                if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }
             }
@@ -1492,6 +1513,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     // Sweep closing slots + retry sends + resume queued input.
+    // Command watchdog: an in-flight command whose KV reply was lost
+    // must not hold the whole anchor busy forever.
+    if anchor.d_phase != D_IDLE {
+        let now = unsafe { dev_millis(&*anchor.syscalls) };
+        if anchor.cmd_deadline_ms != 0 && now > anchor.cmd_deadline_ms {
+            anchor.m_cmd_timeouts = anchor.m_cmd_timeouts.wrapping_add(1);
+            reply_error(anchor, 50, b"statement timeout");
+        }
+    }
+
     for idx in 0..MAX_CONNS {
         if anchor.slots[idx].conn_id == SLOT_FREE {
             continue;
@@ -1562,6 +1593,17 @@ unsafe fn read_one_envelope<'a>(
     }
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     if payload_len > scratch.len() {
+        // Drain the oversized payload to stay frame-aligned: leaving it
+        // in the channel would desync every subsequent read.
+        let mut left = payload_len;
+        let mut sink = [0u8; 256];
+        while left > 0 {
+            let take = left.min(sink.len());
+            if ((sys.channel_read)(chan, sink.as_mut_ptr(), take) as usize) < take {
+                break;
+            }
+            left -= take;
+        }
         return None;
     }
     if payload_len > 0

@@ -40,6 +40,11 @@ for c in "${!PKG[@]}"; do
     || { echo "host_crates: clippy FAILED in $c"; fail=1; }
   ( cd "$dir" && cargo build --all-targets ) >/dev/null 2>&1 \
     || { echo "host_crates: build FAILED in $c"; fail=1; }
+  # Unit tests here (not a cargo `[ci.cargo]` Phase 2): these crates are
+  # artefact-free, so their tests run before the module build without issue —
+  # unlike tests/harness, which is why Phase 2 is omitted (see fluxor.toml).
+  ( cd "$dir" && cargo test --all-targets --all-features ) >/dev/null 2>&1 \
+    || { echo "host_crates: tests FAILED in $c"; fail=1; }
 done
 
 # The wire/ and telemetry/ catalog gates — previously only reachable via the
@@ -53,4 +58,4 @@ if [ "$fail" -ne 0 ]; then
   echo "host_crates: FAILED"
   exit 1
 fi
-echo "host_crates: 3 crate(s) fmt/clippy/built, wire_lint + telemetry_guard gates passed"
+echo "host_crates: 3 crate(s) fmt/clippy/built/tested, wire_lint + telemetry_guard gates passed"

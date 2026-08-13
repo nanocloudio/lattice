@@ -18,6 +18,15 @@ hardware_targets = ["bcm2712"]
 #
 # For reads (linearizable GET), kv_request_router still forwards
 # straight to kv_state_worker — consensus only sequences writes.
+#
+# A second entry kind, `LATTICE_RECORD_TAG`, carries
+# replicated control records (timestamp-allocator advances and worker
+# leases) that must NOT reach the state machine as commands. The bridge
+# demuxes them onto `records_out` as `[record_msg_type]` envelopes in
+# commit order; worker-lease grants (MSG_TS_LEASE_GRANT) are also
+# forwarded in-band on `kv_out`, strictly ordered against the commands
+# around them, which is what makes per-write commit-timestamp
+# assignment deterministic across replicas and replay.
 
 [[ports]]
 name = "committed_in"
@@ -34,9 +43,18 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
+# Committed lattice record entries (LATTICE_RECORD_TAG), demuxed in
+# commit order. Wire per record: `[record_msg_type][len][record…]`.
+# Feed this to `timestamp_allocator.committed_state`.
+[[ports]]
+name = "records_out"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
 # ── Observability (Phase 14) ──────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.
 [observability]
-metrics = ["applied", "dropped", "untagged"]
+metrics = ["applied", "dropped", "untagged", "records", "records_dropped"]

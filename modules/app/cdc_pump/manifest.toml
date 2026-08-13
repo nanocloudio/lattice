@@ -1,0 +1,89 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# The egress pump. Reads committed change-feed windows from the KV
+# surface (an ordinary anchor-pair client — no privileged read path),
+# translates versions into the versioned CDC envelope
+# (modules/common/cdc_wire.rs), publishes to a `stream.sink.ordered_ack`
+# provider, and checkpoints past the contiguous acknowledged prefix
+# through the normal KV path (the generation-pointer protocol).
+#
+# One pump instance serves one feed (simpler WCET reasoning; a graph
+# adds an instance per feed). Ownership is a static pin: this instance
+# is the owner at `owner_epoch`.
+#
+# Feed lifecycle states, reported on the `state` gauge:
+#   0 CREATED  1 BACKFILL  2 STREAMING  3 STALLED  4 NEEDS_BACKFILL
+#   5 WEDGED   6 HALTED
+#
+# Wiring (see configs/single-models-cdc.yaml):
+#   kv_out/kv_in      → a free router anchor pair (e.g. etcd_in/out)
+#   publish_out/ack_in → the sink provider's publish_in/ack_out
+#   retention          → compaction_coordinator.claims (budgeted GC
+#                        claim; lapse is enforced by the claim EXPIRY,
+#                        so release needs no pump cooperation)
+
+# MSG_KV_RESPONSE from the router pair output.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_CDC_ACK from the sink provider.
+[[ports]]
+name = "ack_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST into the router pair input.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_CDC_PUBLISH to the sink provider. Sized for a worst-case
+# envelope (a full 4 KiB row image plus framing).
+[[ports]]
+name = "publish_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8192
+
+# MSG_RETENTION_CLAIM to compaction_coordinator (GC budget).
+[[ports]]
+name = "retention"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Declaration order IS the metric-id contract, append-only. `state`,
+# `unacked_depth`, `cursor_revision`, `frontier` are level gauges on
+# the counter channel (monotone or slow-moving; a regression in
+# `cursor_revision` is itself the alarm).
+[observability]
+metrics = [
+    "events_published",
+    "events_acked",
+    "refusals",
+    "replays",
+    "checkpoints",
+    "resolved_published",
+    "backfill_rows",
+    "compacted_refusals",
+    "state",
+    "unacked_depth",
+    "cursor_revision",
+    "frontier",
+]

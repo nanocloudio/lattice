@@ -28,6 +28,19 @@
 //! WAL's headroom no matter how many runs exist. A miss simply costs
 //! what every read costs today — correct, just slower.
 //!
+//! "Slower" is NOT flat on FAT32, though: re-opening a file for
+//! APPEND walks its whole FAT chain to rebuild the append cursor —
+//! O(file length) per open. `SLOTS` must therefore cover the steady-
+//! state compaction working set (RUN_MERGE_THRESHOLD = 3 input
+//! runs + 1 output + the manifest = 5): at 3 slots, every output
+//! append during a merge step evicted-and-reopened the growing
+//! output run, and the finalize step's footer append crossed the
+//! module step deadline on the rig (~140 ms observed) and got the
+//! worker terminated. 5 + durability's ~3 handles meets the
+//! 8-entry table exactly; the emergency MAX_RUNS-input merge still
+//! thrashes reads by design (bounded, rare) rather than growing
+//! into the WAL's share.
+//!
 //! ## The one way this can be wrong
 //!
 //! A descriptor that outlives its file. Run ids are reused after
@@ -54,8 +67,9 @@
 )]
 
 /// Cached descriptors. Small on purpose — see the module docs on the
-/// 8-entry fat32 table shared with the WAL.
-pub const SLOTS: usize = 3;
+/// 8-entry fat32 table shared with the WAL, and on why this must
+/// cover the compaction working set (3 inputs + output + manifest).
+pub const SLOTS: usize = 5;
 
 /// `fd < 0` means the slot is empty.
 pub const EMPTY_FD: i32 = -1;

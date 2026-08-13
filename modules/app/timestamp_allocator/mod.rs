@@ -87,6 +87,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/types.rs"]
 mod types;
 
+#[path = "../../common/wire.rs"]
+mod wire;
+
 #[path = "../../common/mvcc.rs"]
 mod mvcc;
 
@@ -137,6 +140,27 @@ struct AllocState {
     // ── params ──
     allocator_id: u32,
     advance_chunk: u32,
+    /// Auto-grant target: `issued_to` identity for the
+    /// unsolicited worker leases this allocator proposes as replicated
+    /// `MSG_TS_LEASE_GRANT` records. `0` = auto-grant disabled
+    /// (request/reply only).
+    auto_grant_to: u32,
+    /// Timestamps per auto-granted lease.
+    auto_grant_size: u32,
+    /// Steps between bootstrap probes while `Unestablished`, and
+    /// between reserve top-up checks once established. Grants
+    /// themselves are demand-driven (the worker requests on
+    /// `lease_request` when low), so an idle graph proposes nothing
+    /// after the initial establishment + first grant.
+    auto_grant_interval_steps: u32,
+    /// Wrap outbound proposals in clustor's `MSG_CLIENT_PROPOSAL`
+    /// envelope with `LATTICE_RECORD_TAG` (`1`, for graphs whose
+    /// `propose_out` is wired to `gateway.client_requests`), or emit
+    /// bare records (`0`, the contract-test surface).
+    propose_wrap: u32,
+
+    /// Step counter driving the auto-grant/bootstrap cadence.
+    auto_ctr: u32,
 
     // ── Phase-14 counters (ids follow manifest `[observability] metrics`) ──
     m_grants: u64,
@@ -166,6 +190,11 @@ impl AllocState {
         self.metrics_out = -1;
         self.allocator_id = 1;
         self.advance_chunk = DEFAULT_ADVANCE_CHUNK as u32;
+        self.auto_grant_to = 0;
+        self.auto_grant_size = DEFAULT_ADVANCE_CHUNK as u32;
+        self.auto_grant_interval_steps = 2000;
+        self.propose_wrap = 0;
+        self.auto_ctr = 0;
         self.m_grants = 0;
         self.m_proposals = 0;
         self.m_holds = 0;
@@ -225,6 +254,23 @@ define_params! {
     // crash. Clamped to mvcc::MAX_LEASE_INTERVAL at use.
     2, advance_chunk, u32, 65536
         => |s, d, len| { s.advance_chunk = p_u32(d, len, 0, 65536); };
+
+    // Auto-grant target identity: non-zero enables the
+    // unsolicited replicated worker-lease loop (see AllocState docs).
+    3, auto_grant_to, u32, 0
+        => |s, d, len| { s.auto_grant_to = p_u32(d, len, 0, 0); };
+
+    // Timestamps per auto-granted worker lease.
+    4, auto_grant_size, u32, 65536
+        => |s, d, len| { s.auto_grant_size = p_u32(d, len, 0, 65536); };
+
+    // Steps between auto-grant proposals / bootstrap probes.
+    5, auto_grant_interval_steps, u32, 2000
+        => |s, d, len| { s.auto_grant_interval_steps = p_u32(d, len, 0, 2000); };
+
+    // 1 = wrap proposals for gateway.client_requests (see AllocState).
+    6, propose_wrap, u32, 0
+        => |s, d, len| { s.propose_wrap = p_u32(d, len, 0, 0); };
 }
 
 unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
@@ -297,6 +343,37 @@ unsafe fn send_reject(s: &mut AllocState, sys: &SyscallTable, corr_id: u64, reas
     ok
 }
 
+/// Write one record proposal on `propose_out` — bare (`[record_type]`
+/// envelope, the contract-test surface) or, with `propose_wrap`,
+/// wrapped for clustor's gateway as
+/// `MSG_CLIENT_PROPOSAL [conn_id=0][LATTICE_RECORD_TAG][record_type]
+/// [record…]` so the committed entry body demuxes at
+/// `lattice_apply_bridge` (see `wire::LATTICE_RECORD_TAG`).
+unsafe fn write_record_proposal(
+    s: &mut AllocState,
+    sys: &SyscallTable,
+    record_type: u8,
+    record: &[u8],
+) -> bool {
+    if s.propose_wrap == 0 {
+        return write_envelope(sys, s.propose_out, record_type, record);
+    }
+    let payload_len = 3 + record.len();
+    let total = 3 + payload_len;
+    let mut buf = [0u8; SCRATCH + 16];
+    if total > buf.len() {
+        return false;
+    }
+    buf[0] = wire::MSG_CLIENT_PROPOSAL;
+    buf[1] = (payload_len & 0xFF) as u8;
+    buf[2] = ((payload_len >> 8) & 0xFF) as u8;
+    buf[3] = 0; // conn_id: allocator-originated, no client connection
+    buf[4] = wire::LATTICE_RECORD_TAG;
+    buf[5] = record_type;
+    buf[6..6 + record.len()].copy_from_slice(record);
+    (sys.channel_write)(s.propose_out, buf.as_mut_ptr(), total) == total as i32
+}
+
 /// Propose a high-water advance large enough to serve `min_size`.
 ///
 /// The proposal is only a proposal: `plan_advance` records it as
@@ -313,7 +390,7 @@ unsafe fn propose_advance(s: &mut AllocState, sys: &SyscallTable, min_size: u64)
     if rec.encode(&mut body).is_none() {
         return false;
     }
-    if write_envelope(sys, s.propose_out, MSG_TS_LEASE, &body) {
+    if write_record_proposal(s, sys, MSG_TS_LEASE, &body) {
         s.m_proposals += 1;
         true
     } else {
@@ -326,6 +403,52 @@ unsafe fn propose_advance(s: &mut AllocState, sys: &SyscallTable, min_size: u64)
     }
 }
 
+/// The auto-grant / bootstrap cadence: while
+/// `Unestablished`, propose an establishment probe
+/// (`ReserveState::plan_bootstrap`); once established, cut a worker
+/// lease from the committed reserve and propose it as a replicated
+/// `MSG_TS_LEASE_GRANT` record `[corr_id=0][lease:40]` — the bridge
+/// forwards it in-band to the state worker, which assigns per-write
+/// commit timestamps from it in committed-log order. When the reserve
+/// cannot cover a lease, propose an advance instead and grant on a
+/// later cadence tick.
+unsafe fn auto_grant_tick(s: &mut AllocState, sys: &SyscallTable) {
+    if s.auto_grant_to == 0 || s.propose_out < 0 {
+        return;
+    }
+    let interval = s.auto_grant_interval_steps.max(1);
+    s.auto_ctr = s.auto_ctr.wrapping_add(1);
+    if !u64::from(s.auto_ctr).is_multiple_of(u64::from(interval)) {
+        return;
+    }
+    match s.reserve.phase {
+        ReservePhase::Unestablished => {
+            let Ok(probe) = s.reserve.plan_bootstrap(s.advance_chunk as u64) else {
+                return;
+            };
+            let mut body = [0u8; LEASE_WIRE_LEN];
+            if probe.encode(&mut body).is_some()
+                && write_record_proposal(s, sys, MSG_TS_LEASE, &body)
+            {
+                s.m_proposals += 1;
+            }
+        }
+        // Once established, grants are DEMAND-driven: the worker asks
+        // on `lease_request` when its reserve runs low, and `serve`
+        // answers with a replicated grant record. The cadence's only
+        // established-phase job is keeping enough committed reserve
+        // that a request can be served without waiting a full
+        // propose/commit round trip.
+        ReservePhase::Ready => {
+            let size = u64::from(s.auto_grant_size.max(1));
+            if s.reserve.free() < size {
+                propose_advance(s, sys, size);
+            }
+        }
+        ReservePhase::AwaitingCommit => {}
+    }
+}
+
 /// Serve one request that is not already queued. Returns true when an
 /// envelope was written (a grant, a rejection, or an advance proposal).
 unsafe fn serve(s: &mut AllocState, sys: &SyscallTable, req: LeaseRequest, queued: bool) -> bool {
@@ -333,6 +456,22 @@ unsafe fn serve(s: &mut AllocState, sys: &SyscallTable, req: LeaseRequest, queue
         .reserve
         .try_issue(req.size as u64, req.requester, LEASE_EXPIRY_NONE)
     {
+        // A worker lease (requester == auto_grant_to) is
+        // not answered directly: it is proposed as a replicated
+        // MSG_TS_LEASE_GRANT record so it reaches the state worker
+        // in-band, in committed-log order. Everyone else gets the
+        // classic direct grant on `lease_grant`.
+        Ok(lease) if s.auto_grant_to != 0 && req.requester == s.auto_grant_to => {
+            let mut body = [0u8; LEASE_GRANT_WIRE_LEN];
+            let ok = encode_grant(0, &lease, &mut body).is_some()
+                && write_record_proposal(s, sys, MSG_TS_LEASE_GRANT, &body);
+            if ok {
+                s.m_grants += 1;
+            }
+            // A grant that failed to write strands its interval —
+            // holes are harmless; rolling back risks double issuance.
+            ok
+        }
         Ok(lease) => send_grant(s, sys, req.corr_id, &lease),
         Err(IssueError::Insufficient { .. }) | Err(IssueError::ProposalOutstanding) => {
             // NOT a licence to issue. Hold the request and get the high
@@ -428,6 +567,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !acted {
             pump_request(s, sys);
         }
+
+        // The unsolicited worker-lease cadence runs
+        // alongside the request/reply pump; it is time-driven, not
+        // demand-driven, so it must tick every step regardless of
+        // whether the pump acted.
+        auto_grant_tick(s, sys);
 
         // Phase-14: emit module-scope counters on the metrics port at a
         // coarse cadence (no-op until wired). ids follow manifest order;

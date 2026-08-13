@@ -11,6 +11,10 @@ data
 # OS
 .DS_Store
 
+# Python bytecode (tools/e2e/ drivers)
+__pycache__/
+*.pyc
+
 # AI
 .claude/
 .context/
@@ -48,6 +52,12 @@ target/
 /benches/
 /examples/
 /perf/
+# Bare-metal rig graphs carry the DUT address (192.168.1.9) and dated bench
+# tuning — the rig topology §2 keeps off the shared remote (this is what
+# quantum/wave shadow-track their example graphs for). Only the pi5 rig
+# configs; the reference configs/ stay primary. Staging NEW ones needs `-f`.
+/configs/bare-metal-pi5*.yaml
+/configs/l4-pi5*.yaml
 /.git-shadow/
 
 # Runtime state from local runs — never source

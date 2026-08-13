@@ -73,8 +73,8 @@ use codec::cql_core::{cql_op, cql_parse_frame};
 use codec::models::{self, encode_value_ordered, ClusteringKey, LogicalType, SortDirection, Value};
 use codec::{CqlLit, CqlStatement, WideSchema};
 use net_proto::{
-    NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_INCR, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_TXN,
@@ -89,7 +89,7 @@ const MAX_CONNS: usize = 8;
 const RECV_BUF: usize = 8192;
 const SEND_BUF: usize = 8192;
 const SCRATCH_BUF: usize = 16384;
-const SLOT_FREE: u8 = 0xFF;
+const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 9042;
 const KEY_MAX: usize = 512;
 const DATABASE_ID: u32 = 0;
@@ -125,6 +125,7 @@ const D_WRITE: u8 = 7; // the cells TXN
 const D_SCAN: u8 = 8; // SELECT scan page
 const D_DEL_SCAN: u8 = 9; // DELETE: a row's cell page to remove, then loop
 const D_DEL_DEL: u8 = 10; // DELETE: a page removed → re-scan the row
+const D_PRIOR: u8 = 11; // INSERT/UPDATE: prior-version cell page to reclaim
 
 const PHASE_INIT: u8 = 0;
 const PHASE_WAIT_BOUND: u8 = 1;
@@ -132,7 +133,7 @@ const PHASE_LISTENING: u8 = 2;
 
 #[repr(C)]
 struct Slot {
-    conn_id: u8,
+    conn_id: u16,
     state: u8,
     recv: [u8; RECV_BUF],
     recv_len: usize,
@@ -171,7 +172,7 @@ struct AnchorState {
 
     listen_port: u16,
     phase: u8,
-    server_conn_id: u8,
+    server_conn_id: u16,
     slots: [Slot; MAX_CONNS],
 
     // The single in-flight statement.
@@ -194,9 +195,15 @@ struct AnchorState {
     m_sessions: u64,
     m_statements: u64,
     m_cells_written: u64,
+    m_stmt_timeouts: u64,
     m_rows_returned: u64,
     m_errors: u64,
     step_ctr: u64,
+    /// dev_millis deadline for the in-flight statement (0 = none).
+    /// The statement watchdog: without it a lost KV reply latches
+    /// `d_phase` busy permanently and every later statement is refused
+    /// Overloaded. Mirrors the relational executor's watchdog.
+    stmt_deadline_ms: u64,
 }
 
 impl AnchorState {
@@ -227,18 +234,20 @@ impl AnchorState {
         self.m_sessions = 0;
         self.m_statements = 0;
         self.m_cells_written = 0;
+        self.m_stmt_timeouts = 0;
         self.m_rows_returned = 0;
         self.m_errors = 0;
         self.step_ctr = 0;
+        self.stmt_deadline_ms = 0;
     }
 
-    fn find_slot(&self, conn_id: u8) -> Option<usize> {
+    fn find_slot(&self, conn_id: u16) -> Option<usize> {
         self.slots
             .iter()
             .position(|s| s.conn_id == conn_id && s.conn_id != SLOT_FREE)
     }
 
-    fn alloc_slot(&mut self, conn_id: u8) -> Option<usize> {
+    fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
         let idx = self.slots.iter().position(|s| s.conn_id == SLOT_FREE)?;
         self.slots[idx] = Slot::free();
         self.slots[idx].conn_id = conn_id;
@@ -256,22 +265,28 @@ impl AnchorState {
 
 // ── Net plumbing (doc anchor pattern) ────────────────────────────────
 
-unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u8, data: &[u8]) -> bool {
+unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8]) -> bool {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = cmd;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
     if !data.is_empty() {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+            data.len(),
+        );
     }
     let total = NET_FRAME_HDR + payload_len;
     ((*sys).channel_write)(anchor.net_out, scratch, total) == total as i32
@@ -599,14 +614,14 @@ fn begin_statement(anchor: &mut AnchorState, idx: usize, stream: i16, text: &[u8
         // 0x1001 Overloaded: retryable in every driver.
         let mut out = [0u8; 128];
         if let Some(n) = codec::error(stream, 0x1001, b"one statement at a time", &mut out) {
-            send_to_slot(anchor, idx, &out[..n].to_vec_bounded());
+            send_to_slot(anchor, idx, &out[..n]);
         }
         return;
     }
     if text.len() > anchor.stmt.len() {
         let mut out = [0u8; 128];
         if let Some(n) = codec::error(stream, codec::ERR_INVALID, b"statement too long", &mut out) {
-            send_to_slot(anchor, idx, &out[..n].to_vec_bounded());
+            send_to_slot(anchor, idx, &out[..n]);
         }
         return;
     }
@@ -615,6 +630,8 @@ fn begin_statement(anchor: &mut AnchorState, idx: usize, stream: i16, text: &[u8
     anchor.d_slot = idx as u8;
     anchor.d_stream = stream;
     anchor.slots[idx].state = S_BUSY;
+    // Statement watchdog: see `stmt_deadline_ms`.
+    anchor.stmt_deadline_ms = unsafe { dev_millis(&*anchor.syscalls) }.wrapping_add(10_000);
 
     let mut stmt = [0u8; 2048];
     stmt[..text.len()].copy_from_slice(text);
@@ -642,19 +659,6 @@ fn begin_statement(anchor: &mut AnchorState, idx: usize, stream: i16, text: &[u8
     };
     if !kv_send(anchor, KV_OP_GET, bn, D_NAME) {
         reply_error(anchor, codec::ERR_SERVER, b"internal");
-    }
-}
-
-/// Tiny helper: a bounded copy of an error frame (avoids alloc).
-trait ToVecBounded {
-    fn to_vec_bounded(&self) -> [u8; 128];
-}
-impl ToVecBounded for [u8] {
-    fn to_vec_bounded(&self) -> [u8; 128] {
-        let mut out = [0u8; 128];
-        let n = self.len().min(128);
-        out[..n].copy_from_slice(&self[..n]);
-        out
     }
 }
 
@@ -840,6 +844,95 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                 return;
             }
             anchor.version = counter as u64;
+            // Reclaim pass first: find the row's PRIOR cell versions so
+            // the write TXN deletes them alongside its puts. Cell keys
+            // embed the statement version, so every write creates a
+            // NEW physical key — the engine's MVCC GC can never see
+            // superseded cells as shadowed, and without this pass they
+            // accumulate without bound while every partition scan
+            // walks the pile.
+            anchor.cells_len = 0;
+            send_prior_scan(anchor, &parsed);
+        }
+        D_PRIOR => {
+            if result != KV_RESULT_RANGE || body.len() < 10 {
+                reply_error(anchor, codec::ERR_SERVER, b"store unavailable");
+                return;
+            }
+            // Only cells this statement REWRITES may be reclaimed:
+            // INSERT and UPDATE are partial upserts, so a column the
+            // statement does not set keeps its prior cell (SELECT's
+            // per-column highest-version pick depends on it). The row
+            // marker is always rewritten. Resolve the written column
+            // ids up front; an unresolvable name stays conservative
+            // (its prior cells are kept — the TXN builder refuses the
+            // statement on its own terms).
+            let mut written = [ROW_MARKER_COL; codec::CQL_MAX_COLS + 1];
+            let mut written_n = 1usize;
+            {
+                let (cols, count): (&[&[u8]], usize) = match &parsed {
+                    CqlStatement::Insert(ins) => (&ins.cols, ins.count),
+                    CqlStatement::Update(upd) => (&upd.cols, upd.count),
+                    _ => (&[], 0),
+                };
+                for col in cols.iter().take(count) {
+                    if let Some(ci) = anchor.schema.col_by_name(col) {
+                        if ci != anchor.schema.pk && !anchor.schema.is_clustering(ci) {
+                            written[written_n] = ci as u32;
+                            written_n += 1;
+                        }
+                    }
+                }
+            }
+            // Stage the matching cell keys as a ready KV_OP_DELETE body:
+            // [count:u16] then [klen:u16][key]…, capped by the staging
+            // buffer — a transition-era pile drains over several writes.
+            // The cell key ends with a fixed [column:u32 BE][!version:u64]
+            // tail (`models::encode_wide_key`), so the column id reads
+            // straight off the key.
+            let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+            let mut staged: u16 = 0;
+            let mut p = 2usize;
+            let mut at = 10usize;
+            for _ in 0..count {
+                let Some(klen) = body
+                    .get(at..at + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                else {
+                    break;
+                };
+                let koff = at + 2;
+                let voff = koff + klen;
+                let Some(vlen) = body
+                    .get(voff..voff + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                else {
+                    break;
+                };
+                let keep = klen >= 12
+                    && body.get(koff..koff + klen).is_some_and(|k| {
+                        let cid = u32::from_be_bytes([
+                            k[klen - 12],
+                            k[klen - 11],
+                            k[klen - 10],
+                            k[klen - 9],
+                        ]);
+                        written[..written_n].contains(&cid)
+                    });
+                if keep {
+                    if p + 2 + klen > 2600 {
+                        break; // TXN body budget: leave room for the puts
+                    }
+                    anchor.cells[p..p + 2].copy_from_slice(&(klen as u16).to_le_bytes());
+                    p += 2;
+                    anchor.cells[p..p + klen].copy_from_slice(&body[koff..koff + klen]);
+                    p += klen;
+                    staged += 1;
+                }
+                at = voff + 4 + vlen;
+            }
+            anchor.cells[0..2].copy_from_slice(&staged.to_le_bytes());
+            anchor.cells_len = p as u16;
             match &parsed {
                 CqlStatement::Update(_) => send_update_txn(anchor, &parsed),
                 _ => send_insert_txn(anchor, &parsed),
@@ -934,6 +1027,38 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
     }
 }
 
+/// Build a clustering-key PREFIX from `AND col = lit` predicates,
+/// matched against the schema's clustering columns in declared order
+/// (the CQL prefix rule: predicates must name `c1[, c2…]` with no
+/// gaps). Fills the caller's fixed arrays and returns the component
+/// count, or a typed error message.
+fn build_where_ck<'a>(
+    schema: &WideSchema,
+    preds: &[(&[u8], codec::CqlLit<'a>)],
+    cl_types: &mut [LogicalType; codec::CQL_MAX_CLUSTERING],
+    cl_vals: &mut [Value<'a>; codec::CQL_MAX_CLUSTERING],
+) -> Result<usize, &'static [u8]> {
+    if preds.len() > schema.clustering_count {
+        return Err(b"more clustering predicates than clustering columns");
+    }
+    for (j, (name, lit)) in preds.iter().enumerate() {
+        let cidx = schema.clustering[j];
+        let mut n = [0u8; codec::CQL_NAME_MAX];
+        let nm = schema.col_name(cidx);
+        n[..nm.len()].copy_from_slice(nm);
+        if *name != &n[..nm.len()] {
+            return Err(b"clustering predicates must follow clustering order");
+        }
+        let ty = schema.col_type(cidx);
+        let Some(v) = lit_value(ty, lit) else {
+            return Err(b"clustering key type mismatch");
+        };
+        cl_types[j] = ty;
+        cl_vals[j] = v;
+    }
+    Ok(preds.len())
+}
+
 /// Build + send the cells TXN for the INSERT.
 fn send_insert_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     let CqlStatement::Insert(ins) = parsed else {
@@ -1019,6 +1144,12 @@ fn send_insert_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
         }
         cell_count += 1;
     }
+    // Plus the prior-version reclaim op staged by D_PRIOR (one
+    // KV_OP_DELETE carrying every superseded cell key of this row).
+    let staged_del = anchor.cells_len as usize;
+    if staged_del > 2 {
+        cell_count += 1;
+    }
     let end_guard = BODY_AT + 3800;
     let mut p = BODY_AT;
     anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // no cmps: upsert
@@ -1085,6 +1216,23 @@ fn send_insert_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
         };
         p = np;
     }
+    // Reclaim: delete the row's prior cell versions in the SAME
+    // committed TXN (see D_VERSION). One KV_OP_DELETE sub-op, body
+    // staged ready-to-send by the D_PRIOR arm.
+    if staged_del > 2 {
+        if p + 3 + staged_del > end_guard {
+            reply_error(anchor, codec::ERR_INVALID, b"statement too large");
+            return;
+        }
+        anchor.env[p] = KV_OP_DELETE;
+        p += 1;
+        anchor.env[p..p + 2].copy_from_slice(&(staged_del as u16).to_le_bytes());
+        p += 2;
+        for i in 0..staged_del {
+            anchor.env[p + i] = anchor.cells[i];
+        }
+        p += staged_del;
+    }
     anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // else branch
     p += 2;
     anchor.m_cells_written = anchor.m_cells_written.wrapping_add(u64::from(cell_count));
@@ -1102,13 +1250,13 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
         reply_error(anchor, codec::ERR_SERVER, b"internal");
         return;
     };
-    // A clustered table's UPDATE would need the clustering columns in the
-    // WHERE to name one row; the single-key WHERE grammar cannot, so refuse.
-    if anchor.schema.clustering_count > 0 {
+    // A clustered table's UPDATE names ONE row: the WHERE must carry
+    // the FULL clustering key (`AND ck = v` per clustering column).
+    if upd.where_ck_count != anchor.schema.clustering_count {
         reply_error(
             anchor,
             codec::ERR_INVALID,
-            b"UPDATE on a clustered table needs the full primary key (unsupported)",
+            b"UPDATE needs the full primary key (partition + every clustering column)",
         );
         return;
     }
@@ -1141,7 +1289,32 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
 
     let table_id = anchor.schema.table_id;
     let version = anchor.version;
-    let cell_count: u16 = 1 + upd.count as u16;
+
+    // The row's clustering key, from the WHERE predicates (full key —
+    // checked above; empty on a partition-key-only table).
+    let mut cl_types = [LogicalType::Int; codec::CQL_MAX_CLUSTERING];
+    let mut cl_vals = [Value::Null; codec::CQL_MAX_CLUSTERING];
+    let ckn = match build_where_ck(
+        &anchor.schema,
+        &upd.where_ck[..upd.where_ck_count],
+        &mut cl_types,
+        &mut cl_vals,
+    ) {
+        Ok(n) => n,
+        Err(msg) => {
+            reply_error(anchor, codec::ERR_INVALID, msg);
+            return;
+        }
+    };
+    let cl_dirs = [SortDirection::Ascending; codec::CQL_MAX_CLUSTERING];
+    let row_ck = ClusteringKey {
+        types: &cl_types[..ckn],
+        values: &cl_vals[..ckn],
+        directions: &cl_dirs[..ckn],
+    };
+
+    let staged_del = anchor.cells_len as usize;
+    let cell_count: u16 = 1 + upd.count as u16 + u16::from(staged_del > 2);
     let end_guard = BODY_AT + 3800;
     let mut p = BODY_AT;
     anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // no cmps: upsert
@@ -1149,19 +1322,13 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     anchor.env[p..p + 2].copy_from_slice(&cell_count.to_le_bytes());
     p += 2;
 
-    // No clustering (refused above), so an empty clustering key.
-    let empty_cl = ClusteringKey {
-        types: &[],
-        values: &[],
-        directions: &[],
-    };
     // Row marker: an UPDATE also asserts the row exists (CQL upsert).
     let mut mkey = [0u8; KEY_MAX + 64];
     let Some(mkn) = cell_key(
         &mut mkey,
         table_id,
         &pk_bytes[..pk_len],
-        &empty_cl,
+        &row_ck,
         ROW_MARKER_COL,
         version,
     ) else {
@@ -1183,6 +1350,14 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
             reply_error(anchor, codec::ERR_INVALID, b"cannot SET the partition key");
             return;
         }
+        if anchor.schema.is_clustering(ci) {
+            reply_error(
+                anchor,
+                codec::ERR_INVALID,
+                b"cannot SET a clustering column",
+            );
+            return;
+        }
         let ty = anchor.schema.col_type(ci);
         let Some(v) = lit_value(ty, &upd.values[i]) else {
             reply_error(anchor, codec::ERR_INVALID, b"column type mismatch");
@@ -1198,7 +1373,7 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
             &mut ckey,
             table_id,
             &pk_bytes[..pk_len],
-            &empty_cl,
+            &row_ck,
             ci as u32,
             version,
         ) else {
@@ -1211,6 +1386,23 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
         };
         p = np;
     }
+    // Reclaim: delete the row's prior cell versions in the SAME
+    // committed TXN (see D_VERSION). One KV_OP_DELETE sub-op, body
+    // staged ready-to-send by the D_PRIOR arm.
+    if staged_del > 2 {
+        if p + 3 + staged_del > end_guard {
+            reply_error(anchor, codec::ERR_INVALID, b"statement too large");
+            return;
+        }
+        anchor.env[p] = KV_OP_DELETE;
+        p += 1;
+        anchor.env[p..p + 2].copy_from_slice(&(staged_del as u16).to_le_bytes());
+        p += 2;
+        for i in 0..staged_del {
+            anchor.env[p + i] = anchor.cells[i];
+        }
+        p += staged_del;
+    }
     anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // else branch
     p += 2;
     anchor.m_cells_written = anchor.m_cells_written.wrapping_add(u64::from(cell_count));
@@ -1219,8 +1411,10 @@ fn send_update_txn(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     }
 }
 
-/// One scan page of a DELETE's partition, to physically remove its cells.
-/// The span is exactly one partition — DELETE requires the partition key.
+/// One scan page of a DELETE's span, to physically remove its cells.
+/// The span is one partition, narrowed to the clustering prefix the
+/// WHERE names (one row when the full clustering key is given) —
+/// DELETE always requires the partition key.
 fn send_delete_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     let CqlStatement::Delete(del) = parsed else {
         reply_error(anchor, codec::ERR_SERVER, b"internal");
@@ -1251,17 +1445,35 @@ fn send_delete_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
         reply_error(anchor, codec::ERR_INVALID, b"partition key unencodable");
         return;
     };
-    let empty = ClusteringKey {
-        types: &[],
-        values: &[],
-        directions: &[],
+    // Narrow the span by the clustering predicates (prefix rule): a
+    // full clustering key names ONE row; a prefix names its range; no
+    // predicates delete the whole partition (the historical shape).
+    let mut cl_types = [LogicalType::Int; codec::CQL_MAX_CLUSTERING];
+    let mut cl_vals = [Value::Null; codec::CQL_MAX_CLUSTERING];
+    let ckn = match build_where_ck(
+        &anchor.schema,
+        &del.where_ck[..del.where_ck_count],
+        &mut cl_types,
+        &mut cl_vals,
+    ) {
+        Ok(n) => n,
+        Err(msg) => {
+            reply_error(anchor, codec::ERR_INVALID, msg);
+            return;
+        }
+    };
+    let cl_dirs = [SortDirection::Ascending; codec::CQL_MAX_CLUSTERING];
+    let ck = ClusteringKey {
+        types: &cl_types[..ckn],
+        values: &cl_vals[..ckn],
+        directions: &cl_dirs[..ckn],
     };
     let mut prefix_body = [0u8; KEY_MAX];
     let Some(plen) = models::encode_wide_clustering_prefix(
         &mut prefix_body,
         anchor.schema.table_id,
         &pk_bytes[..pk_len],
-        &empty,
+        &ck,
     ) else {
         reply_error(anchor, codec::ERR_SERVER, b"internal");
         return;
@@ -1299,6 +1511,154 @@ fn send_delete_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     p += 8;
     anchor.env[p..p + 2].copy_from_slice(&32u16.to_le_bytes());
     if !kv_send(anchor, KV_OP_RANGE_SCAN, need, D_DEL_SCAN) {
+        reply_error(anchor, codec::ERR_SERVER, b"internal");
+    }
+}
+
+/// One bounded page over the ROW the pending INSERT/UPDATE names, so
+/// the write TXN can delete the row's prior cell versions (see the
+/// D_VERSION arm). The span is the full primary key — partition plus
+/// every clustering component — exactly one logical row.
+fn send_prior_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
+    // Derive (pk value, clustering values) from the statement.
+    let pk_idx = anchor.schema.pk;
+    let pk_ty = anchor.schema.col_type(pk_idx);
+    let pk_name_owned = {
+        let mut n = [0u8; codec::CQL_NAME_MAX];
+        let name = anchor.schema.col_name(pk_idx);
+        n[..name.len()].copy_from_slice(name);
+        (n, name.len())
+    };
+    let pk_name = &pk_name_owned.0[..pk_name_owned.1];
+    let cc = anchor.schema.clustering_count;
+    let mut cl_types = [LogicalType::Int; codec::CQL_MAX_CLUSTERING];
+    let mut cl_vals = [Value::Null; codec::CQL_MAX_CLUSTERING];
+    let cl_dirs = [SortDirection::Ascending; codec::CQL_MAX_CLUSTERING];
+    let pk_value = match parsed {
+        CqlStatement::Insert(ins) => {
+            let Some(pk_at) = (0..ins.count).find(|&i| ins.cols[i] == pk_name) else {
+                reply_error(
+                    anchor,
+                    codec::ERR_INVALID,
+                    b"insert must set the partition key",
+                );
+                return;
+            };
+            let Some(v) = lit_value(pk_ty, &ins.values[pk_at]) else {
+                reply_error(anchor, codec::ERR_INVALID, b"partition key type mismatch");
+                return;
+            };
+            for j in 0..cc {
+                let cidx = anchor.schema.clustering[j];
+                let ty = anchor.schema.col_type(cidx);
+                let cname_owned = {
+                    let mut n = [0u8; codec::CQL_NAME_MAX];
+                    let nm = anchor.schema.col_name(cidx);
+                    n[..nm.len()].copy_from_slice(nm);
+                    (n, nm.len())
+                };
+                let cname = &cname_owned.0[..cname_owned.1];
+                let Some(pos) = (0..ins.count).find(|&i| ins.cols[i] == cname) else {
+                    reply_error(
+                        anchor,
+                        codec::ERR_INVALID,
+                        b"insert must set every clustering column",
+                    );
+                    return;
+                };
+                let Some(cv) = lit_value(ty, &ins.values[pos]) else {
+                    reply_error(anchor, codec::ERR_INVALID, b"clustering key type mismatch");
+                    return;
+                };
+                cl_types[j] = ty;
+                cl_vals[j] = cv;
+            }
+            v
+        }
+        CqlStatement::Update(upd) => {
+            if upd.where_pk.0 != pk_name {
+                reply_error(
+                    anchor,
+                    codec::ERR_INVALID,
+                    b"only partition-key equality in this slice",
+                );
+                return;
+            }
+            let Some(v) = lit_value(pk_ty, &upd.where_pk.1) else {
+                reply_error(anchor, codec::ERR_INVALID, b"partition key type mismatch");
+                return;
+            };
+            match build_where_ck(
+                &anchor.schema,
+                &upd.where_ck[..upd.where_ck_count],
+                &mut cl_types,
+                &mut cl_vals,
+            ) {
+                Ok(_) => {}
+                Err(msg) => {
+                    reply_error(anchor, codec::ERR_INVALID, msg);
+                    return;
+                }
+            }
+            v
+        }
+        _ => {
+            reply_error(anchor, codec::ERR_SERVER, b"internal");
+            return;
+        }
+    };
+    let mut pk_bytes = [0u8; models::MAX_ORDERED_VALUE_LEN];
+    let Some(pk_len) = encode_value_ordered(&mut pk_bytes, pk_ty, pk_value) else {
+        reply_error(anchor, codec::ERR_INVALID, b"partition key unencodable");
+        return;
+    };
+    let ck = ClusteringKey {
+        types: &cl_types[..cc],
+        values: &cl_vals[..cc],
+        directions: &cl_dirs[..cc],
+    };
+    let mut prefix_body = [0u8; KEY_MAX];
+    let Some(plen) = models::encode_wide_clustering_prefix(
+        &mut prefix_body,
+        anchor.schema.table_id,
+        &pk_bytes[..pk_len],
+        &ck,
+    ) else {
+        reply_error(anchor, codec::ERR_SERVER, b"internal");
+        return;
+    };
+    let mut start = [0u8; KEY_MAX];
+    let Some(sn) = user_key(&mut start, models::KS_WIDE_TABLE, &prefix_body[..plen]) else {
+        reply_error(anchor, codec::ERR_SERVER, b"internal");
+        return;
+    };
+    let mut end = [0u8; KEY_MAX];
+    let Some(en) = prefix_successor(&start[..sn], &mut end) else {
+        reply_error(anchor, codec::ERR_SERVER, b"internal");
+        return;
+    };
+    let need = 2 + sn + 2 + en + 10;
+    if BODY_AT + need > anchor.env.len() {
+        reply_error(anchor, codec::ERR_SERVER, b"internal");
+        return;
+    }
+    let mut p = BODY_AT;
+    anchor.env[p..p + 2].copy_from_slice(&(sn as u16).to_le_bytes());
+    p += 2;
+    for i in 0..sn {
+        anchor.env[p + i] = start[i];
+    }
+    p += sn;
+    anchor.env[p..p + 2].copy_from_slice(&(en as u16).to_le_bytes());
+    p += 2;
+    for i in 0..en {
+        anchor.env[p + i] = end[i];
+    }
+    p += en;
+    anchor.env[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
+    p += 8;
+    anchor.env[p..p + 2].copy_from_slice(&32u16.to_le_bytes());
+    if !kv_send(anchor, KV_OP_RANGE_SCAN, need, D_PRIOR) {
         reply_error(anchor, codec::ERR_SERVER, b"internal");
     }
 }
@@ -1367,16 +1727,33 @@ fn send_select_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
             reply_error(anchor, codec::ERR_INVALID, b"partition key unencodable");
             return;
         };
-        let empty = ClusteringKey {
-            types: &[],
-            values: &[],
-            directions: &[],
+        // Narrow to the clustering prefix the predicates name (a full
+        // clustering key reads one row; none reads the partition).
+        let mut cl_types = [LogicalType::Int; codec::CQL_MAX_CLUSTERING];
+        let mut cl_vals = [Value::Null; codec::CQL_MAX_CLUSTERING];
+        let ckn = match build_where_ck(
+            &anchor.schema,
+            &sel.where_ck[..sel.where_ck_count],
+            &mut cl_types,
+            &mut cl_vals,
+        ) {
+            Ok(n) => n,
+            Err(msg) => {
+                reply_error(anchor, codec::ERR_INVALID, msg);
+                return;
+            }
+        };
+        let cl_dirs = [SortDirection::Ascending; codec::CQL_MAX_CLUSTERING];
+        let ck = ClusteringKey {
+            types: &cl_types[..ckn],
+            values: &cl_vals[..ckn],
+            directions: &cl_dirs[..ckn],
         };
         let Some(n) = models::encode_wide_clustering_prefix(
             &mut prefix_body,
             table_id,
             &pk_bytes[..pk_len],
-            &empty,
+            &ck,
         ) else {
             reply_error(anchor, codec::ERR_SERVER, b"internal");
             return;
@@ -1692,8 +2069,7 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
             cql_op::STARTUP => {
                 let mut out = [0u8; 64];
                 if let Some(n) = codec::ready(stream, &mut out) {
-                    let f = out[..n].to_vec_bounded();
-                    send_to_slot(anchor, idx, &f[..n.min(128)]);
+                    send_to_slot(anchor, idx, &out[..n]);
                     if anchor.slots[idx].state == S_WAIT_STARTUP {
                         anchor.slots[idx].state = S_READY;
                     }
@@ -1702,9 +2078,7 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
             cql_op::OPTIONS => {
                 let mut out = [0u8; 256];
                 if let Some(n) = codec::supported(stream, &mut out) {
-                    let mut f = [0u8; 256];
-                    f[..n].copy_from_slice(&out[..n]);
-                    send_to_slot(anchor, idx, &f[..n]);
+                    send_to_slot(anchor, idx, &out[..n]);
                 }
             }
             cql_op::QUERY => match codec::parse_query(&body[..blen]) {
@@ -1725,8 +2099,7 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
                         b"parameters and paging are not supported",
                         &mut out,
                     ) {
-                        let f = out.to_vec_bounded();
-                        send_to_slot(anchor, idx, &f[..n.min(128)]);
+                        send_to_slot(anchor, idx, &out[..n]);
                     }
                 }
             },
@@ -1735,8 +2108,7 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
                 if let Some(n) =
                     codec::error(stream, codec::ERR_PROTOCOL, b"unsupported opcode", &mut out)
                 {
-                    let f = out.to_vec_bounded();
-                    send_to_slot(anchor, idx, &f[..n.min(128)]);
+                    send_to_slot(anchor, idx, &out[..n]);
                 }
             }
         }
@@ -1746,52 +2118,56 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
 unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
     match msg_type {
         NET_MSG_BOUND => {
-            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // BOUND payload: [conn_id:u16 LE][local_port:u16 LE].
+            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = payload[0];
+                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                     anchor.phase = PHASE_LISTENING;
                 }
-            } else if anchor.phase == PHASE_WAIT_BOUND && !payload.is_empty() {
-                anchor.server_conn_id = payload[0];
+            } else if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= NET_CONN_LEN {
+                // Single-anchor provider (no port in payload): claim
+                // the first BOUND we see.
+                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                 anchor.phase = PHASE_LISTENING;
             }
         }
         NET_MSG_ACCEPTED => {
-            if payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // ACCEPTED payload: [conn_id:u16 LE][local_port:u16 LE].
+            if payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port != anchor.listen_port {
                     return;
                 }
             }
-            if !payload.is_empty() {
-                let new_id = payload[0];
+            if let Some(new_id) = net_conn_id(payload) {
                 if anchor.alloc_slot(new_id).is_none() {
                     let _ = net_send(anchor, NET_CMD_CLOSE, new_id, &[]);
                 }
             }
         }
         NET_MSG_DATA => {
-            if payload.len() >= 2 {
-                let conn_id = payload[0];
-                let data = &payload[1..];
-                if let Some(idx) = anchor.find_slot(conn_id) {
-                    let slot = &mut anchor.slots[idx];
-                    let room = RECV_BUF - slot.recv_len;
-                    if data.len() > room {
-                        slot.state = S_CLOSING;
-                    } else {
-                        let at = slot.recv_len;
-                        slot.recv[at..at + data.len()].copy_from_slice(data);
-                        slot.recv_len += data.len();
-                        drain_slot(anchor, idx);
+            if payload.len() > NET_CONN_LEN {
+                if let Some(conn_id) = net_conn_id(payload) {
+                    let data = &payload[NET_CONN_LEN..];
+                    if let Some(idx) = anchor.find_slot(conn_id) {
+                        let slot = &mut anchor.slots[idx];
+                        let room = RECV_BUF - slot.recv_len;
+                        if data.len() > room {
+                            slot.state = S_CLOSING;
+                        } else {
+                            let at = slot.recv_len;
+                            slot.recv[at..at + data.len()].copy_from_slice(data);
+                            slot.recv_len += data.len();
+                            drain_slot(anchor, idx);
+                        }
                     }
                 }
             }
         }
         NET_MSG_CLOSED | NET_MSG_ERROR => {
-            if !payload.is_empty() {
-                if let Some(idx) = anchor.find_slot(payload[0]) {
+            if let Some(conn_id) = net_conn_id(payload) {
+                if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }
             }
@@ -1887,6 +2263,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
+    // Statement watchdog: an in-flight statement whose KV reply was
+    // lost must not hold the whole anchor busy forever.
+    if anchor.d_phase != D_IDLE {
+        let now = unsafe { dev_millis(&*anchor.syscalls) };
+        if anchor.stmt_deadline_ms != 0 && now > anchor.stmt_deadline_ms {
+            anchor.m_stmt_timeouts = anchor.m_stmt_timeouts.wrapping_add(1);
+            reply_error(anchor, codec::ERR_SERVER, b"statement timeout");
+        }
+    }
+
     for idx in 0..MAX_CONNS {
         if anchor.slots[idx].conn_id == SLOT_FREE {
             continue;
@@ -1957,6 +2343,17 @@ unsafe fn read_one_envelope<'a>(
     }
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     if payload_len > scratch.len() {
+        // Drain the oversized payload to stay frame-aligned: leaving it
+        // in the channel would desync every subsequent read.
+        let mut left = payload_len;
+        let mut sink = [0u8; 256];
+        while left > 0 {
+            let take = left.min(sink.len());
+            if ((sys.channel_read)(chan, sink.as_mut_ptr(), take) as usize) < take {
+                break;
+            }
+            left -= take;
+        }
         return None;
     }
     if payload_len > 0

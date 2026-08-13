@@ -11,8 +11,9 @@ description = "Off-DUT benchmark harness for lattice: open-loop per-protocol loa
 # lib.rs (ported verbatim from clustor-bench).
 
 # Tool-shaped package: prints JSON to stdout, unwraps on arg parsing. Mirrors
-# clustor-bench's [lints] override; exempted from the workspace-lint opt-in
-# audit via [[ci.lints.exemption]] in fluxor.toml.
+# clustor-bench's [lints] override. A standalone crate (its own [workspace]) —
+# with no root workspace there is nothing to opt into, so this relaxed [lints]
+# block is the whole story; tools/ci/host_crates.sh fmt/clippy/builds it.
 [lints.rust]
 unsafe_code               = "forbid"
 unused_must_use           = "deny"

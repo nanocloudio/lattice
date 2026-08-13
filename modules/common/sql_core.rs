@@ -573,6 +573,11 @@ impl<'a> CreateTable<'a> {
 
 pub struct Insert<'a> {
     pub table: &'a [u8],
+    /// `INSERT OR REPLACE`: skip the duplicate-key refusal and write the
+    /// row unconditionally (an MVCC put — a replaced row gets a NEW
+    /// commit timestamp, so a CDC feed sees the resubmission as a fresh
+    /// event). Plain INSERT semantics are unchanged.
+    pub or_replace: bool,
     /// Explicit column list, empty when the statement used positional
     /// `VALUES` over every column.
     cols: [&'a [u8]; MAX_LIST_COLS],
@@ -732,10 +737,9 @@ pub struct Select<'a> {
     pub distinct: bool,
     /// `OFFSET n` — skip the first `n` result rows (after ORDER BY).
     pub offset: Option<u32>,
-    /// `ORDER BY col [ASC|DESC]`, if given. The executor accepts it only
-    /// when `column` is the single-column primary key and `desc` is false,
-    /// because the store returns a range in ascending key order already;
-    /// any other ordering is refused rather than silently ignored.
+    /// `ORDER BY col [ASC|DESC]`, if given. The executor sorts staged rows
+    /// by the column's order-preserving encoding, so ANY resolvable column
+    /// works in either direction (an unresolvable column is refused).
     pub order: Option<OrderBy<'a>>,
     /// `LIMIT n`, if given.
     pub limit: Option<u32>,
@@ -1326,10 +1330,17 @@ fn literal<'a>(p: &mut Parser<'a>) -> Result<Literal<'a>, SqlError> {
 }
 
 fn parse_insert<'a>(p: &mut Parser<'a>) -> Result<Statement<'a>, SqlError> {
+    let or_replace = if p.eat_kw(b"or")? {
+        p.expect_kw(b"replace")?;
+        true
+    } else {
+        false
+    };
     p.expect_kw(b"into")?;
     let table = p.table_name()?;
     let mut ins = Insert {
         table,
+        or_replace,
         cols: [b""; MAX_LIST_COLS],
         col_count: 0,
         rows: [[Literal::Null; MAX_LIST_COLS]; MAX_INSERT_ROWS],

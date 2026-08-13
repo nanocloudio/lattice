@@ -57,8 +57,8 @@ mod types;
 mod wire;
 
 use wire::{
-    MSG_COMPACTION_FLOOR, MSG_GC_FLOOR_COMMITTED, MSG_GC_FLOOR_PROPOSE, MSG_RETENTION_CLAIM,
-    MSG_RETENTION_FLOOR,
+    LATTICE_RECORD_TAG, MSG_CLIENT_PROPOSAL, MSG_COMPACTION_FLOOR, MSG_GC_FLOOR_COMMITTED,
+    MSG_GC_FLOOR_PROPOSE, MSG_RETENTION_CLAIM, MSG_RETENTION_FLOOR,
 };
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
@@ -110,6 +110,19 @@ define_params! {
     // sources that exist today: active-read (bit 0) + operator (bit 1).
     3, required_sources, u8, 3
         => |s, d, len| { s.required_sources = p_u8(d, len, 0, 3); };
+
+    // 1 = wrap proposals for `gateway.client_requests` as
+    // `MSG_CLIENT_PROPOSAL [conn=0][LATTICE_RECORD_TAG]
+    // [MSG_GC_FLOOR_COMMITTED][GcFloorRecord]` — the timestamp
+    // allocator's propose_wrap pattern. The embedded record type is
+    // COMMITTED (not PROPOSE) by the wire contract's byte-identical
+    // rule: the committed entry demuxed at `lattice_apply_bridge`
+    // re-emits with that type on `records_out`, which is exactly what
+    // `kv_state_worker.durability` and this module's `gc_committed_in`
+    // consume. 0 = bare `MSG_GC_FLOOR_PROPOSE` envelopes (the
+    // contract-test surface).
+    4, propose_wrap, u32, 0
+        => |s, d, len| { s.propose_wrap = p_u32(d, len, 0, 0); };
 }
 
 #[repr(C)]
@@ -122,6 +135,10 @@ struct CompState {
     lease_floor_in: i32,
     claims_in: i32,
     gc_committed_in: i32,
+    logged_hw: bool,
+    logged_claim: bool,
+    logged_prop: bool,
+    logged_commit: bool,
     // Dedicated `metrics` output port (output index 1), and the GC
     // proposal port (output index 2).
     metrics_out: i32,
@@ -132,6 +149,7 @@ struct CompState {
     proposer_id: u32,
     required_sources: u8,
     _pad: [u8; 3],
+    propose_wrap: u32,
 
     // Phase-14 counters (ids follow manifest `[observability] metrics`).
     m_updates: u64,
@@ -154,9 +172,14 @@ impl CompState {
         self.lease_floor_in = -1;
         self.claims_in = -1;
         self.gc_committed_in = -1;
+        self.logged_hw = false;
+        self.logged_claim = false;
+        self.logged_prop = false;
+        self.logged_commit = false;
         self.metrics_out = -1;
         self.gc_propose_out = -1;
         self.operator_retain_revisions = u32::MAX;
+        self.propose_wrap = 0;
         self.proposer_id = 1;
         self.required_sources = DEFAULT_REQUIRED_SOURCES;
         self._pad = [0; 3];
@@ -284,6 +307,10 @@ unsafe fn handle(s: &mut CompState, sys: &SyscallTable, mt: u8, body: &[u8]) {
             if let Some(claim) = RetentionClaim::decode(body) {
                 if s.claims.observe_claim(&claim) {
                     s.m_claims += 1;
+                    if !s.logged_claim {
+                        s.logged_claim = true;
+                        dev_log(sys, 3, b"[coor] claim".as_ptr(), 12);
+                    }
                 }
             }
         }
@@ -294,6 +321,10 @@ unsafe fn handle(s: &mut CompState, sys: &SyscallTable, mt: u8, body: &[u8]) {
         MSG_TS_LEASE if body.len() == LEASE_WIRE_LEN => {
             if let Some(lease) = TimestampLease::decode(body) {
                 s.claims.observe_high_water(lease.high_water());
+                if !s.logged_hw {
+                    s.logged_hw = true;
+                    dev_log(sys, 3, b"[coor] hw est".as_ptr(), 13);
+                }
             }
         }
         // The committed decision. This is the one path that advances
@@ -303,6 +334,10 @@ unsafe fn handle(s: &mut CompState, sys: &SyscallTable, mt: u8, body: &[u8]) {
             if let Some(rec) = GcFloorRecord::decode(body) {
                 if let Some(floor) = s.claims.observe_committed_floor(&rec) {
                     s.m_commits += 1;
+                    if !s.logged_commit {
+                        s.logged_commit = true;
+                        dev_log(sys, 3, b"[coor] committed".as_ptr(), 16);
+                    }
                     let mut out = [0u8; 10];
                     out[0..2].copy_from_slice(&rec.kpg_id.to_le_bytes());
                     out[2..10].copy_from_slice(&floor.to_le_bytes());
@@ -312,6 +347,33 @@ unsafe fn handle(s: &mut CompState, sys: &SyscallTable, mt: u8, body: &[u8]) {
         }
         _ => {}
     }
+}
+
+/// Write one GC floor proposal on `gc_propose_out` — bare
+/// (`MSG_GC_FLOOR_PROPOSE`, the contract-test surface) or, with
+/// `propose_wrap`, wrapped for clustor's gateway as
+/// `MSG_CLIENT_PROPOSAL [conn_id=0][LATTICE_RECORD_TAG]
+/// [MSG_GC_FLOOR_COMMITTED][record…]` so the committed entry demuxes
+/// at `lattice_apply_bridge.records_out` with exactly the envelope
+/// the worker and this module's committed input consume.
+unsafe fn write_gc_proposal(s: &mut CompState, sys: &SyscallTable, record: &[u8]) -> bool {
+    if s.propose_wrap == 0 {
+        return write_envelope(sys, s.gc_propose_out, MSG_GC_FLOOR_PROPOSE, record);
+    }
+    let payload_len = 3 + record.len();
+    let total = 3 + payload_len;
+    let mut buf = [0u8; 3 + 3 + GC_FLOOR_WIRE_LEN];
+    if total > buf.len() {
+        return false;
+    }
+    buf[0] = MSG_CLIENT_PROPOSAL;
+    buf[1] = (payload_len & 0xFF) as u8;
+    buf[2] = ((payload_len >> 8) & 0xFF) as u8;
+    buf[3] = 0; // conn_id: coordinator-originated, no client connection
+    buf[4] = LATTICE_RECORD_TAG;
+    buf[5] = MSG_GC_FLOOR_COMMITTED;
+    buf[6..6 + record.len()].copy_from_slice(record);
+    (sys.channel_write)(s.gc_propose_out, buf.as_mut_ptr(), total) == total as i32
 }
 
 /// Re-publish the locally configured operator claim, then try to
@@ -347,10 +409,12 @@ unsafe fn evaluate(s: &mut CompState, sys: &SyscallTable, now_ms: u64) {
         match s.claims.plan_propose(kpg_id, now_ms, s.proposer_id) {
             Ok(rec) => {
                 let mut buf = [0u8; GC_FLOOR_WIRE_LEN];
-                if rec.encode(&mut buf).is_some()
-                    && write_envelope(sys, s.gc_propose_out, MSG_GC_FLOOR_PROPOSE, &buf)
-                {
+                if rec.encode(&mut buf).is_some() && write_gc_proposal(s, sys, &buf) {
                     s.m_proposals += 1;
+                    if !s.logged_prop {
+                        s.logged_prop = true;
+                        dev_log(sys, 3, b"[coor] proposed".as_ptr(), 15);
+                    }
                 } else {
                     // The proposal never left; do not sit in
                     // `AwaitingCommit` waiting for a confirmation that

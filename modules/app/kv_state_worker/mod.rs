@@ -94,18 +94,21 @@ use fs_run_storage::FsRunStorage;
 use kv_store::disk_store::state_store::{
     KvStateStore, Progress, SnapshotChunk, SnapshotRequest, StoreError,
 };
-use kv_store::disk_store::{DiskState, DiskStore};
+use kv_store::disk_store::{
+    DiskState, DiskStore, SNAP_FLAG_DISK_RESIDENT, SNAP_FORMAT_VERSION, SNAP_HDR_LEN, SNAP_MAGIC,
+};
 use kv_store::{DiskMaterializer, KvStore, Materializer};
 use types::{
     KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS, KV_OP_FLUSH, KV_OP_GET,
-    KV_OP_GET_AT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE,
-    KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD,
-    KV_OP_TXN_RESOLVE, KV_RESULT_INTEGER, KV_RESULT_OK,
+    KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT,
+    KV_OP_RANGE, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE,
+    KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_INTEGER, KV_RESULT_OK,
 };
 use wire::{
     APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_REQUEST,
     MSG_APP_SNAPSHOT_RESET, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND,
-    MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_WATCH_EVENT,
+    MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REQUEST,
+    MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
 };
 
 #[path = "../../common/compaction_floor.rs"]
@@ -115,6 +118,34 @@ use compaction_floor::{
 };
 
 const SCRATCH_BUF_SIZE: usize = 8192;
+
+// ── MVCC commit-timestamp assignment ────────────────────
+
+/// Does this op consume one commit timestamp from the worker lease?
+/// The mutating command set, minus the cross-range transaction ops:
+/// resolve stamps its versions from the transaction's own commit
+/// timestamp (carried in the resolve record), and prepare/record write
+/// only staged intents / txn records, which are not user-visible
+/// versions. One timestamp per COMMAND — a multi-key MSET or a TXN's
+/// sub-writes share it. FLUSH is included: it deletes every key as
+/// versioned tombstones, so it produces user-visible versions and
+/// consumes a timestamp like any multi-key mutation.
+const fn op_consumes_timestamp(op: u8) -> bool {
+    matches!(
+        op,
+        KV_OP_PUT
+            | KV_OP_DELETE
+            | KV_OP_INCR
+            | KV_OP_DECR
+            | KV_OP_APPEND
+            | KV_OP_PREPEND
+            | KV_OP_MSET
+            | KV_OP_CAS
+            | KV_OP_TXN
+            | KV_OP_FLUSH
+            | KV_OP_IDEMPOTENT
+    )
+}
 
 // ── state_store provider selection (see module docs) ──────────────────
 
@@ -142,6 +173,15 @@ const DISK_PHASE_QUARANTINED: u8 = 2;
 /// `recover()` failing hard still quarantines immediately, because
 /// there the fault means the on-disk state did not validate.
 const DISK_HARD_FAULT_BUDGET: u32 = 64;
+
+/// Run count at which the SERVING phase arms a space-driven background
+/// merge (same merge a full run set forces, same floor — pure run-count
+/// hygiene). Bounds the READ side: a version scan walks every run's
+/// blocks in one step, so per-scan cost scales with run count and an
+/// unmerged store eventually crosses the module step deadline (measured
+/// on the pi5 rig: terminated worker, "storage unavailable"). Three
+/// keeps steady-state scans at one-or-two runs plus the memtable.
+const RUN_MERGE_THRESHOLD: usize = 3;
 
 /// Consecutive steps an exclusion fence may hold off the write path
 /// **without any storage progress** before the worker force-releases it.
@@ -367,6 +407,34 @@ struct WorkerState {
     gc_claim_mode: u8,
     gc_claim_kpg: u16,
     _gc_pad: u8,
+
+    // ── MVCC commit-timestamp assignment ────────────
+    /// Next unassigned commit timestamp from the current in-band
+    /// worker lease, and the lease's exclusive end. Assignment order
+    /// IS committed-log order (grants and commands share the commands
+    /// channel), so every replica and every replay assigns the same
+    /// timestamp to the same command — this is derived-from-log state,
+    /// deliberately not persisted anywhere.
+    ts_lease_next: u64,
+    ts_lease_end: u64,
+    /// Output port for demand-driven lease requests to the allocator
+    /// (unreplicated hint; the grant comes back replicated, in-band).
+    lease_request_out: i32,
+    /// Step stamp of the last request sent, for bounded retry.
+    ts_request_step: u64,
+    /// Free-running step counter (drives the retry cadence).
+    step_ctr_ts: u64,
+    /// The range's commit-timestamp frontier: highest
+    /// commit timestamp bound to any applied write, monotone by
+    /// construction with in-band lease assignment. Reported on every
+    /// `MSG_KV_APPLIED` head; derived from the log, never persisted.
+    ts_frontier: u64,
+    /// Write commands stamped with a real timestamp (manifest id 20).
+    m_ts_stamped: u64,
+    /// Write commands applied with no timestamp available — lease
+    /// exhausted or never granted (manifest id 21). Non-zero under
+    /// steady load means the allocator cadence is undersized.
+    m_ts_unstamped: u64,
     /// Consecutive steps the disk provider has spent unable to make
     /// storage progress (flush/compact failing, or `recover()` still
     /// waiting on the FS provider). Reset by any success. Drives both
@@ -450,6 +518,13 @@ struct WorkerState {
     m_applied: u64,
     m_reads: u64,
     m_snapshot_chunks: u64,
+    /// App-snapshot captures REFUSED (no chunks emitted): a memory-store
+    /// body over the export budget, or a disk store with nothing durably
+    /// covered yet. The WAL stays authoritative either way; this counter
+    /// is the accounted capacity denial that makes the refusal visible
+    /// (durability's side sees only a capture timeout).
+    m_snapshot_refusals: u64,
+    snap_refusal_logged: bool,
     step_ctr: u64,
 
     import_buf: [u8; SNAPSHOT_BODY_MAX],
@@ -482,6 +557,8 @@ impl WorkerState {
         self.m_applied = 0;
         self.m_reads = 0;
         self.m_snapshot_chunks = 0;
+        self.m_snapshot_refusals = 0;
+        self.snap_refusal_logged = false;
         self.step_ctr = 0;
         self.state_store = STATE_STORE_MEMORY;
         self.root_path = 0;
@@ -516,6 +593,14 @@ impl WorkerState {
         self.disk_fence_aborts = 0;
         self.disk_observe_ms = 0;
         self.disk_heartbeat_ms = 0;
+        self.ts_lease_next = 0;
+        self.ts_lease_end = 0;
+        self.lease_request_out = -1;
+        self.ts_request_step = 0;
+        self.step_ctr_ts = 0;
+        self.ts_frontier = 0;
+        self.m_ts_stamped = 0;
+        self.m_ts_unstamped = 0;
         self.store.init();
         self.disk_state.init();
     }
@@ -530,6 +615,16 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         // Fail closed: a disk store that has not recovered (or has
         // quarantined on a storage fault) never serves. Commands stay
         // queued so backpressure propagates upstream.
+        return false;
+    }
+    if worker.importing {
+        // A snapshot install (boot restore or leader catch-up) is mid-
+        // stream: the ctl channel drains ONE frame per step, so the
+        // WAL-tail commands that follow the snapshot may already be
+        // queued here. Hold them (backpressure) until the install
+        // completes — applying a tail command before the adoption
+        // re-seeds the revision clock would materialize it below the
+        // store's high-water.
         return false;
     }
     let sys = &*sys_ptr;
@@ -564,6 +659,59 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         if index > worker.applied_index {
             worker.applied_term = term;
             worker.applied_index = index;
+            if worker.state_store == STATE_STORE_DISK {
+                // Stamp the store's pending applied position: every
+                // command ahead of this marker is in the memtable, so
+                // the NEXT flush's frozen prefix covers exactly this
+                // position and the manifest publish records it.
+                worker.disk_state.pending_applied_index = index;
+                worker.disk_state.pending_applied_term = term;
+            }
+        }
+        return true;
+    }
+    if hdr[0] == MSG_TS_LEASE_GRANT {
+        // In-band replicated worker lease, forwarded by
+        // lattice_apply_bridge in committed-log order:
+        // `[corr_id:u64 = 0][TimestampLease:40]`. Arriving HERE, on the
+        // commands channel, is the contract — the lease takes effect
+        // exactly between the commands it was committed between, so
+        // per-write timestamp assignment below is a pure function of
+        // the log on every replica and every replay.
+        if payload_len != TS_LEASE_GRANT_WIRE_LEN || payload_len > SCRATCH_BUF_SIZE {
+            return false;
+        }
+        let mut grant = [0u8; TS_LEASE_GRANT_WIRE_LEN];
+        if ((sys.channel_read)(
+            worker.commands_in,
+            grant.as_mut_ptr(),
+            TS_LEASE_GRANT_WIRE_LEN,
+        ) as usize)
+            < TS_LEASE_GRANT_WIRE_LEN
+        {
+            return false;
+        }
+        // TimestampLease wire (mvcc.rs): version:u16 @0, payload_len:u16
+        // @2, interval_start:u64 @12, interval_end:u64 @20 — offsets
+        // within the 40-byte lease, which begins at byte 8 of the frame.
+        let lease = &grant[8..];
+        let version = u16::from_le_bytes([lease[0], lease[1]]);
+        let start = u64::from_le_bytes([
+            lease[12], lease[13], lease[14], lease[15], lease[16], lease[17], lease[18], lease[19],
+        ]);
+        let end = u64::from_le_bytes([
+            lease[20], lease[21], lease[22], lease[23], lease[24], lease[25], lease[26], lease[27],
+        ]);
+        // Adopt only forward: a well-formed successor lease always
+        // starts at or above the previous one's end (allocator §10
+        // succession), so anything else is a duplicate or corruption
+        // and is dropped rather than rewound — a timestamp domain must
+        // never move backwards.
+        if version == 1 && start < end && start >= worker.ts_lease_end {
+            // Timestamp 0 is the "no timestamp" sentinel; a lease that
+            // covers it starts issuing at 1.
+            worker.ts_lease_next = start.max(1);
+            worker.ts_lease_end = end;
         }
         return true;
     }
@@ -630,6 +778,40 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         consistency,
         read_timestamp: 0,
     };
+    // MVCC commit-timestamp assignment. Precedence:
+    // a non-zero head timestamp (stamped into the committed bytes by
+    // the proposer) wins; otherwise mutating commands consume the next
+    // timestamp from the in-band worker lease, in log order. The
+    // cross-range resolve path is deliberately NOT in the consuming
+    // set: its versions carry the transaction's own commit timestamp
+    // from the resolve record (`apply_txn_resolve` re-binds it), and
+    // prepare's staged intents are not user-visible versions.
+    let commit_ts = if head.commit_ts != 0 {
+        head.commit_ts
+    } else if op_consumes_timestamp(op) {
+        if worker.ts_lease_next != 0 && worker.ts_lease_next < worker.ts_lease_end {
+            let ts = worker.ts_lease_next;
+            worker.ts_lease_next += 1;
+            worker.m_ts_stamped = worker.m_ts_stamped.wrapping_add(1);
+            ts
+        } else {
+            worker.m_ts_unstamped = worker.m_ts_unstamped.wrapping_add(1);
+            0
+        }
+    } else if op == KV_OP_TXN_RESOLVE && body.len() >= 45 {
+        // The resolve record carries the transaction's own commit
+        // timestamp at body[37..45]; the engine re-binds it per staged
+        // op (`apply_txn_resolve`). Peeked here only so the frontier
+        // accounts for it.
+        u64::from_le_bytes([
+            body[37], body[38], body[39], body[40], body[41], body[42], body[43], body[44],
+        ])
+    } else {
+        0
+    };
+    if commit_ts > worker.ts_frontier {
+        worker.ts_frontier = commit_ts;
+    }
     // ONE semantic engine (`kv_store::apply_mat_ctx`), provider selected
     // at graph construction: the interpreter is identical on both arms —
     // only the physical materializer differs.
@@ -638,6 +820,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         let mut mat = DiskMaterializer::new(store, worker.disk_revision, worker.disk_replay_floor);
         mat.flush_wanted = worker.disk_flush_wanted;
         mat.set_key_identity(id_tenant, id_database, id_keyspace);
+        mat.set_commit_ts(commit_ts);
         let (r, n) = kv_store::apply_mat_ctx(&mut mat, op, body, &mut result_body, now_ms, policy);
         worker.disk_revision = mat.revision;
         worker.disk_flush_wanted = mat.flush_wanted;
@@ -690,6 +873,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         worker
             .store
             .set_key_identity(id_tenant, id_database, id_keyspace);
+        worker.store.set_commit_ts(commit_ts);
         let (r, n) = kv_store::apply_mat_ctx(
             &mut worker.store,
             op,
@@ -756,6 +940,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         conn_id,
         result,
         revision: result_revision,
+        commit_frontier: worker.ts_frontier,
         body_len: result_body_len as u16,
     }
     .encode(&mut scratch[3..]);
@@ -1050,6 +1235,7 @@ pub extern "C" fn module_new(
         worker.compaction_floor_out = dev_channel_port(sys, 1, 2);
         worker.snapshot_export_out = dev_channel_port(sys, 1, 3);
         worker.metrics_out = dev_channel_port(sys, 1, 4);
+        worker.lease_request_out = dev_channel_port(sys, 1, 5);
     }
     0
 }
@@ -1104,6 +1290,47 @@ const DRAIN_BUDGET_US: u64 = 1500;
 /// would point at the read path's merge over run files.
 const DRAIN_LOG_US: u64 = 5000;
 
+/// Demand-driven commit-timestamp lease refill. When the
+/// in-band lease runs low, ask the allocator for the next one. The
+/// request is an unreplicated HINT — lost requests are retried on a
+/// bounded cadence, and the grant itself arrives replicated on the
+/// commands channel, so restarts and failovers need no special case.
+/// An idle worker with reserve left sends nothing, which is what keeps
+/// an idle graph's log quiet.
+unsafe fn maybe_request_ts_lease(worker: &mut WorkerState) {
+    /// Ask when fewer than this many timestamps remain.
+    const TS_LOW_WATER: u64 = 16384;
+    /// Lease size requested (allocator clamps to its own bounds).
+    const TS_REQUEST_SIZE: u32 = 65536;
+    /// Steps between retries while low (~0.5 s at the 1 ms tick).
+    const TS_REQUEST_RETRY_STEPS: u64 = 500;
+
+    worker.step_ctr_ts = worker.step_ctr_ts.wrapping_add(1);
+    if worker.lease_request_out < 0 || worker.syscalls.is_null() {
+        return;
+    }
+    let remaining = worker.ts_lease_end.saturating_sub(worker.ts_lease_next);
+    if remaining >= TS_LOW_WATER {
+        return;
+    }
+    if worker.ts_request_step != 0
+        && worker.step_ctr_ts.wrapping_sub(worker.ts_request_step) < TS_REQUEST_RETRY_STEPS
+    {
+        return;
+    }
+    worker.ts_request_step = worker.step_ctr_ts;
+    let sys = &*worker.syscalls;
+    // MSG_TS_LEASE_REQUEST [corr_id:u64][requester:u32][size:u32].
+    let mut frame = [0u8; 3 + 16];
+    frame[0] = MSG_TS_LEASE_REQUEST;
+    frame[1] = 16;
+    frame[2] = 0;
+    frame[3..11].copy_from_slice(&worker.step_ctr_ts.to_le_bytes());
+    frame[11..15].copy_from_slice(&1u32.to_le_bytes());
+    frame[15..19].copy_from_slice(&TS_REQUEST_SIZE.to_le_bytes());
+    let _ = (sys.channel_write)(worker.lease_request_out, frame.as_mut_ptr(), frame.len());
+}
+
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -1123,11 +1350,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // which is exactly the blackout this replaced.
             disk_observe(worker);
             disk_maintenance(worker);
+            drain_retirements(worker);
         }
         drain_epoch_events(worker);
         drain_snapshot_ctl(worker);
         drain_gc_floor(worker);
         publish_retention_claim(worker);
+        maybe_request_ts_lease(worker);
     }
     let drain_t0 = unsafe { now_us(worker) };
     let scans0 = worker.disk_state.scans_opened.get();
@@ -1255,6 +1484,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 worker.metrics_out,
                 &[worker.m_applied, worker.m_reads, worker.m_snapshot_chunks],
             );
+            // App-snapshot refusal counter (id 22) — the memory store
+            // is exactly where an over-budget body can refuse.
+            emit_counters_at(
+                &*worker.syscalls,
+                worker.metrics_out,
+                22,
+                &[worker.m_snapshot_refusals],
+            );
             // Memory mode reports its effective config too — a scrape
             // must never have to infer the provider from an ABSENCE.
             emit_effective_config_gauges(
@@ -1340,14 +1577,18 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                 store.recover().is_ok()
             };
             if recovered {
-                // Replay idempotence (RFC §4.3): the WAL re-feeds the
-                // committed stream from the start, so the engine
-                // revision counter restarts at 0 and is recomputed
-                // deterministically over the replayed commands, while
-                // writes the materialization already reflects (ts at
-                // or below the recovered high-water, verified
-                // byte-for-byte) are suppressed and reads serve
-                // as-of the replay position. See DiskMaterializer.
+                // Replay idempotence (RFC §4.3): seed the clock for a
+                // FULL replay — the WAL re-feeds the committed stream
+                // from the start, the revision counter restarts at 0
+                // and is recomputed deterministically over the
+                // replayed commands, and writes the materialization
+                // already reflects (ts at or below the recovered
+                // high-water, verified byte-for-byte) are suppressed.
+                // If the WAL was instead TRUNCATED behind a snapshot
+                // marker, durability installs that marker (RESET +
+                // chunk) before replaying the tail, and the adoption
+                // path re-seeds the clock at the high-water so the
+                // tail's commands recompute their original revisions.
                 worker.disk_replay_floor = worker.disk_state.highest_revision;
                 worker.disk_revision = 0;
                 worker.disk_phase = DISK_PHASE_SERVING;
@@ -1390,6 +1631,26 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                 worker.disk_compact_active = true;
                 worker.disk_compact_cursor = 0;
                 worker.disk_compact_floor = worker.gc_committed_floor;
+            }
+            // Space-driven BACKGROUND merge, armed well before the run set
+            // fills. Without it runs only ever merge at MAX_RUNS (a refused
+            // flush) or on a committed GC floor (which needs GC enablement),
+            // so on a steady write trickle the run count grows without bound
+            // — and the READ side pays for it: a SCAN_VERSIONS drain walks
+            // every run's blocks in ONE step, and on the pi5 rig that walk
+            // was MEASURED crossing the step-deadline ceiling (17.6 ms at
+            // runs=1 growing with count) and getting the module TERMINATED
+            // ("storage unavailable" with a healthy front half). Merging at
+            // 3 runs keeps per-scan work bounded by a constant. Same merge
+            // the MAX_RUNS branch runs: floor already in force, reclaims
+            // nothing, pure run-count hygiene.
+            if !worker.disk_flush_active
+                && !worker.disk_compact_active
+                && worker.disk_state.run_count as usize >= RUN_MERGE_THRESHOLD
+            {
+                worker.disk_compact_active = true;
+                worker.disk_compact_cursor = 0;
+                worker.disk_compact_floor = worker.disk_state.compaction_floor;
             }
             if worker.disk_compact_active && !worker.disk_flush_active {
                 // Pinned at start — the provider refuses a mid-flight
@@ -1639,6 +1900,36 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
     }
 }
 
+/// Drain ONE queued retired-run deletion per step, only when no other
+/// storage action ran. Each FAT32 delete frees a whole cluster chain
+/// synchronously (~35 ms on the rig), which is why they queue instead
+/// of running inside the compaction's manifest-adoption step.
+unsafe fn drain_retirements(worker: &mut WorkerState) {
+    if worker.state_store != STATE_STORE_DISK
+        || worker.disk_phase != DISK_PHASE_SERVING
+        || worker.disk_flush_active
+        || worker.disk_flush_wanted
+        || worker.disk_compact_active
+        || worker.disk_state.retire_count == 0
+    {
+        return;
+    }
+    let t0 = now_us(worker);
+    let outcome = {
+        let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+        store.retire_step()
+    };
+    let us = now_us(worker).wrapping_sub(t0);
+    let mut buf = [0u8; 96];
+    let mut n = write_prefix(&mut buf, 0, b"[kvw] disk retire us=");
+    n = write_dec(&mut buf, n, us);
+    n = write_prefix(&mut buf, n, b" ok=");
+    n = write_dec(&mut buf, n, u64::from(matches!(outcome, Ok(true))));
+    n = write_prefix(&mut buf, n, b" left=");
+    n = write_dec(&mut buf, n, u64::from(worker.disk_state.retire_count));
+    log_line(worker, &buf, n);
+}
+
 /// Bounded-starvation watchdog: enforce that no exclusion fence holds
 /// off the write path for more than `DISK_FENCE_STALL_BUDGET` steps.
 ///
@@ -1789,6 +2080,18 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
             worker.root_path,
             worker.store_id,
         );
+        // Commit-timestamp assignment counters (ids 20, 21) and the
+        // app-snapshot refusal counter (id 22).
+        emit_counters_at(
+            sys,
+            worker.metrics_out,
+            20,
+            &[
+                worker.m_ts_stamped,
+                worker.m_ts_unstamped,
+                worker.m_snapshot_refusals,
+            ],
+        );
     }
 
     if now.wrapping_sub(worker.disk_heartbeat_ms) < DISK_HEARTBEAT_LOG_MS {
@@ -1832,6 +2135,10 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     n = write_dec(&mut buf, n, worker.disk_flush_backpressure);
     n = write_prefix(&mut buf, n, b" cf=");
     n = write_dec(&mut buf, n, worker.disk_cmd_flush_faults);
+    // The committed GC floor (§18) — 0 means no floor has ever
+    // committed, i.e. the reclamation loop is NOT running.
+    n = write_prefix(&mut buf, n, b" gcf=");
+    n = write_dec(&mut buf, n, worker.gc_committed_floor);
     // Which exclusion fence (if any) is refusing writes right now, and
     // for how long — the direct readout of the starvation invariant.
     n = write_prefix(&mut buf, n, b" fence=");
@@ -2165,6 +2472,14 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
     if sys_ptr.is_null() || worker.snapshot_import_in < 0 {
         return;
     }
+    if worker.state_store == STATE_STORE_DISK && worker.disk_phase != DISK_PHASE_SERVING {
+        // Not safe to act on ANY snapshot-ctl message yet — and the
+        // boot-restore RESET from durability may already be queued.
+        // Leave the channel unread (backpressure) rather than draining
+        // and dropping: a consumed-then-ignored RESET would silently
+        // lose the whole boot restore.
+        return;
+    }
     let sys = &*sys_ptr;
     let poll = (sys.channel_poll)(worker.snapshot_import_in, POLL_IN);
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
@@ -2201,37 +2516,21 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             emit_snapshot_chunks(worker, sys);
         }
         MSG_APP_SNAPSHOT_RESET => {
-            // Discard state up front so a chunk stream that never
-            // completes can't leave a half-old, half-new store behind.
             if worker.state_store == STATE_STORE_DISK {
                 if worker.disk_phase != DISK_PHASE_SERVING {
                     return; // fail closed: not safe to install yet
                 }
-                // Begin the provider's REPLACE install with an empty
-                // first chunk: this destroys the on-disk
-                // materialization now (the §17.1 semantics) exactly as
-                // `store.init()` does for the memory table.
-                let req = SnapshotRequest {
-                    applied_index: index,
-                    range_generation: worker.disk_state.range_generation,
-                };
-                let started = {
-                    let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
-                    store.install(
-                        req,
-                        SnapshotChunk {
-                            offset: 0,
-                            data: &[],
-                            last: false,
-                        },
-                    )
-                };
-                if started.is_err() {
-                    // Busy (capture in flight) or storage fault: do not
-                    // start accumulating a stream we cannot install.
-                    return;
-                }
+                // NOTHING destructive here. The body may be a
+                // DISK-RESIDENT marker (the store already holds the
+                // state and must be ADOPTED, not destroyed), and which
+                // kind it is only becomes known once the stream header
+                // arrives — so the provider install (which destroys the
+                // materialization as its first act) is deferred to the
+                // completed stream in the CHUNK arm.
             } else {
+                // Memory table: discard up front so a chunk stream that
+                // never completes can't leave a half-old, half-new
+                // store behind (re-init is free here).
                 worker.store.init();
             }
             worker.applied_term = term;
@@ -2271,15 +2570,73 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             worker.import_len = offset + body_len;
             if done {
                 let total = worker.import_len;
+                // DISK-RESIDENT marker: the body certifies that the
+                // state up to its applied position lives in THIS
+                // node's manifest-named runs. Adopt the local store
+                // (identity-checked) instead of destroying it. A node
+                // whose local store doesn't match fails CLOSED: applied
+                // stays 0 and the store is untouched — it must catch up
+                // from the leader, not fabricate state.
+                if worker.state_store == STATE_STORE_DISK
+                    && total >= SNAP_HDR_LEN
+                    && u32::from_le_bytes([
+                        worker.import_buf[0],
+                        worker.import_buf[1],
+                        worker.import_buf[2],
+                        worker.import_buf[3],
+                    ]) == SNAP_MAGIC
+                    && u16::from_le_bytes([worker.import_buf[4], worker.import_buf[5]])
+                        == SNAP_FORMAT_VERSION
+                    && u16::from_le_bytes([worker.import_buf[6], worker.import_buf[7]])
+                        & SNAP_FLAG_DISK_RESIDENT
+                        != 0
+                {
+                    let hdr_gen = u32::from_le_bytes([
+                        worker.import_buf[16],
+                        worker.import_buf[17],
+                        worker.import_buf[18],
+                        worker.import_buf[19],
+                    ]);
+                    let adopted = worker.disk_phase == DISK_PHASE_SERVING
+                        && hdr_gen == worker.disk_state.range_generation
+                        && worker.disk_state.generation > 0;
+                    if adopted {
+                        // Keep the RESET's (term, index) and the store
+                        // exactly as recovered, and RESUME the revision
+                        // clock at the store's high-water: the WAL tail
+                        // beyond the marker replays on top, each command
+                        // recomputing the same revision it was
+                        // originally assigned (floor+1, floor+2, …).
+                        // Without the re-seed the clock restarts at the
+                        // tail and every run version sits invisibly
+                        // above the read horizon.
+                        worker.disk_revision = worker.disk_state.highest_revision;
+                        worker.disk_replay_floor = worker.disk_state.highest_revision;
+                    } else {
+                        worker.applied_term = 0;
+                        worker.applied_index = 0;
+                    }
+                    worker.importing = false;
+                    worker.import_len = 0;
+                    return;
+                }
                 let installed = if worker.state_store == STATE_STORE_DISK {
-                    // Finish the provider install begun at RESET: one
-                    // final chunk carrying the whole accumulated body.
-                    // The provider re-validates every record and
-                    // aborts to an EMPTY store on any inconsistency.
+                    // Full-fidelity body: run the provider's REPLACE
+                    // install as one self-starting final chunk (it
+                    // destroys the materialization first, re-validates
+                    // every record, and aborts to an EMPTY store on any
+                    // inconsistency).
                     let req = SnapshotRequest {
                         applied_index: worker.applied_index,
                         range_generation: worker.disk_state.range_generation,
                     };
+                    // Stamp BEFORE installing: the install flushes
+                    // through `flush_inner` when its staging memtable
+                    // fills, and every manifest those flushes publish
+                    // must carry the SNAPSHOT's applied position, not
+                    // whatever the store held before the RESET.
+                    worker.disk_state.pending_applied_index = worker.applied_index;
+                    worker.disk_state.pending_applied_term = worker.applied_term;
                     let outcome = {
                         let mut store =
                             DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
@@ -2309,7 +2666,7 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                 };
                 if installed {
                     // State now reflects the RESET's (term, index), which
-                    // we already adopted; nothing further to do.
+                    // we already adopted (pending pair stamped above).
                 } else {
                     // The failed install left the store EMPTY (both
                     // providers guarantee this), so there is no partial
@@ -2332,16 +2689,40 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
 /// fail-closed note on `drain_snapshot_ctl`.
 unsafe fn emit_snapshot_chunks(worker: &mut WorkerState, sys: &SyscallTable) {
     let mut body = [0u8; SNAPSHOT_BODY_MAX];
-    let encoded = if worker.state_store == STATE_STORE_DISK {
-        disk_snapshot_encode(worker, &mut body)
+    let (encoded, term, index) = if worker.state_store == STATE_STORE_DISK {
+        // The disk store's durable state cannot fit an app-snapshot
+        // body (16 KiB cap on the durability side) and does not need
+        // to: the manifest-named runs ARE the snapshot. Emit a
+        // DISK-RESIDENT marker labelled at the manifest's durable
+        // applied position — durability may compact the WAL below it
+        // because the runs alone reconstruct that prefix; the WAL tail
+        // beyond it stays authoritative for the memtable content.
+        (
+            disk_snapshot_marker(worker, &mut body),
+            worker.disk_state.durable_applied_term,
+            worker.disk_state.durable_applied_index,
+        )
     } else {
-        worker.store.snapshot_encode(&mut body)
+        (
+            worker.store.snapshot_encode(&mut body),
+            worker.applied_term,
+            worker.applied_index,
+        )
     };
     let Some(total) = encoded else {
+        // Accounted capacity denial — the fail-closed path is silent on
+        // the wire by design (durability re-requests on the next
+        // rotation), so the refusal must be visible HERE. The memory
+        // store's over-budget encode is the anomalous case and gets a
+        // one-shot log; a disk store refusing before its first durable
+        // flush is normal early-boot state.
+        worker.m_snapshot_refusals = worker.m_snapshot_refusals.wrapping_add(1);
+        if worker.state_store != STATE_STORE_DISK && !worker.snap_refusal_logged {
+            worker.snap_refusal_logged = true;
+            dev_log(sys, 2, b"[kvw] snap body over budget".as_ptr(), 27);
+        }
         return;
     };
-    let term = worker.applied_term;
-    let index = worker.applied_index;
     let mut sent = 0usize;
     loop {
         let chunk = (total - sent).min(SNAPSHOT_CHUNK_MAX);
@@ -2386,40 +2767,28 @@ unsafe fn emit_snapshot_chunks(worker: &mut WorkerState, sys: &SyscallTable) {
     }
 }
 
-/// Drive the disk provider's bounded snapshot capture to completion
-/// into `out` (the app-snapshot body buffer). Fails CLOSED like the
-/// memory `snapshot_encode`: a state too large for the export budget
-/// aborts the capture (releasing the provider's capture fence) and
-/// returns `None` — no chunks at all, the WAL stays authoritative.
-unsafe fn disk_snapshot_encode(worker: &mut WorkerState, out: &mut [u8]) -> Option<usize> {
-    if worker.disk_phase != DISK_PHASE_SERVING {
+/// Build the DISK-RESIDENT marker body (one snapshot-stream header,
+/// `SNAP_FLAG_DISK_RESIDENT` set, zero entries) certifying that the
+/// state up to the manifest's durable applied position lives in this
+/// node's runs. Fails CLOSED (`None` — no chunks, WAL stays
+/// authoritative) while nothing is durably covered yet: before the
+/// first flush publish there is no honest position to certify.
+unsafe fn disk_snapshot_marker(worker: &mut WorkerState, out: &mut [u8]) -> Option<usize> {
+    if worker.disk_phase != DISK_PHASE_SERVING
+        || worker.disk_state.durable_applied_index == 0
+        || out.len() < SNAP_HDR_LEN
+    {
         return None;
     }
-    let req = SnapshotRequest {
-        applied_index: worker.applied_index,
-        range_generation: worker.disk_state.range_generation,
-    };
-    let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
-    let mut total = 0usize;
-    let mut cursor = 0u64;
-    loop {
-        match store.snapshot(req, cursor, &mut out[total..]) {
-            Ok((n, Progress::Done)) => return Some(total + n),
-            Ok((n, Progress::InProgress { cursor: c })) => {
-                total += n;
-                cursor = c;
-                if n == 0 {
-                    // No forward progress — buffer exhausted.
-                    store.snapshot_abort();
-                    return None;
-                }
-            }
-            Err(_) => {
-                store.snapshot_abort();
-                return None;
-            }
-        }
-    }
+    out[0..4].copy_from_slice(&SNAP_MAGIC.to_le_bytes());
+    out[4..6].copy_from_slice(&SNAP_FORMAT_VERSION.to_le_bytes());
+    out[6..8].copy_from_slice(&SNAP_FLAG_DISK_RESIDENT.to_le_bytes());
+    out[8..16].copy_from_slice(&worker.disk_state.durable_applied_index.to_le_bytes());
+    out[16..20].copy_from_slice(&worker.disk_state.range_generation.to_le_bytes());
+    out[20..24].copy_from_slice(&0u32.to_le_bytes());
+    out[24..32].copy_from_slice(&worker.disk_state.highest_revision.to_le_bytes());
+    out[32..40].copy_from_slice(&worker.disk_state.compaction_floor.to_le_bytes());
+    Some(SNAP_HDR_LEN)
 }
 
 /// Read a little-endian u64 from an 8-byte slice.

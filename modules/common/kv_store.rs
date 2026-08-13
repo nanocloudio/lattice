@@ -32,12 +32,12 @@ use types::{
     KV_ARRAY_ELEMENT_NULL, KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS,
     KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET,
     KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE, KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT,
-    KV_OP_SCAN_VERSIONS, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD,
-    KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED, KV_RESULT_COMPACTED,
-    KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE,
-    KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN, KV_RESULT_TXN_PENDING, KV_RESULT_VERSIONS,
-    KV_RESULT_WRONG_TYPE, PUT_FLAG_GET, PUT_FLAG_KEEPTTL, PUT_FLAG_NX, PUT_FLAG_XX,
-    TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER, TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL,
+    KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE,
+    KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED,
+    KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
+    KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN, KV_RESULT_TXN_PENDING,
+    KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET, PUT_FLAG_KEEPTTL, PUT_FLAG_NX,
+    PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER, TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL,
     VERSION_KIND_DELETE, VERSION_KIND_PUT,
 };
 
@@ -72,6 +72,9 @@ pub struct KvRecord {
     pub version: u64,
     pub lease_id: u64,
     pub expiry_ms: u64,
+    /// MVCC commit timestamp of the write that last touched this
+    /// record; `0` = no established timestamp authority.
+    pub commit_ts: u64,
     pub key: [u8; MAX_KEY_LEN],
     pub value: [u8; MAX_VALUE_LEN],
 }
@@ -88,6 +91,7 @@ impl KvRecord {
             version: 0,
             lease_id: 0,
             expiry_ms: 0,
+            commit_ts: 0,
             key: [0; MAX_KEY_LEN],
             value: [0; MAX_VALUE_LEN],
         }
@@ -168,6 +172,10 @@ pub struct KvStore {
     /// `(0, 0, 0)` layout. Not part of the snapshot: it is per-command
     /// state, re-established before every apply, never persisted.
     pub key_identity: [u8; IDENT_LEN],
+    /// MVCC commit timestamp for the command in flight.
+    /// Same per-command discipline as `key_identity`: set before every
+    /// apply from the committed command head, never persisted.
+    pub pending_commit_ts: u64,
     pub records: [KvRecord; MAX_KEYS],
 }
 
@@ -179,6 +187,7 @@ impl KvStore {
         self.revision = 0;
         self.used_count = 0;
         self.key_identity = [0u8; IDENT_LEN];
+        self.pending_commit_ts = 0;
         let mut i = 0;
         while i < MAX_KEYS {
             self.records[i] = KvRecord::empty();
@@ -271,6 +280,7 @@ impl KvStore {
         slot.version = 1;
         slot.lease_id = 0;
         slot.expiry_ms = 0;
+        slot.commit_ts = self.pending_commit_ts;
         slot.key[..key.len()].copy_from_slice(key);
         slot.value[..value.len()].copy_from_slice(value);
         self.used_count += 1;
@@ -283,11 +293,13 @@ impl KvStore {
         }
         self.revision = self.revision.wrapping_add(1);
         let rev = self.revision;
+        let ts = self.pending_commit_ts;
         let slot = &mut self.records[slot_idx];
         slot.value_len = value.len() as u32;
         slot.value[..value.len()].copy_from_slice(value);
         slot.mod_revision = rev;
         slot.version = slot.version.saturating_add(1);
+        slot.commit_ts = ts;
         true
     }
 
@@ -691,6 +703,12 @@ pub struct RecMeta {
     pub version: u64,
     pub lease_id: u64,
     pub expiry_ms: u64,
+    /// MVCC commit timestamp of the write that produced this version
+    ///. `0` = written without an established timestamp
+    /// authority. Distinct from `mod_revision`: the revision is the
+    /// per-partition apply order, the commit timestamp is the
+    /// cluster-wide MVCC domain that survives topology changes.
+    pub commit_ts: u64,
 }
 
 /// Outcome of a live (expiry-filtered) point lookup.
@@ -752,6 +770,13 @@ pub trait Materializer {
     /// keeps the historical single-tenant `(0, 0, 0)` behaviour for any
     /// provider that does not model identity.
     fn set_key_identity(&mut self, _tenant: u32, _database: u32, _keyspace: u32) {}
+    /// Bind the MVCC commit timestamp for the command about to be
+    /// applied. Every version the materializer writes
+    /// until the next call carries it. Same per-command discipline as
+    /// [`set_key_identity`](Self::set_key_identity); the transaction
+    /// resolve path re-binds it per staged op from the resolve record.
+    /// Default no-op keeps timestamp-less providers valid.
+    fn set_commit_ts(&mut self, _ts: u64) {}
     /// Current engine revision (returned in `MSG_KV_APPLIED`).
     fn revision(&self) -> u64;
     /// Bump the engine revision without writing a record (the DELETE
@@ -802,6 +827,13 @@ pub trait Materializer {
     /// state under a historical label — the same fail-closed rule
     /// `get_as_of` follows.
     fn scan_versions_op(&mut self, body: &[u8], out: &mut [u8]) -> (u8, usize);
+    /// The SNAPSHOT_VERSIONS op: live rows as-of a
+    /// revision, emitted in the [`KV_RESULT_VERSIONS`] entry format so
+    /// each row carries its `mod_revision` and MVCC `commit_ts`.
+    /// `(KV_RESULT_COMPACTED, 0)` when the provider does not retain
+    /// the requested revision — the same fail-closed rule as
+    /// [`get_as_of`](Self::get_as_of).
+    fn snapshot_versions_op(&mut self, body: &[u8], out: &mut [u8], now_ms: u64) -> (u8, usize);
     /// FLUSHDB: drop every record and bump the revision once.
     fn flush_all(&mut self) -> bool;
 
@@ -1006,6 +1038,7 @@ pub fn apply_mat_ctx<M: Materializer>(
         KV_OP_SCAN | KV_OP_RANGE => apply_scan(store, body, out_body, now_ms),
         KV_OP_RANGE_SCAN => store.range_scan_op(body, out_body, now_ms),
         KV_OP_SCAN_VERSIONS => store.scan_versions_op(body, out_body),
+        KV_OP_SNAPSHOT_VERSIONS => store.snapshot_versions_op(body, out_body, now_ms),
         KV_OP_GET_AT => apply_get_at(store, body, out_body, now_ms),
         KV_OP_SCAN_AT => apply_scan_at(store, body, out_body, now_ms),
         KV_OP_CAS => apply_cas(store, body, out_body, now_ms),
@@ -1049,6 +1082,10 @@ impl Materializer for KvStore {
         self.key_identity = ident_bytes(tenant, database, keyspace);
     }
 
+    fn set_commit_ts(&mut self, ts: u64) {
+        self.pending_commit_ts = ts;
+    }
+
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -1079,6 +1116,7 @@ impl Materializer for KvStore {
                 version: r.version,
                 lease_id: r.lease_id,
                 expiry_ms: r.expiry_ms,
+                commit_ts: r.commit_ts,
             },
         }
     }
@@ -1162,6 +1200,75 @@ impl Materializer for KvStore {
             return (KV_RESULT_VERSIONS, 10);
         }
         (KV_RESULT_COMPACTED, 0)
+    }
+
+    fn snapshot_versions_op(&mut self, body: &[u8], out: &mut [u8], now_ms: u64) -> (u8, usize) {
+        // The memory provider materializes only current values, so it
+        // can answer the snapshot question only AT the present — the
+        // same fail-closed capability rule as `get_as_of`.
+        let Some((at_rev, q)) = parse_snapshot_versions_body(body) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        if at_rev != 0 && at_rev < self.revision {
+            return (KV_RESULT_COMPACTED, 0);
+        }
+        if out.len() < 10 {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+        let (start, end, cursor, limit) = (q.start, q.end, q.cursor, q.limit);
+        let mut out_off = 10usize;
+        // Linear non-wrapping slot cursor — the exactly-once walk
+        // discipline of `range_slots`, which this mirrors.
+        let mut idx = cursor as usize;
+        let mut emitted: u16 = 0;
+        let mut new_cursor: u64 = 0;
+        while idx < MAX_KEYS {
+            let record = &self.records[idx];
+            if record.used && !is_expired(record, now_ms) {
+                let key = match record.key_bytes().strip_prefix(&self.key_identity[..]) {
+                    Some(k) => k,
+                    None => {
+                        idx += 1;
+                        continue;
+                    }
+                };
+                let in_span = key >= start && (end.is_empty() || key < end);
+                if in_span {
+                    let val = record.value_bytes();
+                    let need = 8 + 8 + 1 + 2 + key.len() + 4 + val.len();
+                    if out_off + need > out.len() {
+                        new_cursor = idx as u64;
+                        break;
+                    }
+                    out[out_off..out_off + 8].copy_from_slice(&record.mod_revision.to_le_bytes());
+                    out_off += 8;
+                    out[out_off..out_off + 8].copy_from_slice(&record.commit_ts.to_le_bytes());
+                    out_off += 8;
+                    out[out_off] = VERSION_KIND_PUT;
+                    out_off += 1;
+                    out[out_off..out_off + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+                    out_off += 2;
+                    out[out_off..out_off + key.len()].copy_from_slice(key);
+                    out_off += key.len();
+                    out[out_off..out_off + 4].copy_from_slice(&(val.len() as u32).to_le_bytes());
+                    out_off += 4;
+                    out[out_off..out_off + val.len()].copy_from_slice(val);
+                    out_off += val.len();
+                    emitted += 1;
+                    if emitted >= limit {
+                        new_cursor = (idx + 1) as u64;
+                        if new_cursor as usize >= MAX_KEYS {
+                            new_cursor = 0;
+                        }
+                        break;
+                    }
+                }
+            }
+            idx += 1;
+        }
+        out[0..8].copy_from_slice(&new_cursor.to_le_bytes());
+        out[8..10].copy_from_slice(&emitted.to_le_bytes());
+        (KV_RESULT_VERSIONS, out_off)
     }
 
     fn flush_all(&mut self) -> bool {
@@ -1400,14 +1507,14 @@ pub const DISK_META_FORMAT: u16 = 1;
 /// ```text
 /// [format:u16 = DISK_META_FORMAT][rsvd:u32 = 0]
 /// [create_revision:u64][mod_revision:u64][version:u64]
-/// [lease_id:u64][expiry_ms:u64]                          (46 bytes)
+/// [lease_id:u64][expiry_ms:u64][commit_ts:u64]           (54 bytes)
 /// ```
 ///
 /// The user value follows immediately. `disk_store::MAX_VALUE_LEN`
 /// budgets for `MAX_VALUE_LEN + DISK_META_LEN` so a full-size user
 /// value still fits. A payload shorter than this prefix, or one whose
 /// format field is unknown, is a storage fault (fail closed).
-pub const DISK_META_LEN: usize = 46;
+pub const DISK_META_LEN: usize = 54;
 
 fn encode_disk_meta(out: &mut [u8], meta: &RecMeta) {
     out[0..2].copy_from_slice(&DISK_META_FORMAT.to_le_bytes());
@@ -1417,6 +1524,7 @@ fn encode_disk_meta(out: &mut [u8], meta: &RecMeta) {
     out[22..30].copy_from_slice(&meta.version.to_le_bytes());
     out[30..38].copy_from_slice(&meta.lease_id.to_le_bytes());
     out[38..46].copy_from_slice(&meta.expiry_ms.to_le_bytes());
+    out[46..54].copy_from_slice(&meta.commit_ts.to_le_bytes());
 }
 
 fn decode_disk_meta(src: &[u8]) -> Option<RecMeta> {
@@ -1441,6 +1549,7 @@ fn decode_disk_meta(src: &[u8]) -> Option<RecMeta> {
         version: rd(&mut off),
         lease_id: rd(&mut off),
         expiry_ms: rd(&mut off),
+        commit_ts: rd(&mut off),
     })
 }
 
@@ -1537,6 +1646,10 @@ pub struct DiskMaterializer<'a, S: RunStorage> {
     pub flush_wanted: bool,
     /// Latched storage fault — fail closed on everything.
     pub fault: bool,
+    /// MVCC commit timestamp for the command in flight;
+    /// stamped into every version this command writes. Per-command
+    /// state like `key_identity`, never persisted on its own.
+    pub pending_commit_ts: u64,
     /// Latched RETRYABLE refusal: the memtable filled while a chunked
     /// flush was already draining it. Distinct from `fault` — nothing
     /// is wrong with the store, the write simply arrived during the
@@ -1564,6 +1677,7 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
             fault: false,
             backpressure: false,
             key_identity: (0, 0, 0),
+            pending_commit_ts: 0,
         }
     }
 
@@ -1845,6 +1959,10 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         self.key_identity = (tenant, database, keyspace);
     }
 
+    fn set_commit_ts(&mut self, ts: u64) {
+        self.pending_commit_ts = ts;
+    }
+
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -1889,6 +2007,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             version: 1,
             lease_id: 0,
             expiry_ms: 0,
+            commit_ts: self.pending_commit_ts,
         };
         let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
         encode_disk_meta(&mut payload, &meta);
@@ -1921,6 +2040,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             version: old.version.saturating_add(1),
             lease_id: old.lease_id,
             expiry_ms: old.expiry_ms,
+            commit_ts: self.pending_commit_ts,
         };
         encode_disk_meta(&mut payload, &meta);
         payload[DISK_META_LEN..DISK_META_LEN + value.len()].copy_from_slice(value);
@@ -1948,7 +2068,8 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         // Rewrite the SAME version (same encoded key: identical
         // timestamp and kind) with the new deadline — the provider
         // treats an exact-key overwrite as deterministic replay.
-        payload[DISK_META_LEN - 8..DISK_META_LEN].copy_from_slice(&expiry_ms.to_le_bytes());
+        // expiry_ms sits at meta offsets 38..46 (commit_ts follows it).
+        payload[38..46].copy_from_slice(&expiry_ms.to_le_bytes());
         self.put_version(key, meta.mod_revision, ValueKind::Value, &payload[..n])
     }
 
@@ -1964,8 +2085,17 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 // Tombstone at the revision the interpreter's
                 // batch-end bump will publish (DELETE bumps once for
                 // the whole op, matching the memory provider).
+                //
+                // A timestamped delete carries its commit timestamp as
+                // the tombstone's 8-byte payload — the
+                // one version kind with no meta prefix to hold it. An
+                // untimestamped delete stays empty, byte-identical to
+                // the historical layout.
                 let ts = self.revision.wrapping_add(1);
-                if self.put_version(key, ts, ValueKind::PointTombstone, &[]) {
+                let cts = self.pending_commit_ts;
+                let payload_bytes = cts.to_le_bytes();
+                let tomb: &[u8] = if cts != 0 { &payload_bytes } else { &[] };
+                if self.put_version(key, ts, ValueKind::PointTombstone, tomb) {
                     Some(true)
                 } else {
                     None
@@ -2071,11 +2201,22 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 // and dropping it would make a resumed stream disagree
                 // with the continuous one that delivered it live.
                 let is_tomb = dec.kind == internal_key::ValueKind::PointTombstone;
-                let (kind, uval) = if is_tomb {
-                    (VERSION_KIND_DELETE, &[][..])
+                let (kind, commit_ts, uval) = if is_tomb {
+                    // A timestamped tombstone carries its commit
+                    // timestamp as an 8-byte payload;
+                    // the emitted delete version has no user value
+                    // either way.
+                    let cts = if val.len() == 8 {
+                        u64::from_le_bytes([
+                            val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7],
+                        ])
+                    } else {
+                        0
+                    };
+                    (VERSION_KIND_DELETE, cts, &[][..])
                 } else {
                     match decode_disk_meta(val) {
-                        Some(_) => (VERSION_KIND_PUT, &val[DISK_META_LEN..]),
+                        Some(meta) => (VERSION_KIND_PUT, meta.commit_ts, &val[DISK_META_LEN..]),
                         None => {
                             self.fault = true;
                             return (KV_RESULT_INTERNAL, 0);
@@ -2083,12 +2224,14 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                     }
                 };
                 let ulen = dec.user_key_len;
-                let need = 8 + 1 + 2 + ulen + 4 + uval.len();
+                let need = 8 + 8 + 1 + 2 + ulen + 4 + uval.len();
                 if out_off + need > out.len() {
                     resume -= 1; // not emitted — do not consume the ordinal
                     break 'outer;
                 }
                 out[out_off..out_off + 8].copy_from_slice(&dec.mvcc_timestamp.to_le_bytes());
+                out_off += 8;
+                out[out_off..out_off + 8].copy_from_slice(&commit_ts.to_le_bytes());
                 out_off += 8;
                 out[out_off] = kind;
                 out_off += 1;
@@ -2121,6 +2264,132 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         (KV_RESULT_VERSIONS, out_off)
     }
 
+    fn snapshot_versions_op(&mut self, body: &[u8], out: &mut [u8], now_ms: u64) -> (u8, usize) {
+        let Some((at_rev, q)) = parse_snapshot_versions_body(body) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        if out.len() < 10 {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+        // As-of semantics follow `range_from`: 0 = latest (or the
+        // replay-window as-of), explicit revisions answered from
+        // retained history or refused COMPACTED by the store.
+        let at = if at_rev != 0 {
+            at_rev
+        } else {
+            self.read_revision()
+        };
+        let force_empty = at_rev == 0 && self.in_replay() && self.revision == 0;
+        let (it, id, ik) = self.key_identity;
+        let (_, ident_hi) = self.ident_span();
+        let mut startbuf = [0u8; disk_store::MAX_ENCODED_KEY];
+        let mut endbuf = [0u8; disk_store::MAX_ENCODED_KEY];
+        let Some(slen) = internal_key::encode_prefix(&mut startbuf, it, id, ik, q.start) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        let elen = if q.end.is_empty() {
+            match ident_hi {
+                Some(hi) => {
+                    endbuf[..IDENT_LEN].copy_from_slice(&hi);
+                    IDENT_LEN
+                }
+                None => 0,
+            }
+        } else {
+            match internal_key::encode_prefix(&mut endbuf, it, id, ik, q.end) {
+                Some(n) => n,
+                None => return (KV_RESULT_INTERNAL, 0),
+            }
+        };
+        let span = disk_store::state_store::KeySpan {
+            start: &startbuf[..slen],
+            end: &endbuf[..elen],
+        };
+
+        let mut out_off = 10usize;
+        let mut emitted: u16 = 0;
+        let mut resume = q.cursor;
+        let mut done = force_empty;
+        let mut sbuf = [0u8; DISK_SCAN_BUF];
+        'outer: while !done && emitted < q.limit {
+            let p = match self.store.scan_at(span, at, resume, &mut sbuf) {
+                Ok(p) => p,
+                Err(disk_store::state_store::StoreError::Compacted) => {
+                    return (KV_RESULT_COMPACTED, 0)
+                }
+                Err(_) => {
+                    self.fault = true;
+                    return (KV_RESULT_INTERNAL, 0);
+                }
+            };
+            let mut at_b = 0usize;
+            for _ in 0..p.entries {
+                let klen = u16::from_le_bytes([sbuf[at_b], sbuf[at_b + 1]]) as usize;
+                let vlen = u32::from_le_bytes([
+                    sbuf[at_b + 2],
+                    sbuf[at_b + 3],
+                    sbuf[at_b + 4],
+                    sbuf[at_b + 5],
+                ]) as usize;
+                at_b += 6;
+                let key = &sbuf[at_b..at_b + klen];
+                let val = &sbuf[at_b + klen..at_b + klen + vlen];
+                at_b += klen + vlen;
+                resume += 1;
+                let mut ubuf = [0u8; MAX_KEY_LEN];
+                let Some(dec) = internal_key::decode(key, &mut ubuf) else {
+                    self.fault = true;
+                    return (KV_RESULT_INTERNAL, 0);
+                };
+                let Some(meta) = decode_disk_meta(val) else {
+                    self.fault = true;
+                    return (KV_RESULT_INTERNAL, 0);
+                };
+                if meta.expiry_ms != 0 && now_ms >= meta.expiry_ms {
+                    continue; // expired — invisible, ordinal consumed
+                }
+                let uval = &val[DISK_META_LEN..];
+                let ulen = dec.user_key_len;
+                let need = 8 + 8 + 1 + 2 + ulen + 4 + uval.len();
+                if out_off + need > out.len() {
+                    resume -= 1; // not emitted — do not consume the ordinal
+                    break 'outer;
+                }
+                out[out_off..out_off + 8].copy_from_slice(&meta.mod_revision.to_le_bytes());
+                out_off += 8;
+                out[out_off..out_off + 8].copy_from_slice(&meta.commit_ts.to_le_bytes());
+                out_off += 8;
+                out[out_off] = VERSION_KIND_PUT;
+                out_off += 1;
+                out[out_off..out_off + 2].copy_from_slice(&(ulen as u16).to_le_bytes());
+                out_off += 2;
+                out[out_off..out_off + ulen].copy_from_slice(&ubuf[..ulen]);
+                out_off += ulen;
+                out[out_off..out_off + 4].copy_from_slice(&(uval.len() as u32).to_le_bytes());
+                out_off += 4;
+                out[out_off..out_off + uval.len()].copy_from_slice(uval);
+                out_off += uval.len();
+                emitted += 1;
+                if emitted >= q.limit {
+                    break 'outer;
+                }
+            }
+            match p.progress {
+                Progress::Done => done = true,
+                Progress::InProgress { .. } => {
+                    if p.entries == 0 {
+                        self.fault = true;
+                        return (KV_RESULT_INTERNAL, 0);
+                    }
+                }
+            }
+        }
+        let new_cursor: u64 = if done { 0 } else { resume };
+        out[0..8].copy_from_slice(&new_cursor.to_le_bytes());
+        out[8..10].copy_from_slice(&emitted.to_le_bytes());
+        (KV_RESULT_VERSIONS, out_off)
+    }
+
     fn flush_all(&mut self) -> bool {
         if self.fault {
             return false;
@@ -2132,6 +2401,16 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         // documented on the worker's step budget.
         let revn = self.revision;
         let ts = self.revision.wrapping_add(1);
+        // Same rule as the single-key delete: a timestamped tombstone
+        // carries its commit timestamp as the 8-byte payload. A bare
+        // tombstone decodes to commit_ts 0 on the versions surface, and
+        // the CDC consumer contract discards any event at or below the
+        // key's applied timestamp — a flush that dropped the stamp
+        // would emit delete events every conforming consumer throws
+        // away.
+        let cts = self.pending_commit_ts;
+        let cts_bytes = cts.to_le_bytes();
+        let tomb: &[u8] = if cts != 0 { &cts_bytes } else { &[] };
         if revn > 0 {
             // §23: FLUSH clears THIS identity's keys, not the whole
             // store — a tenant's flush must not tombstone another's.
@@ -2175,7 +2454,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                         &ubuf[..dec.user_key_len],
                         ts,
                         ValueKind::PointTombstone,
-                        &[],
+                        tomb,
                     ) {
                         return false;
                     }
@@ -2516,6 +2795,26 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         out[8..10].copy_from_slice(&emitted.to_le_bytes());
         (KV_RESULT_RANGE, out_off)
     }
+}
+
+/// Parse a [`KV_OP_SNAPSHOT_VERSIONS`] body into
+/// `(at_rev, RangeQuery)`. Same refusal rule as the range-scan parser.
+fn parse_snapshot_versions_body(body: &[u8]) -> Option<(u64, RangeQuery<'_>)> {
+    let mut off = 0usize;
+    let at_rev = read_u64(body, &mut off)?;
+    let start = read_key(body, &mut off)?;
+    let end = read_key(body, &mut off)?;
+    let cursor = read_u64(body, &mut off)?;
+    let limit = read_u16(body, &mut off)?;
+    Some((
+        at_rev,
+        RangeQuery {
+            start,
+            end,
+            cursor,
+            limit,
+        },
+    ))
 }
 
 /// Parse a [`KV_OP_RANGE_SCAN`] body into `(start, end, cursor, limit)`.
@@ -3998,7 +4297,14 @@ fn apply_txn_resolve<M: Materializer>(
     home.copy_from_slice(&body[16..32]);
     let epoch = u32::from_le_bytes([body[32], body[33], body[34], body[35]]);
     let committed = body[36] != 0;
-    let mut off = 45usize; // 37 + 8 (commit_ts, carried for the record)
+    // The transaction's MVCC commit timestamp: every
+    // version a committed resolve materializes carries it, so a
+    // multi-range transaction's events share one timestamp on the
+    // change feed regardless of which range resolved when.
+    let commit_ts = u64::from_le_bytes([
+        body[37], body[38], body[39], body[40], body[41], body[42], body[43], body[44],
+    ]);
+    let mut off = 45usize;
     let Some(key_count) = read_u16(body, &mut off) else {
         return (KV_RESULT_INTERNAL, 0);
     };
@@ -4045,6 +4351,11 @@ fn apply_txn_resolve<M: Materializer>(
                 return (KV_RESULT_INTERNAL, 0);
             };
             let mut sub_out = [0u8; 1024];
+            // The staged op materializes under the TRANSACTION's commit
+            // timestamp, not the resolve command's own — this is the
+            // stamp that makes intents ordinary records with the right
+            // MVCC identity.
+            store.set_commit_ts(commit_ts);
             let (r, _) = apply_mat(store, op_byte, sub, &mut sub_out, now_ms);
             // The staged op already passed its comparisons at prepare
             // time and the coordinator has committed. A failure here is

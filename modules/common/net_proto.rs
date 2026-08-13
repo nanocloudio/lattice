@@ -12,19 +12,35 @@
 //!
 //! ## Provider → anchor (`NET_MSG_*`)
 //!
-//! - `ACCEPTED` — new TCP connection. Payload: `[conn_id:u8]`.
-//! - `DATA` — bytes from a connection. Payload: `[conn_id:u8][bytes…]`.
-//! - `CLOSED` — peer closed or provider tore down. Payload: `[conn_id:u8]`.
-//! - `BOUND` — listen socket established. Payload: `[port:u16 LE]`.
-//! - `CONNOK` — an outbound dial completed. Payload: `[conn_id:u8]`.
-//! - `ERROR` — listen / accept / read failure. Payload: `[errno:i8]`.
+//! Conn ids are `u16 LE` (`NET_CONN_LEN` bytes) since fluxor's
+//! u16-conn-id contract (d607b80) — the id space outgrew u8 and every
+//! frame's leading field widened with it.
+//!
+//! - `ACCEPTED` — new TCP connection. Payload: `[conn_id:u16 LE][local_port:u16 LE]`.
+//! - `DATA` — bytes from a connection. Payload: `[conn_id:u16 LE][bytes…]`.
+//! - `CLOSED` — peer closed or provider tore down. Payload: `[conn_id:u16 LE]`.
+//! - `BOUND` — listen socket established. Payload: `[conn_id:u16 LE][local_port:u16 LE]`.
+//! - `CONNOK` — an outbound dial completed. Payload: `[conn_id:u16 LE][requester_tag:u8?]`.
+//! - `ERROR` — failure. Payload: `[conn_id:u16 LE][errno:i8][requester_tag:u8?]`.
 //!
 //! ## Anchor → provider (`NET_CMD_*`)
 //!
 //! - `BIND` — open the listen socket. Payload: `[port:u16 LE]`.
-//! - `SEND` — write bytes to a connection. Payload: `[conn_id:u8][bytes…]`.
-//! - `CLOSE` — drop a connection. Payload: `[conn_id:u8]`.
-//! - `CONNECT` — dial out. Payload: `[sock_type:u8][ip:u32 LE][port:u16 LE]`.
+//! - `SEND` — write bytes to a connection. Payload: `[conn_id:u16 LE][bytes…]`.
+//! - `CLOSE` — drop a connection. Payload: `[conn_id:u16 LE]`.
+//! - `CONNECT` — dial out. Payload: `[sock_type:u8][ip:u32 LE][port:u16 LE][requester_tag:u8?]`.
+
+/// Wire width of a connection id in every NET frame (u16 LE).
+pub const NET_CONN_LEN: usize = 2;
+
+/// The leading conn id of a NET payload; `None` on a short payload.
+#[inline]
+pub fn net_conn_id(payload: &[u8]) -> Option<u16> {
+    if payload.len() < NET_CONN_LEN {
+        return None;
+    }
+    Some(u16::from_le_bytes([payload[0], payload[1]]))
+}
 
 pub const NET_MSG_ACCEPTED: u8 = 0x01;
 pub const NET_MSG_DATA: u8 = 0x02;

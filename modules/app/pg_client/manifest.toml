@@ -11,7 +11,8 @@ direction    = "input"
 content_type = "NetProto"
 buffer_size  = 2048
 
-# SQL query text (a simple-query string).
+# SQL query text (a simple-query string), optionally led by a `cid_len`-byte
+# opaque correlation prefix that is echoed at the front of the reply.
 [[ports]]
 name         = "request_in"
 index        = 1
@@ -26,7 +27,7 @@ content_type = "NetProto"
 buffer_size  = 2048
 max_record   = 1600
 
-# The first column of the first result row.
+# The result set: first column of every row, newline-joined (see mod.rs).
 [[ports]]
 name         = "reply_out"
 index        = 1

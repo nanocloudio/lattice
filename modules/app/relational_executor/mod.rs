@@ -286,6 +286,9 @@ const P_UPD_WRITE: u8 = 32;
 const P_AGG_SCAN: u8 = 33;
 /// ALTER TABLE ADD COLUMN: waiting for the descriptor write-back.
 const P_ALTER_WRITE: u8 = 34;
+/// DROP TABLE cascade: the index-descriptor survey page (all of this
+/// table's indexes, ANY phase — a cascade removes half-built ones too).
+const P_DT_IXLIST: u8 = 35;
 
 // ── State ─────────────────────────────────────────────────────────────
 
@@ -388,6 +391,12 @@ struct ExecState {
     /// more secondary indexes than this refuses at CREATE INDEX time.
     idx: [relational::IndexDescriptor; MAX_TABLE_INDEXES],
     idx_count: u8,
+    /// DROP TABLE is cascading through `idx[..idx_count]`: the P_DI_*
+    /// chain is being driven per index, and its terminal steps route
+    /// back to the cascade instead of replying DROP INDEX.
+    drop_cascade: bool,
+    /// Cascade position within `idx`.
+    drop_ix_i: u8,
     /// SELECT-via-index: primary keys staged from entry pages, drained
     /// one point read at a time.
     ix_pks: [u8; IX_PK_BUF],
@@ -537,6 +546,8 @@ impl ExecState {
         self.td = TableDescriptor::EMPTY;
         self.idx = [relational::IndexDescriptor::EMPTY; MAX_TABLE_INDEXES];
         self.idx_count = 0;
+        self.drop_cascade = false;
+        self.drop_ix_i = 0;
         self.ix_pks = [0; IX_PK_BUF];
         self.ix_pks_len = 0;
         self.ix_pks_at = 0;
@@ -1347,13 +1358,9 @@ fn decode_kv_reply(payload: &[u8]) -> Option<KvReply<'_>> {
     }
     let mut c = [0u8; 8];
     c.copy_from_slice(&payload[0..8]);
-    // Fence tail sits after the body; the catalog generation is its
-    // last 8 bytes (see wire::MSG_KV_RESPONSE).
-    let gen_at = 20 + blen + wire::KV_RESPONSE_FENCE_TAIL_LEN - 8;
-    let catalog_generation = match payload.get(gen_at..gen_at + 8) {
-        Some(g) => u64::from_le_bytes([g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]]),
-        None => 0,
-    };
+    // Catalog generation rides the fence tail after the body.
+    let catalog_generation =
+        wire::FenceTail::decode(&payload[20 + blen..]).map_or(0, |t| t.catalog_generation);
     Some(KvReply {
         corr_id: u64::from_le_bytes(c),
         result: payload[9],
@@ -1414,6 +1421,7 @@ fn on_kv_response(exec: &mut ExecState, payload: &[u8]) {
         P_DI_DEL => after_di_del(exec, result),
         P_DI_DESCR => after_di_descr(exec, result),
         P_DI_NAME_W => after_di_name_w(exec, result),
+        P_DT_IXLIST => after_dt_ixlist(exec, result, &body[..body_len]),
         P_LIST => after_list(exec, result, &body[..body_len]),
         P_SEL_IX => after_sel_ix(exec, result, &body[..body_len]),
         P_SEL_IXROW => after_sel_ixrow(exec, result, &body[..body_len]),
@@ -2505,11 +2513,27 @@ fn after_di_descr(exec: &mut ExecState, result: u8) {
         reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
         return;
     }
-    let mut text = [0u8; sql_core::MAX_SQL_LEN];
-    let n = statement_text(exec, &mut text);
-    let Ok(Statement::DropIndex { name, .. }) = parse(&text[..n], dialect_of(exec)) else {
-        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
-        return;
+    // The index NAME: in a DROP TABLE cascade it comes from the staged
+    // descriptor (there is no DROP INDEX statement to parse); a plain
+    // DROP INDEX takes it from the statement, as ever. Both paths go
+    // through `index_name_key`, so the case-folded catalog key is the
+    // one CREATE INDEX wrote.
+    let mut nbuf = [0u8; relational::MAX_NAME_LEN];
+    let name: &[u8] = if exec.drop_cascade {
+        let d = &exec.idx[exec.drop_ix_i as usize];
+        let nb = d.name.as_bytes();
+        nbuf[..nb.len()].copy_from_slice(nb);
+        &nbuf[..nb.len()]
+    } else {
+        let mut text = [0u8; sql_core::MAX_SQL_LEN];
+        let n = statement_text(exec, &mut text);
+        let Ok(Statement::DropIndex { name, .. }) = parse(&text[..n], dialect_of(exec)) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        let nb = name;
+        nbuf[..nb.len()].copy_from_slice(nb);
+        &nbuf[..nb.len()]
     };
     let mut key = [0u8; MAX_KV_KEY];
     let Some(kn) = index_name_key(&mut key, name) else {
@@ -2526,7 +2550,14 @@ fn after_di_descr(exec: &mut ExecState, result: u8) {
 
 fn after_di_name_w(exec: &mut ExecState, result: u8) {
     if result == KV_RESULT_OK || result == KV_RESULT_INTEGER || result == KV_RESULT_NOT_FOUND {
-        reply_simple(exec, OUTCOME_OK, sql_exec::TAG_DROP_INDEX, 0);
+        if exec.drop_cascade {
+            // One cascaded index fully gone; on to the next (or to the
+            // table's own descriptor + name).
+            exec.drop_ix_i += 1;
+            dt_cascade_next(exec);
+        } else {
+            reply_simple(exec, OUTCOME_OK, sql_exec::TAG_DROP_INDEX, 0);
+        }
     } else {
         reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
     }
@@ -2627,8 +2658,12 @@ fn send_insert_row(exec: &mut ExecState) {
     // NX: an INSERT must not silently replace an existing row. SQL
     // spells that as a duplicate-key error, and without the flag an
     // INSERT would behave as an UPSERT — losing data the client never
-    // asked to overwrite.
-    let Some(bl) = stage_put(exec, &key[..kk], &row[..rn], PUT_FLAG_NX) else {
+    // asked to overwrite. `INSERT OR REPLACE` is the caller ASKING for
+    // exactly that overwrite: the put goes unconditional, and the MVCC
+    // engine mints a fresh commit timestamp for the new version (so a
+    // CDC feed reports the resubmission as a new event).
+    let put_flags = if ins.or_replace { 0 } else { PUT_FLAG_NX };
+    let Some(bl) = stage_put(exec, &key[..kk], &row[..rn], put_flags) else {
         reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
         return;
     };
@@ -3944,6 +3979,8 @@ fn encode_numeric_cell(out: &mut [u8], ty: LogicalType, v: f64) -> Option<usize>
 
 fn start_drop_scan(exec: &mut ExecState) {
     exec.cursor = 0;
+    exec.drop_cascade = false;
+    exec.drop_ix_i = 0;
     let mut start = [0u8; MAX_KV_KEY];
     let mut end = [0u8; MAX_KV_KEY];
     let Some((sn, en)) = table_bounds(exec.table_id, &mut start, &mut end) else {
@@ -3967,17 +4004,11 @@ fn after_drop_scan(exec: &mut ExecState, result: u8, body: &[u8]) {
     }
     let count = u16::from_le_bytes([body[8], body[9]]) as usize;
     if count == 0 {
-        // No rows left: remove the descriptor, then the name.
-        let mut key = [0u8; MAX_KV_KEY];
-        let Some(kn) = descr_key(&mut key, exec.table_id) else {
-            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
-            return;
-        };
-        let Some(bn) = stage_delete(exec, &[&key[..kn]]) else {
-            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
-            return;
-        };
-        kv_send(exec, KV_OP_DELETE, bn, P_DROP_DESCR);
+        // No rows left. Before the descriptor and name go, CASCADE to
+        // the table's indexes: entries, descriptor and name of each —
+        // otherwise a re-CREATE INDEX of a dropped table's index name
+        // refuses with 42P07 forever and the entry data orphans.
+        send_dt_ixlist(exec);
         return;
     }
 
@@ -4020,6 +4051,94 @@ fn after_drop_scan(exec: &mut ExecState, result: u8, body: &[u8]) {
     };
     exec.affected += nk as u64;
     kv_send(exec, KV_OP_DELETE, bn, P_DROP_DEL);
+}
+
+/// DROP TABLE cascade step 1: one catalog page of Index-kind
+/// descriptors (the same bounded survey `send_index_list` runs for
+/// writes; a table cannot carry more indexes than one page holds).
+fn send_dt_ixlist(exec: &mut ExecState) {
+    let mut start = [0u8; MAX_KV_KEY];
+    let mut body = [0u8; 5];
+    body[0..4].copy_from_slice(&DATABASE_ID.to_be_bytes());
+    body[4] = ObjectKind::Index as u8;
+    let Some(sn) = kv_key(&mut start, relational::KS_RELATIONAL_CATALOG, &body) else {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    };
+    let mut end = [0u8; MAX_KV_KEY];
+    let Some(en) = prefix_successor(&start[..sn], &mut end) else {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    };
+    let Some(bn) = stage_range_scan(exec, &start[..sn], &end[..en], 0, 32) else {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    };
+    kv_send(exec, KV_OP_RANGE_SCAN, bn, P_DT_IXLIST);
+}
+
+/// The survey answered: stage EVERY index of this table (no phase or
+/// exactness filter — a cascade removes half-built and asynchronous
+/// indexes too) and start the per-index teardown.
+fn after_dt_ixlist(exec: &mut ExecState, result: u8, body: &[u8]) {
+    if result != KV_RESULT_RANGE || body.len() < 10 {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    }
+    exec.idx_count = 0;
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    let mut at = 10usize;
+    for _ in 0..count {
+        if body.len() < at + 2 {
+            reply_simple(exec, ERR_CORRUPT, TAG_EMPTY, 0);
+            return;
+        }
+        let klen = u16::from_le_bytes([body[at], body[at + 1]]) as usize;
+        let voff = at + 2 + klen;
+        if body.len() < voff + 4 {
+            reply_simple(exec, ERR_CORRUPT, TAG_EMPTY, 0);
+            return;
+        }
+        let vlen = u32::from_le_bytes(body[voff..voff + 4].try_into().unwrap_or([0; 4])) as usize;
+        let vend = voff + 4 + vlen;
+        if body.len() < vend {
+            reply_simple(exec, ERR_CORRUPT, TAG_EMPTY, 0);
+            return;
+        }
+        if let Some(d) = relational::IndexDescriptor::decode(&body[voff + 4..vend]) {
+            if d.table_id == exec.table_id && (exec.idx_count as usize) < MAX_TABLE_INDEXES {
+                exec.idx[exec.idx_count as usize] = d;
+                exec.idx_count += 1;
+            }
+        }
+        at = vend;
+    }
+    exec.drop_cascade = true;
+    exec.drop_ix_i = 0;
+    dt_cascade_next(exec);
+}
+
+/// Tear down the next cascaded index through the existing P_DI_* chain
+/// (entries → descriptor → name), or — all indexes gone — proceed to
+/// the table descriptor + name deletions.
+fn dt_cascade_next(exec: &mut ExecState) {
+    if exec.drop_ix_i as usize >= exec.idx_count as usize {
+        exec.drop_cascade = false;
+        let mut key = [0u8; MAX_KV_KEY];
+        let Some(kn) = descr_key(&mut key, exec.table_id) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        let Some(bn) = stage_delete(exec, &[&key[..kn]]) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        kv_send(exec, KV_OP_DELETE, bn, P_DROP_DESCR);
+        return;
+    }
+    exec.index_id = exec.idx[exec.drop_ix_i as usize].index_id;
+    exec.cursor = 0;
+    send_di_scan(exec);
 }
 
 /// Stage a `KV_OP_DELETE` body: `[key_count:u16]` then per key

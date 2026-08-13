@@ -2001,6 +2001,11 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         tenant: id_tenant,
         database: id_database,
         keyspace: id_keyspace,
+        // Not stamped by the router: per-write commit timestamps are
+        // assigned by the worker from in-band replicated leases (CDC
+        // RFC A-1), in committed-log order. A non-zero value here is a
+        // proposer-side override the worker honours verbatim.
+        commit_ts: 0,
         body_len: body_len as u16,
     }
     .encode(&mut out[3..]);
@@ -2546,6 +2551,7 @@ unsafe fn send_help_command(
         tenant: identity.0,
         database: identity.1,
         keyspace: identity.2,
+        commit_ts: 0,
         body_len: body.len() as u16,
     }
     .encode(&mut out[3..]);
@@ -2925,6 +2931,7 @@ unsafe fn emit_reject_with_body(
         source_id: 0,
         durability: 0x01, // Durability::Volatile
         catalog_generation: 0,
+        commit_frontier: 0,
     }
     .encode(&mut env[3 + RESP_HEAD + body.len()..]);
     let _ = router.inflight.remove(corr_id);
@@ -3284,6 +3291,7 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
     let conn_id = ah.conn_id;
     let result = ah.result;
     let revision = ah.revision;
+    let commit_frontier = ah.commit_frontier;
     let mut body_len = ah.body_len as usize;
     let body_off = wire::KvAppliedHead::LEN;
     if body_off + body_len > payload_len {
@@ -3431,6 +3439,7 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
         source_id: kpg_id as u32,
         durability: durability_for_path(meta.path),
         catalog_generation,
+        commit_frontier,
     }
     .encode(&mut out[p..]);
 

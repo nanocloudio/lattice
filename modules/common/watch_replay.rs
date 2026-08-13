@@ -190,6 +190,9 @@ pub fn parse_replay_plan(payload: &[u8]) -> Option<ReplayPlan> {
 /// One decoded entry from a `KV_RESULT_VERSIONS` page.
 pub struct VersionEntry<'a> {
     pub revision: u64,
+    /// MVCC commit timestamp of the version; `0` = the
+    /// write happened without an established timestamp authority.
+    pub commit_ts: u64,
     pub kind: u8,
     pub key: &'a [u8],
     pub value: &'a [u8],
@@ -209,14 +212,15 @@ pub fn walk_versions_page(body: &[u8], mut f: impl FnMut(VersionEntry<'_>)) -> O
     let count = u16::from_le_bytes([body[8], body[9]]) as usize;
     let mut p = 10usize;
     for _ in 0..count {
-        // [revision:8][kind:1][klen:2][key][vlen:4][value]
-        if body.len() < p + 15 {
+        // [revision:8][commit_ts:8][kind:1][klen:2][key][vlen:4][value]
+        if body.len() < p + 23 {
             return None;
         }
         let revision = u64::from_le_bytes(sl8(body, p)?);
-        let kind = body[p + 8];
-        let klen = u16::from_le_bytes([body[p + 9], body[p + 10]]) as usize;
-        p += 11;
+        let commit_ts = u64::from_le_bytes(sl8(body, p + 8)?);
+        let kind = body[p + 16];
+        let klen = u16::from_le_bytes([body[p + 17], body[p + 18]]) as usize;
+        p += 19;
         if body.len() < p + klen + 4 {
             return None;
         }
@@ -231,6 +235,7 @@ pub fn walk_versions_page(body: &[u8], mut f: impl FnMut(VersionEntry<'_>)) -> O
         p += vlen;
         f(VersionEntry {
             revision,
+            commit_ts,
             kind,
             key,
             value,
@@ -424,6 +429,10 @@ mod tests {
         b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
         for (rev, kind, k, v) in entries {
             b.extend_from_slice(&rev.to_le_bytes());
+            // commit_ts: derived here as rev * 10 so tests can assert
+            // the timestamp is carried through independently of the
+            // revision.
+            b.extend_from_slice(&(rev * 10).to_le_bytes());
             b.push(*kind);
             b.extend_from_slice(&(k.len() as u16).to_le_bytes());
             b.extend_from_slice(k);
@@ -479,6 +488,7 @@ mod tests {
     fn tombstones_frame_as_delete_events() {
         let entry = VersionEntry {
             revision: 9,
+            commit_ts: 90,
             kind: VERSION_KIND_DELETE,
             key: b"gone",
             value: b"",
@@ -496,6 +506,7 @@ mod tests {
     fn puts_frame_with_their_value() {
         let entry = VersionEntry {
             revision: 5,
+            commit_ts: 50,
             kind: VERSION_KIND_PUT,
             key: b"k",
             value: b"hello",
@@ -512,6 +523,7 @@ mod tests {
     fn undersized_frame_buffer_refuses() {
         let entry = VersionEntry {
             revision: 5,
+            commit_ts: 50,
             kind: VERSION_KIND_PUT,
             key: b"k",
             value: b"hello",

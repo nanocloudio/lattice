@@ -264,6 +264,11 @@ pub struct CqlSelect<'a> {
     pub cols: [&'a [u8]; CQL_MAX_COLS],
     pub col_count: usize,
     pub where_pk: Option<(&'a [u8], CqlLit<'a>)>,
+    /// Additional `AND col = lit` equality predicates — clustering-key
+    /// components, matched against the schema's clustering order at
+    /// execution (prefix rule).
+    pub where_ck: [(&'a [u8], CqlLit<'a>); CQL_MAX_CLUSTERING],
+    pub where_ck_count: usize,
 }
 
 /// `UPDATE t SET c = v [, c = v]… WHERE pk = k`. An upsert of the named
@@ -275,13 +280,23 @@ pub struct CqlUpdate<'a> {
     pub count: usize,
     /// The partition key the SET applies to. Required.
     pub where_pk: (&'a [u8], CqlLit<'a>),
+    /// `AND col = lit` clustering-key predicates. On a clustered table
+    /// the FULL clustering key is required to name one row.
+    pub where_ck: [(&'a [u8], CqlLit<'a>); CQL_MAX_CLUSTERING],
+    pub where_ck_count: usize,
 }
 
-/// `DELETE FROM t WHERE pk = k`. Removes the whole row (every column).
+/// `DELETE FROM t WHERE pk = k [AND ck = v]…`. Removes every cell in
+/// the named partition — or, with clustering predicates, every cell in
+/// the clustering-prefix span they name (one row when the full
+/// clustering key is given).
 pub struct CqlDelete<'a> {
     pub table: &'a [u8],
     /// The partition key to remove. Required — no whole-table delete here.
     pub where_pk: (&'a [u8], CqlLit<'a>),
+    /// `AND col = lit` clustering-key predicates (prefix rule).
+    pub where_ck: [(&'a [u8], CqlLit<'a>); CQL_MAX_CLUSTERING],
+    pub where_ck_count: usize,
 }
 
 #[allow(
@@ -554,6 +569,8 @@ pub fn parse_cql(text: &[u8]) -> Result<CqlStatement<'_>, ()> {
                 cols: [b"".as_slice(); CQL_MAX_COLS],
                 col_count: 0,
                 where_pk: None,
+                where_ck: [(b"".as_slice(), CqlLit::Int(0)); CQL_MAX_CLUSTERING],
+                where_ck_count: 0,
             };
             match lx.next()? {
                 Some(Tok::Punct(b'*')) => {
@@ -587,7 +604,9 @@ pub fn parse_cql(text: &[u8]) -> Result<CqlStatement<'_>, ()> {
                     lx.expect_punct(b'=')?;
                     let lit = literal(lx.next()?)?;
                     sel.where_pk = Some((col, lit));
-                    end(&mut lx)?;
+                    let (ck, ckn) = where_and_chain(&mut lx)?;
+                    sel.where_ck = ck;
+                    sel.where_ck_count = ckn;
                 }
                 _ => return Err(()),
             }
@@ -616,13 +635,15 @@ pub fn parse_cql(text: &[u8]) -> Result<CqlStatement<'_>, ()> {
             let col = lx.word()?;
             lx.expect_punct(b'=')?;
             let lit = literal(lx.next()?)?;
-            end(&mut lx)?;
+            let (where_ck, where_ck_count) = where_and_chain(&mut lx)?;
             Ok(CqlStatement::Update(CqlUpdate {
                 table,
                 cols,
                 values,
                 count,
                 where_pk: (col, lit),
+                where_ck,
+                where_ck_count,
             }))
         }
         Some(Tok::Word(w)) if eq_kw(w, b"delete") => {
@@ -632,13 +653,48 @@ pub fn parse_cql(text: &[u8]) -> Result<CqlStatement<'_>, ()> {
             let col = lx.word()?;
             lx.expect_punct(b'=')?;
             let lit = literal(lx.next()?)?;
-            end(&mut lx)?;
+            let (where_ck, where_ck_count) = where_and_chain(&mut lx)?;
             Ok(CqlStatement::Delete(CqlDelete {
                 table,
                 where_pk: (col, lit),
+                where_ck,
+                where_ck_count,
             }))
         }
         _ => Err(()),
+    }
+}
+
+/// Parse `[AND col = lit]…` to the end of the statement (consuming the
+/// terminator like `end` does). Bounded by `CQL_MAX_CLUSTERING`.
+#[allow(
+    clippy::type_complexity,
+    reason = "no_std, allocation-free: the fixed pair array is the point"
+)]
+fn where_and_chain<'a>(
+    lx: &mut Lexer<'a>,
+) -> Result<([(&'a [u8], CqlLit<'a>); CQL_MAX_CLUSTERING], usize), ()> {
+    let mut ck = [(b"".as_slice(), CqlLit::Int(0)); CQL_MAX_CLUSTERING];
+    let mut n = 0usize;
+    loop {
+        match lx.next()? {
+            None => return Ok((ck, n)),
+            Some(Tok::Punct(b';')) => {
+                end_after_semi(lx)?;
+                return Ok((ck, n));
+            }
+            Some(Tok::Word(w)) if eq_kw(w, b"and") => {
+                if n >= CQL_MAX_CLUSTERING {
+                    return Err(());
+                }
+                let col = lx.word()?;
+                lx.expect_punct(b'=')?;
+                let lit = literal(lx.next()?)?;
+                ck[n] = (col, lit);
+                n += 1;
+            }
+            _ => return Err(()),
+        }
     }
 }
 

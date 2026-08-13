@@ -277,6 +277,22 @@ pub const KV_OP_TXN_RECORD: u8 = 0x18;
 /// the engine has forgotten and must say so rather than guess.
 pub const KV_OP_IDEMPOTENT: u8 = 0x19;
 
+/// Live-rows snapshot scan WITH per-row commit metadata
+/// — the backfill read (§8): every live (winning, non-tombstone,
+/// unexpired) row in `[start, end)` as of `at_rev` (`0` = latest),
+/// each with the `mod_revision` and MVCC `commit_ts` of the version
+/// that produced it, so a backfilled event's identity is stable if the
+/// same row is ever re-delivered.
+///
+/// Body: `[at_rev:u64 LE][start_len:u16 LE][start…][end_len:u16 LE]
+/// [end…][cursor:u64 LE][limit:u16 LE]` (an empty `end` = unbounded
+/// within the identity, as in [`KV_OP_RANGE_SCAN`]).
+///
+/// Answers a [`KV_RESULT_VERSIONS`] body whose entries all carry
+/// `kind = `[`VERSION_KIND_PUT`], or [`KV_RESULT_COMPACTED`] when the
+/// provider does not retain `at_rev`.
+pub const KV_OP_SNAPSHOT_VERSIONS: u8 = 0x1A;
+
 // ── KV op-specific body shapes ─────────────────────────────────────────
 //
 // The router and worker share these shapes via the `body` payload of
@@ -477,8 +493,8 @@ pub const KV_RESULT_COMPACTED: u8 = 0x0D;
 /// SCAN-class convention so a caller can loop on the same rule.
 pub const KV_RESULT_RANGE: u8 = 0x0E;
 /// Body shape: `[next_cursor:u64 LE][count:u16 LE]` then per entry
-/// `[revision:u64 LE][kind:u8][key_len:u16 LE][key…][value_len:u32 LE]
-/// [value…]`. Emitted by [`KV_OP_SCAN_VERSIONS`] only.
+/// `[revision:u64 LE][commit_ts:u64 LE][kind:u8][key_len:u16 LE][key…]
+/// [value_len:u32 LE][value…]`. Emitted by [`KV_OP_SCAN_VERSIONS`] only.
 ///
 /// `kind` is [`VERSION_KIND_PUT`] or [`VERSION_KIND_DELETE`]. A delete
 /// entry carries a zero-length value: the event is that the key went
@@ -488,6 +504,11 @@ pub const KV_RESULT_RANGE: u8 = 0x0E;
 /// resuming watcher can checkpoint on. It acknowledges up to a revision
 /// and resumes above it; without a per-entry revision it would have to
 /// re-request the whole window after every disconnect.
+///
+/// `commit_ts` is the version's MVCC commit timestamp:
+/// the cluster-wide ordering domain that survives range splits and
+/// merges, where `revision` is only the per-partition apply order.
+/// `0` = the write happened with no established timestamp authority.
 pub const KV_RESULT_VERSIONS: u8 = 0x0F;
 
 /// `kind` values in a [`KV_RESULT_VERSIONS`] entry.

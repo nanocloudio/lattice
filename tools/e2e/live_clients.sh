@@ -3,8 +3,8 @@
 # STANDALONE (no chronicle) against a REAL server. Each case starts the backend,
 # runs the client graph, and asserts the observed effect.
 #
-#   ./tools/live_clients.sh            # all
-#   ./tools/live_clients.sh redis pg   # a subset
+#   ./tools/e2e/live_clients.sh            # all
+#   ./tools/e2e/live_clients.sh redis pg   # a subset
 set -u
 cd "$(dirname "$0")/.."
 FLX=${FLUXOR_BIN:-fluxor}

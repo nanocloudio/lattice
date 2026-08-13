@@ -27,7 +27,8 @@
 //! Each op is a materialization Put of one encoded internal key
 //! (`internal_key.rs` v1 — the key embeds the MVCC timestamp and
 //! `ValueKind`). A tombstone is a Put whose key has
-//! `ValueKind::PointTombstone` and an empty value; a non-empty
+//! `ValueKind::PointTombstone` and an empty value, or exactly an
+//! 8-byte MVCC commit timestamp; any other non-empty
 //! tombstone value is `Malformed`. Unknown magic/format or any
 //! truncation is `Malformed` and applies nothing (validate-then-apply,
 //! never half a batch).
@@ -71,7 +72,9 @@
 //! ```text
 //! header  [magic:u32 = "LMAN"][format:u16 = 1][key_format:u16]
 //!         [contract:u16][flags:u16 = 0][generation:u32]
-//!         [run_count:u32][compaction_floor:u64]                    (28 B)
+//!         [run_count:u32][compaction_floor:u64]
+//!         [applied_index:u64][applied_term:u64]
+//!         [highest_revision:u64]                                   (52 B)
 //! entry*  [run_id:u32][record_count:u32][file_len:u64][digest:u32] (20 B)
 //! trailer [crc32:u32]  — over every preceding byte
 //! padding zeroes to MANIFEST_SLOT_LEN                     (fixed size)
@@ -174,9 +177,9 @@ use state_store::{
 /// Longer keys are rejected `Malformed` — fail closed, never truncate.
 pub const MAX_ENCODED_KEY: usize = 544;
 /// Maximum value length: `kv_store::MAX_VALUE_LEN` (4096) plus the
-/// engine's 46-byte record-metadata prefix (`kv_store::DISK_META_LEN`)
+/// engine's 54-byte record-metadata prefix (`kv_store::DISK_META_LEN`)
 /// that the disk composition stores inside the value payload.
-pub const MAX_VALUE_LEN: usize = 4096 + 46;
+pub const MAX_VALUE_LEN: usize = 4096 + 54;
 /// Memtable slots. 512 * ~4.6 KB ≈ 2.36 MB — see the module-doc
 /// arithmetic.
 pub const MEMTABLE_MAX_ENTRIES: usize = 512;
@@ -474,8 +477,13 @@ pub const MANIFEST_SLOT_B: u32 = 2;
 /// preallocation) and a shorter manifest can never leave a readable
 /// tail of the previous, longer one behind it.
 pub const MANIFEST_SLOT_LEN: usize = MANIFEST_HDR_LEN + MAX_RUNS * MANIFEST_ENTRY_LEN + 4;
-/// See the module-doc layout (28 bytes).
-pub const MANIFEST_HDR_LEN: usize = 28;
+/// See the module-doc layout (44 bytes): the fixed fields through
+/// `floor`, then `[applied_index:u64][applied_term:u64]` — the raft
+/// position DURABLY covered by the named run set (the applied position
+/// at the freeze of the newest flushed run). This is what lets the WAL
+/// compact honestly: entries at or below it are reconstructible from
+/// the runs alone.
+pub const MANIFEST_HDR_LEN: usize = 52;
 /// `[run_id:4][record_count:4][file_len:8][digest:4]`
 pub const MANIFEST_ENTRY_LEN: usize = 20;
 pub const MANIFEST_MAX_LEN: usize = MANIFEST_HDR_LEN + MAX_RUNS * MANIFEST_ENTRY_LEN + 4;
@@ -492,9 +500,24 @@ pub const SNAP_MAGIC: u32 = 0x4C53_4E50;
 pub const SNAP_FORMAT_VERSION: u16 = 1;
 /// See the module-doc layout (40 bytes).
 pub const SNAP_HDR_LEN: usize = 40;
+/// Stream-header flag bit: the body is a DISK-RESIDENT MARKER, not a
+/// record stream. `entry_count` is 0 and the state it certifies lives
+/// in the local store's manifest-named runs. Install of a marker
+/// ADOPTS the local store (identity-checked via `range_generation`)
+/// instead of replacing it; a node without that store fails closed.
+pub const SNAP_FLAG_DISK_RESIDENT: u16 = 0x0001;
 
 /// Input records consumed per bounded `compact` step.
-pub const COMPACT_STEP_RECORDS: u64 = 128;
+// TUNE (rig, 2026-08-16): 128 records/step ≈ 6-8 ms of synchronous
+// device time EVERY worker step during a merge. The WAL (durability)
+// shares the same blocking storage path; its appends/fsyncs queue
+// behind those bursts, and with an unlucky alignment its own step
+// crosses the 12/16 ms deadline and the KERNEL TERMINATES DURABILITY
+// (observed as module-18 timeout kills at varying op counts). 32
+// bounds a merge step to ~2 ms of device time, leaving the tick's
+// deadline headroom to whoever shares the device; compactions take
+// proportionally more steps, which is scheduling, not extra work.
+pub const COMPACT_STEP_RECORDS: u64 = 32;
 
 /// Memtable records written per bounded `flush_step` call.
 ///
@@ -546,6 +569,11 @@ const FLUSH_PHASE_MAN_SYNC: u8 = 3;
 
 /// Merging input records into the output run.
 const COMPACT_PHASE_MERGE: u8 = 0;
+/// Merge input exhausted; the run FOOTER (bloom + index + CRC, one
+/// sizeable append) is written in its OWN step — on FAT32 that append
+/// plus the fsync submit measured ~140 ms together, far past the
+/// module step deadline when run inside the final merge step.
+const COMPACT_PHASE_FOOTER: u8 = 4;
 /// Output run footer written; its durability fence is outstanding.
 const COMPACT_PHASE_RUN_SYNC: u8 = 1;
 /// Writing the manifest slot in place + submitting its fence.
@@ -816,6 +844,26 @@ struct CompactState {
     index: [u8; RUN_INDEX_BYTES],
     blk_first_key: [u8; INDEX_KEY_BYTES],
     blk_has_first: bool,
+    /// A step boundary saved exact per-run merge positions below —
+    /// [`compact_step`] resumes by SEEKING, not by replaying the walk
+    /// from record 0 (the replay made per-step cost grow linearly with
+    /// the cursor — O(n²) total — which on FAT32-over-NVMe crossed the
+    /// module step deadline around cursor ≈ 400 and got the worker
+    /// TERMINATED mid-compaction, killing the graph under sustained
+    /// write load).
+    resume_valid: bool,
+    /// Per-run resume block offsets (`u64::MAX` = run exhausted).
+    run_block: [u64; MAX_RUNS],
+    /// Per-run record index within the resume block.
+    run_rec: [u32; MAX_RUNS],
+    run_pos_count: u8,
+    /// Carried dedup-walk context: the prefix run and its
+    /// below-floor latch cross step boundaries with the positions —
+    /// without them a resumed step would re-decide rule (a)/(b) from
+    /// scratch and keep or drop the wrong versions.
+    carry_kept_below_floor: bool,
+    carry_prefix_len: u16,
+    carry_prefix: [u8; MAX_ENCODED_KEY],
 }
 
 /// Multi-step flush bookkeeping.
@@ -856,6 +904,18 @@ struct FlushState {
     run_id: u32,
     /// `mem_count` at flush start: the size of the frozen prefix.
     freeze_count: u32,
+    /// Applied position sampled from `pending_applied_*` at flush
+    /// start. The frozen prefix contains every apply up to exactly
+    /// this position (later applies land above the prefix), so it is
+    /// what the manifest publish records as durably covered.
+    applied_at_freeze: u64,
+    term_at_freeze: u64,
+    /// `highest_revision` at flush start. The frozen prefix plus the
+    /// existing runs contain every version at or below it, so it is
+    /// the read floor the manifest must restore after a truncated-WAL
+    /// restart — without it the revision clock restarts at the replay
+    /// tail and every run version sits invisibly "in the future".
+    revision_at_freeze: u64,
     /// Records already written into the run.
     cursor: u32,
     out_blocks: u32,
@@ -904,6 +964,33 @@ pub struct DiskState {
     _pad: u32,
     pub highest_revision: u64,
     pub compaction_floor: u64,
+    /// Raft position covered by the PUBLISHED manifest's run set —
+    /// what the last manifest recorded (recovered at boot, advanced on
+    /// flush publish). Everything at or below it is reconstructible
+    /// from the runs alone; the WAL tail beyond it is authoritative
+    /// for the rest. 0 = nothing durably covered yet.
+    pub durable_applied_index: u64,
+    pub durable_applied_term: u64,
+    /// Applied position stamped by the HOST (the module applying
+    /// committed entries) after each apply — the freshest position the
+    /// memtable content corresponds to. Sampled into `FlushState` at
+    /// flush start; never persisted directly.
+    pub pending_applied_index: u64,
+    pub pending_applied_term: u64,
+    /// Revision high-water recorded by the PUBLISHED manifest (the
+    /// run-set's max version). Compaction republishes it unchanged;
+    /// only a flush publish advances it.
+    pub durable_highest_revision: u64,
+    /// Run files retired by a completed compaction, awaiting physical
+    /// deletion. Drained ONE per maintenance step ([`DiskStore::
+    /// retire_step`]): a FAT32 delete frees the whole FAT chain
+    /// synchronously (~35 ms measured on the rig), and doing three of
+    /// them inside the manifest-adoption step blew the module step
+    /// deadline and got the worker terminated. Correctness does not
+    /// depend on the queue: entries lost to a crash are unreferenced
+    /// orphans, which recovery already collects.
+    pub retire_ids: [u32; MAX_RUNS],
+    pub retire_count: u8,
     pub runs: [RunMeta; MAX_RUNS],
     /// Per-run Bloom filters, index-aligned with `runs[0..run_count]`
     /// (newest first). Shifted in lockstep with `runs` on publish, so a
@@ -977,6 +1064,13 @@ impl DiskState {
         self.prepared = 0;
         self.highest_revision = 0;
         self.compaction_floor = 0;
+        self.durable_applied_index = 0;
+        self.durable_applied_term = 0;
+        self.pending_applied_index = 0;
+        self.pending_applied_term = 0;
+        self.durable_highest_revision = 0;
+        self.retire_ids = [0; MAX_RUNS];
+        self.retire_count = 0;
         self.runs = [RunMeta::empty(); MAX_RUNS];
         self.capture.active = false;
         self.compact.active = false;
@@ -1197,6 +1291,11 @@ struct RunScan {
     run_id: u32,
     has_cur: bool,
     exhausted: bool,
+    /// File offset of the block currently in `buf` (resume capture).
+    cur_block_off: u64,
+    /// Index within the current block of the CURRENT record;
+    /// `u32::MAX` = block loaded, nothing parsed yet.
+    cur_rec_idx: u32,
     next_block_off: u64,
     data_end: u64,
     payload_len: usize,
@@ -1215,6 +1314,8 @@ impl RunScan {
             run_id: 0,
             has_cur: false,
             exhausted: true,
+            cur_block_off: 0,
+            cur_rec_idx: u32::MAX,
             next_block_off: 0,
             data_end: 0,
             payload_len: 0,
@@ -1245,7 +1346,56 @@ impl RunScan {
             RUN_HDR_LEN as u64
         };
         rs.exhausted = meta.record_count == 0;
+        rs.cur_block_off = rs.next_block_off;
+        rs.cur_rec_idx = u32::MAX;
         rs
+    }
+
+    /// The scan's resume position: `(block_off, rec_idx)` of the
+    /// CURRENT (unconsumed) record, `(u64::MAX, 0)` when exhausted, or
+    /// `(next_block_off, u32::MAX)` when positioned before any record.
+    /// [`Self::resume_to`] inverts this exactly.
+    fn save_pos(&self) -> (u64, u32) {
+        if self.exhausted {
+            (u64::MAX, 0)
+        } else if self.has_cur {
+            (self.cur_block_off, self.cur_rec_idx)
+        } else {
+            (self.next_block_off, u32::MAX)
+        }
+    }
+
+    /// Re-open the run standing on the exact record `save_pos`
+    /// captured: load the saved block and advance `rec_idx + 1`
+    /// records. The run file is immutable while a compaction holds the
+    /// store's exclusion fence, so a saved offset that no longer lands
+    /// on a block boundary is corruption, not drift — fail closed
+    /// rather than silently walking from the head (which would emit
+    /// wrong records).
+    fn resume_to<S: RunStorage>(
+        meta: &RunMeta,
+        block_off: u64,
+        rec_idx: u32,
+        storage: &S,
+    ) -> Result<Self, StoreError> {
+        if block_off == u64::MAX {
+            return Ok(Self::idle());
+        }
+        let data_end = meta.file_len.saturating_sub(RUN_FOOTER_LEN as u64);
+        if block_off < RUN_HDR_LEN as u64 || block_off > data_end {
+            return Err(StoreError::StorageFault);
+        }
+        let mut rs = Self::open_at(meta, block_off);
+        if rec_idx != u32::MAX {
+            let mut advanced = 0u64;
+            while advanced <= u64::from(rec_idx) {
+                if !rs.next(storage)? {
+                    return Err(StoreError::StorageFault);
+                }
+                advanced += 1;
+            }
+        }
+        Ok(rs)
     }
 
     /// Blocks physically loaded since the last take. The hosting module
@@ -1317,6 +1467,8 @@ impl RunScan {
             }
             self.payload_len = payload_len;
             self.pos = 0;
+            self.cur_block_off = self.next_block_off;
+            self.cur_rec_idx = u32::MAX;
             self.next_block_off = block_end;
         }
         // Parse one record at `pos`.
@@ -1336,6 +1488,7 @@ impl RunScan {
         self.val_off = self.key_off + klen;
         self.val_len = vlen;
         self.pos = self.val_off + vlen;
+        self.cur_rec_idx = self.cur_rec_idx.wrapping_add(1);
         self.has_cur = true;
         Ok(true)
     }
@@ -1448,6 +1601,36 @@ impl Merge {
                 }
             }
             state.add_blocks(rs.take_blocks());
+        }
+        Ok(m)
+    }
+
+    /// Rebuild the compaction merge at the exact positions a paused
+    /// [`compact_step`] saved: one `open_at` + at most one block's
+    /// records advanced per run — O(runs) per step, independent of how
+    /// far the compaction has progressed. Ties re-resolve identically
+    /// (memtable excluded, runs newest-first by index), so the resumed
+    /// merge continues the same sequence the paused one would have.
+    fn resume_compact<S: RunStorage>(state: &DiskState, storage: &S) -> Result<Self, StoreError> {
+        let mut m = Self {
+            include_mem: false,
+            mem_pos: 0,
+            run_count: state.run_count as usize,
+            runs: [RunScan::idle(); MAX_RUNS],
+        };
+        if state.compact.run_pos_count as usize != m.run_count {
+            // The run set changed under a paused compaction — the
+            // exclusion fence forbids that, so this is corruption.
+            return Err(StoreError::StorageFault);
+        }
+        for i in 0..m.run_count {
+            m.runs[i] = RunScan::resume_to(
+                &state.runs[i],
+                state.compact.run_block[i],
+                state.compact.run_rec[i],
+                storage,
+            )?;
+            state.add_blocks(m.runs[i].take_blocks());
         }
         Ok(m)
     }
@@ -1641,6 +1824,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         new_gen: u32,
         runs: &[RunMeta],
         floor: u64,
+        applied_index: u64,
+        applied_term: u64,
+        highest_revision: u64,
     ) -> usize {
         buf[0..4].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         buf[4..6].copy_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
@@ -1650,6 +1836,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         buf[12..16].copy_from_slice(&new_gen.to_le_bytes());
         buf[16..20].copy_from_slice(&(runs.len() as u32).to_le_bytes());
         buf[20..28].copy_from_slice(&floor.to_le_bytes());
+        buf[28..36].copy_from_slice(&applied_index.to_le_bytes());
+        buf[36..44].copy_from_slice(&applied_term.to_le_bytes());
+        buf[44..52].copy_from_slice(&highest_revision.to_le_bytes());
         let mut p = MANIFEST_HDR_LEN;
         for r in runs {
             buf[p..p + 4].copy_from_slice(&r.id.to_le_bytes());
@@ -1679,9 +1868,20 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         new_gen: u32,
         runs: &[RunMeta],
         floor: u64,
+        applied_index: u64,
+        applied_term: u64,
+        highest_revision: u64,
     ) -> Result<FsyncTicket, StoreError> {
         let mut buf = [0u8; MANIFEST_MAX_LEN];
-        let p = Self::encode_manifest(&mut buf, new_gen, runs, floor);
+        let p = Self::encode_manifest(
+            &mut buf,
+            new_gen,
+            runs,
+            floor,
+            applied_index,
+            applied_term,
+            highest_revision,
+        );
         // IN PLACE, at offset 0, into a file that already exists at its
         // final size. No create, no unlink, no directory enumeration.
         match storage.write_at(FileKind::Manifest, slot, 0, &buf[..p]) {
@@ -1806,6 +2006,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             write_run_header(self.storage, id, &mut crc_state, &mut file_len)?;
             let freeze = self.state.mem_count;
             self.state.flush.active = true;
+            self.state.flush.applied_at_freeze = self.state.pending_applied_index;
+            self.state.flush.term_at_freeze = self.state.pending_applied_term;
+            self.state.flush.revision_at_freeze = self.state.highest_revision;
             self.state.flush.phase = FLUSH_PHASE_RECORDS;
             self.state.flush.ticket = 0;
             self.state.flush.pending_gen = 0;
@@ -2012,6 +2215,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.pending_gen,
             &new_runs[..old_count + 1],
             self.state.compaction_floor,
+            self.state.flush.applied_at_freeze,
+            self.state.flush.term_at_freeze,
+            self.state.flush.revision_at_freeze,
         )?;
         self.state.flush.pending_slot = slot;
         self.state.flush.ticket = ticket;
@@ -2083,6 +2289,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.manifest_slot = self.state.flush.pending_slot;
         self.state.next_run_id = self.state.flush.run_id + 1;
         self.state.flush.active = false;
+        self.state.durable_applied_index = self.state.flush.applied_at_freeze;
+        self.state.durable_applied_term = self.state.flush.term_at_freeze;
+        self.state.durable_highest_revision = self.state.flush.revision_at_freeze;
         // Back to the resting phase. Leaving it at MANIFEST_SYNC would
         // make `flush_phase()` lie to diagnostics after a completed
         // flush, and would leave a stale ticket one missed `active`
@@ -2215,8 +2424,10 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut floor = 0u64;
         let mut run_count = 0usize;
         let mut runs = [RunMeta::empty(); MAX_RUNS];
+        let mut applied = (0u64, 0u64);
+        let mut man_revision = 0u64;
         for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
-            let Some((gen, f, rc, rs)) = self.read_manifest(slot)? else {
+            let Some((gen, f, rc, rs, ai, at, hr)) = self.read_manifest(slot)? else {
                 continue;
             };
             if winner_gen.is_none_or(|w| gen > w) {
@@ -2225,6 +2436,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                 floor = f;
                 run_count = rc;
                 runs = rs;
+                applied = (ai, at);
+                man_revision = hr;
             }
         }
 
@@ -2279,6 +2492,19 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.generation = gen;
             self.state.manifest_slot = winner_slot;
             self.state.compaction_floor = floor;
+            self.state.durable_applied_index = applied.0;
+            self.state.durable_applied_term = applied.1;
+            // Baseline for the next flush: nothing newer than the
+            // manifest has been applied yet at recovery time.
+            self.state.pending_applied_index = applied.0;
+            self.state.pending_applied_term = applied.1;
+            // Restore the revision clock to the run-set's high water:
+            // the WAL tail beyond the manifest replays ON TOP of this,
+            // so run content stays visible and new versions keep
+            // ascending. Without this, a truncated WAL restarts the
+            // clock at the tail and every run version is "future".
+            self.state.durable_highest_revision = man_revision;
+            self.state.highest_revision = self.state.highest_revision.max(man_revision);
         } else {
             // No usable manifest: the durable state is empty; every
             // run present was never published and is an orphan.
@@ -2319,10 +2545,14 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// The generation comes from the BODY, not the filename. Under the
     /// A/B scheme the filename is a fixed slot id and carries no
     /// ordering information at all.
+    #[allow(
+        clippy::type_complexity,
+        reason = "single internal caller destructures in place; a named struct would outlive its one use"
+    )]
     fn read_manifest(
         &self,
         slot: u32,
-    ) -> Result<Option<(u32, u64, usize, [RunMeta; MAX_RUNS])>, StoreError> {
+    ) -> Result<Option<(u32, u64, usize, [RunMeta; MAX_RUNS], u64, u64, u64)>, StoreError> {
         let mut buf = [0u8; MANIFEST_SLOT_LEN];
         let mut len = 0usize;
         loop {
@@ -2358,6 +2588,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let generation = rd_u32(body, 12);
         let run_count = rd_u32(body, 16) as usize;
         let floor = rd_u64(body, 20);
+        let applied_index = rd_u64(body, 28);
+        let applied_term = rd_u64(body, 36);
+        let highest_revision = rd_u64(body, 44);
         if run_count > MAX_RUNS {
             return Ok(None);
         }
@@ -2381,7 +2614,15 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             meta.digest = rd_u32(body, p + 16);
             p += MANIFEST_ENTRY_LEN;
         }
-        Ok(Some((generation, floor, run_count, runs)))
+        Ok(Some((
+            generation,
+            floor,
+            run_count,
+            runs,
+            applied_index,
+            applied_term,
+            highest_revision,
+        )))
     }
 
     /// Validate one referenced run end-to-end: exact length,
@@ -2783,7 +3024,10 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             let Some(decoded) = internal_key::decode(key, &mut user_key) else {
                 return Err(StoreError::Malformed);
             };
-            if decoded.kind == ValueKind::PointTombstone && vlen != 0 {
+            // A tombstone is empty (historical layout) or carries
+            // exactly its 8-byte MVCC commit timestamp.
+            // Anything else is malformed.
+            if decoded.kind == ValueKind::PointTombstone && vlen != 0 && vlen != 8 {
                 return Err(StoreError::Malformed);
             }
             batch_max = batch_max.max(decoded.mvcc_timestamp);
@@ -3161,6 +3405,13 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 index: [0u8; RUN_INDEX_BYTES],
                 blk_first_key: [0u8; INDEX_KEY_BYTES],
                 blk_has_first: false,
+                resume_valid: false,
+                run_block: [0; MAX_RUNS],
+                run_rec: [0; MAX_RUNS],
+                run_pos_count: 0,
+                carry_kept_below_floor: false,
+                carry_prefix_len: 0,
+                carry_prefix: [0u8; MAX_ENCODED_KEY],
             };
         } else {
             if floor != self.state.compact.floor {
@@ -3177,6 +3428,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         // the publish fsync is far too long for one step.
         if self.state.compact.phase != COMPACT_PHASE_MERGE {
             let polled = match self.state.compact.phase {
+                COMPACT_PHASE_FOOTER => self.compact_finalize(),
                 COMPACT_PHASE_RUN_SYNC => self.compact_poll_run(),
                 COMPACT_PHASE_MAN_WRITE => self.compact_manifest_write(),
                 _ => self.compact_poll_manifest(),
@@ -3210,25 +3462,48 @@ impl<S: RunStorage> DiskStore<'_, S> {
     fn compact_step(&mut self) -> Result<Progress, StoreError> {
         let floor = self.state.compact.floor;
         let resume = self.state.compact.input_ordinal;
-        let mut m = Merge::init(self.state, &*self.storage, false, b"")?;
+        // Resume by SEEKING to the saved per-run positions (O(runs)),
+        // never by replaying the merge from record 0 (O(resume) per
+        // step, O(n²) total — the shape that outgrew the module step
+        // deadline on FAT32 and got the worker terminated).
+        let resuming = self.state.compact.resume_valid;
+        if !resuming && resume != 0 {
+            return Err(StoreError::StorageFault);
+        }
+        let mut m = if resuming {
+            Merge::resume_compact(self.state, &*self.storage)?
+        } else {
+            Merge::init(self.state, &*self.storage, false, b"")?
+        };
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         let mut prefix = [0u8; MAX_ENCODED_KEY];
         let mut prefix_len = 0usize;
         let mut kept_below_floor = false;
-        let mut processed = 0u64;
+        if resuming {
+            prefix_len = self.state.compact.carry_prefix_len as usize;
+            prefix[..prefix_len].copy_from_slice(&self.state.compact.carry_prefix[..prefix_len]);
+            kept_below_floor = self.state.compact.carry_kept_below_floor;
+        }
+        let mut processed = resume;
         let mut block = [0u8; BLOCK_MAX_PAYLOAD];
         let mut fill = 0usize;
         let mut block_recs = 0u32;
         loop {
             let next = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?;
             let Some((klen, vlen)) = next else {
-                // Input exhausted: close the last block, footer, fsync,
-                // publish, swap.
+                // Input exhausted: close the last block, then hand the
+                // footer + fsync + publish tail to its own phases —
+                // each is a separate step with its own deadline
+                // budget.
                 if fill > 0 {
                     self.compact_write_block(&block[..fill], block_recs)?;
                 }
-                return self.compact_finalize();
+                self.state.compact.resume_valid = false;
+                self.state.compact.phase = COMPACT_PHASE_FOOTER;
+                return Ok(Progress::InProgress {
+                    cursor: self.state.compact.input_ordinal,
+                });
             };
             if klen < MIN_ENCODED_KEY {
                 return Err(StoreError::StorageFault);
@@ -3251,9 +3526,6 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 false // rule (a): shadowed below the floor
             };
             processed += 1;
-            if processed <= resume {
-                continue; // decided in an earlier step
-            }
             if keep {
                 let rec_len = RECORD_FIXED + klen + vlen;
                 if fill > 0 && fill + rec_len > BLOCK_TARGET {
@@ -3285,11 +3557,24 @@ impl<S: RunStorage> DiskStore<'_, S> {
             }
             if processed - resume >= COMPACT_STEP_RECORDS {
                 // Step budget spent: close the partial block so no
-                // block state needs to persist across steps.
+                // block state needs to persist across steps, and save
+                // the exact merge positions + dedup-walk context so
+                // the next step SEEKS here instead of replaying.
                 if fill > 0 {
                     self.compact_write_block(&block[..fill], block_recs)?;
                 }
                 self.state.compact.input_ordinal = processed;
+                self.state.compact.resume_valid = true;
+                self.state.compact.run_pos_count = m.run_count as u8;
+                for i in 0..m.run_count {
+                    let (b, r) = m.runs[i].save_pos();
+                    self.state.compact.run_block[i] = b;
+                    self.state.compact.run_rec[i] = r;
+                }
+                self.state.compact.carry_prefix_len = prefix_len as u16;
+                self.state.compact.carry_prefix[..prefix_len]
+                    .copy_from_slice(&prefix[..prefix_len]);
+                self.state.compact.carry_kept_below_floor = kept_below_floor;
                 return Ok(Progress::InProgress { cursor: processed });
             }
         }
@@ -3391,7 +3676,16 @@ impl<S: RunStorage> DiskStore<'_, S> {
         let c = self.state.compact;
         let slot = self.state.inactive_manifest_slot();
         let ticket = if c.out_records == 0 {
-            Self::manifest_write_submit(self.storage, slot, c.pending_gen, &[], c.floor)?
+            Self::manifest_write_submit(
+                self.storage,
+                slot,
+                c.pending_gen,
+                &[],
+                c.floor,
+                self.state.durable_applied_index,
+                self.state.durable_applied_term,
+                self.state.durable_highest_revision,
+            )?
         } else {
             let meta = RunMeta {
                 id: c.out_run_id,
@@ -3400,7 +3694,16 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 digest: c.pending_crc,
                 _pad: 0,
             };
-            Self::manifest_write_submit(self.storage, slot, c.pending_gen, &[meta], c.floor)?
+            Self::manifest_write_submit(
+                self.storage,
+                slot,
+                c.pending_gen,
+                &[meta],
+                c.floor,
+                self.state.durable_applied_index,
+                self.state.durable_applied_term,
+                self.state.durable_highest_revision,
+            )?
         };
         self.state.compact.pending_slot = slot;
         self.state.compact.ticket = ticket;
@@ -3454,16 +3757,47 @@ impl<S: RunStorage> DiskStore<'_, S> {
         self.state.compaction_floor = c.floor;
         self.state.compact.active = false;
         self.state.compact.phase = COMPACT_PHASE_MERGE;
-        // The merged-away inputs are unreferenced now; delete them.
+        // The merged-away inputs are unreferenced now. QUEUE their
+        // deletion instead of doing it here: each FAT32 delete walks
+        // and frees the file's whole cluster chain synchronously, and
+        // several of them in this one step is exactly the deadline
+        // overrun that used to kill the worker at manifest adoption.
+        // The maintenance loop drains one per step; a crash merely
+        // leaves orphans for recovery.
         for meta in old_runs.iter().take(old_count) {
             if c.out_records != 0 && meta.id == c.out_run_id {
                 continue;
             }
-            match self.storage.delete(FileKind::Run, meta.id) {
-                Ok(()) | Err(StorageError::NotFound) => {}
-                Err(e) => return Err(map_storage(e)),
+            if (self.state.retire_count as usize) < MAX_RUNS {
+                self.state.retire_ids[self.state.retire_count as usize] = meta.id;
+                self.state.retire_count += 1;
             }
+            // A full queue would only mean deletions are outpaced by
+            // compactions, which the one-per-step drain plus the
+            // 3-run merge threshold makes impossible; dropping the id
+            // would still only orphan a file for recovery.
         }
         Ok(Progress::Done)
+    }
+
+    /// Physically delete ONE queued retired run file. Returns whether
+    /// a deletion was performed. Bounded on purpose: one FAT-chain
+    /// free per module step.
+    pub fn retire_step(&mut self) -> Result<bool, StoreError> {
+        if self.state.retire_count == 0 {
+            return Ok(false);
+        }
+        self.state.retire_count -= 1;
+        let id = self.state.retire_ids[self.state.retire_count as usize];
+        match self.storage.delete(FileKind::Run, id) {
+            Ok(()) | Err(StorageError::NotFound) => Ok(true),
+            Err(e) => {
+                // Put it back; the next step retries. A permanently
+                // undeletable file degrades to an orphan, not a fault.
+                self.state.retire_ids[self.state.retire_count as usize] = id;
+                self.state.retire_count += 1;
+                Err(map_storage(e))
+            }
+        }
     }
 }

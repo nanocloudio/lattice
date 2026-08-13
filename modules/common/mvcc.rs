@@ -852,4 +852,61 @@ impl ReserveState {
             lease_expiry_unix_ms: 0,
         })
     }
+
+    /// Build an ESTABLISHMENT probe record to propose while
+    /// `Unestablished` — the bootstrap for compositions where no
+    /// ordered replay-complete signal reaches the allocator's
+    /// `committed_state` port.
+    ///
+    /// Safety does not rest on the caller knowing whether the log is
+    /// empty. The probe is proposed through consensus like any record,
+    /// so it lands AFTER every record already in the log, and
+    /// [`observe_committed`](Self::observe_committed) folds records in
+    /// log order:
+    ///
+    /// - **Log empty**: the probe is the first record. Folding it
+    ///   establishes the allocator (foreign branch — the probe's epoch
+    ///   is not this incarnation's post-fold epoch), adopting its high
+    ///   water with no reserve. Correct: nothing was ever issued.
+    /// - **Log non-empty**: the earlier records fold first and
+    ///   establish the allocator; when the probe arrives its interval
+    ///   `[seen_high_water, …)` built below is either a valid successor
+    ///   (harmless extra advance) or — if it raced a concurrent record
+    ///   — an interval regression that `validate_successor` refuses,
+    ///   so every replica DROPS it identically. Either way nothing is
+    ///   ever re-issued.
+    ///
+    /// The caller retries on a coarse cadence while `Unestablished`;
+    /// duplicate probes are refused by succession the same way.
+    ///
+    /// Shared precondition with [`establish_empty_log`]
+    /// (Self::establish_empty_log): the committed log must still
+    /// CONTAIN every allocator record ever committed. WAL compaction
+    /// that discards lease records without carrying the high water in
+    /// the snapshot would let a probe re-issue timestamps — the same
+    /// hazard the replay-complete path has, gated today by the pinned
+    /// compaction floor (§18).
+    pub fn plan_bootstrap(&mut self, chunk: u64) -> Result<TimestampLease, IssueError> {
+        if self.phase != ReservePhase::Unestablished {
+            return Err(IssueError::BadRequest);
+        }
+        if chunk == 0 || chunk > MAX_LEASE_INTERVAL {
+            return Err(IssueError::BadRequest);
+        }
+        // Strictly above anything observed so far; epoch strictly above
+        // every observed epoch. `epoch + 1` because a fresh allocator's
+        // epoch is 0 and a probe at epoch 0 could tie a genuine epoch-0
+        // predecessor's records instead of superseding them.
+        let (start, end) =
+            next_interval(self.committed_high_water, chunk).ok_or(IssueError::Overflow)?;
+        let epoch = self.epoch.checked_add(1).ok_or(IssueError::Overflow)?;
+        Ok(TimestampLease {
+            allocator_id: self.allocator_id,
+            epoch,
+            interval_start: start,
+            interval_end: end,
+            issued_to: ISSUED_TO_NONE,
+            lease_expiry_unix_ms: 0,
+        })
+    }
 }

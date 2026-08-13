@@ -1,8 +1,10 @@
 // Bounded, no_std, no-alloc Postgres v3 wire framing — StartupMessage, the SASL
 // authentication messages, simple Query, and message parsing. `include!`d by the
-// host crate (tests) and the `pg` .fmod. The SCRAM computation lives in
-// scram_core.rs; the connection state machine lives in the module. Message
-// building + parsing only here, so it is pure and host-testable.
+// `pg` .fmod and `#[path]`-mounted by `tests/harness/tests/contract_pg_wire.rs`,
+// whose vectors cover this whole surface. The SCRAM computation lives in
+// scram_core.rs; reply accumulation lives in pg_reply.rs; the connection state
+// machine lives in the module. Message building + parsing only here, so it is
+// pure and host-testable.
 
 fn pg_put(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> Option<()> {
     if *pos + bytes.len() > out.len() {
@@ -137,27 +139,4 @@ pub fn pg_sasl_has_scram_sha256(body: &[u8]) -> bool {
 /// The ReadyForQuery (`Z`) transaction-status byte (`I`/`T`/`E`).
 pub fn pg_ready_status(body: &[u8]) -> Option<u8> {
     body.first().copied()
-}
-
-/// The first column value of a DataRow (`D`) body
-/// (`[ncols:i16 BE]` then per column `[len:i32 BE (-1 = NULL)][bytes]`), as a
-/// byte range into `body`. `None` if absent, NULL, or truncated.
-pub fn pg_datarow_col0(body: &[u8]) -> Option<(usize, usize)> {
-    if body.len() < 2 {
-        return None;
-    }
-    let ncols = i16::from_be_bytes([body[0], body[1]]);
-    if ncols < 1 || body.len() < 6 {
-        return None;
-    }
-    let collen = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
-    if collen < 0 {
-        return None; // NULL column
-    }
-    let start = 6;
-    let end = start + collen as usize;
-    if end > body.len() {
-        return None;
-    }
-    Some((start, end))
 }

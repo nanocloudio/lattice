@@ -1,6 +1,11 @@
-# Lattice: single-node DURABLE relational graph (RFC database
-# foundation §6.3's durable database composition, carrying the §14.1
-# relational front).
+# Lattice: the CDC egress composition — the durable model
+# graph plus a cdc_pump streaming the graph-vertex keyrange into the
+# in-repo loopback_sink reference provider. Swap loopback_sink for any
+# `stream.sink.ordered_ack` provider (e.g. quantum's mqtt sink) to
+# reach a real broker; the pump neither knows nor cares (§11).
+#
+# The pump rides the FREE etcd anchor pair as an ordinary KV client —
+# no privileged read path (§5), no new router surface.
 #
 # `single-relational.yaml` proves the SQL path; this composition gives
 # it the durability story every other write in the system has. The
@@ -24,9 +29,7 @@
 # the existing `op_is_write` classification with no relational special
 # case, which is the §14.1 split earning its keep.
 #
-# Run: mkdir -p wal kv && fluxor run configs/single-relational-disk.yaml
-# Then: `psql    -h 127.0.0.1 -p 5432 -U lattice -d lattice`
-#   or: `mariadb -h 127.0.0.1 -P 3306 -u lattice --skip-ssl`
+# Run: mkdir -p wal kv && fluxor run configs/single-models-cdc.yaml
 
 target: linux
 tick_us: 1000
@@ -103,6 +106,26 @@ modules:
       self_id: 0
       voter_count: 1
       partition_id: 0
+
+  # ── CDC egress ────────────────────────────────
+  - name: cdc_pump
+    params:
+      feed_id: 1
+      table_id: 0
+      # graph-vertex keyspace prefix (0x80030001), hex.
+      prefix: "80030001"
+      proto: 1              # PROTO_ETCD — matches the wired pair
+      checkpoint_interval_ms: 500
+      resolved_interval_ms: 500
+      claim_interval_ms: 500
+      retention_budget_ms: 60000
+  - name: loopback_sink
+  # §9/B-4: the pump's budgeted retention claim lands here. The claim's
+  # EXPIRY is the budget — a dead pump's claim lapses on its own and
+  # the GC side stops honouring it, no cooperation required. (Physical
+  # reclamation itself stays pinned until GC enablement lands; the
+  # lapse rule fails safe either way.)
+  - name: compaction_coordinator
 
   # ── Observability: metric fan-in + HTTP /metrics ────────────────
   - name: adapter_metrics
@@ -202,12 +225,34 @@ wiring:
   - from: durability.quorum_durable
     to: consensus.durable
 
+  # ── CDC wiring: pump ⇄ router (etcd pair), pump ⇄ sink ─────────
+  - from: cdc_pump.kv_out
+    to: kv_request_router.etcd_in
+  - from: kv_request_router.etcd_out
+    to: cdc_pump.kv_in
+  - from: cdc_pump.publish_out
+    to: loopback_sink.publish_in
+  - from: loopback_sink.ack_out
+    to: cdc_pump.ack_in
+  - from: cdc_pump.retention
+    to: compaction_coordinator.retention_claims
+  - from: kv_state_worker.compaction_floor
+    to: compaction_coordinator.kv_floor
+  - from: compaction_coordinator.retention_floor_out
+    to: durability.retention_floor
+
   # ── Observability fan-in → operations → HTTP /metrics ───────────
   - from: model_edge_anchor.metrics
     to: adapter_metrics.events_in
   - from: kv_request_router.metrics
     to: adapter_metrics.events_in
   - from: kv_state_worker.metrics
+    to: adapter_metrics.events_in
+  - from: cdc_pump.metrics
+    to: adapter_metrics.events_in
+  - from: loopback_sink.metrics
+    to: adapter_metrics.events_in
+  - from: compaction_coordinator.metrics
     to: adapter_metrics.events_in
   - from: adapter_metrics.telemetry_out
     to: operations.ingest

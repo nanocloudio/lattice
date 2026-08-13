@@ -666,6 +666,117 @@ pub fn encode_range_kv_body(req: &RangeRequest<'_>, out: &mut [u8]) -> Option<(b
     Some((historical, need))
 }
 
+/// Cap on entries per ranged Range page. The anchor's response body
+/// budget is 2 KiB (`STREAM_BODY_MAX`); a small page with an honest
+/// `more` flag beats a large one the transport silently drops.
+pub const RANGE_SCAN_PAGE_MAX: u16 = 8;
+
+/// Encode a RANGED `RangeRequest` (non-empty `range_end`) into a
+/// `KV_OP_RANGE_SCAN` body:
+/// `[start_len:u16][start…][end_len:u16][end…][cursor:u64 = 0]
+///  [limit:u16]`. Historical ranged reads are the caller's job to
+/// refuse (there is no ranged `GET_AT`).
+pub fn encode_range_scan_body(req: &RangeRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    let (start, end) = (req.key, req.range_end);
+    if start.len() > u16::MAX as usize || end.len() > u16::MAX as usize {
+        return None;
+    }
+    let limit: u16 = if req.limit > 0 && req.limit < i64::from(RANGE_SCAN_PAGE_MAX) {
+        req.limit as u16
+    } else {
+        RANGE_SCAN_PAGE_MAX
+    };
+    let need = 2 + start.len() + 2 + end.len() + 8 + 2;
+    if need > out.len() {
+        return None;
+    }
+    let mut p = 0usize;
+    out[p..p + 2].copy_from_slice(&(start.len() as u16).to_le_bytes());
+    p += 2;
+    let mut i = 0;
+    while i < start.len() {
+        out[p + i] = start[i];
+        i += 1;
+    }
+    p += start.len();
+    out[p..p + 2].copy_from_slice(&(end.len() as u16).to_le_bytes());
+    p += 2;
+    i = 0;
+    while i < end.len() {
+        out[p + i] = end[i];
+        i += 1;
+    }
+    p += end.len();
+    out[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
+    p += 8;
+    out[p..p + 2].copy_from_slice(&limit.to_le_bytes());
+    p += 2;
+    // The cursor, not the estimate: `need` sized the buffer, `p` counts
+    // what was written. They agree by construction, and returning the
+    // one the writes produced keeps every advance load-bearing — a
+    // field appended after the last one cannot then land at a stale
+    // offset.
+    Some(p)
+}
+
+/// Build an `etcdserverpb.RangeResponse` from a `KV_RESULT_RANGE`
+/// body (`[cursor:u64][count:u16]` then per entry
+/// `[key_len:u16][key…][value_len:u32][value…]`). Every entry that
+/// fits the output budget is written; a non-zero provider cursor OR a
+/// budget stop sets `more = true`, so a truncated page is announced,
+/// never passed off as complete. Per-entry `mod_revision` is
+/// approximated by the response head revision (the native scan body
+/// does not carry per-key revisions).
+pub fn build_range_scan_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    body: &[u8],
+) -> Option<()> {
+    if body.len() < 10 {
+        return None;
+    }
+    let cursor = u64::from_le_bytes([
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ]);
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    write_response_header(out, off, revision)?;
+    // Tail budget: `more` (≤2 bytes) + `count` (≤11 bytes).
+    let tail_budget = 16usize;
+    let mut p = 10usize;
+    let mut written: i64 = 0;
+    let mut budget_stop = false;
+    for _ in 0..count {
+        if body.len() < p + 2 {
+            return None;
+        }
+        let klen = u16::from_le_bytes([body[p], body[p + 1]]) as usize;
+        p += 2;
+        let key = body.get(p..p + klen)?;
+        p += klen;
+        let vlen = u32::from_le_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]) as usize;
+        p += 4;
+        let value = body.get(p..p + vlen)?;
+        p += vlen;
+        // Conservative encoded bound: key + value + tags/varints.
+        if *off + klen + vlen + 40 + tail_budget > out.len() {
+            budget_stop = true;
+            break;
+        }
+        write_keyvalue(out, off, 2, key, value, revision, 1)?;
+        written += 1;
+    }
+    if cursor != 0 || budget_stop {
+        // bool `more = 3`.
+        write_tag(out, off, 3, WIRE_VARINT)?;
+        write_varint(out, off, 1)?;
+    }
+    // int64 `count = 4`.
+    write_tag(out, off, 4, WIRE_VARINT)?;
+    write_varint(out, off, written as u64)?;
+    Some(())
+}
+
 /// Subset of `etcdserverpb.PutRequest`.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PutRequest<'a> {

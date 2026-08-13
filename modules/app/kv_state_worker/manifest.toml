@@ -144,6 +144,17 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
+# Demand-driven commit-timestamp lease requests to timestamp_allocator
+#. Unreplicated HINT — the grant returns replicated,
+# in-band on `commands` via the apply bridge. Sent only while the
+# worker's lease runs low, so an idle graph proposes nothing.
+# MSG_TS_LEASE_REQUEST `[corr_id:u64][requester:u32][size:u32]`
+[[ports]]
+name = "lease_request"
+index = 5
+direction = "output"
+content_type = "OctetStream"
+
 # ── Observability (Phase 14) ──────────────────────────────────────────
 # Module-scope metrics emitted on `metrics` at a ~1 s WALL-CLOCK cadence
 # (NOT a step cadence — see the emitter's docs: a step cadence goes
@@ -214,4 +225,7 @@ metrics = [
     "cfg_state_store",
     "cfg_root_path",
     "cfg_store_id",
+    "ts_stamped",
+    "ts_unstamped",
+    "snapshot_refusals",
 ]

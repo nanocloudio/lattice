@@ -102,8 +102,8 @@ mod data_surface;
 #[path = "../../common/net_proto.rs"]
 mod net_proto;
 use net_proto::{
-    NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNOK, NET_MSG_DATA,
-    NET_MSG_ERROR, NET_SOCK_STREAM,
+    net_conn_id, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_CLOSED,
+    NET_MSG_CONNOK, NET_MSG_DATA, NET_MSG_ERROR, NET_SOCK_STREAM,
 };
 
 use data_surface::{
@@ -136,7 +136,9 @@ const SCRATCH_BUF_SIZE: usize = REQUEST_FRAME_MAX_LEN + 256;
 /// slow enough not to spin on a storage graph that is still booting.
 const REDIAL_STEPS: u32 = 2000;
 
-const NO_CONN: u8 = 0xFF;
+/// u16 conn-id sentinel: the ip stack's ids are monotone u16s, so
+/// 0xFFFF is unreachable long before the tables bind.
+const NO_CONN: u16 = 0xFFFF;
 
 define_params! {
     ClientState;
@@ -253,7 +255,7 @@ struct ClientState {
     database_id: u32,
 
     /// Connection to the storage graph, or `NO_CONN` while dialling.
-    conn_id: u8,
+    conn_id: u16,
     /// Steps since the last dial attempt.
     since_dial: u32,
     next_request_id: u64,
@@ -877,7 +879,7 @@ unsafe fn handle_wire_data(client: &mut ClientState, data: &[u8]) {
 /// its slot would leak the table across a flapping link.
 unsafe fn drop_connection(client: &mut ClientState) {
     if client.conn_id != NO_CONN {
-        let payload = [client.conn_id];
+        let payload = client.conn_id.to_le_bytes();
         let scratch = client.scratch.as_mut_ptr();
         let sys = client.syscalls;
         if !sys.is_null() && client.net_out >= 0 {
@@ -886,7 +888,7 @@ unsafe fn drop_connection(client: &mut ClientState) {
                 client.net_out,
                 NET_CMD_CLOSE,
                 payload.as_ptr(),
-                1,
+                NET_CONN_LEN,
                 scratch,
                 SCRATCH_BUF_SIZE,
             );
@@ -958,16 +960,22 @@ unsafe fn net_send_data(client: &mut ClientState, data: &[u8]) -> bool {
     if sys.is_null() || client.net_out < 0 || client.conn_id == NO_CONN {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
+    let id = client.conn_id.to_le_bytes();
     let scratch = client.scratch.as_mut_ptr();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = client.conn_id;
-    core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        data.len(),
+    );
     let total = NET_FRAME_HDR + payload_len;
     ((*sys).channel_write)(client.net_out, scratch, total) == total as i32
 }
@@ -1004,28 +1012,31 @@ unsafe fn poll_net_in(client: &mut ClientState) -> bool {
 unsafe fn dispatch_net_frame(client: &mut ClientState, msg_type: u8, payload: &[u8]) {
     match msg_type {
         NET_MSG_CONNOK => {
-            if !payload.is_empty() && client.conn_id == NO_CONN {
-                client.conn_id = payload[0];
-                client.recv_len = 0;
-                client.dial_unanswered = false;
-                let sys = client.syscalls;
-                if !sys.is_null() {
-                    dev_log(&*sys, 3, b"[data_cli] connected".as_ptr(), 20);
+            // CONNOK payload: [conn_id:u16 LE][requester_tag:u8?].
+            if client.conn_id == NO_CONN {
+                if let Some(new_id) = net_conn_id(payload) {
+                    client.conn_id = new_id;
+                    client.recv_len = 0;
+                    client.dial_unanswered = false;
+                    let sys = client.syscalls;
+                    if !sys.is_null() {
+                        dev_log(&*sys, 3, b"[data_cli] connected".as_ptr(), 20);
+                    }
                 }
             }
         }
         NET_MSG_DATA => {
-            if payload.len() >= 2 && payload[0] == client.conn_id {
+            if payload.len() > NET_CONN_LEN && net_conn_id(payload) == Some(client.conn_id) {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-                let n = (payload.len() - 1).min(SCRATCH_BUF_SIZE);
-                tmp[..n].copy_from_slice(&payload[1..1 + n]);
+                let n = (payload.len() - NET_CONN_LEN).min(SCRATCH_BUF_SIZE);
+                tmp[..n].copy_from_slice(&payload[NET_CONN_LEN..NET_CONN_LEN + n]);
                 handle_wire_data(client, &tmp[..n]);
             }
         }
         // `net_out` is broadcast, so both of these also carry events for
         // connections other modules own. Only react to our own.
         NET_MSG_CLOSED | NET_MSG_ERROR => {
-            if !payload.is_empty() && payload[0] == client.conn_id {
+            if net_conn_id(payload) == Some(client.conn_id) {
                 drop_connection(client);
                 // A dead leader presents as a disconnect, not as a
                 // refusal. Move on rather than re-dialling a corpse;

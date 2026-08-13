@@ -1,0 +1,57 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# The in-repo REFERENCE implementation of the
+# `stream.sink.ordered_ack` capability (modules/common/cdc_wire.rs),
+# and the sink lattice's own CI runs the cdc_pump against so no gate
+# needs a broker. The "backend" is the module itself: a publish is
+# durably accepted the moment it is validated, and acked status 0 in
+# arrival order — which trivially satisfies contract terms 1 (ack =
+# durable acceptance at the strongest level this backend offers) and 2
+# (per-key order within a connection).
+#
+# Fault injection for pump conformance: `linkdown_every` acks, the
+# sink emits LINK_DOWN (invalidating every unacked corr) and, after
+# `linkdown_hold_steps`, LINK_UP — exercising the pump's mandatory
+# replay path. While down, arriving publishes are dropped WITHOUT ack:
+# they were already invalidated by the LINK_DOWN, which is exactly the
+# hole the replay rule exists to cover.
+
+capabilities = ["stream.sink.ordered_ack"]
+
+# MSG_CDC_PUBLISH `SinkPublish` frames from the pump.
+[[ports]]
+name = "publish_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_CDC_ACK `SinkAck` frames (replies + link-state signals).
+[[ports]]
+name = "ack_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability (Phase 14) ──────────────────────────────────────────
+# Declaration order IS the metric-id contract, append-only.
+# `delivered_key_hash` is a rolling FNV over (msg_key, payload) of every
+# delivered publish — a content DIGEST the end-to-end tests compare
+# against the expected event stream without a second transport.
+[observability]
+metrics = [
+    "delivered",
+    "acked",
+    "refused",
+    "dropped_while_down",
+    "linkdowns",
+    "delivered_bytes",
+    "delivered_key_hash",
+    "contract_violations",
+]

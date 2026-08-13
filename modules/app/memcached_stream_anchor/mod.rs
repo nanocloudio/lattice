@@ -92,8 +92,8 @@ use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 #[path = "../../common/net_proto.rs"]
 mod net_proto;
 use net_proto::{
-    NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 
 // ── Capacities ────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ define_params! {
         => |s, d, len| { s.listen_port = p_u16(d, len, 0, DEFAULT_LISTEN_PORT); };
 }
 const DEFAULT_TENANT: u32 = 0;
-const SLOT_FREE: u8 = 0xFF;
+const SLOT_FREE: u16 = 0xFFFF;
 
 // ── Slot ──────────────────────────────────────────────────────────────
 
@@ -134,7 +134,7 @@ enum SlotPhase {
 
 #[repr(C)]
 struct Slot {
-    conn_id: u8,
+    conn_id: u16,
     phase: SlotPhase,
     // Number of GET requests currently in flight for the current
     // `get`/`gets` batch on this slot. `END\r\n` is emitted only when
@@ -189,7 +189,7 @@ enum AnchorPhase {
 #[repr(C)]
 struct InflightVal {
     op: u8,
-    conn_id: u8,
+    conn_id: u16,
     // For multi-key GET we'd need the full key list; Phase 2 keeps GET
     // single-key (memcached `get k1 k2 k3` becomes one round-trip per
     // key — semantically equivalent, slightly chattier).
@@ -220,7 +220,7 @@ struct AnchorState {
     listen_port: u16,
     phase: AnchorPhase,
     _pad0: u8,
-    server_conn_id: u8,
+    server_conn_id: u16,
     _pad1: [u8; 3],
     corr_seq: u64,
     // STATS counters (memcached `stats` command). `curr_connections` is
@@ -266,7 +266,7 @@ impl AnchorState {
         }
     }
 
-    fn alloc_slot(&mut self, conn_id: u8) -> Option<usize> {
+    fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
         for i in 0..MAX_CONNS {
             if self.slots[i].conn_id == SLOT_FREE {
                 self.slots[i].conn_id = conn_id;
@@ -279,7 +279,7 @@ impl AnchorState {
         None
     }
 
-    fn find_slot(&self, conn_id: u8) -> Option<usize> {
+    fn find_slot(&self, conn_id: u16) -> Option<usize> {
         for (i, slot) in self.slots.iter().enumerate() {
             if slot.conn_id == conn_id {
                 return Some(i);
@@ -417,7 +417,10 @@ unsafe fn send_envelope(
     p += 1;
     scratch[p..p + 4].copy_from_slice(&tenant.to_le_bytes());
     p += 4;
-    scratch[p] = conn_id;
+    // The head's conn byte is this anchor's SLOT INDEX (a caller-
+    // chosen routing slot the router echoes) — NOT the net conn id,
+    // which is u16 now and does not fit the byte.
+    scratch[p] = slot_idx as u8;
     p += 1;
     scratch[p] = op_consistency;
     p += 1;
@@ -976,9 +979,13 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     let Some(inflight) = anchor.inflight.remove(corr_id) else {
         return true;
     };
-    let Some(slot_idx) = anchor.find_slot(conn_id) else {
+    // The head's conn byte is the SLOT INDEX this anchor stamped on
+    // the request (the router echoes it). Validate occupancy — a slot
+    // freed while a reply was in flight must not resurrect.
+    let slot_idx = conn_id as usize;
+    if slot_idx >= MAX_CONNS || anchor.slots[slot_idx].conn_id == SLOT_FREE {
         return true;
-    };
+    }
 
     let slot = &mut anchor.slots[slot_idx];
     let mem_op = MemOp::from_u8(inflight.op).unwrap_or(MemOp::Get);
@@ -1048,45 +1055,45 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
     match msg_type {
         NET_MSG_BOUND => {
             // Multi-anchor graphs share `net_out` (broadcast); the
-            // BOUND frame carries `[conn_id:1][local_port:2 LE]` so
+            // BOUND frame carries `[conn_id:u16 LE][local_port:2 LE]` so
             // we only claim the listener whose port matches ours.
-            if anchor.phase == AnchorPhase::WaitBound && payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            if anchor.phase == AnchorPhase::WaitBound && payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = payload[0];
+                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                     anchor.phase = AnchorPhase::Listening;
                 }
-            } else if anchor.phase == AnchorPhase::WaitBound && !payload.is_empty() {
-                anchor.server_conn_id = payload[0];
+            } else if anchor.phase == AnchorPhase::WaitBound && payload.len() >= NET_CONN_LEN {
+                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                 anchor.phase = AnchorPhase::Listening;
             }
         }
         NET_MSG_ACCEPTED => {
-            if payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // ACCEPTED payload: [conn:u16 LE][local_port:u16 LE].
+            if payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port != anchor.listen_port {
                     return;
                 }
             }
-            if !payload.is_empty() {
-                let new_id = payload[0];
+            if let Some(new_id) = net_conn_id(payload) {
                 if anchor.alloc_slot(new_id).is_none() {
                     let _ = net_send_close(anchor, new_id);
                 }
             }
         }
         NET_MSG_DATA => {
-            if payload.len() >= 2 {
-                let conn_id = payload[0];
-                let data_slice = &payload[1..];
-                if let Some(idx) = anchor.find_slot(conn_id) {
-                    handle_client_data(anchor, idx, data_slice);
+            if payload.len() > NET_CONN_LEN {
+                if let Some(conn_id) = net_conn_id(payload) {
+                    let data_slice = &payload[NET_CONN_LEN..];
+                    if let Some(idx) = anchor.find_slot(conn_id) {
+                        handle_client_data(anchor, idx, data_slice);
+                    }
                 }
             }
         }
         NET_MSG_CLOSED => {
-            if !payload.is_empty() {
-                let conn_id = payload[0];
+            if let Some(conn_id) = net_conn_id(payload) {
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }
@@ -1101,8 +1108,7 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
             // dead on every dialing node, fine on pure acceptors. Only
             // react to an error for a conn WE own: free that slot, keep
             // listening. See redis_edge_anchor for the same fix + trace.
-            if !payload.is_empty() {
-                let conn_id = payload[0];
+            if let Some(conn_id) = net_conn_id(payload) {
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }
@@ -1132,40 +1138,46 @@ unsafe fn net_send_bind(anchor: &mut AnchorState) -> bool {
     wrote > 0
 }
 
-unsafe fn net_send_close(anchor: &mut AnchorState, conn_id: u8) -> bool {
+unsafe fn net_send_close(anchor: &mut AnchorState, conn_id: u16) -> bool {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload = [conn_id];
+    let payload = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys,
         anchor.net_out,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        1,
+        NET_CONN_LEN,
         scratch,
         SCRATCH_BUF_SIZE,
     );
     wrote > 0
 }
 
-unsafe fn net_send_data(anchor: &mut AnchorState, conn_id: u8, data: &[u8]) -> bool {
+unsafe fn net_send_data(anchor: &mut AnchorState, conn_id: u16, data: &[u8]) -> bool {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
-    core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        data.len(),
+    );
     let total = NET_FRAME_HDR + payload_len;
     let n = ((*sys).channel_write)(anchor.net_out, scratch, total);
     n == total as i32

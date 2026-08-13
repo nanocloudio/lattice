@@ -99,9 +99,15 @@ mod models;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/db_ops.rs"]
+mod db_ops;
+
+#[path = "../../common/hex_core.rs"]
+mod hex_core;
+
 use net_proto::{
-    NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use redis_codec::{
     enc_array_header, enc_bulk, enc_error, enc_integer, enc_null_bulk, enc_simple_str, parse_one,
@@ -119,7 +125,9 @@ const MAX_CONNS: usize = 8;
 const RECV_BUF: usize = 8192;
 const SEND_BUF: usize = 8192;
 const SCRATCH_BUF: usize = 16384;
-const SLOT_FREE: u8 = 0xFF;
+/// u16 conn-id sentinel: the ip stack's ids are monotone u16s, so
+/// 0xFFFF is unreachable long before the tables bind.
+const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 6380;
 const KEY_MAX: usize = 512;
 /// Search: max terms per document / vector: max dimensions.
@@ -156,7 +164,7 @@ const PHASE_LISTENING: u8 = 2;
 
 #[repr(C)]
 struct Slot {
-    conn_id: u8,
+    conn_id: u16,
     state: u8,
     recv: [u8; RECV_BUF],
     recv_len: usize,
@@ -195,7 +203,7 @@ struct AnchorState {
 
     listen_port: u16,
     phase: u8,
-    server_conn_id: u8,
+    server_conn_id: u16,
     slots: [Slot; MAX_CONNS],
 
     // In-flight command.
@@ -246,6 +254,13 @@ struct AnchorState {
     feed_count: u16,
     feed_from: u64,
     feed_to: u64,
+    /// Commit-timestamp frontier from the newest MSG_KV_RESPONSE fence
+    /// tail — reported verbatim in FEED.READ replies.
+    last_frontier: u64,
+    /// The inbound cursor's timestamp on a CURSOR-form FEED.READ; the
+    /// issued cursor falls back to it when a page renders no entries,
+    /// so an idle feed's cursor never regresses its timestamp.
+    feed_resume_ts: u64,
 
     /// Delete context. `del_index`/`del_entity` carry a VECTOR.DEL target
     /// across the embedding read that recovers its LSH bucket;
@@ -360,6 +375,8 @@ impl AnchorState {
         self.feed_count = 0;
         self.feed_from = 0;
         self.feed_to = 0;
+        self.last_frontier = 0;
+        self.feed_resume_ts = 0;
         self.del_index = 0;
         self.del_entity = [0; 64];
         self.del_entity_len = 0;
@@ -381,13 +398,13 @@ impl AnchorState {
         self.step_ctr = 0;
     }
 
-    fn find_slot(&self, conn_id: u8) -> Option<usize> {
+    fn find_slot(&self, conn_id: u16) -> Option<usize> {
         self.slots
             .iter()
             .position(|s| s.conn_id == conn_id && s.conn_id != SLOT_FREE)
     }
 
-    fn alloc_slot(&mut self, conn_id: u8) -> Option<usize> {
+    fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
         let idx = self.slots.iter().position(|s| s.conn_id == SLOT_FREE)?;
         self.slots[idx] = Slot::free();
         self.slots[idx].conn_id = conn_id;
@@ -502,22 +519,28 @@ fn prefix_successor(prefix: &[u8], out: &mut [u8]) -> Option<usize> {
 
 // ── Net + KV plumbing (established anchor pattern) ───────────────────
 
-unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u8, data: &[u8]) -> bool {
+unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8]) -> bool {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = cmd;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
     if !data.is_empty() {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+            data.len(),
+        );
     }
     let total = NET_FRAME_HDR + payload_len;
     ((*sys).channel_write)(anchor.net_out, scratch, total) == total as i32
@@ -1385,27 +1408,77 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
     }
 
     if eq_ci(cmd, b"FEED.READ") {
-        // FEED.READ <keyspace-hex-or-name> <from_rev> <to_rev>
+        // Two forms:
+        //   FEED.READ <prefix> <from_rev> <to_rev>   — open a window
+        //   FEED.READ <prefix> CURSOR <hex-token>    — resume from a
+        //     FeedCursor issued by a previous reply, up to now.
+        // Every reply is ONE bounded page:
+        //   [cursor_hex, frontier, [[rev, ts, kind, key, value]…]]
+        // and the client pages by re-sending the returned cursor. An
+        // empty entries array means caught up to the window bound.
         if argv.count != 4 {
-            reply_error_str(anchor, b"ERR FEED.READ prefix from to");
+            reply_error_str(
+                anchor,
+                b"ERR FEED.READ prefix from to | prefix CURSOR token",
+            );
             return;
         }
         let prefix = arg(recv, argv, 1);
-        let (Some(from), Some(to)) = (
-            parse_u64_dec(arg(recv, argv, 2)),
-            parse_u64_dec(arg(recv, argv, 3)),
-        ) else {
-            reply_error_str(anchor, b"ERR FEED.READ needs decimal revisions");
-            return;
+        let (from, to) = if eq_ci(arg(recv, argv, 2), b"CURSOR") {
+            let tok = arg(recv, argv, 3);
+            let mut cb = [0u8; db_ops::FeedCursor::WIRE_LEN];
+            let Some(cn) = hex_core::hex_decode(tok, &mut cb) else {
+                reply_error_str(anchor, b"ERR cursor is not hex");
+                return;
+            };
+            let Some(cur) = db_ops::FeedCursor::decode(&cb[..cn]) else {
+                reply_error_str(anchor, b"ERR cursor unreadable; resubscribe");
+                return;
+            };
+            if cur.format_version != db_ops::FEED_EVENT_FORMAT_VERSION {
+                // The token was issued against another event format.
+                // Serving it would hand the consumer events it will
+                // misparse — refuse loudly instead (§15).
+                reply_error_str(anchor, b"ERR cursor format stale; resubscribe");
+                return;
+            }
+            // Topology check: this composition
+            // serves the single implicit range at generation 1. A
+            // cursor naming any other range identity or generation
+            // was issued across a topology transition and cannot be
+            // resumed by revision here — the spelled TOPOLOGY refusal
+            // is the in-stream transition signal in its minimal form;
+            // the consumer derives successors via the §5.4 cursor
+            // rules (split/merge of a fed keyrange is refused until
+            // multi-range feed serving lands).
+            let mut expect_range = [0u8; 16];
+            expect_range[15] = 1;
+            if cur.range_id != expect_range || cur.range_generation != 1 {
+                reply_error_str(
+                    anchor,
+                    b"TOPOLOGY range changed; derive successor cursors and resubscribe",
+                );
+                return;
+            }
+            anchor.feed_resume_ts = cur.timestamp;
+            (cur.revision, 0u64)
+        } else {
+            let (Some(from), Some(to)) = (
+                parse_u64_dec(arg(recv, argv, 2)),
+                parse_u64_dec(arg(recv, argv, 3)),
+            ) else {
+                reply_error_str(anchor, b"ERR FEED.READ needs decimal revisions");
+                return;
+            };
+            if to != 0 && from > to {
+                reply_error_str(anchor, b"ERR inverted revision window");
+                return;
+            }
+            anchor.feed_resume_ts = 0;
+            (from, to)
         };
-        if from > to {
-            reply_error_str(anchor, b"ERR inverted revision window");
-            return;
-        }
         anchor.feed_from = from;
         anchor.feed_to = to;
-        anchor.feed_len = 0;
-        anchor.feed_count = 0;
         anchor.cursor = 0;
         // The span: everything under the caller's literal prefix. A
         // feed over a prefix is a feed over a keyspace region, and the
@@ -2302,58 +2375,106 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                 reply_error_str(anchor, b"ERR store unavailable");
                 return;
             }
-            anchor.cursor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
+            // One KV page per client call: render as many
+            // entries as the reply budget holds, DIRECTLY from the page
+            // — no staging buffer, so no window-size wedge and no value
+            // truncation. Entries past the budget are simply re-scanned
+            // on the next call: the issued cursor names the last
+            // rendered revision, and revision resume is exact.
             let count = u16::from_le_bytes([body[8], body[9]]) as usize;
-            let take = (body.len() - 10).min(4096 - anchor.feed_len as usize);
-            if body.len() - 10 > take {
-                reply_error_str(anchor, b"ERR feed page exceeds one batch");
-                return;
-            }
-            let at = anchor.feed_len as usize;
-            anchor.feed[at..at + take].copy_from_slice(&body[10..10 + take]);
-            anchor.feed_len = (at + take) as u16;
-            anchor.feed_count += count as u16;
-            if anchor.cursor != 0 {
-                if !send_feed_scan(anchor) {
-                    reply_error_str(anchor, b"ERR internal");
-                }
-                return;
-            }
-            // Render: [resume_token, [ [rev, kind, key, value], ... ] ].
-            // The token is the exclusive lower bound a resumed reader
-            // passes back — the whole point of a resolved feed.
-            let mut out = [0u8; SEND_BUF];
-            let mut n = 0usize;
-            let _ = enc_array_header(&mut out, &mut n, 2);
-            let mut tok = [0u8; 24];
-            let tn = fmt_u64(anchor.feed_to, &mut tok);
-            let _ = enc_bulk(&mut out, &mut n, &tok[..tn]);
-            let _ = enc_array_header(&mut out, &mut n, anchor.feed_count as i64);
-            let mut at = 0usize;
-            let flen = anchor.feed_len as usize;
-            for _ in 0..anchor.feed_count {
-                if at + 15 > flen {
+
+            // Pass 1: how many entries fit the reply budget, and what
+            // the cursor position after the last one is.
+            // Per-entry RESP cost: *5 header (4) + rev bulk (<=34) +
+            // ts bulk (<=34) + kind bulk (<=12) + key bulk (klen+40) +
+            // value bulk (vlen+40) — over-estimated slack, never
+            // under. Fixed reply overhead: outer *3 + cursor hex bulk
+            // (~110) + frontier bulk (~34).
+            const REPLY_OVERHEAD: usize = 160;
+            let mut fit = 0usize;
+            let mut budget = SEND_BUF - REPLY_OVERHEAD;
+            let mut last_rev = anchor.feed_from;
+            let mut last_ts = anchor.feed_resume_ts;
+            let mut at = 10usize;
+            for _ in 0..count {
+                if at + 23 > body.len() {
                     break;
                 }
-                let rev = u64::from_le_bytes(anchor.feed[at..at + 8].try_into().unwrap_or([0; 8]));
-                let kind = anchor.feed[at + 8];
-                let klen = u16::from_le_bytes([anchor.feed[at + 9], anchor.feed[at + 10]]) as usize;
-                let koff = at + 11;
-                let voff = koff + klen;
-                if voff + 4 > flen {
+                let rev = u64::from_le_bytes(body[at..at + 8].try_into().unwrap_or([0; 8]));
+                let ts = u64::from_le_bytes(body[at + 8..at + 16].try_into().unwrap_or([0; 8]));
+                let klen = u16::from_le_bytes([body[at + 17], body[at + 18]]) as usize;
+                let voff = at + 19 + klen;
+                if voff + 4 > body.len() {
                     break;
                 }
                 let vlen =
-                    u32::from_le_bytes(anchor.feed[voff..voff + 4].try_into().unwrap_or([0; 4]))
-                        as usize;
-                let vend = voff + 4 + vlen;
-                if vend > flen {
+                    u32::from_le_bytes(body[voff..voff + 4].try_into().unwrap_or([0; 4])) as usize;
+                if voff + 4 + vlen > body.len() {
                     break;
                 }
-                let _ = enc_array_header(&mut out, &mut n, 4);
+                let cost = 4 + 34 + 34 + 12 + klen + 40 + vlen + 40;
+                if cost > budget {
+                    break;
+                }
+                budget -= cost;
+                fit += 1;
+                last_rev = rev;
+                last_ts = ts;
+                at = voff + 4 + vlen;
+            }
+
+            // The resume token: a FeedCursor at the last rendered
+            // position. Range identity is the single implicit range of
+            // this composition until multi-range feeds land (§5.4
+            // refuses split/merge of a fed range).
+            let mut range_id = [0u8; 16];
+            range_id[15] = 1;
+            let cur = db_ops::FeedCursor {
+                database_id: 0,
+                partition_map_id: 0,
+                range_id,
+                range_generation: 1,
+                revision: last_rev,
+                timestamp: last_ts,
+                format_version: db_ops::FEED_EVENT_FORMAT_VERSION,
+            };
+            let mut cw = [0u8; db_ops::FeedCursor::WIRE_LEN];
+            let Some(cwn) = cur.encode(&mut cw) else {
+                reply_error_str(anchor, b"ERR internal");
+                return;
+            };
+            let mut chex = [0u8; db_ops::FeedCursor::WIRE_LEN * 2];
+            let Some(chn) = hex_core::hex_encode(&cw[..cwn], &mut chex) else {
+                reply_error_str(anchor, b"ERR internal");
+                return;
+            };
+
+            // Pass 2: render.
+            let mut out = [0u8; SEND_BUF];
+            let mut n = 0usize;
+            let _ = enc_array_header(&mut out, &mut n, 3);
+            let _ = enc_bulk(&mut out, &mut n, &chex[..chn]);
+            let mut fb = [0u8; 24];
+            let fbn = fmt_u64(anchor.last_frontier, &mut fb);
+            let _ = enc_bulk(&mut out, &mut n, &fb[..fbn]);
+            let _ = enc_array_header(&mut out, &mut n, fit as i64);
+            let mut at = 10usize;
+            for _ in 0..fit {
+                let rev = u64::from_le_bytes(body[at..at + 8].try_into().unwrap_or([0; 8]));
+                let ts = u64::from_le_bytes(body[at + 8..at + 16].try_into().unwrap_or([0; 8]));
+                let kind = body[at + 16];
+                let klen = u16::from_le_bytes([body[at + 17], body[at + 18]]) as usize;
+                let koff = at + 19;
+                let voff = koff + klen;
+                let vlen =
+                    u32::from_le_bytes(body[voff..voff + 4].try_into().unwrap_or([0; 4])) as usize;
+                let _ = enc_array_header(&mut out, &mut n, 5);
                 let mut rb = [0u8; 24];
                 let rn = fmt_u64(rev, &mut rb);
                 let _ = enc_bulk(&mut out, &mut n, &rb[..rn]);
+                let mut tb = [0u8; 24];
+                let tn = fmt_u64(ts, &mut tb);
+                let _ = enc_bulk(&mut out, &mut n, &tb[..tn]);
                 // Kind is spelled, not numbered: a delete that reads
                 // as an empty put is the §15 failure this avoids.
                 let kname: &[u8] = if kind == types::VERSION_KIND_DELETE {
@@ -2362,15 +2483,9 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                     b"put"
                 };
                 let _ = enc_bulk(&mut out, &mut n, kname);
-                let mut kb = [0u8; 256];
-                let kt = klen.min(kb.len());
-                kb[..kt].copy_from_slice(&anchor.feed[koff..koff + kt]);
-                let _ = enc_bulk(&mut out, &mut n, &kb[..kt]);
-                let mut vb = [0u8; 512];
-                let vt = vlen.min(vb.len());
-                vb[..vt].copy_from_slice(&anchor.feed[voff + 4..voff + 4 + vt]);
-                let _ = enc_bulk(&mut out, &mut n, &vb[..vt]);
-                at = vend;
+                let _ = enc_bulk(&mut out, &mut n, &body[koff..koff + klen]);
+                let _ = enc_bulk(&mut out, &mut n, &body[voff + 4..voff + 4 + vlen]);
+                at = voff + 4 + vlen;
             }
             let mut f = [0u8; SEND_BUF];
             f[..n].copy_from_slice(&out[..n]);
@@ -3102,35 +3217,40 @@ fn drain_slot(anchor: &mut AnchorState, idx: usize) {
 unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
     match msg_type {
         NET_MSG_BOUND => {
-            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // BOUND payload: [conn_id:u16 LE][local_port:u16 LE].
+            if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = payload[0];
+                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                     anchor.phase = PHASE_LISTENING;
                 }
-            } else if anchor.phase == PHASE_WAIT_BOUND && !payload.is_empty() {
-                anchor.server_conn_id = payload[0];
+            } else if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= NET_CONN_LEN {
+                // Single-anchor provider (no port in payload): claim
+                // the first BOUND we see.
+                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
                 anchor.phase = PHASE_LISTENING;
             }
         }
         NET_MSG_ACCEPTED => {
-            if payload.len() >= 3 {
-                let port = u16::from_le_bytes([payload[1], payload[2]]);
+            // ACCEPTED payload: [conn_id:u16 LE][local_port:u16 LE].
+            if payload.len() >= 4 {
+                let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port != anchor.listen_port {
                     return;
                 }
             }
-            if !payload.is_empty() {
-                let new_id = payload[0];
+            if let Some(new_id) = net_conn_id(payload) {
                 if anchor.alloc_slot(new_id).is_none() {
                     let _ = net_send(anchor, NET_CMD_CLOSE, new_id, &[]);
                 }
             }
         }
         NET_MSG_DATA => {
-            if payload.len() >= 2 {
-                let conn_id = payload[0];
-                let data = &payload[1..];
+            if payload.len() > NET_CONN_LEN {
+                let Some(conn_id) = net_conn_id(payload) else {
+                    return;
+                };
+                let data = &payload[NET_CONN_LEN..];
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     let slot = &mut anchor.slots[idx];
                     let room = RECV_BUF - slot.recv_len;
@@ -3146,8 +3266,8 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
             }
         }
         NET_MSG_CLOSED | NET_MSG_ERROR => {
-            if !payload.is_empty() {
-                if let Some(idx) = anchor.find_slot(payload[0]) {
+            if let Some(conn_id) = net_conn_id(payload) {
+                if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }
             }
@@ -3235,6 +3355,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let result = payload[9];
                 let blen = u16::from_le_bytes([payload[18], payload[19]]) as usize;
                 if corr == anchor.kv_corr && payload.len() >= 20 + blen {
+                    // Fence tail (wire::FenceTail) trails the body; its
+                    // commit_frontier is the feed surface's resolved
+                    // frontier.
+                    let tail_at = 20 + blen;
+                    if let Some(tail) = payload.get(tail_at..tail_at + wire::FenceTail::LEN) {
+                        if let Some(t) = wire::FenceTail::decode(tail) {
+                            anchor.last_frontier = t.commit_frontier;
+                        }
+                    }
                     let mut body = [0u8; SCRATCH_BUF];
                     body[..blen].copy_from_slice(&payload[20..20 + blen]);
                     on_kv_response(anchor, result, &body[..blen]);

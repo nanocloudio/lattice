@@ -42,7 +42,9 @@ mod wire;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
-use wire::{LATTICE_ENTRY_TAG, MSG_APP_APPLIED_POS, MSG_KV_COMMAND};
+use wire::{
+    LATTICE_ENTRY_TAG, LATTICE_RECORD_TAG, MSG_APP_APPLIED_POS, MSG_KV_COMMAND, MSG_TS_LEASE_GRANT,
+};
 
 /// Clustor's `MSG_COMMITTED_ENTRY` opcode (see
 /// `deps/clustor/modules/sdk/wire/wire.rs`). Inlined here to avoid
@@ -60,6 +62,12 @@ struct BridgeState {
     committed_in: i32,
     kv_out: i32,
     metrics_out: i32,
+    /// Committed lattice RECORD entries (`LATTICE_RECORD_TAG`) re-emit
+    /// here as `[record_msg_type]` envelopes in commit order — the
+    /// committed_state feed for `timestamp_allocator`. Unwired (-1) in
+    /// graphs without a record
+    /// consumer; records are then counted, not silently dropped.
+    records_out: i32,
     /// Last raft index we forwarded — drives gap detection. The
     /// consensus streams in strict commit-index order so this
     /// MUST be monotonically increasing; a gap means the upstream
@@ -88,6 +96,14 @@ struct BridgeState {
     /// config change) or pre-tag segments being replayed. A non-zero,
     /// growing value under pure KV load means the tag contract broke.
     untagged: u64,
+    /// Record entries forwarded on `records_out` (and, for worker
+    /// leases, in-band on `kv_out`).
+    records: u64,
+    /// Record entries that could not be forwarded (port unwired or
+    /// backpressure). The position still advances — a record the
+    /// consumer misses is re-derived from a later one (allocator
+    /// grants supersede each other), never a state-machine gap.
+    records_dropped: u64,
     step_ctr: u64,
 
     scratch: [u8; SCRATCH],
@@ -99,6 +115,7 @@ impl BridgeState {
         self.committed_in = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
+        self.records_out = -1;
         self.last_index = 0;
         self.pos_term = 0;
         self.pos_index = 0;
@@ -107,6 +124,8 @@ impl BridgeState {
         self.gaps = 0;
         self.dropped = 0;
         self.untagged = 0;
+        self.records = 0;
+        self.records_dropped = 0;
         self.step_ctr = 0;
     }
 }
@@ -193,8 +212,10 @@ pub extern "C" fn module_new(
     unsafe {
         let sys = &*s.syscalls;
         // metrics on output port index 1; committed_in is port 0
-        // input (in_chan), kv_out is output port 0.
+        // input (in_chan), kv_out is output port 0, records_out is
+        // output port index 2.
         s.metrics_out = dev_channel_port(sys, 1, 1);
+        s.records_out = dev_channel_port(sys, 1, 2);
     }
     0
 }
@@ -250,12 +271,68 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // the body can never begin with one of clustor's in-band entry
         // markers (see `wire::LATTICE_ENTRY_TAG`). Strip it here.
         //
+        // A record entry (`LATTICE_RECORD_TAG`) is a
+        // replicated control record, not state-machine input: body
+        // after the tag is `[record_msg_type][record…]`. Forward it on
+        // `records_out` in commit order; a worker lease
+        // (MSG_TS_LEASE_GRANT) ALSO goes in-band on `kv_out` so the
+        // state worker adopts it strictly ordered against the commands
+        // around it — that ordering is what makes per-write commit
+        // timestamps identical on every replica and every replay.
+        let tagged_len = len - COMMITTED_HEADER_LEN;
+        if tagged_len >= 2 && scratch[COMMITTED_HEADER_LEN] == LATTICE_RECORD_TAG {
+            let record_type = scratch[COMMITTED_HEADER_LEN + 1];
+            let rec_off = COMMITTED_HEADER_LEN + 2;
+            let rec_len = len - rec_off;
+            tmp_body[..rec_len].copy_from_slice(&scratch[rec_off..len]);
+            let mut out_scratch = [0u8; SCRATCH];
+            let mut ok = true;
+            if s.records_out >= 0 {
+                ok &= unsafe {
+                    write_envelope(
+                        &*sys,
+                        s.records_out,
+                        record_type,
+                        &tmp_body[..rec_len],
+                        &mut out_scratch,
+                    )
+                };
+            } else {
+                ok = false;
+            }
+            if record_type == MSG_TS_LEASE_GRANT {
+                ok &= unsafe {
+                    write_envelope(
+                        &*sys,
+                        s.kv_out,
+                        record_type,
+                        &tmp_body[..rec_len],
+                        &mut out_scratch,
+                    )
+                };
+            }
+            if ok {
+                s.records = s.records.wrapping_add(1);
+            } else {
+                s.records_dropped = s.records_dropped.wrapping_add(1);
+            }
+            // The position advances either way: like an internal
+            // entry, a record is fully accounted for at the log level
+            // the moment it is demuxed, and holding the applied
+            // position back would starve the linearizable-read fence
+            // (see the untagged arm below). A dropped record strands
+            // at most one lease interval; grants supersede.
+            s.pos_term = term;
+            s.pos_index = index;
+            processed += 1;
+            continue;
+        }
+
         // An untagged body is NOT ours: it is a clustor-internal entry
         // (admin / config change), or a segment written by a pre-tag
         // build being replayed. Applying it as a KV command would feed
         // the deterministic state machine garbage, so skip and count it
         // rather than guessing.
-        let tagged_len = len - COMMITTED_HEADER_LEN;
         if tagged_len < 1 || scratch[COMMITTED_HEADER_LEN] != LATTICE_ENTRY_TAG {
             s.untagged = s.untagged.wrapping_add(1);
             // The position still advances. "Applied through index N" is a
@@ -326,7 +403,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             telemetry::emit_counters(
                 &*s.syscalls,
                 s.metrics_out,
-                &[s.forwarded, s.dropped, s.untagged],
+                &[
+                    s.forwarded,
+                    s.dropped,
+                    s.untagged,
+                    s.records,
+                    s.records_dropped,
+                ],
             );
         }
     }

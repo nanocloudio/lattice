@@ -77,8 +77,8 @@ use etcd_codec::{
     GRPC_STATUS_COMPACTED, HTTP2_PREFACE_LEN,
 };
 use types::{
-    KV_OP_DELETE, KV_OP_GET, KV_OP_GET_AT, KV_OP_PUT, KV_RESULT_COMPACTED, KV_RESULT_INTEGER,
-    KV_RESULT_NOT_FOUND, KV_RESULT_OK, PROTO_ETCD,
+    KV_OP_DELETE, KV_OP_GET, KV_OP_GET_AT, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_RESULT_COMPACTED,
+    KV_RESULT_INTEGER, KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, PROTO_ETCD,
 };
 use wire::{
     MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_LEASE_CTRL, MSG_LEASE_STATE, MSG_WATCH_CTRL,
@@ -98,8 +98,8 @@ const WATCH_CTRL_CANCEL: u8 = 2;
 #[path = "../../common/net_proto.rs"]
 mod net_proto;
 use net_proto::{
-    NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 
 // NET_CMD_* live in modules/common/net_proto.rs (imported above).
@@ -142,7 +142,7 @@ const SCRATCH_BUF_SIZE: usize = 4096 + 64;
 const DEFAULT_LISTEN_PORT: u16 = 2379;
 const DEFAULT_TENANT: u32 = 0;
 
-const SLOT_FREE: u8 = 0xFF;
+const SLOT_FREE: u16 = 0xFFFF;
 const STREAM_FREE: u32 = 0;
 
 // HPACK static-table indices for the response header set.
@@ -241,7 +241,7 @@ impl StreamSlot {
 
 #[repr(C)]
 struct Slot {
-    conn_id: u8,
+    conn_id: u16,
     phase: SlotPhase,
     preface_seen: bool,
     settings_sent: bool,
@@ -363,7 +363,7 @@ struct AnchorState {
     phase: AnchorPhase,
     _pad0: u8,
 
-    server_conn_id: u8,
+    server_conn_id: u16,
     _pad1: [u8; 3],
 
     corr_seq: u64,
@@ -424,7 +424,7 @@ impl AnchorState {
         }
     }
 
-    fn alloc_slot(&mut self, conn_id: u8) -> Option<usize> {
+    fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.conn_id == SLOT_FREE {
                 slot.conn_id = conn_id;
@@ -436,7 +436,7 @@ impl AnchorState {
         None
     }
 
-    fn find_slot(&self, conn_id: u8) -> Option<usize> {
+    fn find_slot(&self, conn_id: u16) -> Option<usize> {
         self.slots.iter().position(|s| s.conn_id == conn_id)
     }
 
@@ -697,6 +697,19 @@ fn build_kv_op_body(method: GrpcMethod, grpc_body: &[u8], out: &mut [u8]) -> Opt
     match method {
         GrpcMethod::Range => {
             let req = RangeRequest::decode(proto_body)?;
+            if !req.range_end.is_empty() {
+                // RANGED read (prefix scans included): a real
+                // `KV_OP_RANGE_SCAN`, bounded to one page with an
+                // honest `more` flag. Historical ranged reads refuse
+                // typed (there is no ranged GET_AT) — an empty answer
+                // pretending to be complete is the one thing this
+                // path must never produce.
+                if req.revision > 0 {
+                    return None;
+                }
+                let n = etcd_codec::encode_range_scan_body(&req, out)?;
+                return Some((KV_OP_RANGE_SCAN, n));
+            }
             // `revision > 0` is a historical read (RFC §10/§20
             // snapshot). The codec picks the body shape; we pick the
             // op byte that matches it.
@@ -732,6 +745,12 @@ fn build_kv_op_body(method: GrpcMethod, grpc_body: &[u8], out: &mut [u8]) -> Opt
         }
         GrpcMethod::DeleteRange => {
             let req = DeleteRangeRequest::decode(proto_body)?;
+            if !req.range_end.is_empty() {
+                // Ranged deletes are not implemented; refuse typed
+                // (INVALID_ARGUMENT) rather than silently deleting
+                // only `key` and reporting success.
+                return None;
+            }
             // KV_OP_DELETE body: [key_count:u16 LE] then per key
             // [key_len:u16 LE][key…]. We emit a single key (etcd
             // single-key delete via empty range_end).
@@ -777,12 +796,17 @@ fn build_grpc_response_with_key(
     let mut proto_off = GRPC_FRAME_HEADER_LEN;
     match method {
         GrpcMethod::Range => {
-            let kv = if result == KV_RESULT_OK {
-                Some((key, kv_body, revision, 1i64))
+            if result == KV_RESULT_RANGE {
+                // Ranged read: the scan body carries the keys.
+                etcd_codec::build_range_scan_response(out, &mut proto_off, revision, kv_body)?;
             } else {
-                None
-            };
-            build_range_response(out, &mut proto_off, revision, kv)?;
+                let kv = if result == KV_RESULT_OK {
+                    Some((key, kv_body, revision, 1i64))
+                } else {
+                    None
+                };
+                build_range_response(out, &mut proto_off, revision, kv)?;
+            }
         }
         GrpcMethod::Put => {
             build_put_response(out, &mut proto_off, revision)?;
@@ -1109,7 +1133,6 @@ fn dispatch_request(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     }
 
     let body_len = anchor.slots[slot_idx].streams[strm].body_len;
-    let conn_id = anchor.slots[slot_idx].conn_id;
     let corr = anchor.next_corr();
 
     // Build the MSG_KV_REQUEST envelope directly into anchor.scratch.
@@ -1159,7 +1182,10 @@ fn dispatch_request(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     p += 1;
     anchor.scratch[p..p + 4].copy_from_slice(&DEFAULT_TENANT.to_le_bytes());
     p += 4;
-    anchor.scratch[p] = conn_id;
+    // The head's conn byte is this anchor's SLOT INDEX — the net conn
+    // id is u16 now and does not fit the byte. Replies are matched by
+    // `find_inflight(corr)`, so the byte is informational only.
+    anchor.scratch[p] = slot_idx as u8;
     p += 1;
     anchor.scratch[p] = 0;
     p += 1;
@@ -1187,7 +1213,7 @@ fn dispatch_request(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     // Stash the request key in body_buf for the response path
     // (only needed for Range — the response carries the key back).
     anchor.slots[slot_idx].streams[strm].pending_corr = corr;
-    if method == GrpcMethod::Range {
+    if method == GrpcMethod::Range && op != KV_OP_RANGE_SCAN {
         // The KV body for GET starts with [key_len:u16 LE][key…];
         // GET_AT prefixes it with the 8-byte revision. It's currently
         // at scratch[op_body_start..].
@@ -1549,7 +1575,7 @@ fn write_response_frames(
     //   current revision), NOT a server fault; reporting it as 13 would
     //   tell every etcd client the server was broken.
     let grpc_status: u8 = match result {
-        KV_RESULT_OK | KV_RESULT_NOT_FOUND | KV_RESULT_INTEGER => 0,
+        KV_RESULT_OK | KV_RESULT_NOT_FOUND | KV_RESULT_INTEGER | KV_RESULT_RANGE => 0,
         KV_RESULT_COMPACTED => GRPC_STATUS_COMPACTED,
         _ => 13,
     };
@@ -1927,7 +1953,6 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
             // start_revision on the open stream today so 0 means
             // "current". Build the blob in a local buffer and hand
             // it to send_watch_ctrl.
-            let conn_id = anchor.slots[slot_idx].conn_id;
             let mut filter = [0u8; 320];
             let mut fp = 0usize;
             // start_revision = 0 (current)
@@ -1937,7 +1962,11 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
             fp += 1;
             filter[fp] = 0; // progress_notify
             fp += 1;
-            filter[fp] = conn_id;
+            // The registry's conn byte is this anchor's SLOT INDEX —
+            // the net conn id is u16 now and does not fit the byte.
+            // Watch frames rendezvous by `watch_id`, so the byte is
+            // informational only.
+            filter[fp] = slot_idx as u8;
             fp += 1;
             filter[fp..fp + 4].copy_from_slice(&stream_id.to_le_bytes());
             fp += 4;
@@ -2247,46 +2276,49 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
         return false;
     }
     // The NET frame payload sits in anchor.scratch starting at
-    // offset NET_FRAME_HDR. Extract the small metadata (1-byte
+    // offset NET_FRAME_HDR. Extract the small metadata (u16 LE
     // conn_id, optional data) before dispatching — we copy bytes
     // we still need into the slot's recv_buf so scratch is free
     // for downstream NET_CMD_SEND framing.
     let payload_start = NET_FRAME_HDR;
-    let payload_end = payload_start + payload_len;
+    let payload_end = (payload_start + payload_len).min(anchor.scratch.len());
+    // Leading conn id (u16 LE) of the frame, when present.
+    let frame_conn = net_conn_id(&anchor.scratch[payload_start..payload_end]);
 
     match msg_type {
         NET_MSG_BOUND => {
-            // Multi-anchor: BOUND payload is `[conn_id:1][port:2 LE]`.
+            // Multi-anchor: BOUND payload is `[conn:u16 LE][port:2 LE]`.
             // Only claim the listener whose port matches ours.
-            if anchor.phase == AnchorPhase::WaitBound && payload_len >= 3 {
+            if anchor.phase == AnchorPhase::WaitBound && payload_len >= 4 {
                 let port = u16::from_le_bytes([
-                    anchor.scratch[payload_start + 1],
                     anchor.scratch[payload_start + 2],
+                    anchor.scratch[payload_start + 3],
                 ]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = anchor.scratch[payload_start];
+                    anchor.server_conn_id = frame_conn.unwrap_or(SLOT_FREE);
                     anchor.phase = AnchorPhase::Listening;
                     dev_log(&*sys, 3, b"[etcd_anc] bound".as_ptr(), 16);
                 }
-            } else if anchor.phase == AnchorPhase::WaitBound && payload_len > 0 {
-                anchor.server_conn_id = anchor.scratch[payload_start];
+            } else if anchor.phase == AnchorPhase::WaitBound && payload_len >= NET_CONN_LEN {
+                anchor.server_conn_id = frame_conn.unwrap_or(SLOT_FREE);
                 anchor.phase = AnchorPhase::Listening;
                 dev_log(&*sys, 3, b"[etcd_anc] bound".as_ptr(), 16);
             }
         }
         NET_MSG_ACCEPTED => {
-            // Per-port filter — see redis/memcache anchors for rationale.
-            if payload_len >= 3 {
+            // Per-port filter — ACCEPTED carries the parent listener's
+            // local_port at payload[2..4]; see redis/memcache anchors
+            // for rationale.
+            if payload_len >= 4 {
                 let port = u16::from_le_bytes([
-                    anchor.scratch[payload_start + 1],
                     anchor.scratch[payload_start + 2],
+                    anchor.scratch[payload_start + 3],
                 ]);
                 if port != anchor.listen_port {
                     return true;
                 }
             }
-            if payload_len > 0 {
-                let new_id = anchor.scratch[payload_start];
+            if let Some(new_id) = frame_conn {
                 if anchor.alloc_slot(new_id).is_some() {
                     dev_log(&*sys, 3, b"[etcd_anc] accepted".as_ptr(), 19);
                 } else {
@@ -2301,9 +2333,11 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
             }
         }
         NET_MSG_DATA => {
-            if payload_len >= 2 {
-                let conn_id = anchor.scratch[payload_start];
-                let data_start = payload_start + 1;
+            if payload_len > NET_CONN_LEN {
+                let Some(conn_id) = frame_conn else {
+                    return true;
+                };
+                let data_start = payload_start + NET_CONN_LEN;
                 let data_end = payload_end;
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     // Move data from scratch into the slot's recv_buf
@@ -2329,8 +2363,7 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
             }
         }
         NET_MSG_CLOSED => {
-            if payload_len > 0 {
-                let conn_id = anchor.scratch[payload_start];
+            if let Some(conn_id) = frame_conn {
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                     dev_log(&*sys, 3, b"[etcd_anc] client closed".as_ptr(), 24);
@@ -2346,8 +2379,7 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
             // dead on every dialing node, fine on pure acceptors. Only
             // react to an error for a conn WE own: free that slot, keep
             // listening. See redis_edge_anchor for the same fix + trace.
-            if payload_len > 0 {
-                let conn_id = anchor.scratch[payload_start];
+            if let Some(conn_id) = frame_conn {
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                     anchor.m_net_errors += 1;
@@ -2395,42 +2427,48 @@ unsafe fn net_send_bind_pic(anchor: &mut AnchorState) -> bool {
     wrote > 0
 }
 
-unsafe fn net_send_close_pic(anchor: &mut AnchorState, conn_id: u8) -> bool {
+unsafe fn net_send_close_pic(anchor: &mut AnchorState, conn_id: u16) -> bool {
     let sys = anchor.syscalls;
     let out_chan = anchor.net_out;
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload = [conn_id];
+    let payload = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys,
         out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        1,
+        NET_CONN_LEN,
         scratch,
         SCRATCH_BUF_SIZE,
     );
     wrote > 0
 }
 
-unsafe fn net_send_data_pic(anchor: &mut AnchorState, conn_id: u8, data: &[u8]) -> bool {
+unsafe fn net_send_data_pic(anchor: &mut AnchorState, conn_id: u16, data: &[u8]) -> bool {
     let sys = anchor.syscalls;
     let out_chan = anchor.net_out;
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload_len = 1 + data.len();
+    let payload_len = NET_CONN_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
-    core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data.len());
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        data.len(),
+    );
     let total = NET_FRAME_HDR + payload_len;
     let n = ((*sys).channel_write)(out_chan, scratch, total);
     n == total as i32
@@ -2527,7 +2565,7 @@ fn split_send_borrow(anchor: &mut AnchorState, slot_idx: usize) -> (&[u8], &mut 
 /// anchor.frame_payload[..data_len] (not a borrowed slice).
 unsafe fn net_send_data_pic_from_frame(
     anchor: &mut AnchorState,
-    conn_id: u8,
+    conn_id: u16,
     data_len: usize,
 ) -> bool {
     let sys = anchor.syscalls;
@@ -2535,18 +2573,20 @@ unsafe fn net_send_data_pic_from_frame(
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload_len = 1 + data_len;
+    let payload_len = NET_CONN_LEN + data_len;
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
+    let id = conn_id.to_le_bytes();
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
+    *scratch.add(NET_FRAME_HDR) = id[0];
+    *scratch.add(NET_FRAME_HDR + 1) = id[1];
     core::ptr::copy_nonoverlapping(
         anchor.frame_payload.as_ptr(),
-        scratch.add(NET_FRAME_HDR + 1),
+        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
         data_len,
     );
     let total = NET_FRAME_HDR + payload_len;

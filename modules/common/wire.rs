@@ -56,8 +56,9 @@ pub const MSG_KV_REQUEST: u8 = 0xC0;
 ///           [body_len:u16 LE][body…][fence tail]`
 ///
 /// The fence tail is `[applied_index:u64 LE][applied_term:u64 LE]
-/// [source_id:u32 LE][durability:u8][catalog_generation:u64 LE]` —
-/// [`KV_RESPONSE_FENCE_TAIL_LEN`] bytes, always present.
+/// [source_id:u32 LE][durability:u8][catalog_generation:u64 LE]
+/// [commit_frontier:u64 LE]` — [`KV_RESPONSE_FENCE_TAIL_LEN`] bytes,
+/// always present.
 ///
 /// It sits AFTER the body rather than in the head because every one of
 /// the fifteen consumers reads `body_len` at offset 18 and slices
@@ -97,7 +98,7 @@ pub const MSG_KV_REQUEST: u8 = 0xC0;
 pub const MSG_KV_RESPONSE: u8 = 0xC1;
 
 /// Size of [`MSG_KV_RESPONSE`]'s trailing fence record.
-pub const KV_RESPONSE_FENCE_TAIL_LEN: usize = 8 + 8 + 4 + 1 + 8;
+pub const KV_RESPONSE_FENCE_TAIL_LEN: usize = 8 + 8 + 4 + 1 + 8 + 8;
 
 /// Router → worker. Stamps the routing decision as `kpg_id` and carries
 /// the §23 canonical identity `(tenant, database, keyspace)` the worker
@@ -252,6 +253,15 @@ pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD4;
 // envelope prefix — clustor's outer framing supplies that).
 pub const MSG_CLIENT_PROPOSAL: u8 = 0x10;
 
+// MVCC timestamp-lease opcodes and grant-frame width, shared by the
+// timestamp allocator, the apply bridge, and the state worker. Mirror the
+// canonical protocol definitions in `mvcc.rs` (mounted by the allocator);
+// modules that do not mount `mvcc.rs` reference these rather than inlining
+// the byte. The grant frame is `[corr_id:u64][TimestampLease:40]`.
+pub const MSG_TS_LEASE_REQUEST: u8 = 0xE3;
+pub const MSG_TS_LEASE_GRANT: u8 = 0xE4;
+pub const TS_LEASE_GRANT_WIRE_LEN: usize = 48;
+
 // ── Gateway reject feedback (clustor → router) ────────────────────────
 //
 // **Byte-identical to `clustor/modules/common/wire.rs` by
@@ -306,6 +316,23 @@ pub const CLIENT_REJECT_BODY_LEN: usize = 10;
 /// format change. This keeps lattice correct against clustor as it is.
 pub const LATTICE_ENTRY_TAG: u8 = 0x4C; // 'L'
 
+/// Leading byte of a lattice-replicated **record** entry body — the
+/// second entry kind next to [`LATTICE_ENTRY_TAG`], for replicated
+/// control records that are NOT KV commands and must not reach the
+/// state machine (timestamp-allocator leases, GC floor records).
+///
+/// Body layout after the tag: `[record_msg_type:u8][record bytes…]`.
+/// `lattice_apply_bridge` demuxes on this tag and re-emits the record
+/// on its `records_out` port as an ordinary `[record_msg_type]`
+/// envelope, in commit order, exactly once per committed entry — which
+/// is what lets `timestamp_allocator.committed_state` (and later the
+/// GC floor loop) be fed from the same committed log as everything
+/// else, replay included, with no second durability channel.
+///
+/// Same constraint as [`LATTICE_ENTRY_TAG`]: the value must be neither
+/// of clustor's sniffed markers (`0xAD`, `0xCC`).
+pub const LATTICE_RECORD_TAG: u8 = 0x52; // 'R'
+
 // ── Linearizable-read fence (ReadIndex, RFC §1.3 / spec Phase 5) ──────
 //
 // Byte-compatible with clustor's consensus read protocol. The
@@ -358,7 +385,9 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 // 0xE0 retention floor, 0xE1 compaction floor, 0xE2 ttl map update,
 // 0xE3/0xE4/0xE6/0xE7 timestamp-allocator lease traffic (see
 // `modules/common/mvcc.rs`), 0xE5 applied position, 0xE8/0xE9 adapter
-// metrics. 0xEA..0xEF were free; three are allocated here.
+// metrics. 0xEA..0xEF were free; three are allocated here, and
+// 0xED/0xEE carry the CDC pump↔sink frames (MSG_CDC_PUBLISH /
+// MSG_CDC_ACK — see `modules/common/cdc_wire.rs`).
 //
 // Why these exist when MSG_RETENTION_FLOOR / MSG_COMPACTION_FLOOR
 // already do: those two are a purely LOCAL aggregation — a source
@@ -511,12 +540,19 @@ pub struct KvCommandHead {
     pub tenant: u32,
     pub database: u32,
     pub keyspace: u32,
+    /// MVCC commit timestamp for the command's writes.
+    /// Stamped by the proposer from a `timestamp_allocator` lease
+    /// BEFORE the command enters consensus, so it is part of the
+    /// committed bytes and every replica materializes the same value.
+    /// `0` = no allocator wired/established — versions then carry no
+    /// timestamp, which the feed surface reports rather than hides.
+    pub commit_ts: u64,
     pub body_len: u16,
 }
 
 impl KvCommandHead {
     /// Wire length of the head; the op body follows immediately.
-    pub const LEN: usize = 8 + 2 + 1 + 1 + 1 + 4 + 4 + 4 + 2;
+    pub const LEN: usize = 8 + 2 + 1 + 1 + 1 + 4 + 4 + 4 + 8 + 2;
 
     /// Encode into `out[..LEN]`. `false` if `out` is too short.
     pub fn encode(&self, out: &mut [u8]) -> bool {
@@ -531,7 +567,8 @@ impl KvCommandHead {
         out[13..17].copy_from_slice(&self.tenant.to_le_bytes());
         out[17..21].copy_from_slice(&self.database.to_le_bytes());
         out[21..25].copy_from_slice(&self.keyspace.to_le_bytes());
-        out[25..27].copy_from_slice(&self.body_len.to_le_bytes());
+        out[25..33].copy_from_slice(&self.commit_ts.to_le_bytes());
+        out[33..35].copy_from_slice(&self.body_len.to_le_bytes());
         true
     }
 
@@ -549,7 +586,8 @@ impl KvCommandHead {
             tenant: u32::from_le_bytes(src[13..17].try_into().ok()?),
             database: u32::from_le_bytes(src[17..21].try_into().ok()?),
             keyspace: u32::from_le_bytes(src[21..25].try_into().ok()?),
-            body_len: u16::from_le_bytes([src[25], src[26]]),
+            commit_ts: u64::from_le_bytes(src[25..33].try_into().ok()?),
+            body_len: u16::from_le_bytes([src[33], src[34]]),
         })
     }
 }
@@ -565,11 +603,17 @@ pub struct KvAppliedHead {
     pub conn_id: u8,
     pub result: u8,
     pub revision: u64,
+    /// The range's commit-timestamp frontier: the
+    /// highest MVCC commit timestamp this worker has bound to any
+    /// applied write. Everything at or below it is applied; with
+    /// in-band lease assignment the value is monotone in apply order.
+    /// `0` = no timestamp authority established yet.
+    pub commit_frontier: u64,
     pub body_len: u16,
 }
 
 impl KvAppliedHead {
-    pub const LEN: usize = 8 + 2 + 1 + 1 + 8 + 2;
+    pub const LEN: usize = 8 + 2 + 1 + 1 + 8 + 8 + 2;
 
     pub fn encode(&self, out: &mut [u8]) -> bool {
         if out.len() < Self::LEN {
@@ -580,7 +624,8 @@ impl KvAppliedHead {
         out[10] = self.conn_id;
         out[11] = self.result;
         out[12..20].copy_from_slice(&self.revision.to_le_bytes());
-        out[20..22].copy_from_slice(&self.body_len.to_le_bytes());
+        out[20..28].copy_from_slice(&self.commit_frontier.to_le_bytes());
+        out[28..30].copy_from_slice(&self.body_len.to_le_bytes());
         true
     }
 
@@ -594,7 +639,8 @@ impl KvAppliedHead {
             conn_id: src[10],
             result: src[11],
             revision: u64::from_le_bytes(src[12..20].try_into().ok()?),
-            body_len: u16::from_le_bytes([src[20], src[21]]),
+            commit_frontier: u64::from_le_bytes(src[20..28].try_into().ok()?),
+            body_len: u16::from_le_bytes([src[28], src[29]]),
         })
     }
 }
@@ -653,6 +699,10 @@ pub struct FenceTail {
     pub source_id: u32,
     pub durability: u8,
     pub catalog_generation: u64,
+    /// The answering range's commit-timestamp frontier,
+    /// copied from [`KvAppliedHead::commit_frontier`]. Feed consumers
+    /// read the resolved frontier from here on every response.
+    pub commit_frontier: u64,
 }
 
 impl FenceTail {
@@ -667,6 +717,7 @@ impl FenceTail {
         out[16..20].copy_from_slice(&self.source_id.to_le_bytes());
         out[20] = self.durability;
         out[21..29].copy_from_slice(&self.catalog_generation.to_le_bytes());
+        out[29..37].copy_from_slice(&self.commit_frontier.to_le_bytes());
         true
     }
 
@@ -680,6 +731,7 @@ impl FenceTail {
             source_id: u32::from_le_bytes(src[16..20].try_into().ok()?),
             durability: src[20],
             catalog_generation: u64::from_le_bytes(src[21..29].try_into().ok()?),
+            commit_frontier: u64::from_le_bytes(src[29..37].try_into().ok()?),
         })
     }
 }
