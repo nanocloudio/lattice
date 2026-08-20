@@ -1,8 +1,6 @@
-# Lattice project config consumed by the `fluxor` CLI. See
-# ~/Development/nanocloudio/standards/{ci,fluxor-modules,tests,lints,dependencies}.md
-# for the schema each table belongs to.
+# Lattice project config consumed by the `fluxor` CLI.
 
-# Project identity (standards/dependencies.md §2.1). Required for
+# Project identity. Required for
 # `fluxor publish`; downstream projects reference lattice by this
 # name. Version is held on the 0.x pre-release line until the
 # protocol surface stabilises (etcd anchor + watch/lease services
@@ -11,7 +9,7 @@
 name    = "lattice"
 version = "0.0.1"
 
-# Cross-project dependencies (standards/dependencies.md §2.2).
+# Cross-project dependencies.
 # `fluxor` supplies the kernel, ABI, SDK source crates, and the
 # foundation fmod palette (linux_net, tls, ip, …). `clustor` supplies
 # the Raft / WAL / placement substrate that lattice modules attach
@@ -19,13 +17,16 @@ version = "0.0.1"
 # through the local OCI store (`$FLUXOR_STORE`, default
 # `~/.local/share/fluxor/store`); digest pins live in fluxor.lock.
 # Workspace membership (`~/.fluxor/workspace.toml`) supports
-# sibling-checkout iteration — see standards/dependencies.md §6.
+# sibling-checkout iteration.
 [dependencies]
 fluxor  = "0.0.1"
 # Protocol modules (http, ws_stream, rtp, websocket) live in wave since the
 # extraction; fluxor's copy is now `http_edge` (workload-ingress variant).
 wave   = "0.0.1"
 clustor = "0.0.1"
+# The bare-metal CDC composition (configs/bare-metal-pi5-cdc.yaml)
+# consumes quantum's mqtt_sink as its `stream.sink.ordered_ack` provider.
+quantum = "0.0.1"
 
 [ci]
 # Module targets to build in CI phase 3. Lattice ships to high-throughput
@@ -63,8 +64,8 @@ max_inline_lines    = 80
 
 [ci.test]
 # CI phase 3.5 project gates, in order:
-#   1. shadow_guard.sh — shadow-checkout hard-fail (standards/test-tracking.md
-#      §7): tests/, benches/, examples/, perf/ are shadow-tracked in
+#   1. shadow_guard.sh — shadow-checkout hard-fail:
+#      tests/, benches/, examples/, perf/ are shadow-tracked in
 #      .git-shadow/, so a primary-only checkout has zero files there and the
 #      test phases would pass vacuously. The guard fails CI instead.
 #   2. host_crates.sh — with no root workspace, nothing else fmt/clippy/builds
@@ -86,5 +87,4 @@ vars = { SELF_ID = "0", LISTEN_PORT = "6379", REDIS_PORT = "6379", DATA_PORT = "
 # when fluxor's `modules/sdk/wire.rs::ABI_VERSION` changes (module
 # headers / channel hints / contract ids break). The installed `fluxor`
 # CLI must implement this exact ABI version.
-# See standards/fluxor-modules.md §5.
 fluxor = { abi = 1 }

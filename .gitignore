@@ -27,8 +27,9 @@ Cargo.lock
 # its own target/. Unanchored to catch every one of them (matches wave/spectra).
 target/
 
-# Runtime WAL state (mutated by local runs, not source)
+# Runtime WAL + Raft metadata state (mutated by local runs, not source)
 /wal/
+/raft/
 
 # Local dev symlinks to sibling checkouts (clustor, fluxor). Resolved at
 # build time via the fluxor OCI store, not these paths — they exist only for

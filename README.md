@@ -1,266 +1,187 @@
-# Lattice — Raft-Backed Multi-Protocol Data Store
+# Lattice
 
-Lattice is a multi-protocol **distributed data store**, built as a set of
-fluxor PIC modules, that layers familiar client protocols on top of the
-Clustor Raft consensus core. There is no standalone binary: a node is a
-`fluxor run` over a graph config in [`configs/`](configs/). Each tenant is
-sharded into Key-Value Partition Groups (KPGs) that host the same KV state
-machine, while ControlPlaneRaft (CP-Raft) stores tenant manifests, routing
-epochs, adapter policies, quotas, and PKI material. Lattice inherits
-Clustor's ordering, durability ledgers, strict fallback, read gates, snapshot
-model, and security guardrails (Clustor spec §§3–14), and constrains every
-adapter to the same durability and determinism rules.
+Lattice is a multi-protocol data store for the nanocloud products,
+built on the clustor Raft replication substrate and the
+[fluxor](../fluxor/) runtime. Familiar client protocols — Redis
+RESP, Memcached ASCII, etcd v3 gRPC, the PostgreSQL and MySQL wire
+protocols, MongoDB documents, Cassandra CQL, and RESP-based
+graph/search/vector/time-series models — map onto one MVCC key-value
+state machine with a shared revision model, replicated and made
+durable by the substrate.
 
-The normative contract — adapter mappings, LIN-BOUND, revision semantics,
-deterministic TTL, routing epochs, error mappings — is
-[`docs/specification.md`](docs/specification.md). This README is descriptive;
-where the two differ, the specification wins.
+There is no standalone binary: a node is a `fluxor run` over a graph
+config that composes lattice's protocol anchors and KV modules with
+the clustor substrate modules. The same graph runs as a single node
+or a three-node cluster; only the config changes.
 
----
+## Quick start
 
-## Why Lattice
-
-- **Many protocol surfaces, one state machine** — key-value protocols (etcd
-  v3 gRPC, Redis RESP, Memcached ASCII) and data-model protocols (PostgreSQL
-  and MySQL wire SQL, MongoDB documents, Cassandra CQL, and RESP-based graph /
-  search / vector / time-series) all map onto the same KV primitive set with a
-  shared revision contract and deterministic TTL.
-- **LIN-BOUND (fail-closed linearizability)** — Lattice never claims
-  linearizable semantics unless the Clustor leader can serve ReadIndex and the
-  response is fenced by the same proof and index equality. When LIN-BOUND is
-  not satisfied, linearizable operations fail closed with protocol-specific
-  errors; snapshot-only reads are offered only where explicitly allowed.
-- **KVSOURCE durability invariant** — every observable effect derives
-  exclusively from WAL entries or signed snapshots; adapters cannot introduce
-  an alternate durable channel.
-- **Operational determinism** — strict fallback and CP cache-freshness
-  semantics are inherited from Clustor; stale/expired control-plane caches
-  force LIN-BOUND failure and stricter policy enforcement.
-- **Multi-tenant isolation + quotas** — tenant namespaces, routing epochs,
-  command allowlists, and token buckets live in CP-Raft and are enforced
-  uniformly across every adapter.
-
----
-
-## Architecture Overview
-
-```mermaid
-graph TD
-    subgraph Edge["Protocol Anchors (PIC modules)"]
-        ETCD["etcd v3 gRPC\n(KV / Watch / Lease subset)"]
-        REDIS["Redis TCP\n(RESP2, RESP3 gate)"]
-        MEM["Memcached TCP/UDP\n(ASCII)"]
-        SQL["PostgreSQL / MySQL wire\n(SQL subset)"]
-        MODEL["Document / CQL / model\n(Mongo, Cassandra, RESP models)"]
-    end
-
-    CP["Control Plane (CP-Raft)\n(manifests, epochs, policies, quotas, PKI)"]
-
-    subgraph Tenant["Tenant Keyspace"]
-        subgraph KPGs["Key-Value Partition Groups (KPGs)"]
-            KPG1["KPG Leader/Follower\nKV state machine + apply loop"]
-            KPGN["KPG ..."]
-        end
-    end
-
-    WAL["Clustor consensus + durability\n(WAL, snapshots, ordering, proofs)"]
-    Metrics["Telemetry, /readyz, /metrics"]
-
-    Clients["Clients / SDKs"] --> ETCD
-    Clients --> REDIS
-    Clients --> MEM
-    Clients --> SQL
-    Clients --> MODEL
-
-    CP --> KPG1
-    CP --> KPGN
-    ETCD --> KPG1
-    REDIS --> KPG1
-    MEM --> KPG1
-    SQL --> KPG1
-    MODEL --> KPG1
-
-    KPG1 --> WAL
-    KPGN --> WAL
-    WAL --> Metrics
-    CP --> Metrics
+```sh
+fluxor modules build --all      # build the module palette
+fluxor run --replicas 1 --var REDIS_PORT=6390 - <<'EOF'
+<the node config — embedded in docs/guides/running.md>
+EOF
 ```
 
-- **Protocol anchors** translate wire semantics into a unified KV primitive
-  set and route requests by tenant + key hash and the active `kv_epoch`.
-- **KPG runtime** applies mutations in WAL order, enforces deterministic TTL
-  via committed ticks, emits snapshots, and exposes adapter-facing request
-  routing and read fences.
-- **CP cache agent** watches CP-Raft for manifests and policy, enforces cache
-  state semantics (Fresh/Cached/Stale/Expired), and couples stale
-  control-plane state to strict fallback and LIN-BOUND behavior.
+The deployment config pipes straight into `fluxor run` from the run
+guide, which carries it inline: nothing else to fetch. A node is
+ready when `GET /readyz` on its HTTP port (19090 by default) returns
+200, and any Redis client can then do a durable, Raft-committed
+put/get round trip against the node's Redis port.
+[`docs/guides/running.md`](docs/guides/running.md) has the full
+config plus bring-up, smoke checks, and a three-node cluster.
 
-Routing, sharding (`kpg = hash64(tenant_id, key, seed) % tenant_kpg_count`),
-the revision/data model, and the LIN-BOUND read-semantics matrix are specified
-in [`docs/specification.md`](docs/specification.md). They are not repeated here
-to keep a single normative copy.
+## Setup
 
----
+Lattice consumes fluxor, clustor, wave, and quantum through the
+local OCI store (`$FLUXOR_STORE`, default
+`~/.local/share/fluxor/store`); digest pins live in `fluxor.lock`.
 
-## Protocol Surfaces
+```sh
+# one-time, per developer machine
+git clone git@github.com:nanocloudio/fluxor.git ../fluxor
+make -C ../fluxor install    # put the fluxor CLI launcher on PATH
+make -C ../fluxor publish    # publish SDK, runtime, foundation modules
 
-Each surface is a per-config PIC anchor (`modules/app/*`), enabled in the
-graph config rather than as a separate daemon. The command sets below are what
-the code dispatches today; the standalone guides carry the full per-command
-detail, and [the specification](docs/specification.md#protocol-adapters) is normative.
+git clone git@github.com:nanocloudio/clustor.git
+make -C clustor publish      # publish the substrate module palette
+                             # (run inside your clustor clone)
 
-| Surface | Anchor module | Commands implemented today |
+# in lattice's checkout
+fluxor modules build --all   # build; pre-flight materialises pinned
+                             # artefacts from fluxor.lock
+```
+
+To pick up new upstream changes: `make publish` in the upstream
+checkout, then `fluxor update` here to advance `fluxor.lock`, and
+commit the lockfile. When iterating on several repos at once, add
+them to `~/.fluxor/workspace.toml`; workspace members resolve
+`:latest` automatically and `fluxor sync` writes the resolved digests
+through the lockfile.
+
+## Architecture
+
+Client traffic enters through a per-protocol **anchor** module
+(`modules/app/*_edge_anchor`), which translates wire semantics into a
+common KV request envelope. The **request router**
+(`kv_request_router`) routes each request by key to a partition,
+sends writes into the clustor proposal pipeline, and serves reads
+either directly from local state or through a ReadIndex fence. The
+**apply bridge** (`lattice_apply_bridge`) re-emits Raft-committed
+entries, in commit order, to the **state worker**
+(`kv_state_worker`), which hosts the deterministic MVCC state machine
+(`modules/common/kv_store.rs`) in memory or on disk. Replication,
+WAL durability, quorum tracking, leadership, and snapshots are the
+substrate's: lattice modules never write their own durable channel,
+so every observable effect derives from committed log entries or
+snapshots.
+
+The normative reference is
+[`docs/architecture/specification.md`](docs/architecture/specification.md):
+the data model, partitioning and routing epochs, read semantics
+(LIN-BOUND), snapshots and compaction, TTL, and error mapping.
+
+## Protocol surfaces
+
+Each surface is an anchor module enabled in the graph config. The
+command sets below are what the code dispatches; the per-protocol
+guides carry the detail.
+
+| Surface | Anchor module | Implemented today |
 |---|---|---|
-| **etcd v3** (gRPC) | `etcd_edge_anchor` | Range, Put, DeleteRange, Watch, Lease{Grant,Revoke,KeepAlive} |
-| **Redis** (RESP2) | `redis_edge_anchor` | GET, SET (`NX/XX`, `EX/PX`, `GET`), SETNX, GETSET, APPEND, STRLEN, INCR/INCRBY/DECR/DECRBY, DEL/UNLINK, EXISTS, KEYS, SCAN, MGET, MSET, FLUSHDB/FLUSHALL, MULTI/EXEC/DISCARD, SUBSCRIBE, PING, AUTH (`requirepass`) |
+| **Redis** (RESP2) | `redis_edge_anchor` | GET, SET (`NX/XX`, `EX/PX`, `GET`), SETNX, GETSET, APPEND, STRLEN, EXISTS, INCR/INCRBY/DECR/DECRBY, DEL/UNLINK, KEYS, SCAN, MGET, MSET, FLUSHDB/FLUSHALL, TS.ADD/TS.RANGE, MULTI/EXEC/DISCARD, SUBSCRIBE family, PING, ECHO, QUIT, SELECT, AUTH (`requirepass`), HELLO, RESET, CLIENT, COMMAND |
 | **Memcached** (ASCII) | `memcached_stream_anchor`, `memcached_datagram_anchor` | get, gets, set, add, replace, append, prepend, delete, incr, decr, flush_all, version, stats, quit |
-| **Relational SQL** | `pg_edge_anchor`, `mysql_edge_anchor` → `relational_executor` | SELECT, INSERT, UPDATE, DELETE, CREATE TABLE; single-range transactions — over the PostgreSQL and MySQL/MariaDB server wire protocols |
-| **Document** | `doc_edge_anchor` | MongoDB wire: find, insert, update, delete, hello/ismaster |
-| **Wide-column** | `wide_edge_anchor` | Cassandra CQL: SELECT, INSERT, UPDATE, DELETE, CREATE |
-| **Models (RESP)** | `model_edge_anchor` | `GRAPH.*` (VERTEX/EDGE/IN/OUT/DELVERTEX/DELEDGE), `SEARCH.*` (INDEX/QUERY/DELETE), `VECTOR.*` (ADD/COS/SIM/SIMWHERE/ANN/GET/DEL/TAG), `TS.*` (ADD/RANGE/AGG/DOWNSAMPLE/TRIM) |
+| **etcd v3** (gRPC) | `etcd_edge_anchor` | Range, Put, DeleteRange, Watch, LeaseGrant, LeaseRevoke, LeaseKeepAlive |
+| **Relational SQL** | `pg_edge_anchor`, `mysql_edge_anchor` → `relational_executor` | SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE/DROP INDEX, ALTER TABLE ADD — over the PostgreSQL and MySQL/MariaDB server wire protocols |
+| **Document** | `doc_edge_anchor` | MongoDB wire: find, insert, update, delete, hello/ismaster/ping/buildInfo |
+| **Wide-column** | `wide_edge_anchor` | Cassandra CQL v4: SELECT, INSERT, UPDATE, DELETE, CREATE TABLE |
+| **Models (RESP)** | `model_edge_anchor` | `GRAPH.*` (VERTEX/EDGE/IN/OUT/DELVERTEX/DELEDGE), `SEARCH.*` (INDEX/QUERY/DELETE), `VECTOR.*` (ADD/COS/SIM/SIMWHERE/ANN/GET/DEL/TAG), `TS.*` (ADD/RANGE/AGG/DOWNSAMPLE/TRIM), `FEED.READ` |
 
-Time-series (`TS.ADD`/`TS.RANGE`) is also reachable on the Redis surface. What
-is not implemented is listed under [Not implemented](#not-implemented).
+What is not implemented is listed under
+[Not implemented](#not-implemented).
 
----
+## Change data capture
+
+The `cdc_pump` module streams committed changes out of a running
+graph: it reads change windows through the ordinary router path,
+emits one event per change to any sink module declaring the
+`stream.sink.ordered_ack` capability, and advances a durable
+checkpoint only past the contiguous acknowledged prefix, so delivery
+is at-least-once and survives sink outages. The in-repo reference
+sink is `loopback_sink`; MQTT delivery lives in quantum. See
+[`docs/architecture/cdc.md`](docs/architecture/cdc.md).
 
 ## Errors
 
-Adapter-visible error mappings are normative in the specification's
-[error mapping](docs/specification.md#error-mapping). In brief, the routing and
-linearizability conditions surface per protocol as:
+The conditions clients most often see, per surface:
 
-| Condition | etcd v3 | Redis | Memcached |
+| Condition | Redis | Memcached | etcd v3 |
 |---|---|---|---|
-| Routing epoch advanced / wrong KPG | `FAILED_PRECONDITION` | `-MOVED routing epoch advanced` | `NOT_STORED` † |
-| Linearizability unavailable (LIN-BOUND fail) | `UNAVAILABLE` | `-CLUSTERDOWN no authority available for this operation` | `SERVER_ERROR backpressure` † |
-| Wrong value type | — | `-WRONGTYPE …` | — |
+| Routing epoch advanced | `-MOVED routing epoch advanced` | `NOT_STORED` | gRPC status 13 |
+| No authority for a fenced operation | `-CLUSTERDOWN no authority available for this operation` | `SERVER_ERROR backpressure` | gRPC status 13 |
+| Wrong value type | `-WRONGTYPE …` | — | — |
 
-The Redis surface uses `-MOVED`/`-CLUSTERDOWN` — not Redis Cluster redirection,
-but the closest standard client-retry signals — so unmodified clients
-re-resolve routing on an epoch flip.
+The Redis strings reuse the closest standard client-retry signals so
+an unmodified client re-resolves routing; they are not Redis Cluster
+redirection. The Memcached ASCII surface has no dedicated
+routing or linearizability strings. The etcd surface carries
+`grpc-status` only (no `grpc-message`), and today maps both
+conditions to status 13; historical reads below the compaction floor
+return status 11 (OUT_OF_RANGE), matching etcd's compacted error.
+The full mapping is in the
+[specification](docs/architecture/specification.md#error-mapping).
 
-† The Memcached ASCII adapter has **no** dedicated routing-epoch or
-linearizability error string; those conditions surface as the generic
-`NOT_STORED` / `SERVER_ERROR backpressure`. Distinct strings are described in
-the [specification](docs/specification.md#error-mapping) as intended design, not shipped behavior.
+## Status
 
----
-
-## Control Plane (CP-Raft)
-
-CP-Raft is authoritative for tenant manifests (KPG count, routing epoch, hash
-seed version, adapter enablement, command allowlists, TTL bounds), per-tenant
-quota token buckets, PKI/RBAC, and feature gates (RESP3, scan support,
-multi-KPG fanout plans, future cross-shard Txn). Cache semantics follow
-Clustor's Fresh/Cached/Stale/Expired matrix; any transition to Stale/Expired
-forces strict fallback, fails LIN-BOUND for linearizable operations, and
-revokes follower-read and watch-start linearization guarantees.
-
----
-
-## Observability
-
-Metrics live under the dotted `lattice.kv.*`, `lattice.adapter.<name>.*`, and
-`lattice.quota.*` namespaces plus inherited `clustor.*`; the catalog is
-[`telemetry/catalog.json`](telemetry/catalog.json) (validated in CI by
-`tools/ci/telemetry_guard`). `/readyz` reports the tenant routing-epoch cache
-age, adapter enablement states, and a digest of the active manifest used for
-routing. Full field list: the specification's
-[observability](docs/specification.md#observability) section and
-[`docs/performance.md`](docs/performance.md).
-
----
-
-## Quick Start
-
-```bash
-make build                                  # fluxor build (stages SDK, builds modules + host crates)
-make test                                   # fluxor test
-make lint                                   # fluxor lint
-
-fluxor modules build --target bcm2712       # PIC module .fmods
-fluxor run configs/single-replicated-lattice.yaml   # single-node bring-up
-```
-
-Multi-node uses the rendered template — each node runs `fluxor run` over
-`configs/multi-3node.yaml` with its own identity/peers filled in by the
-template renderer. See [`docs/deployment.md`](docs/deployment.md).
-
----
-
-## Internals
-
-Behind the edge anchors, the KV path is `kv_state_worker` (MVCC state machine
-with revisions), `kv_request_router` (LIN-BOUND read fence + per-connection
-ordering), and a Raft-commit → apply bridge with state-machine snapshots.
-Watch, lease, and TTL are `watch_registry` + `watch_fanout`, `lease_manager`,
-and the deterministic `ttl_scheduler`. Multi-tenancy and ops are `auth_manager`
-(principal table), `quota_manager` (per-tenant token bucket),
-`compaction_coordinator`, `adapter_metrics`, and `backup_coordinator`.
-
-### Substrate (inherited from Clustor)
-
-Clustor ships seven runtime modules; lattice graphs compose the ones a
-deployment needs, alongside the fluxor foundation (`linux_net`/`ip`, `tls`)
-and lattice's own modules.
-
-| Module | What it provides | Attach points lattice uses |
-|---|---|---|
-| `peer_router` | Peer/client socket demux and framing | `net_in`/`net_out`, `cleartext`, `peer_rx`, `raft_rpc`, `peer_tx`, `repl_tx` |
-| `gateway` | Client framing, conn correlation, admission throttle | `client_requests`, `proposals`, `proposals_tagged`, `proposal_assigned`, `leader_state`, `placement`, `credit_supply`, `rejected` |
-| `consensus` | Raft, replication, commit tracking, apply | `proposals_tagged`, `committed_entries`, `applied`, `read`, `read_permits`, `log_append`, `entry_request`/`entry_reply`, `rpc`/`rpc_out`, `durable`, `retention_floor` |
-| `durability` | WAL, durability ledger, snapshots, keys | `entries`, `flushed`, `replay_complete`, `quorum_durable`, `ack`, `compact_before`, `installed_local`, `export_chunks`/`import_chunks`, `app_snapshot_ctl`/`app_snapshot_body` |
-| `admission` | CP proof cache, read gate, flow control | `input`, `fresh_state`, `permits`, `credits`, `lag` |
-| `control_plane` | CP bridge and placement | `proof`, `capabilities`, `tenant_records`, `routing`, `epoch_events` |
-| `operations` | RBAC, admin workflows, telemetry, HTTP surface | `admin_req`, `authorized`, `denied`, `ingest`, `readyz`, `why`, `export`, `net_in`/`net_out`, `request`/`response` |
-
-Variants narrow a module's port surface: `durability-volatile` omits the
-quorum-durable proof port, and `operations-headless` omits the HTTP ports.
-Clustor's `docs/substrate_sharing.md` is the authoritative contract page.
+| Surface | State |
+|---|---|
+| KV core (`kv_state_worker`, `kv_store.rs`) | MVCC with per-key revisions, memory and disk state stores, snapshot export/import: working. |
+| Replicated write path | Anchor → router → gateway → consensus → WAL → apply bridge → worker: working, single node and three-node. |
+| Linearizable reads | ReadIndex fence path (`lin_reads`, per-request consistency byte): wired; reads are snapshot-consistency by default. |
+| Partitioning | Ordered key-range and hash-slot maps, routing epochs, range split/merge with cutover barriers: working. |
+| Watch / lease / TTL | In-memory watch registry with revision-window replay, lease table, deterministic tick-driven expiry: working; state is not yet persisted across restart. |
+| Compaction / backup | Claim-based MVCC GC floor and consistent backup/restore at a protected revision: working. |
+| CDC | Ordered-ack egress with backfill, resolved watermarks, retention claims: working. |
+| Multi-tenancy | Single tenant today: every anchor stamps tenant 0; the key layout and wire carry tenant identity for later use. |
+| Control-plane policy | Quota, auth-principal, and placement-advice modules exist but are not driven by a real control-plane feed; the substrate's control plane emits a synthetic proof. |
 
 ## Not implemented
 
-- Cross-KPG transactions and cross-KPG linearizable ranges
-- etcd `Txn`, `Auth`, `Compact`; election/lock services
-- Redis hashes/lists/sets, `EXPIRE`/`TTL`, `WATCH`, `EVAL`/`EVALSHA`, `PUBLISH`
-- Memcached `cas`/`touch`, binary protocol, SASL
-- RESP3 push framing (HELLO negotiates the version; the parser is RESP2)
-- ACL / username-scoped principals (Redis AUTH is single-password `requirepass`)
-- Formal metric-id catalogs
+- Cross-partition transactions and cross-partition linearizable
+  ranges (statement-level batches are single-range; `BEGIN`/`COMMIT`
+  on the SQL surface are accepted but not transactional)
+- etcd `Txn`, `Compact`, `Auth`; election/lock services; TLS on the
+  gRPC listener (all shipped graphs serve plaintext HTTP/2)
+- Redis hashes/lists/sets/sorted sets/streams, `EXPIRE`/`TTL`,
+  `WATCH`, `EVAL`, `PUBLISH`; RESP3 framing (`HELLO 3` is accepted
+  but both directions stay RESP2)
+- Memcached `cas`/`touch`, the binary protocol, SASL, `noreply`
+- Tenant identity on connections (AUTH authenticates, it does not
+  select a tenant)
 
----
+## Repository layout
 
-## Repository Layout
+| Path | Contents |
+|---|---|
+| `modules/app/` | `no_std` PIC modules: protocol anchors, KV/router/apply modules, watch/lease/TTL, compaction, backup, CDC, range lifecycle, and outbound client connectors. `fluxor modules build` packs each into a `.fmod`. |
+| `modules/common/` | Shared `no_std` cores: the KV state machine, codecs, partition maps, wire constants. Pulled into each app module via `#[path]`. |
+| `docs/` | Reference documentation, indexed by [`docs/overview.md`](docs/overview.md): architecture (`docs/architecture/`) and guides (`docs/guides/`). |
+| `tools/` | Host-side helpers, including `lattice-scrape` (decodes the binary `/metrics` export). |
+| `telemetry/` | Telemetry catalog (`telemetry/catalog.json`). |
+| `wire/` | Per-protocol wire catalogs. |
+| `fluxor.toml` | Project manifest for the `fluxor` CLI: identity, dependencies, project policy. |
+| `Makefile` | Thin alias layer over the `fluxor` CLI; `make help` lists the targets. |
 
-| Path | Type | Description |
-|------|------|-------------|
-| `modules/app/*` | Fluxor PIC modules | Protocol anchors + KV/watch/lease/TTL/auth/quota/compaction/metrics modules (compiled to `.fmod`) |
-| `modules/common/*` | Shared source | `no_std` state machines and codecs, dual-target: compiled into the module ELFs and mounted into host tests via `#[path]` |
-| `configs/` | Assets | Fluxor graph configs (`fluxor run`) with per-anchor enablement and durability-mode templates |
-| `docs/` | Documentation | Normative spec (`specification.md`), protocol guides, and operational runbooks |
-| `tools/` | Utilities | Host-side CI/dev tools (wire lint, telemetry-catalog validator, load generator) |
-| `telemetry/` | Assets | Telemetry catalog (`catalog.json`), validated in CI |
-| `wire/` | Assets | Protocol wire catalogs (`redis.json`, `memcached.json`, `etcd.json`) |
-| `tests/`, `benches/`, `examples/`, `perf/` | Tests / benches | **Shadow-tracked** in `.git-shadow/`, never pushed to the shared remote — see [`standards/test-tracking.md`](../standards/test-tracking.md) |
+## Documentation
 
----
+- [`docs/guides/running.md`](docs/guides/running.md) — bring-up and
+  smoke checks.
+- [`docs/overview.md`](docs/overview.md) — index of everything below.
+- [`docs/architecture/`](docs/architecture/) — the specification,
+  CDC, and the limit register.
+- [`docs/guides/`](docs/guides/) — deployment, high availability,
+  tuning, and the per-protocol guides (Redis, Memcached, etcd).
 
-## Tests and benches are shadow-tracked
+## License
 
-`tests/`, `benches/`, `examples/`, and `perf/` live in a second, local-only
-Git history under `.git-shadow/` and are **not** on this repo's GitHub remote
-(rationale and mechanism: `standards/test-tracking.md`). A fresh clone of the
-primary repo has no files there — that is expected, not missing work.
-
-```bash
-make shadow-status          # git shadow status — read this alongside `git status`
-make shadow-log             # git shadow log --oneline -20
-git shadow add -f tests benches examples perf   # staging NEW files needs -f
-```
-
-Host-side integration tests mount the `no_std` module state machines via
-`#[path]` and exercise the codecs and state machines directly; runtime-gated
-load suites drive real client crates against a live node and are skipped
-unless a node is up. `make test` (→ `fluxor test`) runs the module-test lane,
-the host crates, and the shadow-checkout guard.
+See [`LICENSE`](LICENSE).
