@@ -1,0 +1,18 @@
+[package]
+name = "clock_lint"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Semantic graph lint for Lattice's committed-clock path"
+
+[[bin]]
+name = "clock_lint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.95"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
+clap = { version = "4.5.20", features = ["derive"] }
+
+[workspace]

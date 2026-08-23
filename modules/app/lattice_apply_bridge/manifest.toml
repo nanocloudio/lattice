@@ -20,13 +20,15 @@ hardware_targets = ["bcm2712"]
 # straight to kv_state_worker — consensus only sequences writes.
 #
 # A second entry kind, `LATTICE_RECORD_TAG`, carries
-# replicated control records (timestamp-allocator advances and worker
-# leases) that must NOT reach the state machine as commands. The bridge
-# demuxes them onto `records_out` as `[record_msg_type]` envelopes in
-# commit order; worker-lease grants (MSG_TS_LEASE_GRANT) are also
+# replicated control records (timestamp-allocator advances, worker
+# leases, and the cluster clock) that must NOT reach the state machine
+# as commands. The bridge demuxes them onto `records_out` as
+# `[record_msg_type]` envelopes in commit order; worker-lease grants
+# (MSG_TS_LEASE_GRANT) and clock ticks (MSG_LEASE_TICK) are also
 # forwarded in-band on `kv_out`, strictly ordered against the commands
 # around them, which is what makes per-write commit-timestamp
-# assignment deterministic across replicas and replay.
+# assignment and every TTL decision deterministic across replicas and
+# replay.
 
 [[ports]]
 name = "committed_in"

@@ -57,9 +57,18 @@ one node at a time.
    log, or by snapshot transfer if it is too far behind.
 4. Move on only once the cluster is back to full strength.
 
-Committed data survives the restart through WAL replay. Watch,
-lease, and TTL state does not: it is held in memory, so clients
-re-establish watches and re-grant leases after their node restarts.
+Committed data survives the restart through WAL replay, and so does a
+key's TTL: the deadline lives in the record, and the clock it is
+measured against is a committed log entry that replay rebuilds. Where
+the log has been compacted past those ticks, the clock frontier comes
+back with the state it belongs to — in the snapshot header, and in the
+disk manifest — so a node that recovers from a compacted log resumes
+at the time its deadlines were written against. That clock does not
+advance while the cluster is down, so a key comes back with the term it
+had left rather than an expired or a renewed one.
+Watch and lease state is held in memory and does not survive, so
+clients re-establish watches and re-grant leases after their node
+restarts.
 
 ## Failure behaviour
 

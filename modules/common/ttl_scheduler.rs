@@ -223,28 +223,63 @@ impl<const N: usize> TtlQueue<N> {
         Some(removed)
     }
 
-    /// Pop every entry with `deadline_ms <= now_ms`, calling
-    /// `sink` for each. Returns the count fired. The queue's
-    /// head is always the earliest deadline, so the loop runs at
-    /// most as many times as there are expired entries.
-    pub fn drain_due<F: FnMut(ExpiryEntry)>(&mut self, now_ms: u64, mut sink: F) -> usize {
+    /// Fire entries with `deadline_ms <= now_ms`, in deadline order,
+    /// popping each one only once `deliver` reports it delivered.
+    /// Returns the count actually fired.
+    ///
+    /// Two bounds, both of which exist because an expiry that leaves
+    /// the queue without being acted on is gone for good — the queue is
+    /// the only record that the entry was ever due:
+    ///
+    /// - `limit` caps how many are popped in one call. A caller that
+    ///   can emit at most N per step passes N, and entry N+1 stays
+    ///   queued at its original deadline rather than being popped into
+    ///   a full buffer and discarded.
+    /// - `deliver` returning `false` (its output refused the event)
+    ///   stops the drain with that entry still at the head, so the next
+    ///   call — the next tick — offers it again.
+    ///
+    /// The head is always the earliest deadline, so stopping early
+    /// never skips over an entry that was due.
+    pub fn drain_due_while<F: FnMut(&ExpiryEntry) -> bool>(
+        &mut self,
+        now_ms: u64,
+        limit: usize,
+        mut deliver: F,
+    ) -> usize {
         let mut count = 0;
-        while let Some(head) = self.peek() {
+        while count < limit {
+            let Some(head) = self.peek() else {
+                break;
+            };
             if head.deadline_ms > now_ms {
                 break;
             }
-            // SAFETY: peek told us len > 0.
-            let due = unsafe { self.entries[0].assume_init_read() };
+            // SAFETY: peek told us len > 0. The entry is COPIED, not
+            // read out — it is only removed below, after delivery.
+            let due = unsafe { *self.entries[0].assume_init_ref() };
+            if !deliver(&due) {
+                break;
+            }
             let mut i = 0;
             while i + 1 < self.len {
                 self.entries[i] = self.entries[i + 1];
                 i += 1;
             }
             self.len -= 1;
-            sink(due);
             count += 1;
         }
         count
+    }
+
+    /// Pop every entry with `deadline_ms <= now_ms`, calling `sink` for
+    /// each. Convenience wrapper over [`Self::drain_due_while`] for
+    /// callers whose sink cannot fail and has no per-step bound.
+    pub fn drain_due<F: FnMut(ExpiryEntry)>(&mut self, now_ms: u64, mut sink: F) -> usize {
+        self.drain_due_while(now_ms, usize::MAX, |e| {
+            sink(*e);
+            true
+        })
     }
 
     /// Iterate every entry in deadline order. Useful for snapshot
@@ -408,6 +443,67 @@ mod tests {
             .insert(ExpiryEntry::new(4, EXPIRY_KIND_LEASE, 4))
             .unwrap_err();
         assert_eq!(err, TtlError::Full);
+    }
+
+    #[test]
+    fn drain_due_while_leaves_what_it_cannot_emit() {
+        // The loss this bound exists to prevent: more entries come due
+        // than one step can announce. What is not emitted must still be
+        // in the queue, at its own deadline, for the next tick.
+        let mut q = Q::new();
+        q.init();
+        for id in 0..6u64 {
+            q.insert(ExpiryEntry::new(10 + id, EXPIRY_KIND_KV, id))
+                .unwrap();
+        }
+        let mut fired = std::vec::Vec::new();
+        let n = q.drain_due_while(100, 2, |e| {
+            fired.push(e.payload);
+            true
+        });
+        assert_eq!(n, 2);
+        assert_eq!(fired, std::vec![0, 1]);
+        assert_eq!(q.len(), 4, "the rest stay queued, not discarded");
+
+        // The next call resumes with the earliest still-due entry.
+        let n = q.drain_due_while(100, 99, |e| {
+            fired.push(e.payload);
+            true
+        });
+        assert_eq!(n, 4);
+        assert_eq!(fired, std::vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn drain_due_while_retains_a_refused_entry() {
+        // Backpressure is not a licence to drop: an entry whose output
+        // refuses it stays at the head and is offered again.
+        let mut q = Q::new();
+        q.init();
+        q.insert(ExpiryEntry::new(10, EXPIRY_KIND_KV, 1)).unwrap();
+        q.insert(ExpiryEntry::new(11, EXPIRY_KIND_KV, 2)).unwrap();
+
+        let mut attempts = std::vec::Vec::new();
+        let n = q.drain_due_while(100, 99, |e| {
+            attempts.push(e.payload);
+            false
+        });
+        assert_eq!(n, 0);
+        assert_eq!(
+            attempts,
+            std::vec![1],
+            "stops at the refusal, does not skip on"
+        );
+        assert_eq!(q.len(), 2);
+
+        let n = q.drain_due_while(100, 99, |e| {
+            attempts.push(e.payload);
+            true
+        });
+        assert_eq!(n, 2);
+        assert_eq!(attempts, std::vec![1, 1, 2]);
+        assert_eq!(q.len(), 0);
     }
 
     #[test]

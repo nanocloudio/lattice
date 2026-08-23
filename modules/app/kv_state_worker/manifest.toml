@@ -61,7 +61,12 @@ hardware_targets = ["bcm2712"]
 requires_contract = "fs"
 access = "write"
 
-# Routed commands from kv_request_router (already epoch-validated).
+# Routed commands from kv_request_router (already epoch-validated), and
+# the committed clock: MSG_LEASE_TICK arrives on this same channel so
+# the time a command applies under is fixed by its position in the
+# stream rather than by the applying node's local timer. A graph that
+# never delivers a tick leaves the clock at 0, under which no deadline
+# has passed and nothing with a TTL ever expires.
 [[ports]]
 name = "commands"
 direction = "input"
@@ -90,7 +95,10 @@ name = "lease_revoke"
 direction = "input"
 content_type = "OctetStream"
 
-# TTL-driven expiry from ttl_scheduler.
+# Reclamation events from ttl_scheduler. Each one releases slots the
+# committed clock has already put past their deadline: no revision, no
+# tombstone, no watch event, so a replica sweeping earlier or later than
+# another cannot make their observable states differ.
 [[ports]]
 name = "expire"
 direction = "input"
@@ -152,6 +160,18 @@ content_type = "OctetStream"
 [[ports]]
 name = "lease_request"
 index = 5
+direction = "output"
+content_type = "OctetStream"
+
+# KV expiry registrations to ttl_scheduler.
+# MSG_TTL_REGISTER `[deadline_ms:u64][key_hash:u64]`, deadline 0 =
+# cancel. The deadline comes from the committed clock, so every replica
+# publishes the same value from the same log position. It schedules
+# reclamation; visibility is decided by the record's own deadline at
+# apply time.
+[[ports]]
+name = "expiry_out"
+index = 6
 direction = "output"
 content_type = "OctetStream"
 

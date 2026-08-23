@@ -43,7 +43,8 @@ mod wire;
 mod telemetry;
 
 use wire::{
-    LATTICE_ENTRY_TAG, LATTICE_RECORD_TAG, MSG_APP_APPLIED_POS, MSG_KV_COMMAND, MSG_TS_LEASE_GRANT,
+    LATTICE_ENTRY_TAG, LATTICE_RECORD_TAG, MSG_APP_APPLIED_POS, MSG_KV_COMMAND, MSG_LEASE_TICK,
+    MSG_TS_LEASE_GRANT,
 };
 
 /// Clustor's `MSG_COMMITTED_ENTRY` opcode (see
@@ -55,6 +56,17 @@ const MSG_COMMITTED_ENTRY: u8 = 0x24;
 const COMMITTED_HEADER_LEN: usize = 16;
 
 const SCRATCH: usize = 4096;
+
+/// Retained-entry kinds. A committed entry read off `committed_in` is
+/// held in `BridgeState` until every destination it owes has accepted
+/// it, because the channel read already destroyed the only other copy:
+/// what is not retained here is gone from the state machine for good.
+/// For a command that is a permanent divergence between this replica's
+/// store and the log it claims to be applying; for a clock tick it is
+/// two consumers advancing on different clocks.
+const PEND_NONE: u8 = 0;
+const PEND_COMMAND: u8 = 1;
+const PEND_RECORD: u8 = 2;
 
 #[repr(C)]
 struct BridgeState {
@@ -90,6 +102,10 @@ struct BridgeState {
     // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=applied [=forwarded], 1=dropped).
+    /// Steps that ended holding a retained entry a destination refused.
+    /// NOT a loss count — the entry is still here and is re-offered on
+    /// the next step; this is the backpressure signal, and a value that
+    /// climbs steadily means a consumer is not keeping up.
     dropped: u64,
     /// Committed entries whose body did not carry `LATTICE_ENTRY_TAG`
     /// and were therefore not applied — clustor-internal entries (admin /
@@ -99,12 +115,33 @@ struct BridgeState {
     /// Record entries forwarded on `records_out` (and, for worker
     /// leases, in-band on `kv_out`).
     records: u64,
-    /// Record entries that could not be forwarded (port unwired or
-    /// backpressure). The position still advances — a record the
-    /// consumer misses is re-derived from a later one (allocator
-    /// grants supersede each other), never a state-machine gap.
+    /// Record entries `records_out` never received because no consumer
+    /// is wired to it. Backpressure is NOT counted here — a wired port
+    /// that refuses gets the entry retained and re-offered. With no
+    /// consumer at all there is nobody to retain it for, so the entry
+    /// is counted and released; a record whose only reader is absent
+    /// cannot become a state-machine gap.
     records_dropped: u64,
     step_ctr: u64,
+
+    /// The retained committed entry (`PEND_*`), and which destinations
+    /// still owe it acceptance. `pend_kind == PEND_NONE` means nothing
+    /// is outstanding and the next entry may be read; otherwise no
+    /// further entry is read, and the applied position does not move,
+    /// until this one has been taken by every destination — which is
+    /// also what keeps delivery in commit order, since a later entry
+    /// can never overtake a stalled one.
+    pend_kind: u8,
+    /// Record message type for `PEND_RECORD` (ignored for a command).
+    pend_type: u8,
+    /// `1` while `kv_out` has not yet accepted the retained entry.
+    pend_need_kv: u8,
+    /// `1` while `records_out` has not yet accepted the retained entry.
+    pend_need_records: u8,
+    pend_len: u32,
+    pend_term: u64,
+    pend_index: u64,
+    pend_body: [u8; SCRATCH],
 
     scratch: [u8; SCRATCH],
 }
@@ -127,6 +164,13 @@ impl BridgeState {
         self.records = 0;
         self.records_dropped = 0;
         self.step_ctr = 0;
+        self.pend_kind = PEND_NONE;
+        self.pend_type = 0;
+        self.pend_need_kv = 0;
+        self.pend_need_records = 0;
+        self.pend_len = 0;
+        self.pend_term = 0;
+        self.pend_index = 0;
     }
 }
 
@@ -175,6 +219,66 @@ unsafe fn write_envelope(
     scratch[2] = ((body.len() >> 8) & 0xFF) as u8;
     scratch[3..total].copy_from_slice(body);
     (sys.channel_write)(chan, scratch.as_mut_ptr(), total) == total as i32
+}
+
+/// Offer the retained entry to every destination that has not yet taken
+/// it.
+///
+/// Returns `true` when nothing is outstanding — the caller may then
+/// advance the applied position and read the next entry — and `false`
+/// while a destination is still refusing, in which case the entry stays
+/// exactly where it is and is offered again next step.
+///
+/// Each destination is cleared independently, so a partial delivery is
+/// never repeated: a tick that reached `records_out` but not `kv_out`
+/// resumes owing only `kv_out`.
+unsafe fn flush_pending(s: &mut BridgeState) -> bool {
+    if s.pend_kind == PEND_NONE {
+        return true;
+    }
+    if s.syscalls.is_null() {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let len = s.pend_len as usize;
+    let mut out_scratch = [0u8; SCRATCH];
+    if s.pend_need_records == 1 {
+        if write_envelope(
+            sys,
+            s.records_out,
+            s.pend_type,
+            &s.pend_body[..len],
+            &mut out_scratch,
+        ) {
+            s.pend_need_records = 0;
+        } else {
+            return false;
+        }
+    }
+    if s.pend_need_kv == 1 {
+        let mt = if s.pend_kind == PEND_COMMAND {
+            MSG_KV_COMMAND
+        } else {
+            s.pend_type
+        };
+        if write_envelope(sys, s.kv_out, mt, &s.pend_body[..len], &mut out_scratch) {
+            s.pend_need_kv = 0;
+        } else {
+            return false;
+        }
+    }
+    if s.pend_kind == PEND_COMMAND {
+        s.forwarded = s.forwarded.wrapping_add(1);
+    } else {
+        s.records = s.records.wrapping_add(1);
+    }
+    // Only an entry every destination has taken may move the position
+    // the worker labels snapshots with, and it is exactly then that it
+    // is safe to move: there is nothing left owed for this index.
+    s.pos_term = s.pend_term;
+    s.pos_index = s.pend_index;
+    s.pend_kind = PEND_NONE;
+    true
 }
 
 #[no_mangle]
@@ -235,8 +339,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // horizon can advance by many entries in one tick under load.
     const PER_TICK_BUDGET: u32 = 32;
     let mut processed: u32 = 0;
-    let mut tmp_body = [0u8; SCRATCH];
     while processed < PER_TICK_BUDGET {
+        // An entry retained from an earlier step owes its destinations
+        // before another may be read. Reading past it would put a later
+        // commit index into the state machine ahead of an earlier one.
+        if s.pend_kind != PEND_NONE && unsafe { !flush_pending(s) } {
+            break;
+        }
         let mut scratch = [0u8; SCRATCH];
         let (mt, len) = match unsafe { read_envelope(&*sys, s.committed_in, &mut scratch) } {
             Some(p) => p,
@@ -284,46 +393,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let record_type = scratch[COMMITTED_HEADER_LEN + 1];
             let rec_off = COMMITTED_HEADER_LEN + 2;
             let rec_len = len - rec_off;
-            tmp_body[..rec_len].copy_from_slice(&scratch[rec_off..len]);
-            let mut out_scratch = [0u8; SCRATCH];
-            let mut ok = true;
-            if s.records_out >= 0 {
-                ok &= unsafe {
-                    write_envelope(
-                        &*sys,
-                        s.records_out,
-                        record_type,
-                        &tmp_body[..rec_len],
-                        &mut out_scratch,
-                    )
-                };
-            } else {
-                ok = false;
-            }
-            if record_type == MSG_TS_LEASE_GRANT {
-                ok &= unsafe {
-                    write_envelope(
-                        &*sys,
-                        s.kv_out,
-                        record_type,
-                        &tmp_body[..rec_len],
-                        &mut out_scratch,
-                    )
-                };
-            }
-            if ok {
-                s.records = s.records.wrapping_add(1);
-            } else {
+            s.pend_body[..rec_len].copy_from_slice(&scratch[rec_off..len]);
+            s.pend_len = rec_len as u32;
+            s.pend_kind = PEND_RECORD;
+            s.pend_type = record_type;
+            s.pend_term = term;
+            s.pend_index = index;
+            // Two record kinds also go in-band on `kv_out`, strictly
+            // ordered against the commands around them: a worker lease,
+            // and the cluster clock. Both are inputs the state machine
+            // must consume at exactly the log position they committed
+            // at, or two replicas stop agreeing on what a command means.
+            // A clock tick reaching one destination and not the other
+            // is how the scheduler and the state worker end up on
+            // different clocks, so both are owed before the position
+            // moves.
+            s.pend_need_kv =
+                u8::from(record_type == MSG_TS_LEASE_GRANT || record_type == MSG_LEASE_TICK);
+            s.pend_need_records = u8::from(s.records_out >= 0);
+            if s.records_out < 0 {
+                // Nobody is wired to receive it; there is no consumer
+                // to retain it for.
                 s.records_dropped = s.records_dropped.wrapping_add(1);
             }
-            // The position advances either way: like an internal
-            // entry, a record is fully accounted for at the log level
-            // the moment it is demuxed, and holding the applied
-            // position back would starve the linearizable-read fence
-            // (see the untagged arm below). A dropped record strands
-            // at most one lease interval; grants supersede.
-            s.pos_term = term;
-            s.pos_index = index;
+            if s.pend_need_kv == 0 && s.pend_need_records == 0 {
+                s.pend_kind = PEND_NONE;
+                s.pos_term = term;
+                s.pos_index = index;
+            }
             processed += 1;
             continue;
         }
@@ -354,32 +451,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             continue;
         }
         let body_len = tagged_len - 1;
-        tmp_body[..body_len].copy_from_slice(&scratch[COMMITTED_HEADER_LEN + 1..len]);
-
-        let mut out_scratch = [0u8; SCRATCH];
-        let ok = unsafe {
-            write_envelope(
-                &*sys,
-                s.kv_out,
-                MSG_KV_COMMAND,
-                &tmp_body[..body_len],
-                &mut out_scratch,
-            )
-        };
-        if ok {
-            s.forwarded = s.forwarded.wrapping_add(1);
-            // Only a command the worker actually received may advance
-            // the position it will label snapshots with. A dropped
-            // write (backpressure) leaves the position behind, which
-            // is what we want: the next batch re-establishes it.
-            s.pos_term = term;
-            s.pos_index = index;
-        } else {
-            // Single chokepoint: a committed entry dropped on `kv_out`
-            // backpressure (its position stays behind for re-forward).
-            s.dropped = s.dropped.wrapping_add(1);
-        }
+        s.pend_body[..body_len].copy_from_slice(&scratch[COMMITTED_HEADER_LEN + 1..len]);
+        s.pend_len = body_len as u32;
+        s.pend_kind = PEND_COMMAND;
+        s.pend_type = MSG_KV_COMMAND;
+        s.pend_need_kv = 1;
+        s.pend_need_records = 0;
+        s.pend_term = term;
+        s.pend_index = index;
         processed += 1;
+    }
+    // Deliver whatever the last iteration classified, so an entry read
+    // on the final pass of the budget is not held for a whole step.
+    if unsafe { !flush_pending(s) } {
+        s.dropped = s.dropped.wrapping_add(1);
     }
 
     // Publish the applied position for this batch, in-band on `kv_out`

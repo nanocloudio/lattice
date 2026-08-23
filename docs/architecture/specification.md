@@ -31,9 +31,11 @@ else is present-tense fact with its defining source file.
   when no authority is available the operation fails closed with a
   protocol-specific error rather than degrading. Source:
   `modules/app/kv_request_router/mod.rs`.
-- **TTL determinism** — expiry is applied from tick envelopes
-  processed in the apply path, never from a wall-clock sample at
-  read time. Source: `modules/common/ttl_scheduler.rs`.
+- **TTL determinism** — every deadline is assigned and tested
+  against the committed tick, which the state machine reads on the
+  same channel as the commands it orders against. No apply or read
+  samples a local timer. Source:
+  `modules/app/kv_state_worker/mod.rs`.
 
 ## Terminology
 
@@ -171,17 +173,54 @@ the backup).
 
 ## TTL, leases, and watches
 
-Expiry deadlines are evaluated only when a tick envelope reaches the
-lease manager; nothing samples the wall clock at read time. The tick
-source is the `ttl_scheduler` module. Lease keepalives move the
-keepalive deadline; a revoked or recreated lease bumps its session
-epoch so stale keepalives are fenced. Watch delivery
+Expiry runs on one clock, and that clock is a committed log entry.
+`ttl_scheduler` proposes a tick on a cadence and the tick becomes the
+cluster's time only once it returns committed, on the same channel as
+the commands it is ordered against. A deadline is therefore a function
+of the log position that set it: replicas applying the same log agree,
+and a replay reaches the same answer again.
+
+The proposal carries an elapsed interval added to the current
+committed time rather than a reading of the proposer's own clock. Two
+consequences follow. A node whose clock is wrong cannot move expiry,
+and a cluster that is down does not age its TTLs — when it returns,
+expiry resumes from where the log left off, so keys outlive an outage
+rather than expiring unobserved during one.
+
+A record's own deadline decides whether it is visible. The scheduler's
+queue schedules the release of the slot behind it, which allocates no
+revision and emits no event, so replicas may reclaim at different
+moments without their answers differing.
+
+Every graph that runs a state worker wires the clock, and the port is
+declared required: a graph that omits it fails `fluxor build` rather
+than running with expiry silently stopped. A required port only proves
+an edge exists, so the shape is checked separately (`tools/ci/
+clock_lint`, a CI gate over every config): the tick a graph applies
+must be one this scheduler proposed and got back through the same
+ordering its commands went through — directly on the command channel
+where there is no consensus, out of the commit stream where there is.
+A graph that satisfies the port by wiring some other producer to it is
+refused with the reason.
+
+Lease keepalives move the keepalive deadline against the same clock; a
+revoked or recreated lease bumps its session epoch so stale keepalives
+are fenced. Watch delivery
 (`watch_registry` + `watch_fanout`) replays a revision window
 through versioned scans: every version in `(from, to]` is delivered
 in order, tombstones included, and a compacted answer abandons the
-backfill rather than delivering a partial tail. Watch, lease, and
-TTL state is held in memory: it does not survive a node restart
-(see [Design targets](#design-targets-not-wired)).
+backfill rather than delivering a partial tail. Watch and lease
+state is held in memory: it does not survive a node restart (see
+[Design targets](#design-targets-not-wired)). A record's TTL does
+survive one: the deadline lives in the record, and the clock it is
+measured against is restored with it. A full replay re-establishes the
+clock from the ticks in the log; where the log has been compacted the
+frontier travels in the snapshot header — and, for the disk provider,
+in the manifest — so a store recovered from a compacted log resumes at
+the time its deadlines were written against rather than at zero. On
+restore the worker hands the scheduler that frontier and re-registers
+the restored deadlines, since the scheduler's clock and queue live
+only in its arena.
 
 ## Error mapping
 
@@ -251,9 +290,6 @@ observable behaviour today.
   bucket (`modules/common/quota_bucket.rs`) and its
   throttle/disconnect envelopes exist, but no producer drives the
   refill tick in a shipped graph.
-- **Committed time** — a WAL-committed tick entry as the sole time
-  source, making expiry replay-deterministic across the cluster;
-  today's tick is a graph-local scheduler envelope.
 - **Durable watch/lease state** — persisting `last_sent_revision`
   and the lease table so watches and leases survive restart.
 - **Per-request read consistency on the client wire** — honouring

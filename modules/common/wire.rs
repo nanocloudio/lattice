@@ -212,8 +212,16 @@ pub const MSG_LEASE_CTRL: u8 = 0xD0;
 ///           [keepalive_deadline_ms:u64 LE]`
 pub const MSG_LEASE_STATE: u8 = 0xD1;
 
-/// Scheduler → manager: deterministic tick event with current time.
+/// The cluster clock: a committed tick carrying the current time.
 /// Payload: `[tick_ms:u64 LE]`
+///
+/// `ttl_scheduler` proposes one on a cadence; it reaches consumers only
+/// after it commits, wrapped in [`LATTICE_RECORD_TAG`] in a replicated
+/// graph and emitted directly onto the command channel in a graph with
+/// no replication. `kv_state_worker` reads it in-band on `commands`, so
+/// it is ordered against the mutations around it, and `lease_manager`
+/// reads it via the scheduler's `tick_out`. Nothing downstream of this
+/// message samples a local timer for a TTL decision.
 pub const MSG_LEASE_TICK: u8 = 0xD2;
 
 /// Manager → kv_state_worker: lease-attached key revoke.
@@ -236,6 +244,38 @@ pub const MSG_LEASE_REVOKE: u8 = 0xD3;
 /// `0 → 1` transition; subsequent events advance monotonically
 /// whenever the substrate detects a rebalance / admin change.
 pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD4;
+
+/// `kv_state_worker` → `ttl_scheduler`: a KV record's expiry deadline.
+/// Payload: `[deadline_ms:u64 LE][key_hash:u64 LE]`, deadline `0` =
+/// cancel any pending entry for the key.
+///
+/// The deadline is computed from the committed clock at apply time, so
+/// every replica registers the same value from the same log position.
+/// The entry schedules RECLAMATION only — whether a record is visible
+/// is decided by its own stored deadline when a command touches it, so
+/// a lost, late, or duplicated registration changes when a slot is
+/// released and nothing a client can observe. For the same reason a
+/// write that carries no TTL sends nothing: a stale entry left behind
+/// fires a sweep that frees nothing.
+pub const MSG_TTL_REGISTER: u8 = 0xD5;
+
+/// `kv_state_worker` → `ttl_scheduler`: resume the clock at this
+/// frontier. Payload: `[frontier_ms:u64 LE]`.
+///
+/// Sent once after a snapshot install, ahead of the re-registrations
+/// that rebuild the queue. A snapshot restores the records and the
+/// clock they were deadlined against (see
+/// `kv_store::snapshot_clock_ms`), but the scheduler's own `now_ms`
+/// and its expiry queue live only in its arena, so without this it
+/// would resume from ZERO and propose ticks far below the frontier the
+/// worker just restored — every one of them discarded as backwards,
+/// freezing expiry for as long as the previous incarnation had been up.
+///
+/// This is a HINT and cannot be anything else: it only moves what the
+/// scheduler PROPOSES, and a proposal becomes the time only once it
+/// comes back committed. A replica that misses it proposes low values
+/// that are discarded, which is the same outcome as not restarting.
+pub const MSG_TTL_CLOCK_RESUME: u8 = 0xD6;
 
 // ── Clustor consensus bridge (Phase 7) ────────────────────────────────
 //

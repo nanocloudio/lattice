@@ -74,6 +74,9 @@ modules:
       replicated: 1
   - name: kv_state_worker
   - name: lattice_apply_bridge
+  - name: ttl_scheduler
+    params:
+      propose_wrap: 1
 
   # ── Clustor substrate ─────────────────────────────────────
   - name: peer_router
@@ -145,6 +148,21 @@ wiring:
     to: kv_state_worker.commands
   - from: kv_state_worker.responses
     to: kv_request_router.kv_in
+
+  # ── The clock ─────────────────────────────────────────────
+  # `ttl_scheduler` proposes a tick on a cadence; it becomes the
+  # cluster's time only once it comes back committed, on the same
+  # channel as the commands it orders against. That is what makes a
+  # TTL expire at the same point of the log on every replica and
+  # again on replay.
+  - from: ttl_scheduler.propose_out
+    to: gateway.client_requests
+  - from: lattice_apply_bridge.records_out
+    to: ttl_scheduler.tick_in
+  - from: kv_state_worker.expiry_out
+    to: ttl_scheduler.kv_expiry
+  - from: ttl_scheduler.expire_out
+    to: kv_state_worker.expire
 
   # ── Linearizable-read fence ───────────────────────────────
   - from: kv_request_router.lin_read_out

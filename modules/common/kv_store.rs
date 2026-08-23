@@ -48,8 +48,15 @@ use types::{
 /// it doesn't recognise rather than mis-parsing them.
 pub const SNAPSHOT_MAGIC: u32 = 0x4C4B_5653;
 pub const SNAPSHOT_FORMAT_VERSION: u16 = 1;
-/// `[magic:4][format:2][flags:2][revision:8][count:4][rsvd:4]`
-pub const SNAPSHOT_HDR_LEN: usize = 24;
+/// `[magic:4][format:2][flags:2][revision:8][count:4][rsvd:4][clock:8]`
+///
+/// `clock` is the committed clock frontier — the state machine's `now`
+/// at the position this snapshot was taken. It belongs in the snapshot
+/// for the same reason the revision counter does: a restore that put
+/// the records back but restarted the clock at zero would make every
+/// record whose deadline had already passed VISIBLE AGAIN, and would
+/// then re-age the survivors from zero.
+pub const SNAPSHOT_HDR_LEN: usize = 32;
 /// Per-record fixed prefix ahead of the key/value bytes:
 /// `[key_len:2][value_len:4][create_rev:8][mod_rev:8][version:8][lease:8][expiry:8]`
 pub const SNAPSHOT_REC_FIXED: usize = 46;
@@ -329,6 +336,76 @@ impl KvStore {
         true
     }
 
+    /// Release the record the expiry queue named, if the committed
+    /// clock has already put it past its deadline. Returns how many
+    /// slots were freed (0 or 1 in the ordinary case; more only if two
+    /// live keys collide on the same hash).
+    ///
+    /// `key_hash` is `fnv1a64(key)` — the same value the slot lookup
+    /// uses — so this walks the probe chain the record must be on
+    /// rather than scanning an unrelated slice of the table. That is
+    /// what makes a single expiry event actually reclaim the single
+    /// record it was raised for.
+    ///
+    /// Reclamation only, on the same terms as [`Self::reap_expired`]:
+    /// the record is already absent from every read on every replica,
+    /// so freeing it allocates no revision and emits no event.
+    pub fn reap_expired_hash(&mut self, now_ms: u64, key_hash: u64) -> u32 {
+        let mut released = 0u32;
+        let mut idx = (key_hash as usize) % MAX_KEYS;
+        let mut visited = 0usize;
+        while visited < MAX_KEYS {
+            let r = &self.records[idx];
+            if !r.used {
+                // The probe chain ends at the first free slot: no key
+                // hashing here can live beyond it.
+                break;
+            }
+            let klen = r.key_len as usize;
+            if fnv1a64(&r.key[..klen]) == key_hash && is_expired(r, now_ms) {
+                if self.delete_at(idx) {
+                    released += 1;
+                }
+                // `delete_at` rehashes the chain behind this slot, so
+                // re-examine `idx` rather than stepping over whatever
+                // moved into it.
+            } else {
+                idx = (idx + 1) % MAX_KEYS;
+            }
+            visited += 1;
+        }
+        released
+    }
+
+    /// Release slots whose absolute deadline has already passed under
+    /// `now_ms`, visiting at most `budget` slots from `cursor`. Returns
+    /// `(next_cursor, released)`.
+    ///
+    /// Reclamation only. A record past its deadline is already absent
+    /// from every read on every replica, so releasing it allocates no
+    /// revision, writes no tombstone, and emits no mutation event —
+    /// which is what allows the sweep to run at a different moment on
+    /// each replica without the observable states diverging.
+    pub fn reap_expired(&mut self, now_ms: u64, cursor: usize, budget: usize) -> (usize, u32) {
+        let mut idx = cursor % MAX_KEYS;
+        let mut released = 0u32;
+        let mut visited = 0usize;
+        while visited < budget && visited < MAX_KEYS {
+            if self.records[idx].used && is_expired(&self.records[idx], now_ms) {
+                if self.delete_at(idx) {
+                    released += 1;
+                }
+                // `delete_at` rehashes the probe chain behind this slot,
+                // so the slot is re-examined on the next pass rather
+                // than advancing over a record that moved into it.
+            } else {
+                idx = (idx + 1) % MAX_KEYS;
+            }
+            visited += 1;
+        }
+        (idx, released)
+    }
+
     pub fn flush(&mut self) {
         let mut i = 0;
         while i < MAX_KEYS {
@@ -355,11 +432,17 @@ impl KvStore {
     ///
     /// Layout (little-endian):
     /// ```text
-    /// header  [magic:u32][format:u16][flags:u16][revision:u64][count:u32][rsvd:u32]
+    /// header  [magic:u32][format:u16][flags:u16][revision:u64][count:u32]
+    ///         [rsvd:u32][clock_ms:u64]
     /// record  [key_len:u16][value_len:u32][create_rev:u64][mod_rev:u64]
     ///         [version:u64][lease_id:u64][expiry_ms:u64][key][value]
     /// ```
-    pub fn snapshot_encode(&self, out: &mut [u8]) -> Option<usize> {
+    ///
+    /// `clock_ms` is the caller's committed clock frontier. Record
+    /// deadlines are absolute against that clock, so a body carrying
+    /// the records without it is not a restorable state — see
+    /// [`snapshot_clock_ms`].
+    pub fn snapshot_encode(&self, out: &mut [u8], clock_ms: u64) -> Option<usize> {
         if out.len() < SNAPSHOT_HDR_LEN {
             return None;
         }
@@ -404,6 +487,7 @@ impl KvStore {
         out[8..16].copy_from_slice(&self.revision.to_le_bytes());
         out[16..20].copy_from_slice(&count.to_le_bytes());
         out[20..24].copy_from_slice(&0u32.to_le_bytes()); // reserved
+        out[24..32].copy_from_slice(&clock_ms.to_le_bytes());
         Some(p)
     }
 
@@ -421,6 +505,39 @@ impl KvStore {
     /// (bad magic/format, truncation, over-long key/value, duplicate or
     /// unindexable key). A partial restore must never be mistaken for a
     /// good one; the caller fails closed and replays from the log.
+    /// `(deadline_ms, key_hash)` for the record in `slot`, if it holds
+    /// one with an absolute expiry deadline.
+    ///
+    /// Slot-addressed rather than a closure walk so the caller can
+    /// rebuild the expiry queue INCREMENTALLY, a budget at a time,
+    /// resuming where it left off. The queue that schedules reclamation
+    /// lives in `ttl_scheduler`'s arena and is in no snapshot, so after
+    /// a restore it knows about none of these records; re-registering
+    /// them is what puts it back in agreement with the store.
+    pub fn expiring_at(&self, slot: usize) -> Option<(u64, u64)> {
+        if slot >= MAX_KEYS {
+            return None;
+        }
+        let r = &self.records[slot];
+        if !r.used || r.expiry_ms == 0 {
+            return None;
+        }
+        Some((r.expiry_ms, fnv1a64(&r.key[..r.key_len as usize])))
+    }
+
+    /// The committed clock frontier a snapshot body was taken at, or
+    /// `0` if the body is too short to carry one. Read this alongside
+    /// [`Self::snapshot_decode`] and latch it as the restored state
+    /// machine's `now`: the records' deadlines are absolute against it.
+    pub fn snapshot_clock_ms(src: &[u8]) -> u64 {
+        if src.len() < SNAPSHOT_HDR_LEN {
+            return 0;
+        }
+        u64::from_le_bytes([
+            src[24], src[25], src[26], src[27], src[28], src[29], src[30], src[31],
+        ])
+    }
+
     pub fn snapshot_decode(&mut self, src: &[u8]) -> bool {
         if src.len() < SNAPSHOT_HDR_LEN {
             return false;
@@ -627,6 +744,44 @@ fn read_u8(body: &[u8], offset: &mut usize) -> Option<u8> {
     let v = body[*offset];
     *offset += 1;
     Some(v)
+}
+
+/// Recover `(key_hash, ttl_ms)` from a `KV_OP_PUT` body: the identity
+/// under which the expiry queue tracks the record, and the relative TTL
+/// the command carried (`0` = no expiry).
+///
+/// `ident` is the command's canonical identity prefix (§23). The hash
+/// covers `ident ++ key`, exactly as the stored record's key does, for
+/// two reasons: two tenants writing the same user key must not
+/// register, cancel and reclaim each OTHER's entries, and the hash is
+/// what an expiry event hands back to the store to find the record it
+/// named — a hash taken over anything but the canonical key would land
+/// on the wrong probe chain.
+///
+/// The queue entry it feeds is a reclamation hint. The record's own
+/// absolute `expiry_ms` is the authority for visibility, so a hint that
+/// is late, early, or absent changes when a slot is released and
+/// nothing else.
+pub fn put_ttl_registration(body: &[u8], ident: &[u8; IDENT_LEN]) -> Option<(u64, u64)> {
+    let mut off = 0;
+    let key = read_key(body, &mut off)?;
+    read_value(body, &mut off)?;
+    read_u8(body, &mut off)?;
+    let ttl_ms = read_u64(body, &mut off).unwrap_or(0);
+    Some((canonical_key_hash(ident, key), ttl_ms))
+}
+
+/// `fnv1a64` over the canonical key — the identity prefix followed by
+/// the user key — computed without materialising the concatenation.
+/// This is the SAME value as `fnv1a64(stored_key)` for the record the
+/// command writes, which is what lets an expiry event name a slot.
+pub fn canonical_key_hash(ident: &[u8; IDENT_LEN], key: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in ident.iter().chain(key.iter()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 // ── Decimal int parse/format for INCR/DECR ────────────────────────────

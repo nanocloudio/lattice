@@ -52,6 +52,10 @@ use wire::{
 
 const SCRATCH_BUF_SIZE: usize = 4096;
 const MAX_LEASES: usize = 256;
+/// Lease revokes announced per committed tick. A bound on WORK, not on
+/// how many leases may expire at once: the remainder stay queued at
+/// their own deadlines and are revoked on the following ticks.
+const REVOKE_PER_TICK: usize = 32;
 
 const LEASE_CTRL_GRANT: u8 = 0;
 const LEASE_CTRL_REVOKE: u8 = 1;
@@ -263,7 +267,10 @@ fn handle_ctrl(mgr: &mut LeaseManagerState, payload: &[u8]) {
                 mgr.leases[idx] = LeaseRecord::free();
                 let _ = mgr.expiry.remove(EXPIRY_KIND_LEASE, lease_id);
                 mgr.m_revokes += 1;
-                emit_revoke(mgr, lease_id);
+                // Client-initiated: the caller is told the outcome on
+                // `responses` regardless, and the lease is already gone
+                // from the table, so there is no queued event to retain.
+                let _ = emit_revoke(mgr, lease_id);
                 emit_state(mgr, lease_id, 0, 0, 0, 0);
             }
         }
@@ -345,11 +352,15 @@ fn emit_state_epoch(
     }
 }
 
-fn emit_revoke(mgr: &mut LeaseManagerState, lease_id: u64) {
-    // [lease_id:8][kpg_id:2][key_len:2][key…]
-    // Attached-keys list is Phase 5 scope; Phase 4 emits a
-    // key-less revoke envelope (worker treats it as "evict every
-    // record tagged with this lease_id" when key_len == 0).
+/// Emit one lease revoke: `[lease_id:8][kpg_id:2][key_len:2][key…]`.
+/// Attached-keys list is Phase 5 scope; Phase 4 emits a key-less revoke
+/// envelope (worker treats it as "evict every record tagged with this
+/// lease_id" when key_len == 0).
+///
+/// Returns whether `revoke_out` took it. A revoke is an EVENT — no
+/// later message re-derives it — so a refused write must leave the
+/// lease in the expiry queue rather than dropping it.
+fn emit_revoke(mgr: &mut LeaseManagerState, lease_id: u64) -> bool {
     let mut body = [0u8; 12];
     body[0..8].copy_from_slice(&lease_id.to_le_bytes());
     body[8] = 0;
@@ -358,9 +369,16 @@ fn emit_revoke(mgr: &mut LeaseManagerState, lease_id: u64) {
     body[11] = 0;
     unsafe {
         let sys = mgr.syscalls;
-        if !sys.is_null() {
-            let _ = write_envelope(&*sys, mgr.revoke_out, MSG_LEASE_REVOKE, &body);
+        if sys.is_null() {
+            return false;
         }
+        if mgr.revoke_out < 0 {
+            // Nothing is wired to receive revokes; retaining the lease
+            // would only fill the queue against a channel that will
+            // never drain.
+            return true;
+        }
+        write_envelope(&*sys, mgr.revoke_out, MSG_LEASE_REVOKE, &body)
     }
 }
 
@@ -377,24 +395,32 @@ fn handle_tick(mgr: &mut LeaseManagerState, payload: &[u8]) {
     if tick_ms > mgr.now_ms {
         mgr.now_ms = tick_ms;
     }
-    // Drain due leases.
-    let mut to_revoke: [u64; 32] = [0; 32];
-    let mut count = 0usize;
-    mgr.expiry.drain_due(mgr.now_ms, |entry| {
-        if count < to_revoke.len() {
-            to_revoke[count] = entry.payload;
-            count += 1;
+    // Revoke due leases, taking each out of the queue only once its
+    // revoke has been accepted. The table holds far more leases than
+    // one step can announce, so the bound is on how many are ANNOUNCED
+    // per tick; the rest keep their place in the queue and are revoked
+    // on a later tick rather than expiring unnoticed.
+    let mut fired = 0usize;
+    while fired < REVOKE_PER_TICK {
+        let Some(entry) = mgr.expiry.peek() else {
+            break;
+        };
+        if entry.deadline_ms > mgr.now_ms {
+            break;
         }
-    });
-    let mut i = 0;
-    while i < count {
-        let id = to_revoke[i];
-        if let Some(idx) = mgr.find(id) {
+        let id = entry.payload;
+        let known = mgr.find(id);
+        if known.is_some() && !emit_revoke(mgr, id) {
+            // Backpressure: leave it queued and due, and try again on
+            // the next tick.
+            break;
+        }
+        if let Some(idx) = known {
             mgr.leases[idx] = LeaseRecord::free();
             mgr.m_expiries += 1;
-            emit_revoke(mgr, id);
         }
-        i += 1;
+        let _ = mgr.expiry.pop();
+        fired += 1;
     }
 }
 

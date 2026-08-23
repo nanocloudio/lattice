@@ -95,9 +95,10 @@ use kv_store::disk_store::state_store::{
     KvStateStore, Progress, SnapshotChunk, SnapshotRequest, StoreError,
 };
 use kv_store::disk_store::{
-    DiskState, DiskStore, SNAP_FLAG_DISK_RESIDENT, SNAP_FORMAT_VERSION, SNAP_HDR_LEN, SNAP_MAGIC,
+    DiskState, DiskStore, SNAP_FLAG_DISK_RESIDENT, SNAP_FORMAT_VERSION, SNAP_HDR_CLOCK_OFF,
+    SNAP_HDR_LEN, SNAP_MAGIC,
 };
-use kv_store::{DiskMaterializer, KvStore, Materializer};
+use kv_store::{DiskMaterializer, KvStore, Materializer, MAX_KEYS};
 use types::{
     KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS, KV_OP_FLUSH, KV_OP_GET,
     KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT,
@@ -106,9 +107,9 @@ use types::{
 };
 use wire::{
     APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_REQUEST,
-    MSG_APP_SNAPSHOT_RESET, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND,
+    MSG_APP_SNAPSHOT_RESET, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_LEASE_TICK,
     MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REQUEST,
-    MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
+    MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
 };
 
 #[path = "../../common/compaction_floor.rs"]
@@ -327,6 +328,40 @@ struct WorkerState {
     compaction_floor_out: i32,
     snapshot_export_out: i32,
     metrics_out: i32,
+    expiry_out: i32,
+
+    /// The one clock this state machine has: the millisecond reading
+    /// carried by the most recent committed `MSG_LEASE_TICK`, which
+    /// arrives in-band on `commands` and is therefore ordered against
+    /// the mutations around it. Every TTL decision — deadline
+    /// assignment on a PUT, expiry filtering on a read, the
+    /// reclamation sweep — is taken against this value, so two
+    /// replicas applying the same log reach the same answer, and a
+    /// replay reaches it again.
+    ///
+    /// Monotone: a tick that would move it backwards is ignored. Zero
+    /// until the first tick commits, which is the correct reading for
+    /// a log that has not yet established a time: no deadline has
+    /// passed.
+    committed_now_ms: u64,
+    /// Slot the next reclamation sweep resumes from.
+    reap_cursor: u32,
+    /// A snapshot install has left the scheduler owed a clock frontier
+    /// (`MSG_TTL_CLOCK_RESUME`). Cleared once the write is accepted;
+    /// retried every step until then, because until the scheduler has
+    /// it, every tick it proposes is below the restored frontier and is
+    /// discarded, and cluster time stops moving.
+    clock_resume_pending: bool,
+    /// Slot the incremental expiry-queue rebuild resumes from.
+    /// `>= MAX_KEYS` means the rebuild is complete.
+    ttl_resume_cursor: u32,
+    /// Slots the latched sweep still owes a visit. An expiry event sets
+    /// it to the table size; each step spends at most `REAP_BUDGET` of
+    /// it. Until it reaches zero the sweep continues on its own, so a
+    /// single expiry event reclaims every record the committed clock
+    /// has put past its deadline rather than one arbitrary window of
+    /// the table.
+    reap_remaining: u32,
 
     /// Cluster-wide placement epoch as last reported by substrate
     /// `control_plane.epoch_events`. Used to stamp newly-minted
@@ -547,6 +582,12 @@ impl WorkerState {
         self.compaction_floor_out = -1;
         self.snapshot_export_out = -1;
         self.metrics_out = -1;
+        self.expiry_out = -1;
+        self.committed_now_ms = 0;
+        self.reap_cursor = 0;
+        self.reap_remaining = 0;
+        self.clock_resume_pending = false;
+        self.ttl_resume_cursor = MAX_KEYS as u32;
         self.cluster_epoch = 1;
         self.applied_term = 0;
         self.applied_index = 0;
@@ -715,6 +756,30 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         }
         return true;
     }
+    if hdr[0] == MSG_LEASE_TICK {
+        // The authoritative clock, arriving on the SAME channel as the
+        // commands it orders against: `[tick_ms:u64]`, proposed by
+        // `ttl_scheduler` and delivered here only after it committed.
+        // Reading it anywhere else — a local timer, a side channel —
+        // would give each replica its own notion of now, which is the
+        // one thing a replicated TTL cannot have.
+        if payload_len != 8 || payload_len > SCRATCH_BUF_SIZE {
+            return false;
+        }
+        let mut tick = [0u8; 8];
+        if ((sys.channel_read)(worker.commands_in, tick.as_mut_ptr(), 8) as usize) < 8 {
+            return false;
+        }
+        let tick_ms = u64::from_le_bytes(tick);
+        if tick_ms > worker.committed_now_ms {
+            worker.committed_now_ms = tick_ms;
+        }
+        // The disk provider persists the frontier with its manifest, so
+        // a store recovered from runs alone resumes at the clock its
+        // records' deadlines were written against.
+        worker.disk_state.committed_clock_ms = worker.committed_now_ms;
+        return true;
+    }
     if hdr[0] != MSG_KV_COMMAND {
         return false;
     }
@@ -749,10 +814,11 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     let body = &cmd[body_off..body_off + body_len];
 
     let mut result_body = [0u8; SCRATCH_BUF_SIZE];
-    // TIMER::MILLIS (0x0602) — monotonic wall clock for TTL enforcement.
-    // `kv_store::apply` uses this as `now_ms` for absolute-deadline
-    // comparisons and lazy expiry-on-touch.
-    let now_ms = dev_millis(sys);
+    // The committed clock. `kv_store::apply` uses this as `now_ms` for
+    // absolute-deadline assignment and expiry filtering, so a deadline
+    // is a function of the log position that set it and never of the
+    // applying node's local timer.
+    let now_ms = worker.committed_now_ms;
     // Read policy (RFC §8/§20). `MSG_KV_COMMAND` carries the
     // `Consistency` byte but not yet a `read_timestamp` field, so the
     // only way a request reaches this worker asking for a historical
@@ -888,6 +954,14 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     // `reads` is the read-op subset of `applied` (the &mut store borrow has
     // ended, so the counter writes are borrow-safe).
     worker.m_applied = worker.m_applied.wrapping_add(1);
+    if op == KV_OP_PUT && result == KV_RESULT_OK {
+        publish_expiry_registration(
+            worker,
+            body,
+            now_ms,
+            &kv_store::ident_bytes(id_tenant, id_database, id_keyspace),
+        );
+    }
     // Temporary: did the cross-range transaction ops reach the apply
     // chokepoint at all, and what did they answer? "the entry
     // committed" and "the worker applied it" are different claims.
@@ -1236,6 +1310,7 @@ pub extern "C" fn module_new(
         worker.snapshot_export_out = dev_channel_port(sys, 1, 3);
         worker.metrics_out = dev_channel_port(sys, 1, 4);
         worker.lease_request_out = dev_channel_port(sys, 1, 5);
+        worker.expiry_out = dev_channel_port(sys, 1, 6);
     }
     0
 }
@@ -1289,6 +1364,210 @@ const DRAIN_BUDGET_US: u64 = 1500;
 /// itself too slow — which no per-step budget can bound, and which
 /// would point at the read path's merge over run files.
 const DRAIN_LOG_US: u64 = 5000;
+
+/// Number of slots one reclamation sweep visits.
+const REAP_BUDGET: usize = 64;
+
+/// `ttl_scheduler`'s expiry-event kinds (`common/ttl_scheduler.rs`).
+/// Only the KV kind names a record here; a lease expiry is the lease
+/// manager's business and reaches this worker as a revoke instead.
+const EXPIRY_KIND_KV: u8 = 0x02;
+
+/// Register (or cancel) a KV record's expiry with `ttl_scheduler`:
+/// `[deadline_ms:u64][key_hash:u64]`, deadline `0` = cancel. The hash
+/// is taken over the CANONICAL key (§23 identity prefix + user key),
+/// which is both what keeps two tenants' entries apart and what lets
+/// the resulting expiry event name the record's slot.
+///
+/// The deadline is computed from the committed clock, so every replica
+/// registers the same value from the same log position. The queue that
+/// receives it schedules reclamation; visibility is decided by the
+/// record's own deadline at apply time, never by this message arriving.
+unsafe fn publish_expiry_registration(
+    worker: &mut WorkerState,
+    body: &[u8],
+    now_ms: u64,
+    ident: &[u8; kv_store::IDENT_LEN],
+) {
+    if worker.expiry_out < 0 || worker.syscalls.is_null() {
+        return;
+    }
+    let Some((key_hash, ttl_ms)) = kv_store::put_ttl_registration(body, ident) else {
+        return;
+    };
+    if ttl_ms == 0 {
+        // Nothing to schedule, and nothing to withdraw either: a queue
+        // entry left over from an earlier TTL on this key fires a sweep
+        // that finds the record unexpired and frees nothing. Staying
+        // silent here keeps the ordinary write off this path entirely.
+        return;
+    }
+    let deadline = now_ms.saturating_add(ttl_ms);
+    let sys = &*worker.syscalls;
+    let mut frame = [0u8; 3 + 16];
+    frame[0] = MSG_TTL_REGISTER;
+    frame[1] = 16;
+    frame[2] = 0;
+    frame[3..11].copy_from_slice(&deadline.to_le_bytes());
+    frame[11..19].copy_from_slice(&key_hash.to_le_bytes());
+    let _ = (sys.channel_write)(worker.expiry_out, frame.as_mut_ptr(), frame.len());
+}
+
+/// Re-registrations emitted per step while rebuilding the scheduler's
+/// expiry queue. A bound on work, not on how many records may carry a
+/// deadline: the rebuild resumes from its cursor on the next step.
+const TTL_RESUME_BUDGET: usize = 32;
+
+/// Arm the post-install rebuild of everything about expiry that lives
+/// outside this worker.
+///
+/// A snapshot restores the store and — since the frontier travels in
+/// its header — this worker's clock. It restores nothing at all in
+/// `ttl_scheduler`, whose `now_ms` and expiry queue are arena-only.
+/// Left alone, the scheduler would resume from zero, propose ticks far
+/// below the frontier just restored, have every one of them discarded
+/// as backwards, and hold cluster time still for as long as the
+/// previous incarnation had been up. So the worker hands it both
+/// halves: the frontier first, then the deadlines.
+fn resume_expiry_service(worker: &mut WorkerState) {
+    worker.clock_resume_pending = true;
+    // The disk provider reclaims through compaction and keeps no
+    // slot-addressed arena to walk; only the memory store rebuilds a
+    // queue.
+    worker.ttl_resume_cursor = if worker.state_store == STATE_STORE_DISK {
+        MAX_KEYS as u32
+    } else {
+        0
+    };
+    // Reclaim anything the restored frontier has already put past its
+    // deadline, without waiting for the rebuilt queue to say so.
+    worker.reap_remaining = MAX_KEYS as u32;
+}
+
+/// Drive the post-install rebuild forward by one step's worth.
+///
+/// Every write is offered again next step if the channel refuses it —
+/// the frontier because the clock does not restart without it, and the
+/// registrations because the queue is the only thing that will ever
+/// schedule those records for reclamation.
+unsafe fn drive_expiry_resume(worker: &mut WorkerState) {
+    if !worker.clock_resume_pending && worker.ttl_resume_cursor >= MAX_KEYS as u32 {
+        return;
+    }
+    if worker.expiry_out < 0 || worker.syscalls.is_null() {
+        // No scheduler is wired to this graph; there is nothing to
+        // rebuild and nobody to retain the work for.
+        worker.clock_resume_pending = false;
+        worker.ttl_resume_cursor = MAX_KEYS as u32;
+        return;
+    }
+    let sys = &*worker.syscalls;
+    if worker.clock_resume_pending {
+        let mut frame = [0u8; 3 + 8];
+        frame[0] = MSG_TTL_CLOCK_RESUME;
+        frame[1] = 8;
+        frame[2] = 0;
+        frame[3..11].copy_from_slice(&worker.committed_now_ms.to_le_bytes());
+        if (sys.channel_write)(worker.expiry_out, frame.as_mut_ptr(), frame.len())
+            != frame.len() as i32
+        {
+            return;
+        }
+        worker.clock_resume_pending = false;
+    }
+    // The frontier goes first and the deadlines follow, so the
+    // scheduler can never insert a restored deadline against a clock of
+    // zero and fire it immediately.
+    let mut budget = TTL_RESUME_BUDGET;
+    while budget > 0 && worker.ttl_resume_cursor < MAX_KEYS as u32 {
+        let slot = worker.ttl_resume_cursor as usize;
+        if let Some((deadline, key_hash)) = worker.store.expiring_at(slot) {
+            let mut frame = [0u8; 3 + 16];
+            frame[0] = MSG_TTL_REGISTER;
+            frame[1] = 16;
+            frame[2] = 0;
+            frame[3..11].copy_from_slice(&deadline.to_le_bytes());
+            frame[11..19].copy_from_slice(&key_hash.to_le_bytes());
+            if (sys.channel_write)(worker.expiry_out, frame.as_mut_ptr(), frame.len())
+                != frame.len() as i32
+            {
+                return; // retry this slot next step
+            }
+            budget -= 1;
+        }
+        worker.ttl_resume_cursor += 1;
+    }
+}
+
+/// Consume expiry events from `ttl_scheduler` and release the slots
+/// they name.
+///
+/// This is reclamation, not mutation: the sweep only frees records the
+/// committed clock has already put past their deadline, so it allocates
+/// no revision and emits no watch event, and a replica running it
+/// earlier or later than another cannot make their observable states
+/// differ. The disk provider reclaims through compaction instead and is
+/// left alone here.
+unsafe fn drain_expire(worker: &mut WorkerState) {
+    if worker.syscalls.is_null() {
+        return;
+    }
+    let sys = &*worker.syscalls;
+    if worker.expire_in >= 0 {
+        let poll = (sys.channel_poll)(worker.expire_in, POLL_IN);
+        if poll > 0 && (poll as u32) & POLL_IN != 0 {
+            let mut hdr = [0u8; 3];
+            if (sys.channel_read)(worker.expire_in, hdr.as_mut_ptr(), 3) < 3 {
+                return;
+            }
+            let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+            let mut body = [0u8; 32];
+            if payload_len > body.len() {
+                return;
+            }
+            if payload_len > 0
+                && ((sys.channel_read)(worker.expire_in, body.as_mut_ptr(), payload_len) as usize)
+                    < payload_len
+            {
+                return;
+            }
+            if worker.state_store == STATE_STORE_DISK {
+                // The disk provider reclaims through compaction.
+                return;
+            }
+            // `[kind:1][payload:8]`. For a KV expiry the payload is the
+            // key's `fnv1a64` hash — the identity the record is stored
+            // under — so the named record is reclaimed directly instead
+            // of hoping a cursor sweep wanders onto it.
+            if payload_len >= 9 && body[0] == EXPIRY_KIND_KV {
+                let key_hash = le_u64(&body[1..9]);
+                worker
+                    .store
+                    .reap_expired_hash(worker.committed_now_ms, key_hash);
+            }
+            // …and latch a table sweep behind it. The named record is
+            // the common case, but an event that never arrived at all
+            // would otherwise leave a slot allocated forever in a
+            // bounded table. The latch spends a table's worth of slot
+            // VISITS, a budget at a time, across the steps that follow;
+            // a visit that reclaims re-examines its slot rather than
+            // advancing, so a sweep can end short of a full lap — but
+            // only by having freed a slot for each step it fell short,
+            // and the next event latches another.
+            worker.reap_remaining = MAX_KEYS as u32;
+        }
+    }
+    if worker.state_store == STATE_STORE_DISK || worker.reap_remaining == 0 {
+        return;
+    }
+    let budget = REAP_BUDGET.min(worker.reap_remaining as usize);
+    let (cursor, _released) =
+        worker
+            .store
+            .reap_expired(worker.committed_now_ms, worker.reap_cursor as usize, budget);
+    worker.reap_cursor = cursor as u32;
+    worker.reap_remaining = worker.reap_remaining.saturating_sub(budget as u32);
+}
 
 /// Demand-driven commit-timestamp lease refill. When the
 /// in-band lease runs low, ask the allocator for the next one. The
@@ -1355,6 +1634,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_epoch_events(worker);
         drain_snapshot_ctl(worker);
         drain_gc_floor(worker);
+        drain_expire(worker);
+        drive_expiry_resume(worker);
         publish_retention_claim(worker);
         maybe_request_ts_lease(worker);
     }
@@ -1592,6 +1873,17 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                 worker.disk_replay_floor = worker.disk_state.highest_revision;
                 worker.disk_revision = 0;
                 worker.disk_phase = DISK_PHASE_SERVING;
+                // Resume the committed clock the recovered runs were
+                // written against (the manifest carries it). A WAL
+                // replay on top only moves it forward, so this can
+                // never place the clock ahead of the log — but without
+                // it a store whose WAL was compacted past its last tick
+                // comes back at zero, and every record that had already
+                // expired is visible again.
+                if worker.disk_state.committed_clock_ms > worker.committed_now_ms {
+                    worker.committed_now_ms = worker.disk_state.committed_clock_ms;
+                }
+                resume_expiry_service(worker);
                 worker.disk_degraded_steps = 0;
                 worker.disk_hard_faults = 0;
                 worker.disk_fence_steps = 0;
@@ -2600,6 +2892,15 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                     let adopted = worker.disk_phase == DISK_PHASE_SERVING
                         && hdr_gen == worker.disk_state.range_generation
                         && worker.disk_state.generation > 0;
+                    // The marker's clock frontier stands whether or not
+                    // the local store is adopted: it is a fact about
+                    // the log this node is following, and the records
+                    // it certifies carry deadlines measured against it.
+                    let frontier = le_u64(&worker.import_buf[SNAP_HDR_CLOCK_OFF..SNAP_HDR_LEN]);
+                    if frontier > worker.committed_now_ms {
+                        worker.committed_now_ms = frontier;
+                        worker.disk_state.committed_clock_ms = frontier;
+                    }
                     if adopted {
                         // Keep the RESET's (term, index) and the store
                         // exactly as recovered, and RESUME the revision
@@ -2615,6 +2916,12 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                     } else {
                         worker.applied_term = 0;
                         worker.applied_index = 0;
+                    }
+                    if adopted {
+                        // The scheduler's queue and clock are arena-only
+                        // and did not survive whatever brought this node
+                        // back; hand it the frontier.
+                        resume_expiry_service(worker);
                     }
                     worker.importing = false;
                     worker.import_len = 0;
@@ -2650,6 +2957,12 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                         )
                     };
                     if matches!(outcome, Ok(Progress::Done)) {
+                        // `install` adopted the header's frontier into
+                        // the store; the state machine must run on the
+                        // same one.
+                        if worker.disk_state.committed_clock_ms > worker.committed_now_ms {
+                            worker.committed_now_ms = worker.disk_state.committed_clock_ms;
+                        }
                         // Snapshot install: the state corresponds to
                         // the RESET's applied position and the WAL
                         // resumes AFTER it, so the revision counter
@@ -2662,11 +2975,28 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                         false
                     }
                 } else {
-                    worker.store.snapshot_decode(&worker.import_buf[..total])
+                    let ok = worker.store.snapshot_decode(&worker.import_buf[..total]);
+                    if ok {
+                        // The records are back; so must be the clock
+                        // they were deadlined against. Their `expiry_ms`
+                        // is ABSOLUTE against it, so resuming at zero
+                        // would make every already-expired record
+                        // visible again and re-age the survivors from
+                        // the start.
+                        let frontier = KvStore::snapshot_clock_ms(&worker.import_buf[..total]);
+                        if frontier > worker.committed_now_ms {
+                            worker.committed_now_ms = frontier;
+                        }
+                    }
+                    ok
                 };
                 if installed {
                     // State now reflects the RESET's (term, index), which
                     // we already adopted (pending pair stamped above).
+                    // Put the scheduler back in agreement with the store:
+                    // its clock and its expiry queue are arena-only, so
+                    // nothing else rebuilds them.
+                    resume_expiry_service(worker);
                 } else {
                     // The failed install left the store EMPTY (both
                     // providers guarantee this), so there is no partial
@@ -2704,7 +3034,9 @@ unsafe fn emit_snapshot_chunks(worker: &mut WorkerState, sys: &SyscallTable) {
         )
     } else {
         (
-            worker.store.snapshot_encode(&mut body),
+            worker
+                .store
+                .snapshot_encode(&mut body, worker.committed_now_ms),
             worker.applied_term,
             worker.applied_index,
         )
@@ -2788,6 +3120,7 @@ unsafe fn disk_snapshot_marker(worker: &mut WorkerState, out: &mut [u8]) -> Opti
     out[20..24].copy_from_slice(&0u32.to_le_bytes());
     out[24..32].copy_from_slice(&worker.disk_state.highest_revision.to_le_bytes());
     out[32..40].copy_from_slice(&worker.disk_state.compaction_floor.to_le_bytes());
+    out[SNAP_HDR_CLOCK_OFF..SNAP_HDR_LEN].copy_from_slice(&worker.committed_now_ms.to_le_bytes());
     Some(SNAP_HDR_LEN)
 }
 

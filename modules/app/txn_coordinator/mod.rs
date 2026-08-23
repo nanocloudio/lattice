@@ -33,11 +33,14 @@
 //!
 //! **What this module does NOT do**, named rather than implied:
 //!
-//! - It does not help. A reader that gets `KV_RESULT_TXN_PENDING` for a
-//!   transaction whose coordinator has died still has nowhere to turn;
-//!   the record it needs is readable, but nothing walks it. Until that
-//!   exists, a coordinator lost between prepare and decide leaves keys
-//!   pending until it is restarted.
+//! - It does not help — but a reader is no longer stranded. Helping
+//!   lives in `kv_request_router` (`maybe_start_help`): a
+//!   `KV_RESULT_TXN_PENDING` reply carries the txn id, and the router
+//!   reads the home record and resolves the intent under the decision
+//!   it finds there. What this module still does not do is RESUME: on
+//!   restart it constructs a new machine from its declaration rather
+//!   than discovering the durable home record of a transaction it left
+//!   in flight.
 //! - It runs one transaction, not a stream of them. The machine is
 //!   per-transaction and the module holds one.
 //! - It does not lease timestamps from `timestamp_allocator`; the

@@ -18,10 +18,17 @@ direction = "input"
 content_type = "OctetStream"
 
 # Deterministic ticks from ttl_scheduler.
+#
+# `required`: the deadline scan runs on this tick and on nothing else,
+# so a graph that grants leases without it hands out TTLs that never
+# arrive — the lease lives until a client revokes it. `fluxor build`
+# refuses such a graph, which makes the omission a build failure rather
+# than leases that quietly never expire.
 [[ports]]
 name = "tick"
 direction = "input"
 content_type = "OctetStream"
+required = true
 
 # Cluster-wide placement epoch events from substrate
 # `control_plane.epoch_events`. MSG_PLACEMENT_EPOCH_EVENT bumps

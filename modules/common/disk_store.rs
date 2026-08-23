@@ -74,7 +74,7 @@
 //!         [contract:u16][flags:u16 = 0][generation:u32]
 //!         [run_count:u32][compaction_floor:u64]
 //!         [applied_index:u64][applied_term:u64]
-//!         [highest_revision:u64]                                   (52 B)
+//!         [highest_revision:u64][committed_clock_ms:u64]           (60 B)
 //! entry*  [run_id:u32][record_count:u32][file_len:u64][digest:u32] (20 B)
 //! trailer [crc32:u32]  — over every preceding byte
 //! padding zeroes to MANIFEST_SLOT_LEN                     (fixed size)
@@ -123,7 +123,8 @@
 //! ```text
 //! header  [magic:u32 = "LSNP"][format:u16 = 1][flags:u16 = 0]
 //!         [applied_index:u64][range_generation:u32][entry_count:u32]
-//!         [highest_revision:u64][compaction_floor:u64]             (40 B)
+//!         [highest_revision:u64][compaction_floor:u64]
+//!         [committed_clock_ms:u64]                                 (48 B)
 //! entry*  [key_len:u16][value_len:u32][key][value]
 //! ```
 //!
@@ -477,13 +478,13 @@ pub const MANIFEST_SLOT_B: u32 = 2;
 /// preallocation) and a shorter manifest can never leave a readable
 /// tail of the previous, longer one behind it.
 pub const MANIFEST_SLOT_LEN: usize = MANIFEST_HDR_LEN + MAX_RUNS * MANIFEST_ENTRY_LEN + 4;
-/// See the module-doc layout (44 bytes): the fixed fields through
+/// See the module-doc layout: the fixed fields through
 /// `floor`, then `[applied_index:u64][applied_term:u64]` — the raft
 /// position DURABLY covered by the named run set (the applied position
 /// at the freeze of the newest flushed run). This is what lets the WAL
 /// compact honestly: entries at or below it are reconstructible from
 /// the runs alone.
-pub const MANIFEST_HDR_LEN: usize = 52;
+pub const MANIFEST_HDR_LEN: usize = 60;
 /// `[run_id:4][record_count:4][file_len:8][digest:4]`
 pub const MANIFEST_ENTRY_LEN: usize = 20;
 pub const MANIFEST_MAX_LEN: usize = MANIFEST_HDR_LEN + MAX_RUNS * MANIFEST_ENTRY_LEN + 4;
@@ -498,8 +499,13 @@ pub const MAX_LISTED_RUNS: usize = 64;
 /// "LSNP" — snapshot stream magic.
 pub const SNAP_MAGIC: u32 = 0x4C53_4E50;
 pub const SNAP_FORMAT_VERSION: u16 = 1;
-/// See the module-doc layout (40 bytes).
-pub const SNAP_HDR_LEN: usize = 40;
+/// See the module-doc layout (48 bytes).
+pub const SNAP_HDR_LEN: usize = 48;
+/// Byte offset of the committed clock frontier in a snapshot stream
+/// header. Record deadlines are absolute against it, so a receiver
+/// that installs the body without adopting it resurrects everything
+/// that had already expired.
+pub const SNAP_HDR_CLOCK_OFF: usize = 40;
 /// Stream-header flag bit: the body is a DISK-RESIDENT MARKER, not a
 /// record stream. `entry_count` is 0 and the state it certifies lives
 /// in the local store's manifest-named runs. Install of a marker
@@ -806,6 +812,10 @@ struct InstallState {
     entry_count: u32,
     entries_done: u32,
     snap_highest_revision: u64,
+    /// Committed clock frontier carried by the installing snapshot's
+    /// header; adopted with the rest of the state, since the installed
+    /// records' deadlines are absolute against it.
+    snap_clock_ms: u64,
     snap_floor: u64,
     partial_len: u32,
     _pad2: u32,
@@ -916,6 +926,10 @@ struct FlushState {
     /// restart — without it the revision clock restarts at the replay
     /// tail and every run version sits invisibly "in the future".
     revision_at_freeze: u64,
+    /// Committed clock frontier at flush start. Published with the
+    /// manifest so the recovered store's `now` matches the run set the
+    /// manifest names — the same discipline as `applied_at_freeze`.
+    clock_at_freeze: u64,
     /// Records already written into the run.
     cursor: u32,
     out_blocks: u32,
@@ -977,10 +991,26 @@ pub struct DiskState {
     /// flush start; never persisted directly.
     pub pending_applied_index: u64,
     pub pending_applied_term: u64,
+    /// Committed clock frontier stamped by the HOST on every tick it
+    /// applies — the state machine's `now` the durable state
+    /// corresponds to.
+    ///
+    /// It is persisted for the same reason the applied position is:
+    /// record deadlines are ABSOLUTE against this clock, so a store
+    /// recovered without it would resume at zero, make every record
+    /// whose deadline had passed visible again, and then re-age the
+    /// survivors from the start. The WAL tail usually carries a tick
+    /// that would repair this; "usually" is not a recovery guarantee.
+    pub committed_clock_ms: u64,
     /// Revision high-water recorded by the PUBLISHED manifest (the
     /// run-set's max version). Compaction republishes it unchanged;
     /// only a flush publish advances it.
     pub durable_highest_revision: u64,
+    /// Committed clock frontier recorded by the PUBLISHED manifest.
+    /// Compaction republishes it unchanged; only a flush publish
+    /// advances it, so it always names the clock the durable run set
+    /// actually corresponds to.
+    pub durable_clock_ms: u64,
     /// Run files retired by a completed compaction, awaiting physical
     /// deletion. Drained ONE per maintenance step ([`DiskStore::
     /// retire_step`]): a FAT32 delete frees the whole FAT chain
@@ -1068,7 +1098,9 @@ impl DiskState {
         self.durable_applied_term = 0;
         self.pending_applied_index = 0;
         self.pending_applied_term = 0;
+        self.committed_clock_ms = 0;
         self.durable_highest_revision = 0;
+        self.durable_clock_ms = 0;
         self.retire_ids = [0; MAX_RUNS];
         self.retire_count = 0;
         self.runs = [RunMeta::empty(); MAX_RUNS];
@@ -1827,6 +1859,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         applied_index: u64,
         applied_term: u64,
         highest_revision: u64,
+        committed_clock_ms: u64,
     ) -> usize {
         buf[0..4].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         buf[4..6].copy_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
@@ -1839,6 +1872,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         buf[28..36].copy_from_slice(&applied_index.to_le_bytes());
         buf[36..44].copy_from_slice(&applied_term.to_le_bytes());
         buf[44..52].copy_from_slice(&highest_revision.to_le_bytes());
+        buf[52..60].copy_from_slice(&committed_clock_ms.to_le_bytes());
         let mut p = MANIFEST_HDR_LEN;
         for r in runs {
             buf[p..p + 4].copy_from_slice(&r.id.to_le_bytes());
@@ -1871,6 +1905,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         applied_index: u64,
         applied_term: u64,
         highest_revision: u64,
+        committed_clock_ms: u64,
     ) -> Result<FsyncTicket, StoreError> {
         let mut buf = [0u8; MANIFEST_MAX_LEN];
         let p = Self::encode_manifest(
@@ -1881,6 +1916,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             applied_index,
             applied_term,
             highest_revision,
+            committed_clock_ms,
         );
         // IN PLACE, at offset 0, into a file that already exists at its
         // final size. No create, no unlink, no directory enumeration.
@@ -2009,6 +2045,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.applied_at_freeze = self.state.pending_applied_index;
             self.state.flush.term_at_freeze = self.state.pending_applied_term;
             self.state.flush.revision_at_freeze = self.state.highest_revision;
+            self.state.flush.clock_at_freeze = self.state.committed_clock_ms;
             self.state.flush.phase = FLUSH_PHASE_RECORDS;
             self.state.flush.ticket = 0;
             self.state.flush.pending_gen = 0;
@@ -2218,6 +2255,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.applied_at_freeze,
             self.state.flush.term_at_freeze,
             self.state.flush.revision_at_freeze,
+            self.state.flush.clock_at_freeze,
         )?;
         self.state.flush.pending_slot = slot;
         self.state.flush.ticket = ticket;
@@ -2292,6 +2330,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.durable_applied_index = self.state.flush.applied_at_freeze;
         self.state.durable_applied_term = self.state.flush.term_at_freeze;
         self.state.durable_highest_revision = self.state.flush.revision_at_freeze;
+        self.state.durable_clock_ms = self.state.flush.clock_at_freeze;
         // Back to the resting phase. Leaving it at MANIFEST_SYNC would
         // make `flush_phase()` lie to diagnostics after a completed
         // flush, and would leave a stale ticket one missed `active`
@@ -2426,8 +2465,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut runs = [RunMeta::empty(); MAX_RUNS];
         let mut applied = (0u64, 0u64);
         let mut man_revision = 0u64;
+        let mut man_clock = 0u64;
         for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
-            let Some((gen, f, rc, rs, ai, at, hr)) = self.read_manifest(slot)? else {
+            let Some((gen, f, rc, rs, ai, at, hr, clock)) = self.read_manifest(slot)? else {
                 continue;
             };
             if winner_gen.is_none_or(|w| gen > w) {
@@ -2438,6 +2478,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                 runs = rs;
                 applied = (ai, at);
                 man_revision = hr;
+                man_clock = clock;
             }
         }
 
@@ -2505,6 +2546,12 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             // clock at the tail and every run version is "future".
             self.state.durable_highest_revision = man_revision;
             self.state.highest_revision = self.state.highest_revision.max(man_revision);
+            // Resume the clock the runs' deadlines are measured
+            // against. A WAL tick replayed on top only ever moves it
+            // forward (the host latches the maximum), so recovering it
+            // here can never place the clock ahead of the log.
+            self.state.durable_clock_ms = man_clock;
+            self.state.committed_clock_ms = self.state.committed_clock_ms.max(man_clock);
         } else {
             // No usable manifest: the durable state is empty; every
             // run present was never published and is an orphan.
@@ -2552,7 +2599,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     fn read_manifest(
         &self,
         slot: u32,
-    ) -> Result<Option<(u32, u64, usize, [RunMeta; MAX_RUNS], u64, u64, u64)>, StoreError> {
+    ) -> Result<Option<(u32, u64, usize, [RunMeta; MAX_RUNS], u64, u64, u64, u64)>, StoreError>
+    {
         let mut buf = [0u8; MANIFEST_SLOT_LEN];
         let mut len = 0usize;
         loop {
@@ -2591,6 +2639,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let applied_index = rd_u64(body, 28);
         let applied_term = rd_u64(body, 36);
         let highest_revision = rd_u64(body, 44);
+        let committed_clock_ms = rd_u64(body, 52);
         if run_count > MAX_RUNS {
             return Ok(None);
         }
@@ -2622,6 +2671,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             applied_index,
             applied_term,
             highest_revision,
+            committed_clock_ms,
         )))
     }
 
@@ -3128,6 +3178,8 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             out[20..24].copy_from_slice(&(self.state.capture.total_entries as u32).to_le_bytes());
             out[24..32].copy_from_slice(&self.state.highest_revision.to_le_bytes());
             out[32..40].copy_from_slice(&self.state.compaction_floor.to_le_bytes());
+            out[SNAP_HDR_CLOCK_OFF..SNAP_HDR_LEN]
+                .copy_from_slice(&self.state.committed_clock_ms.to_le_bytes());
             pos = SNAP_HDR_LEN;
             self.state.capture.header_sent = true;
         }
@@ -3264,6 +3316,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 self.state.install.entry_count = rd_u32(&hdr, 20);
                 self.state.install.snap_highest_revision = rd_u64(&hdr, 24);
                 self.state.install.snap_floor = rd_u64(&hdr, 32);
+                self.state.install.snap_clock_ms = rd_u64(&hdr, SNAP_HDR_CLOCK_OFF);
                 self.state.install.header_done = true;
                 self.state.install.partial_len = 0;
                 continue;
@@ -3340,6 +3393,10 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 return Err(StoreError::Malformed);
             }
             self.state.highest_revision = self.state.install.snap_highest_revision;
+            self.state.committed_clock_ms = self
+                .state
+                .committed_clock_ms
+                .max(self.state.install.snap_clock_ms);
             self.state.compaction_floor = self.state.install.snap_floor;
             self.state.install.active = false;
             return Ok(Progress::Done);
@@ -3685,6 +3742,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 self.state.durable_applied_index,
                 self.state.durable_applied_term,
                 self.state.durable_highest_revision,
+                self.state.durable_clock_ms,
             )?
         } else {
             let meta = RunMeta {
@@ -3703,6 +3761,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 self.state.durable_applied_index,
                 self.state.durable_applied_term,
                 self.state.durable_highest_revision,
+                self.state.durable_clock_ms,
             )?
         };
         self.state.compact.pending_slot = slot;

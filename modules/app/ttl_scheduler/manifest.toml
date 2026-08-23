@@ -8,12 +8,21 @@ hardware_targets = ["bcm2712"]
 # back into the KV path. The important property is deterministic
 # replay-safe expiry, not wall-clock convenience.
 
-# Deterministic clock ticks from substrate consensus (or a
-# replicated TTL tick emitter).
+# The cluster clock, coming back committed. In a replicated graph this
+# is `lattice_apply_bridge.records_out`; in a graph with no replication
+# it is this module's own `propose_out`, which is then also the command
+# channel's ordering. Either way the module's `now_ms` advances only
+# from a tick that has been through whatever ordering the graph has, and
+# never from a device timer.
+#
+# `required`: with no producer the clock never starts and nothing with a
+# TTL ever expires. `fluxor build` refuses such a graph, so the omission
+# surfaces at build time rather than as keys that outlive their TTL.
 [[ports]]
 name = "tick_in"
 direction = "input"
 content_type = "OctetStream"
+required = true
 
 # Lease deadlines from lease_manager.
 [[ports]]
@@ -21,11 +30,22 @@ name = "lease_deadlines"
 direction = "input"
 content_type = "OctetStream"
 
-# Key expiry queue updates from kv_state_worker.
+# Key expiry registrations from `kv_state_worker.expiry_out`
+# (MSG_TTL_REGISTER). `required`, same rule as `tick_in`: without them
+# the queue schedules no reclamation and TTL'd records are released only
+# when a command happens to touch them.
+#
+# The same channel carries MSG_TTL_CLOCK_RESUME after a snapshot
+# install: this module's clock and queue are arena-only, so a restored
+# worker hands back the frontier it recovered and then re-registers the
+# restored deadlines. Without the frontier every tick proposed after a
+# restore is below the committed clock and is discarded, and expiry
+# stops for as long as the previous incarnation had been up.
 [[ports]]
 name = "kv_expiry"
 direction = "input"
 content_type = "OctetStream"
+required = true
 
 # Expire actions out to kv_state_worker.
 [[ports]]
@@ -43,6 +63,28 @@ content_type = "OctetStream"
 name = "metrics"
 direction = "output"
 content_type = "OctetStream"
+
+# Tick proposals. With `propose_wrap = 1` this goes to
+# `gateway.client_requests` and each tick becomes a committed entry; with
+# `propose_wrap = 0` it carries the bare MSG_LEASE_TICK envelope straight
+# to `kv_state_worker.commands` and back to this module's own `tick_in`,
+# which is the same ordering guarantee a graph without replication has
+# for its commands.
+[[ports]]
+name = "propose_out"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+# Params (TLV, parsed by the module):
+#   tick_interval_ms  default 250 — milliseconds between proposed ticks,
+#                     and therefore the clock's resolution. Every
+#                     interval costs one committed entry even on an idle
+#                     cluster, so this trades expiry precision against
+#                     idle log traffic.
+#   propose_wrap      default 0 — 1 wraps the tick as a gateway proposal
+#                     (replicated graphs); 0 emits the bare envelope
+#                     (graphs with no consensus).
 
 # ── Observability (Phase 14) ──────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
