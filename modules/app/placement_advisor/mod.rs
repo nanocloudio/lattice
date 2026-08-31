@@ -1,15 +1,20 @@
 //! placement_advisor — the §12.4 load-policy recommender as a running
-//! module (RFC database foundation Phase 10's hot-range policy).
+//! module.
 //!
 //! Observes each range's key count by scanning it, asks
-//! `placement::recommend` what §12.4 permits saying about that load,
-//! and REPORTS the answer. It has no path to the lifecycle machinery
-//! and no port that could reach one: §12.4 requires that "execution
-//! remains bounded by operator policy", and an advisor wired to the
-//! supervisor would turn every policy bug into a topology change. An
-//! operator reads the recommendation and declares the operation in a
-//! config, which is the same manual gate the split and merge pumps
-//! already run behind.
+//! `placement::recommend` what §12.4 permits saying about that load, and
+//! REPORTS the answer. By default it only reports: §12.4 keeps execution
+//! bounded by operator policy, and an advisor free to act on its own would
+//! turn every policy bug into a topology change. An operator reads the
+//! recommendation and declares the operation in a config, the same manual
+//! gate the split and merge pumps run behind.
+//!
+//! Under an explicit opt-in (`auto_execute = 1`), the advisor emits one
+//! `MSG_PLACEMENT_SPLIT_CMD` the first time policy recommends a split,
+//! carrying an operator-declared split key, to a `range_supervisor`
+//! running `op_kind 4`. This automates the TIMING of a split while the
+//! operator still enables the automation and chooses WHERE to split — so
+//! §12.4's operator gate is the opt-in itself, not a wire left absent.
 //!
 //! ## What it can and cannot measure, stated rather than implied
 //!
@@ -28,34 +33,25 @@
 //! SILENT: the split half would never fire anywhere the write rate is
 //! unmeasured, which is everywhere in this graph.
 //!
-//! ## The load signal, and a correction worth reading
+//! ## The load signal
 //!
 //! Two rates are available. The MEASURED one is the router's per-range
-//! write count, differenced across surveys — the real signal, since
-//! the router is the only place that sees both a write and its range.
-//! The DERIVED one is how fast this range's key count grows.
+//! write count, differenced across surveys — the real signal, since the
+//! router is the only place that sees both a write and its range. The
+//! DERIVED one is how fast this range's key count grows, and it is an
+//! ESTIMATE OF UNKNOWN DIRECTION: one write can create several keys (a
+//! single `KV_OP_TXN` inserting a row plus its secondary-index entries
+//! moves the count by more than one), so growth can exceed the write rate
+//! as readily as fall short of it. It is used only when nothing better
+//! exists and is never preferred over a measurement — a rate that may
+//! over-report would make the advisor MORE eager, the direction every
+//! policy knob here avoids. A divergence between the two is informative:
+//! growth above the counted rate means batched writes, growth below means
+//! overwrites.
 //!
-//! An earlier version of this file claimed the derived rate was a
-//! strict LOWER BOUND on the write rate, on the reasoning that every
-//! new key costs at least one write. **That claim was wrong**, and
-//! comparing the two rates side by side is what exposed it: one write
-//! can create SEVERAL keys. A single `KV_OP_TXN` inserting a row plus
-//! its secondary-index entries moves the key count by more than one,
-//! so growth can EXCEED the write rate rather than under-report it.
-//!
-//! This matters because the safety argument rested on that bound. A
-//! lower bound could only ever make the advisor quieter; a rate that
-//! may over-report can make it MORE eager, which is the direction
-//! every policy knob here is built to avoid. So the derived rate is
-//! now what it always actually was — an ESTIMATE OF UNKNOWN DIRECTION,
-//! useful when nothing better exists and never preferred over a
-//! measurement. Both are reported, and a divergence is informative:
-//! growth above the counted rate means batched writes, growth below
-//! means overwrites.
-//!
-//! Per-KEY concentration remains unavailable from either: the router
-//! counts writes per RANGE, so §12.4's hot-key clause still needs a
-//! signal neither of these provides.
+//! Per-KEY concentration is unavailable from either: the router counts
+//! writes per RANGE, so §12.4's hot-key clause needs a signal neither of
+//! these provides.
 
 #![no_std]
 #![allow(
@@ -149,7 +145,26 @@ define_params! {
         => |s, d, len| { s.max_merge_keys = p_u32(d, len, 0, 512); };
     3, cooldown_ms, u32, 60000
         => |s, d, len| { s.cooldown_ms = p_u32(d, len, 0, 60000); };
+
+    // §12.4 opt-in automation. `auto_execute = 1` lets the advisor EMIT a
+    // split command (to a wired `range_supervisor` in op_kind 4) the first
+    // time policy recommends a split — automating the TIMING. The split
+    // KEY is the operator's, declared here as hex; the recommender never
+    // invents a split point. Default 0 keeps the advisor advice-only.
+    4, auto_execute, u8, 0 => |s, d, len| { s.auto_execute = p_u8(d, len, 0, 0); };
+    5, auto_split_key, str, 0 => |s, d, len| {
+        let at = s.split_key_hex_len as usize;
+        if at != usize::from(u16::MAX) && at + len <= SPLIT_KEY_MAX * 2 {
+            unsafe { for i in 0..len { s.split_key_hex[at + i] = *d.add(i); } }
+            s.split_key_hex_len = (at + len) as u16;
+        } else {
+            s.split_key_hex_len = u16::MAX;
+        }
+    };
 }
+
+/// Bound on the operator-declared split key.
+const SPLIT_KEY_MAX: usize = 64;
 
 #[repr(C)]
 struct AdvisorState {
@@ -191,6 +206,17 @@ struct AdvisorState {
     hotkey_frames: u64,
     signal_in: i32,
 
+    // §12.4 opt-in auto-execution (default off).
+    auto_execute: u8,
+    /// True once the split command has been emitted, so a recommendation
+    /// that persists across surveys fires the split exactly once.
+    auto_fired: bool,
+    split_key_hex: [u8; SPLIT_KEY_MAX * 2],
+    split_key_hex_len: u16,
+    split_key: [u8; SPLIT_KEY_MAX],
+    split_key_len: u16,
+    exec_out: i32,
+
     env: [u8; ENV_BUF],
 
     m_surveys: u64,
@@ -223,6 +249,13 @@ impl AdvisorState {
         self.busiest_percent = 0;
         self.hotkey_frames = 0;
         self.signal_in = -1;
+        self.auto_execute = 0;
+        self.auto_fired = false;
+        self.split_key_hex = [0; SPLIT_KEY_MAX * 2];
+        self.split_key_hex_len = 0;
+        self.split_key = [0; SPLIT_KEY_MAX];
+        self.split_key_len = 0;
+        self.exec_out = -1;
         self.env = [0; ENV_BUF];
         self.m_surveys = 0;
         self.m_recommendations = 0;
@@ -460,6 +493,22 @@ fn on_kv_response(a: &mut AdvisorState, result: u8, body: &[u8]) {
     }
     report(a, r, a.counted, write_rate, measured);
 
+    // §12.4 opt-in automation: the FIRST time policy recommends a split,
+    // fire the operator's pre-declared split command exactly once. The
+    // recommendation itself is unchanged — this only acts on it when the
+    // operator has both enabled `auto_execute` and wired `exec_out`.
+    if a.auto_execute == 1 && !a.auto_fired && matches!(r, Recommendation::Split { .. }) {
+        if emit_split_command(a) {
+            a.auto_fired = true;
+            unsafe {
+                if !a.syscalls.is_null() {
+                    let m = b"[padv] auto_execute: split command emitted (operator-declared key)";
+                    dev_log(&*a.syscalls, 2, m.as_ptr(), m.len());
+                }
+            }
+        }
+    }
+
     // Capacity forecast (Phase 10): when does this range reach the
     // size at which a split is warranted? Reported separately from the
     // recommendation because a forecast is not an instruction — it is
@@ -528,8 +577,77 @@ pub extern "C" fn module_new(
         // compositions that do not wire it, which is why every use of
         // the counted signal is conditional.
         a.signal_in = dev_channel_port(sys, 0, 1);
+        // Output index 2: the §12.4 opt-in split-command port to a
+        // range_supervisor. Absent unless the composition wires it, so
+        // auto-execution stays off unless BOTH `auto_execute = 1` AND this
+        // edge exist.
+        a.exec_out = dev_channel_port(sys, 1, 2);
+    }
+    // Decode the operator's split key once, at boot. A malformed or
+    // over-long key disables auto-execution rather than emitting a command
+    // that would split at the wrong place.
+    if a.auto_execute == 1 {
+        let hl = a.split_key_hex_len;
+        if hl == 0 || hl == u16::MAX {
+            a.auto_execute = 0;
+        } else {
+            let mut key = [0u8; SPLIT_KEY_MAX];
+            match hex_decode(&a.split_key_hex[..hl as usize], &mut key) {
+                Some(kn) => {
+                    a.split_key[..kn].copy_from_slice(&key[..kn]);
+                    a.split_key_len = kn as u16;
+                }
+                None => a.auto_execute = 0,
+            }
+        }
     }
     0
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode(src: &[u8], out: &mut [u8]) -> Option<usize> {
+    if !src.len().is_multiple_of(2) || src.len() / 2 > out.len() {
+        return None;
+    }
+    for i in 0..src.len() / 2 {
+        out[i] = (hex_nibble(src[i * 2])? << 4) | hex_nibble(src[i * 2 + 1])?;
+    }
+    Some(src.len() / 2)
+}
+
+/// Emit a split command to a wired `range_supervisor`. Fired at most once
+/// per advisor (`auto_fired`), the first survey policy recommends a split.
+fn emit_split_command(a: &mut AdvisorState) -> bool {
+    if a.exec_out < 0 || a.split_key_len == 0 {
+        return false;
+    }
+    let kl = a.split_key_len as usize;
+    let at = wire::ENVELOPE_HDR;
+    let payload = 2 + kl;
+    if at + payload > a.env.len() {
+        return false;
+    }
+    a.env[at..at + 2].copy_from_slice(&(kl as u16).to_le_bytes());
+    a.env[at + 2..at + 2 + kl].copy_from_slice(&a.split_key[..kl]);
+    unsafe {
+        let sys = a.syscalls;
+        !sys.is_null()
+            && write_envelope(
+                &*sys,
+                a.exec_out,
+                wire::MSG_PLACEMENT_SPLIT_CMD,
+                payload,
+                &mut a.env,
+            )
+    }
 }
 
 #[no_mangle]

@@ -293,6 +293,24 @@ pub const KV_OP_IDEMPOTENT: u8 = 0x19;
 /// provider does not retain `at_rev`.
 pub const KV_OP_SNAPSHOT_VERSIONS: u8 = 0x1A;
 
+/// Pure rediscovery lookup of an idempotency identity — the wire form of
+/// the `ViaIdempotencyIdentity` resolution route (§21). It reads the
+/// identity record WITHOUT running any inner op: where [`KV_OP_IDEMPOTENT`]
+/// re-submits the whole mutation to find out whether it already happened,
+/// this asks the question directly, which is what a client that lost its
+/// reply (not its intent) actually needs.
+///
+/// Body: `[id:u64 LE][identity_revision:u64 LE]`. `identity_revision` is
+/// the revision at or above which the caller knows a record would still
+/// exist if it were ever written — the datum that lets a miss mean
+/// `DidNotHappen` rather than the honest `Indeterminate` once the engine's
+/// reclaim floor has passed it (`txn::interpret_lookup`).
+///
+/// Answers [`KV_RESULT_IDEMPOTENT_LOOKUP`] with a
+/// `txn::IdempotencyLookup` body. Read-only: it never writes a record, so
+/// it is safe to route off the consensus path.
+pub const KV_OP_IDEMPOTENT_LOOKUP: u8 = 0x1B;
+
 // ── KV op-specific body shapes ─────────────────────────────────────────
 //
 // The router and worker share these shapes via the `body` payload of
@@ -556,6 +574,16 @@ pub const KV_RESULT_TXN_PENDING: u8 = 0x11;
 /// for domains) is a Clustor protocol migration, deliberately postponed
 /// (§28, §29) — domains are the scaling step that comes first.
 pub const KV_RESULT_CROSS_DOMAIN: u8 = 0x12;
+
+/// The answer to a [`KV_OP_IDEMPOTENT_LOOKUP`]. Body is a
+/// `txn::IdempotencyLookup` (`[outcome:u8][committed_revision:u64 LE]
+/// [result:u8]`): outcome 0 = `Committed` (the mutation happened; the
+/// original result byte and its commit revision follow), 1 =
+/// `DidNotHappen` (no record, and the identity is newer than the reclaim
+/// floor — proof it never committed), 2 = `Indeterminate` (no record, but
+/// the floor has passed the identity, so absence proves nothing). The
+/// three are never collapsed — that distinction is the whole point.
+pub const KV_RESULT_IDEMPOTENT_LOOKUP: u8 = 0x13;
 
 pub const KV_RESULT_INTERNAL: u8 = 0xFF;
 

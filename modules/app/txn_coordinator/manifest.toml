@@ -3,25 +3,31 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Cross-range transaction coordinator (RFC database foundation §13,
-# Phase 5).
+# Cross-range transaction coordinator (RFC database foundation §13).
 #
-# Drives ONE declared cross-range transaction through §13.2 using the
-# decision machine in modules/common/txn_coordinator.rs and the
-# participant ops TXN_PREPARE / TXN_RESOLVE / TXN_RECORD. Every send is
-# addressed to a named partition through KV_OP_TARGETED, because the
-# routing map deliberately refuses to route one op to two ranges.
+# Drives a cross-range transaction through §13.2 using the decision
+# machine in modules/common/txn_coordinator.rs and the participant ops
+# TXN_PREPARE / TXN_RESOLVE / TXN_RECORD. mode 0 is inert; mode 1 runs one
+# transaction DECLARED in the graph config, addressing participants by
+# named partition through KV_OP_TARGETED; mode 2 runs transactions
+# submitted at runtime by relational_executor, routing participant ops by
+# key so no partition map is needed.
 #
-# The manual execution gate, same as range_supervisor's: the
-# transaction is DECLARED in the graph config and starts
-# `start_delay_ms` after boot. mode 0 is inert and costs nothing.
-#
-# Does NOT help: a reader that gets KV_RESULT_TXN_PENDING for a
-# transaction whose coordinator died has nowhere to turn yet.
+# A stranded intent — a reader that gets KV_RESULT_TXN_PENDING — is
+# resolved by the router's help path (maybe_start_help), which reads the
+# home record and applies the decision it finds there.
 
 # Replies from kv_request_router.internal_lifecycle_out.
 [[ports]]
 name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# mode 2 (dynamic): MSG_TXN_SUBMIT from relational_executor — a
+# cross-range write set the router refused as a single-range KV_OP_TXN.
+# Input index 1; unwired (and unused) in the declared modes 0/1.
+[[ports]]
+name = "submit_in"
 direction = "input"
 content_type = "OctetStream"
 
@@ -34,6 +40,13 @@ content_type = "OctetStream"
 
 [[ports]]
 name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# mode 2 (dynamic): MSG_TXN_SUBMIT_RESULT back to relational_executor.
+# Output index 2.
+[[ports]]
+name = "result_out"
 direction = "output"
 content_type = "OctetStream"
 

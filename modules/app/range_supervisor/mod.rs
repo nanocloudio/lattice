@@ -1,12 +1,16 @@
-//! range_supervisor — the §12 lifecycle pump (RFC database foundation
-//! Phase 4).
+//! range_supervisor — the §12 lifecycle pump.
 //!
-//! Drives ONE declared lifecycle operation through the state machines
-//! in `modules/common/range_lifecycle.rs`. That file owns every
-//! transition rule, fence, and map transformation; this module is the
-//! thin pump it was written for — its whole job is to turn each
-//! machine phase into real KV effects and feed the resulting EVENTS
-//! back through `advance_split`.
+//! Drives ONE lifecycle operation at a time through the state machines in
+//! `modules/common/range_lifecycle.rs`. That file owns every transition
+//! rule, fence, and map transformation; this module is the thin pump it
+//! was written for — its whole job is to turn each machine phase into real
+//! KV effects and feed the resulting EVENTS back through `advance_split`.
+//!
+//! The operation is either DECLARED in the graph config (`op_kind` 1
+//! split, 2 merge; run `start_delay_ms` after boot), or received at
+//! RUNTIME (`op_kind: 4`) as a `MSG_PLACEMENT_SPLIT_CMD` from
+//! `placement_advisor` carrying the operator's split key — the same split
+//! state machine, triggered by policy rather than by config.
 //!
 //! ## What a split physically is, in this composition
 //!
@@ -58,10 +62,16 @@
 //!   this pump: ownership of the combined interval flips at
 //!   `TargetOwns`, one phase BEFORE the descriptors are published, so
 //!   routing lags the truth rather than leading it.
-//! - Relocation: still not driven. It changes replicas, not key
-//!   bounds, and a single-node static composition has nowhere to
-//!   relocate TO — so `op_kind: 3` refuses at init rather than
-//!   pretending. Named, not hidden.
+//! - Runtime split (`op_kind: 4`): the supervisor decodes its map at
+//!   boot, publishes it once to release a router running `await_map`,
+//!   then waits idle for a `MSG_PLACEMENT_SPLIT_CMD`. The command supplies
+//!   the operator's split key; execution then runs the split machine
+//!   exactly as a declared split does. Automating WHEN a split fires
+//!   without giving up the operator's choice of WHERE (§12.4).
+//! - Relocation: not driven. It changes replicas, not key bounds, and a
+//!   single-node static composition has nowhere to relocate TO — so
+//!   `op_kind: 3` refuses at init rather than pretending. Named, not
+//!   hidden.
 //! - One operation at a time, like the executor: the record slot is
 //!   singular by design.
 
@@ -113,7 +123,7 @@ use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_TARGETED, KV_RESULT_NOT_FOUND,
     KV_RESULT_OK, KV_RESULT_RANGE, PROTO_INTERNAL_LIFECYCLE,
 };
-use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
+use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_PLACEMENT_SPLIT_CMD};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -206,6 +216,8 @@ struct SupState {
     kv_out: i32,
     map_out: i32,
     metrics_out: i32,
+    /// op_kind 4 only: `MSG_PLACEMENT_SPLIT_CMD` from placement_advisor.
+    cmd_in: i32,
 
     op_kind: u8,
     split_key_hex: [u8; SPLIT_KEY_MAX * 2],
@@ -261,6 +273,7 @@ impl SupState {
     fn init(&mut self, sys: *const SyscallTable) {
         self.syscalls = sys;
         self.kv_in = -1;
+        self.cmd_in = -1;
         self.kv_out = -1;
         self.map_out = -1;
         self.metrics_out = -1;
@@ -1365,6 +1378,21 @@ pub extern "C" fn module_new(
         sup.state = S_IDLE;
         return 0;
     }
+    if sup.op_kind == 4 {
+        // Runtime-triggered split (§12.4 opt-in automation): decode the
+        // map now, then wait idle for a `MSG_PLACEMENT_SPLIT_CMD` on
+        // `cmd_in` carrying the operator's split key. The split itself
+        // runs the SAME state machine a declared split does.
+        // SAFETY: sys_ptr non-null.
+        unsafe {
+            sup.cmd_in = dev_channel_port(&*sys_ptr, 0, 1);
+        }
+        if sup.cmd_in < 0 || !decode_range_map(sup) {
+            return -1;
+        }
+        sup.state = S_IDLE;
+        return 0;
+    }
     if sup.op_kind != 1 && sup.op_kind != 2 {
         // Relocation: contract-complete, no target on a single-node
         // static composition (see the module docs).
@@ -1399,18 +1427,42 @@ pub extern "C" fn module_new(
     // nothing, copy nothing, and advance through every phase reporting
     // success. Zero copied records is what the instrumentation showed;
     // no amount of reasoning about span bounds would have.
-    let Some(idx) = move_span_index(sup) else {
-        return -1;
-    };
-    sup.source_partition = sup.initial_map.ranges()[idx].binding.partition_id;
-    // The declaration must FORM a valid operation now, not at first
-    // use (validate_split runs inside apply_to_map on every phase, but
-    // a config that can never publish should refuse boot).
-    if build_operation(sup).is_none() {
+    if !arm_operation(sup) {
         return -1;
     }
     sup.state = S_WAIT_DELAY;
     0
+}
+
+/// Resolve the source partition from the (now-known) split key and form
+/// the operation. Shared by boot-declared ops (`op_kind` 1/2) and a
+/// runtime split command (`op_kind` 4). `false` if the declaration cannot
+/// form a valid operation — the caller refuses rather than half-arm one.
+fn arm_operation(sup: &mut SupState) -> bool {
+    let Some(idx) = move_span_index(sup) else {
+        return false;
+    };
+    sup.source_partition = sup.initial_map.ranges()[idx].binding.partition_id;
+    // The declaration must FORM a valid operation now, not at first use
+    // (validate_split runs inside apply_to_map on every phase, but a
+    // declaration that can never publish should refuse).
+    build_operation(sup).is_some()
+}
+
+/// Decode and apply the `range_map` param into `initial_map`. Shared by
+/// every op_kind, since the map is needed to resolve partitions.
+fn decode_range_map(sup: &mut SupState) -> bool {
+    let map_hex_len = sup.range_map_hex_len;
+    if map_hex_len == 0 || map_hex_len == u16::MAX {
+        return false;
+    }
+    let mut frame = [0u8; RANGE_MAP_PARAM_MAX];
+    let mut frame_hex = [0u8; RANGE_MAP_PARAM_MAX * 2];
+    frame_hex[..map_hex_len as usize].copy_from_slice(&sup.range_map_hex[..map_hex_len as usize]);
+    let Some(fl) = hex_decode(&frame_hex[..map_hex_len as usize], &mut frame) else {
+        return false;
+    };
+    sup.initial_map.apply_full_update(&frame[..fl]).is_some()
 }
 
 #[no_mangle]
@@ -1443,6 +1495,46 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut body = [0u8; ENV_BUF];
                     body[..blen].copy_from_slice(&payload[20..20 + blen]);
                     on_kv_response(sup, result, &body[..blen]);
+                }
+            }
+        }
+    }
+
+    // op_kind 4: release a router running `await_map: 1` by publishing the
+    // unchanged initial map once, then accept one runtime split command
+    // while idle. `loaded_once` doubles as the published flag here; the
+    // command handler resets it so the armed split re-probes the record.
+    if sup.op_kind == 4 && sup.state == S_IDLE && sup.loaded_once == 0 {
+        if send_initial_map(sup) {
+            sup.loaded_once = 1;
+        }
+    }
+    if sup.op_kind == 4 && sup.state == S_IDLE && sup.cmd_in >= 0 {
+        // SAFETY: sys_ptr non-null; `env` module-owned.
+        unsafe {
+            let sys = &*sys_ptr;
+            let mut env = [0u8; ENV_BUF];
+            if let Some((msg, payload)) = read_one_envelope(sys, sup.cmd_in, &mut env) {
+                if msg == MSG_PLACEMENT_SPLIT_CMD && payload.len() >= 2 {
+                    let klen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                    if klen > 0 && klen <= SPLIT_KEY_MAX && payload.len() >= 2 + klen {
+                        sup.split_key[..klen].copy_from_slice(&payload[2..2 + klen]);
+                        sup.split_key_len = klen as u16;
+                        sup.op_kind = 1; // a split, from here on
+                        if arm_operation(sup) {
+                            // Start immediately: the manual gate is the
+                            // advisor's policy threshold, already crossed.
+                            sup.loaded_once = 0;
+                            sup.boot_ms = now.max(1);
+                            sup.start_delay_ms = 0;
+                            sup.state = S_WAIT_DELAY;
+                        } else {
+                            // A command that cannot form an operation
+                            // leaves the supervisor armed for a valid one.
+                            sup.op_kind = 4;
+                            sup.split_key_len = 0;
+                        }
+                    }
                 }
             }
         }

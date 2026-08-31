@@ -36,5 +36,12 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
+# §12.4 opt-in: MSG_PLACEMENT_SPLIT_CMD to a range_supervisor (op_kind 4).
+# Output index 2; unwired unless the operator opts into auto-execution.
+[[ports]]
+name = "exec_out"
+direction = "output"
+content_type = "OctetStream"
+
 [observability]
 metrics = ["surveys", "recommendations", "keys_last_survey"]

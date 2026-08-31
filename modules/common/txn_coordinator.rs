@@ -313,6 +313,51 @@ impl Coordinator {
         }
     }
 
+    /// RESUME a transaction whose durable home record already shows a
+    /// DECISION — this coordinator crashed after `Committed`/`Aborted` was
+    /// replicated but before every intent was resolved. Rebuilds the
+    /// machine straight into `Resolving`: the record is the authority
+    /// (rule 1), so no re-prepare and no re-decision happen, and every
+    /// participant is re-resolved. Re-resolving one already resolved is a
+    /// no-op — resolve is idempotent and retried forever by design — so
+    /// driving all of them is always safe and never double-applies.
+    ///
+    /// The counterpart to `on_record_refused`: instead of concluding
+    /// `OutcomeUnknown` when the reopening `Pending` write is refused
+    /// because a decided record already exists, the module reads that
+    /// record and calls this with the decision it found. Only legal from
+    /// a freshly-`begin`-constructed machine (the restart's fresh start),
+    /// hence the `OpeningRecord`/`Idle` guard.
+    pub fn resume_decided(&mut self, committed: bool) {
+        if !matches!(self.phase, Phase::OpeningRecord | Phase::Idle) {
+            return;
+        }
+        self.record.status = if committed {
+            TxnStatus::Committed
+        } else {
+            TxnStatus::Aborted
+        };
+        self.decided = true;
+        self.committed = committed;
+        self.outcome = if committed {
+            TxnOutcome::Committed
+        } else {
+            TxnOutcome::Aborted
+        };
+        for i in 0..self.count {
+            // Voted (so no prepare is issued) and unresolved (so every
+            // participant gets a resolve). `prepared` mirrors the
+            // decision purely for consistency; nothing reads it in
+            // `Resolving`.
+            self.slots[i].voted = true;
+            self.slots[i].prepared = committed;
+            self.slots[i].prepare_inflight = false;
+            self.slots[i].resolved = false;
+            self.slots[i].resolve_inflight = false;
+        }
+        self.phase = Phase::Resolving;
+    }
+
     /// A send was lost; allow it to be re-issued. Retry, not decision:
     /// this never changes a vote or an outcome.
     pub fn on_send_lost(&mut self, index: usize) {

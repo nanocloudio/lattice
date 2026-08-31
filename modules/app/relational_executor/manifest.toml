@@ -47,6 +47,14 @@ name = "kv_in"
 direction = "input"
 content_type = "OctetStream"
 
+# MSG_TXN_SUBMIT_RESULT from txn_coordinator (cross-range 2PC outcome).
+# Input index 3; wired only in a two-range relational graph. Where it is
+# unwired a cross-range batch is refused rather than coordinated.
+[[ports]]
+name = "txn_result_in"
+direction = "input"
+content_type = "OctetStream"
+
 # Results out to pg_edge_anchor.
 [[ports]]
 name = "pg_out"
@@ -69,6 +77,13 @@ content_type = "OctetStream"
 
 [[ports]]
 name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_TXN_SUBMIT to txn_coordinator.submit_in when a batch spans ranges.
+# Output index 4; wired only in a two-range relational graph.
+[[ports]]
+name = "txn_submit_out"
 direction = "output"
 content_type = "OctetStream"
 

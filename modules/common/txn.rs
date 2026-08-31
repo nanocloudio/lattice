@@ -1369,3 +1369,56 @@ pub fn interpret_lookup(
         None => IdempotencyLookup::Indeterminate,
     }
 }
+
+/// Outcome byte for a `Committed` lookup.
+pub const IDEMPOTENCY_LOOKUP_COMMITTED: u8 = 0;
+/// Outcome byte for a `DidNotHappen` lookup.
+pub const IDEMPOTENCY_LOOKUP_DID_NOT_HAPPEN: u8 = 1;
+/// Outcome byte for an `Indeterminate` lookup.
+pub const IDEMPOTENCY_LOOKUP_INDETERMINATE: u8 = 2;
+
+/// Wire length of an encoded [`IdempotencyLookup`]:
+/// `[outcome:u8][committed_revision:u64 LE][result:u8]`. The revision and
+/// result bytes are zero for the two absent outcomes; a decoder keys off
+/// `outcome` and must not read them as meaningful there.
+pub const IDEMPOTENCY_LOOKUP_WIRE_LEN: usize = 1 + 8 + 1;
+
+impl IdempotencyLookup {
+    /// Encode into `out`; returns the byte count, or `None` if `out` is
+    /// too small.
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < IDEMPOTENCY_LOOKUP_WIRE_LEN {
+            return None;
+        }
+        let (outcome, rev, result) = match *self {
+            IdempotencyLookup::Committed {
+                committed_revision,
+                result,
+            } => (IDEMPOTENCY_LOOKUP_COMMITTED, committed_revision, result),
+            IdempotencyLookup::DidNotHappen => (IDEMPOTENCY_LOOKUP_DID_NOT_HAPPEN, 0, 0),
+            IdempotencyLookup::Indeterminate => (IDEMPOTENCY_LOOKUP_INDETERMINATE, 0, 0),
+        };
+        out[0] = outcome;
+        out[1..9].copy_from_slice(&rev.to_le_bytes());
+        out[9] = result;
+        Some(IDEMPOTENCY_LOOKUP_WIRE_LEN)
+    }
+
+    /// Decode a wire form produced by [`encode`](Self::encode). Unknown
+    /// outcome bytes are rejected rather than guessed.
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() < IDEMPOTENCY_LOOKUP_WIRE_LEN {
+            return None;
+        }
+        let rev = u64::from_le_bytes(src[1..9].try_into().ok()?);
+        match src[0] {
+            IDEMPOTENCY_LOOKUP_COMMITTED => Some(IdempotencyLookup::Committed {
+                committed_revision: rev,
+                result: src[9],
+            }),
+            IDEMPOTENCY_LOOKUP_DID_NOT_HAPPEN => Some(IdempotencyLookup::DidNotHappen),
+            IDEMPOTENCY_LOOKUP_INDETERMINATE => Some(IdempotencyLookup::Indeterminate),
+            _ => None,
+        }
+    }
+}

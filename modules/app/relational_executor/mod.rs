@@ -31,24 +31,31 @@
 //!   how many clients happened to connect.
 //! - No interleaving to reason about. A `CREATE TABLE` allocates an id,
 //!   writes a descriptor and writes a name-index entry as three separate
-//!   durable writes. Concurrent statements would need those three to be
-//!   atomic against each other, and the transaction machinery that makes
-//!   them atomic is Phase 5. Until it exists, serializing is the honest
-//!   way to keep the catalog consistent rather than the fast one.
+//!   durable writes; concurrent statements would need those three atomic
+//!   against each other. Serializing sidesteps that — the honest way to
+//!   keep the catalog consistent rather than the fast one.
 //!
 //! A full queue is reported as `ERR_BUSY` rather than dropped, so a
 //! client backs off instead of assuming its statement was wrong.
 //!
-//! ## Statement atomicity (§13.1), and the boundary it stops at
+//! ## Atomicity: statement, and transaction
 //!
-//! A multi-row `INSERT` executes as ONE `KV_OP_TXN`: every row key is
-//! compared absent, then every row is written, inside a single Raft
-//! entry. A crash cannot leave a partial statement, and a duplicate
-//! key anywhere in the batch fails the WHOLE statement with nothing
-//! written. The boundary: on an ordered multi-range map, a batch whose
-//! rows straddle a range boundary refuses BY NAME (feature not
-//! supported) — cross-range atomicity is the Phase 5 coordinator's to
-//! provide, and half a statement is worse than a refusal.
+//! A multi-row `INSERT` executes as ONE `KV_OP_TXN` (§13.1): every row key
+//! is compared absent, then every row is written, inside a single Raft
+//! entry. A crash cannot leave a partial statement, and a duplicate key
+//! anywhere in the batch fails the WHOLE statement with nothing written.
+//!
+//! When a batch's rows straddle a range boundary the router refuses it as
+//! single-range; the executor forwards it to a `txn_coordinator` for
+//! two-phase commit where one is wired, and refuses BY NAME (feature not
+//! supported) where one is not — half a statement is worse than a refusal.
+//!
+//! `BEGIN … COMMIT` extends this across statements: each buffered INSERT's
+//! writes are deferred and replayed as one atomic `KV_OP_TXN` at COMMIT
+//! (single-range in the worker, or forwarded to the coordinator when it
+//! spans ranges), ROLLBACK drops them, and a read inside a transaction is
+//! refused rather than served without its own uncommitted writes. See the
+//! transaction section on `TxnSlot` below.
 
 #![no_std]
 #![allow(
@@ -106,7 +113,10 @@ use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_INCR, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_RESULT_INTEGER,
     KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, PROTO_INTERNAL_SQL, PUT_FLAG_NX,
 };
-use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_SQL_REQUEST, MSG_SQL_RESPONSE};
+use wire::{
+    MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_SQL_REQUEST, MSG_SQL_RESPONSE, MSG_TXN_SUBMIT,
+    MSG_TXN_SUBMIT_RESULT, TXN_SUBMIT_ABORTED, TXN_SUBMIT_COMMITTED,
+};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -289,6 +299,9 @@ const P_ALTER_WRITE: u8 = 34;
 /// DROP TABLE cascade: the index-descriptor survey page (all of this
 /// table's indexes, ANY phase — a cascade removes half-built ones too).
 const P_DT_IXLIST: u8 = 35;
+/// Cross-range INSERT: forwarded to `txn_coordinator`, awaiting the
+/// `MSG_TXN_SUBMIT_RESULT` two-phase-commit outcome.
+const P_TXN_COORD: u8 = 36;
 
 // ── State ─────────────────────────────────────────────────────────────
 
@@ -312,19 +325,83 @@ impl Queued {
     }
 }
 
+/// Concurrent multi-statement transactions the executor can hold open.
+/// Small on purpose: the serial executor is not a high-concurrency
+/// transaction engine, and a fourth open transaction refuses rather than
+/// grows unbounded state.
+const MAX_TXN_SLOTS: usize = 2;
+/// Accumulation budget for one open transaction's comparisons or PUTs.
+/// The COMMIT must still fit every hop's 4 KiB scratch, so the assembled
+/// TXN is bounded exactly as a single multi-row INSERT is.
+const TXN_ACC_MAX: usize = 3600;
+
+/// One open `BEGIN … COMMIT` transaction: the accumulated absence
+/// comparisons and PUTs of every buffered `INSERT`, replayed as ONE
+/// atomic `KV_OP_TXN` at `COMMIT`. Deferring the writes this way gives
+/// isolation for free — nothing reaches the store until COMMIT, so no
+/// other connection sees an uncommitted row — and makes ROLLBACK a
+/// matter of dropping the buffer. Reads and non-INSERT DML inside a
+/// transaction are refused rather than silently served stale.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TxnSlot {
+    active: bool,
+    conn_id: u8,
+    cmp_count: u16,
+    cmp_len: u16,
+    then_count: u16,
+    put_len: u16,
+    rows: u64,
+    cmp_buf: [u8; TXN_ACC_MAX],
+    put_buf: [u8; TXN_ACC_MAX],
+}
+
+impl TxnSlot {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            conn_id: 0,
+            cmp_count: 0,
+            cmp_len: 0,
+            then_count: 0,
+            put_len: 0,
+            rows: 0,
+            cmp_buf: [0; TXN_ACC_MAX],
+            put_buf: [0; TXN_ACC_MAX],
+        }
+    }
+}
+
 #[repr(C)]
 struct ExecState {
     syscalls: *const SyscallTable,
 
-    // Inputs: pg_in[0], mysql_in[1], kv_in[2]
+    // Inputs: pg_in[0], mysql_in[1], kv_in[2], txn_result_in[3]
     pg_in: i32,
     mysql_in: i32,
     kv_in: i32,
-    // Outputs: pg_out[0], mysql_out[1], kv_out[2], metrics[3]
+    /// MSG_TXN_SUBMIT_RESULT from txn_coordinator (cross-range 2PC). -1
+    /// (unwired) in single-range compositions, where a cross-range INSERT
+    /// is refused rather than coordinated.
+    txn_result_in: i32,
+    // Outputs: pg_out[0], mysql_out[1], kv_out[2], metrics[3], txn_submit_out[4]
     pg_out: i32,
     mysql_out: i32,
     kv_out: i32,
     metrics_out: i32,
+    /// MSG_TXN_SUBMIT to txn_coordinator when a batch spans ranges.
+    txn_submit_out: i32,
+    /// Length of the KV_OP_TXN body last staged at `env[BODY_AT..]`, kept
+    /// so a `KV_RESULT_CROSS_RANGE` reply can forward that same body to
+    /// the coordinator (the response read lands in `scratch`, so `env`
+    /// still holds it).
+    txn_body_len: u16,
+
+    /// Open `BEGIN … COMMIT` transactions, at most one per connection.
+    txn_slots: [TxnSlot; MAX_TXN_SLOTS],
+    /// The slot whose assembled COMMIT is in flight (index), or -1. On
+    /// the TXN reply the executor answers `TAG_COMMIT` and frees it.
+    committing_slot: i8,
 
     // ── Catalog name cache (RFC §14.2 schema generation) ─────────────
     //
@@ -529,10 +606,15 @@ impl ExecState {
         self.pg_in = -1;
         self.mysql_in = -1;
         self.kv_in = -1;
+        self.txn_result_in = -1;
         self.pg_out = -1;
         self.mysql_out = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
+        self.txn_submit_out = -1;
+        self.txn_body_len = 0;
+        self.txn_slots = [TxnSlot::empty(); MAX_TXN_SLOTS];
+        self.committing_slot = -1;
         self.phase = P_IDLE;
         self.from_mysql = false;
         self.corr_id = 0;
@@ -1233,31 +1315,41 @@ fn step_statement(exec: &mut ExecState) {
             return;
         }
     };
+    // Transaction gate: inside an open BEGIN … COMMIT, only INSERT
+    // (buffered) and the session verbs are honoured. A read cannot see the
+    // transaction's own buffered writes, and UPDATE/DELETE-in-transaction
+    // is not buffered yet, so both refuse rather than answer wrongly —
+    // the transaction stays open for the client to COMMIT or ROLLBACK.
+    if find_active_slot(exec, exec.conn_id).is_some()
+        && !matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Session(_) | Statement::Empty
+        )
+    {
+        reply_simple(exec, sql_exec::ERR_UNSUPPORTED, TAG_EMPTY, 0);
+        return;
+    }
+
     match stmt {
         Statement::Empty => reply_simple(exec, OUTCOME_OK, TAG_EMPTY, 0),
         Statement::Session(s) => {
-            // Session statements are answered here, not stored. The
-            // connector renders each one; the executor only says which
-            // it was. BEGIN/COMMIT are accepted and are NOT transactional
-            // yet — recorded in the module docs, because a client that
-            // believed them would expect rollback to work.
-            let tag = match s {
-                sql_core::SessionStatement::Begin => TAG_BEGIN,
-                sql_core::SessionStatement::Commit => TAG_COMMIT,
-                sql_core::SessionStatement::Rollback => TAG_ROLLBACK,
-                sql_core::SessionStatement::Set => TAG_SET,
-                sql_core::SessionStatement::Show(_) => TAG_SHOW,
+            match s {
+                // BEGIN opens a deferred write batch, COMMIT replays it as
+                // one atomic TXN, ROLLBACK drops it. See the transaction
+                // section above.
+                sql_core::SessionStatement::Begin => begin_txn(exec),
+                sql_core::SessionStatement::Commit => commit_txn(exec),
+                sql_core::SessionStatement::Rollback => rollback_txn(exec),
+                sql_core::SessionStatement::Set => reply_simple(exec, OUTCOME_OK, TAG_SET, 0),
+                sql_core::SessionStatement::Show(_) => reply_simple(exec, OUTCOME_OK, TAG_SHOW, 0),
                 sql_core::SessionStatement::SelectConstant { value, alias } => {
                     // A constant select must return a ROW, not just a
                     // completion. `SELECT 1` is the liveness probe every
-                    // driver and pooler sends, and answering it with an
-                    // empty result set makes a healthy server look
-                    // broken.
+                    // driver and pooler sends (and it reads no store
+                    // state, so it is allowed even inside a transaction).
                     reply_constant(exec, value, alias);
-                    return;
                 }
-            };
-            reply_simple(exec, OUTCOME_OK, tag, 0);
+            }
         }
         // Every DDL/DML path starts by resolving the table name, so they
         // share one first step.
@@ -1856,6 +1948,150 @@ fn encode_insert_index_key(
     kv_key(key, relational::KS_RELATIONAL_INDEX, &body[..bn2]).ok_or(ERR_STORE)
 }
 
+// ── Multi-statement transactions (BEGIN … COMMIT / ROLLBACK) ─────────
+//
+// Deferred atomic write batches: every buffered INSERT's comparisons and
+// PUTs accumulate in the connection's slot, and COMMIT replays the whole
+// accumulation as ONE `KV_OP_TXN` (single-range in the worker, or
+// forwarded to `txn_coordinator` when it spans ranges). Isolation is a
+// consequence of deferral — nothing reaches the store until COMMIT, so no
+// other connection observes an uncommitted row — and ROLLBACK just drops
+// the slot. Reads and non-INSERT DML inside a transaction are refused
+// (`the transaction gate` in `step_statement`), because a buffered write
+// is invisible to a store read and serving one stale would be the silent
+// wrong answer this design exists to avoid.
+
+/// The active transaction slot for `conn`, if any.
+fn find_active_slot(exec: &ExecState, conn: u8) -> Option<usize> {
+    (0..MAX_TXN_SLOTS).find(|&i| exec.txn_slots[i].active && exec.txn_slots[i].conn_id == conn)
+}
+
+/// Claim a free slot for `conn`. `None` when all are busy — the executor
+/// refuses a further concurrent transaction rather than grow state.
+fn alloc_slot(exec: &mut ExecState, conn: u8) -> Option<usize> {
+    let i = (0..MAX_TXN_SLOTS).find(|&i| !exec.txn_slots[i].active)?;
+    exec.txn_slots[i] = TxnSlot::empty();
+    exec.txn_slots[i].active = true;
+    exec.txn_slots[i].conn_id = conn;
+    Some(i)
+}
+
+fn free_slot(exec: &mut ExecState, i: usize) {
+    exec.txn_slots[i] = TxnSlot::empty();
+}
+
+/// Append one INSERT's comparison and PUT regions (already staged in
+/// `env`) to a transaction slot. The regions are consecutive in `env`: the
+/// comparisons occupy `[BODY_AT + 2, cmp_end)` and the PUTs
+/// `[cmp_end + 2, put_end)` (the two `+ 2`s skip the count fields the
+/// builder wrote). `false` on overflow — the assembled COMMIT must still
+/// fit one hop's scratch.
+fn buffer_txn_insert(
+    exec: &mut ExecState,
+    slot: usize,
+    cmp_end: usize,
+    put_end: usize,
+    cmp_count: u16,
+    then_count: u16,
+) -> bool {
+    let (cmp_at, put_at) = (BODY_AT + 2, cmp_end + 2);
+    let cmp_bytes = cmp_end - cmp_at;
+    let put_bytes = put_end - put_at;
+    // Copy out of `env` first (disjoint borrow from the slot bufs).
+    let mut cmp_tmp = [0u8; TXN_ACC_MAX];
+    let mut put_tmp = [0u8; TXN_ACC_MAX];
+    if cmp_bytes > cmp_tmp.len() || put_bytes > put_tmp.len() {
+        return false;
+    }
+    cmp_tmp[..cmp_bytes].copy_from_slice(&exec.env[cmp_at..cmp_end]);
+    put_tmp[..put_bytes].copy_from_slice(&exec.env[put_at..put_end]);
+
+    let s = &mut exec.txn_slots[slot];
+    let (cl, pl) = (s.cmp_len as usize, s.put_len as usize);
+    if cl + cmp_bytes > TXN_ACC_MAX || pl + put_bytes > TXN_ACC_MAX {
+        return false;
+    }
+    s.cmp_buf[cl..cl + cmp_bytes].copy_from_slice(&cmp_tmp[..cmp_bytes]);
+    s.cmp_len = (cl + cmp_bytes) as u16;
+    s.put_buf[pl..pl + put_bytes].copy_from_slice(&put_tmp[..put_bytes]);
+    s.put_len = (pl + put_bytes) as u16;
+    s.cmp_count = s.cmp_count.wrapping_add(cmp_count);
+    s.then_count = s.then_count.wrapping_add(then_count);
+    s.rows = s.rows.wrapping_add(cmp_count as u64);
+    true
+}
+
+/// `BEGIN`: open a transaction for this connection. Idempotent within an
+/// open one (Postgres warns and continues); refuses when no slot is free.
+fn begin_txn(exec: &mut ExecState) {
+    if find_active_slot(exec, exec.conn_id).is_some() {
+        reply_simple(exec, OUTCOME_OK, TAG_BEGIN, 0);
+        return;
+    }
+    if alloc_slot(exec, exec.conn_id).is_some() {
+        reply_simple(exec, OUTCOME_OK, TAG_BEGIN, 0);
+    } else {
+        reply_simple(exec, ERR_BUSY, TAG_EMPTY, 0);
+    }
+}
+
+/// `ROLLBACK`: drop every buffered write. Nothing was ever sent, so there
+/// is nothing to undo. A ROLLBACK with no open transaction is a no-op.
+fn rollback_txn(exec: &mut ExecState) {
+    if let Some(i) = find_active_slot(exec, exec.conn_id) {
+        free_slot(exec, i);
+    }
+    reply_simple(exec, OUTCOME_OK, TAG_ROLLBACK, 0);
+}
+
+/// `COMMIT`: assemble every buffered INSERT into ONE `KV_OP_TXN` and send
+/// it down the normal insert path — which commits it single-range in the
+/// worker or forwards it to `txn_coordinator` when it spans ranges. The
+/// TXN reply (`after_ins_txn` / `on_txn_result`) answers `TAG_COMMIT` and
+/// frees the slot. An empty or absent transaction commits trivially.
+fn commit_txn(exec: &mut ExecState) {
+    let Some(i) = find_active_slot(exec, exec.conn_id) else {
+        reply_simple(exec, OUTCOME_OK, TAG_COMMIT, 0);
+        return;
+    };
+    let (cmp_count, then_count) = (exec.txn_slots[i].cmp_count, exec.txn_slots[i].then_count);
+    if then_count == 0 {
+        free_slot(exec, i);
+        reply_simple(exec, OUTCOME_OK, TAG_COMMIT, 0);
+        return;
+    }
+    // Assemble `[cmp_count][cmps][then_count][puts][else_count=0]` into env.
+    let (cl, pl) = (exec.txn_slots[i].cmp_len as usize, exec.txn_slots[i].put_len as usize);
+    let total = 2 + cl + 2 + pl + 2;
+    if BODY_AT + total > exec.env.len() {
+        // Too large to send in one entry. The transaction stays open for
+        // the client to ROLLBACK; nothing was written.
+        reply_simple(exec, sql_exec::ERR_TOO_MANY_ITEMS, TAG_EMPTY, 0);
+        return;
+    }
+    // Copy slot bufs out first (disjoint borrow from env).
+    let mut cmp_tmp = [0u8; TXN_ACC_MAX];
+    let mut put_tmp = [0u8; TXN_ACC_MAX];
+    cmp_tmp[..cl].copy_from_slice(&exec.txn_slots[i].cmp_buf[..cl]);
+    put_tmp[..pl].copy_from_slice(&exec.txn_slots[i].put_buf[..pl]);
+    let mut p = BODY_AT;
+    exec.env[p..p + 2].copy_from_slice(&cmp_count.to_le_bytes());
+    p += 2;
+    exec.env[p..p + cl].copy_from_slice(&cmp_tmp[..cl]);
+    p += cl;
+    exec.env[p..p + 2].copy_from_slice(&then_count.to_le_bytes());
+    p += 2;
+    exec.env[p..p + pl].copy_from_slice(&put_tmp[..pl]);
+    p += pl;
+    exec.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
+    p += 2;
+
+    exec.affected = exec.txn_slots[i].rows;
+    exec.txn_body_len = (p - BODY_AT) as u16;
+    exec.committing_slot = i as i8;
+    kv_send(exec, types::KV_OP_TXN, p - BODY_AT, P_INS_TXN);
+}
+
 /// Multi-row INSERT as ONE `KV_OP_TXN`: compare every row key absent
 /// (`mod_revision == 0`), THEN write every row. The worker evaluates
 /// the whole thing atomically inside one Raft entry, which is what SQL
@@ -1901,6 +2137,8 @@ fn send_insert_txn(exec: &mut ExecState, ins: &sql_core::Insert<'_>) {
         exec.env[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
         p += 8;
     }
+    // End of the comparison region (its bytes are `env[BODY_AT+2..cmp_end]`).
+    let cmp_end = p;
     // [then_count]: one PUT per row plus one per (row, index) entry.
     let then_count = rows + rows * exec.idx_count as usize;
     if then_count > u16::MAX as usize {
@@ -1981,12 +2219,53 @@ fn send_insert_txn(exec: &mut ExecState, ins: &sql_core::Insert<'_>) {
             p += 8;
         }
     }
+    // End of the PUT region (its bytes are `env[cmp_end+2..put_end]`).
+    let put_end = p;
     // [else_count] = 0: a failed comparison answers `succeeded = 0`
     // and writes nothing.
     exec.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
     p += 2;
     exec.affected = rows as u64;
+
+    // Inside an open transaction, defer: accumulate this INSERT's
+    // comparisons and PUTs into the connection's slot and answer OK now.
+    // Nothing reaches the store until COMMIT assembles every buffered
+    // INSERT into ONE atomic KV_OP_TXN.
+    if let Some(slot) = find_active_slot(exec, exec.conn_id) {
+        if !buffer_txn_insert(exec, slot, cmp_end, put_end, rows as u16, then_count as u16) {
+            // Overflow: the transaction cannot hold this INSERT. Fail the
+            // statement (and leave the transaction for the client to
+            // ROLLBACK) rather than silently drop rows.
+            reply_simple(exec, sql_exec::ERR_TOO_MANY_ITEMS, TAG_EMPTY, 0);
+            return;
+        }
+        let affected = rows as u64;
+        reply_simple(exec, OUTCOME_OK, TAG_INSERT, affected);
+        return;
+    }
+
+    // Autocommit: remember the body so a CROSS_RANGE refusal can forward
+    // it to the coordinator (see `after_ins_txn`). `env` survives the
+    // reply, which lands in `scratch`.
+    exec.txn_body_len = (p - BODY_AT) as u16;
     kv_send(exec, types::KV_OP_TXN, p - BODY_AT, P_INS_TXN);
+}
+
+/// Answer a TXN reply, freeing an in-flight COMMIT's slot first. When a
+/// COMMIT is what produced the TXN, its success tag is `TAG_COMMIT`;
+/// otherwise it is an autocommit INSERT (`TAG_INSERT`).
+fn finish_txn_reply(exec: &mut ExecState, outcome: u8, success_tag: u8, affected: u64) {
+    let committing = exec.committing_slot >= 0;
+    if committing {
+        free_slot(exec, exec.committing_slot as usize);
+        exec.committing_slot = -1;
+    }
+    if outcome == OUTCOME_OK {
+        let tag = if committing { TAG_COMMIT } else { success_tag };
+        reply_simple(exec, OUTCOME_OK, tag, affected);
+    } else {
+        reply_simple(exec, outcome, TAG_EMPTY, 0);
+    }
 }
 
 fn after_ins_txn(exec: &mut ExecState, result: u8, body: &[u8]) {
@@ -1995,20 +2274,113 @@ fn after_ins_txn(exec: &mut ExecState, result: u8, body: &[u8]) {
             if body[0] == 1 {
                 let affected = exec.affected;
                 exec.m_rows_written = exec.m_rows_written.wrapping_add(affected);
-                reply_simple(exec, OUTCOME_OK, TAG_INSERT, affected);
+                finish_txn_reply(exec, OUTCOME_OK, TAG_INSERT, affected);
             } else {
                 // A comparison failed: some row's key already exists.
-                // Nothing was written — that is the whole point.
-                reply_simple(exec, ERR_DUPLICATE_KEY, TAG_EMPTY, 0);
+                // Nothing was written — that is the whole point (and it
+                // aborts the whole transaction on a COMMIT).
+                finish_txn_reply(exec, ERR_DUPLICATE_KEY, TAG_EMPTY, 0);
             }
         }
         types::KV_RESULT_CROSS_RANGE => {
-            // The rows straddle a range boundary and there is no
-            // cross-range coordinator yet: refuse BY NAME rather than
-            // write half a statement.
-            reply_simple(exec, sql_exec::ERR_UNSUPPORTED, TAG_EMPTY, 0)
+            // The rows straddle a range boundary. Where a mode-2
+            // `txn_coordinator` is wired, forward the SAME TXN body for
+            // two-phase commit and wait for the outcome; otherwise there
+            // is no coordinator and half a statement is worse than none,
+            // so refuse BY NAME. `committing_slot` (if set) rides through
+            // to `on_txn_result`, which frees it.
+            if exec.txn_submit_out < 0 || exec.txn_result_in < 0 {
+                finish_txn_reply(exec, sql_exec::ERR_UNSUPPORTED, TAG_EMPTY, 0);
+            } else {
+                forward_cross_range_txn(exec);
+            }
         }
-        _ => reply_simple(exec, ERR_STORE, TAG_EMPTY, 0),
+        _ => finish_txn_reply(exec, ERR_STORE, TAG_EMPTY, 0),
+    }
+}
+
+/// Read timestamp handed to the coordinator for a forwarded cross-range
+/// transaction. A nonzero constant: `may_commit` refuses zero, and a
+/// single-statement autocommit INSERT reads nothing, so it needs no
+/// snapshot behind the present. A leased timestamp from
+/// `timestamp_allocator` is what a multi-statement snapshot would require.
+const CROSS_RANGE_READ_TS: u64 = 1;
+
+/// Forward the just-built `KV_OP_TXN` body — refused as single-range — to
+/// the `txn_coordinator` for two-phase commit, and wait in `P_TXN_COORD`
+/// for `MSG_TXN_SUBMIT_RESULT`. `env` still holds the body (the reply
+/// landed in `scratch`); the submit is built in `scratch`, now free.
+fn forward_cross_range_txn(exec: &mut ExecState) {
+    let body_len = exec.txn_body_len as usize;
+    let payload_len = 20 + body_len; // corr8 proto1 conn1 ts8 blen2 + body
+    let at = wire::ENVELOPE_HDR;
+    if body_len == 0 || at + payload_len > exec.scratch.len() {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    }
+    // Copy the TXN body out of `env` first (disjoint-borrow dance).
+    let mut tmp = [0u8; 4096];
+    if body_len > tmp.len() {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    }
+    tmp[..body_len].copy_from_slice(&exec.env[BODY_AT..BODY_AT + body_len]);
+
+    let (corr, conn, mysql) = (exec.corr_id, exec.conn_id, exec.from_mysql);
+    let sc = &mut exec.scratch;
+    sc[at..at + 8].copy_from_slice(&corr.to_le_bytes());
+    sc[at + 8] = u8::from(mysql);
+    sc[at + 9] = conn;
+    sc[at + 10..at + 18].copy_from_slice(&CROSS_RANGE_READ_TS.to_le_bytes());
+    sc[at + 18..at + 20].copy_from_slice(&(body_len as u16).to_le_bytes());
+    sc[at + 20..at + 20 + body_len].copy_from_slice(&tmp[..body_len]);
+
+    let (ok, now) = unsafe {
+        let sys = exec.syscalls;
+        if sys.is_null() {
+            (false, 0)
+        } else {
+            let ok = write_envelope(
+                &*sys,
+                exec.txn_submit_out,
+                MSG_TXN_SUBMIT,
+                payload_len,
+                &mut exec.scratch,
+            );
+            (ok, dev_millis(&*sys))
+        }
+    };
+    if !ok {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    }
+    // Wait for the coordinator; re-arm the wedge timer for the 2PC round.
+    exec.phase = P_TXN_COORD;
+    exec.inflight_since_ms = now;
+}
+
+/// Handle `MSG_TXN_SUBMIT_RESULT` from the coordinator: the outcome of a
+/// forwarded cross-range INSERT. Payload:
+/// `[client_corr:u64][proto:u8][conn:u8][outcome:u8]`.
+fn on_txn_result(exec: &mut ExecState, payload: &[u8]) {
+    if exec.phase != P_TXN_COORD || payload.len() < 11 {
+        return;
+    }
+    let corr = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
+    if corr != exec.corr_id {
+        return; // a result for a statement no longer in flight
+    }
+    match payload[10] {
+        TXN_SUBMIT_COMMITTED => {
+            let affected = exec.affected;
+            exec.m_rows_written = exec.m_rows_written.wrapping_add(affected);
+            finish_txn_reply(exec, OUTCOME_OK, TAG_INSERT, affected);
+        }
+        TXN_SUBMIT_ABORTED => {
+            // A participant's absence comparison failed: a duplicate key.
+            finish_txn_reply(exec, ERR_DUPLICATE_KEY, TAG_EMPTY, 0);
+        }
+        _ => finish_txn_reply(exec, ERR_STORE, TAG_EMPTY, 0),
     }
 }
 
@@ -2584,8 +2956,14 @@ fn send_insert_row(exec: &mut ExecState) {
     // Statement atomicity (§13.1): more than one row — or ANY row of a
     // table with secondary indexes (§14.4: index entries update in the
     // same transaction as primary records) — goes as ONE atomic TXN
-    // command instead of a resumable PUT loop.
-    if (ins.row_count() > 1 || exec.idx_count > 0) && exec.row_index == 0 {
+    // command instead of a resumable PUT loop. Inside an open `BEGIN …
+    // COMMIT` EVERY insert takes the TXN path too, so its comparisons and
+    // PUTs are buffered into the transaction rather than written now.
+    if (ins.row_count() > 1
+        || exec.idx_count > 0
+        || find_active_slot(exec, exec.conn_id).is_some())
+        && exec.row_index == 0
+    {
         send_insert_txn(exec, &ins);
         return;
     }
@@ -4943,17 +5321,23 @@ pub extern "C" fn module_new(
     let exec = unsafe { &mut *state.cast::<ExecState>() };
     exec.init(sys_ptr);
 
-    // inputs:  pg_in[0], mysql_in[1], kv_in[2]
-    // outputs: pg_out[0], mysql_out[1], kv_out[2], metrics[3]
+    // inputs:  pg_in[0], mysql_in[1], kv_in[2], txn_result_in[3]
+    // outputs: pg_out[0], mysql_out[1], kv_out[2], metrics[3], txn_submit_out[4]
     exec.pg_in = in_chan;
     exec.pg_out = out_chan;
     unsafe {
         let sys = &*sys_ptr;
         exec.mysql_in = dev_channel_port(sys, 0, 1);
         exec.kv_in = dev_channel_port(sys, 0, 2);
+        // Optional cross-range 2PC ports: valid only where the config
+        // wires them (a two-range relational graph with a mode-2
+        // txn_coordinator). A negative port means "not wired", and a
+        // cross-range batch is then refused rather than coordinated.
+        exec.txn_result_in = dev_channel_port(sys, 0, 3);
         exec.mysql_out = dev_channel_port(sys, 1, 1);
         exec.kv_out = dev_channel_port(sys, 1, 2);
         exec.metrics_out = dev_channel_port(sys, 1, 3);
+        exec.txn_submit_out = dev_channel_port(sys, 1, 4);
     }
     // Without a KV path the module can parse but never execute, and a
     // client would hang on the first real statement. Refuse to start
@@ -4994,6 +5378,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
                 on_kv_response(exec, &tmp[..len]);
+            }
+        }
+        // Cross-range 2PC outcome from txn_coordinator (only wired in a
+        // two-range relational graph; -1 elsewhere and skipped).
+        if exec.txn_result_in >= 0 {
+            if let Some((mt, len)) = read_envelope(sys, exec.txn_result_in, &mut exec.scratch) {
+                if mt == MSG_TXN_SUBMIT_RESULT {
+                    let mut tmp = [0u8; SCRATCH_BUF];
+                    tmp[..len].copy_from_slice(&exec.scratch[..len]);
+                    on_txn_result(exec, &tmp[..len]);
+                }
             }
         }
         if let Some((mt, len)) = read_envelope(sys, exec.pg_in, &mut exec.scratch) {

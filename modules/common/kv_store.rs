@@ -30,11 +30,13 @@ use disk_store::state_store::{KvStateStore, Progress, StoreError};
 use disk_store::{DiskStore, BATCH_FORMAT_VERSION, BATCH_HDR_LEN, BATCH_MAGIC, RECORD_FIXED};
 use types::{
     KV_ARRAY_ELEMENT_NULL, KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS,
-    KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET,
+    KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_IDEMPOTENT_LOOKUP, KV_OP_INCR,
+    KV_OP_MGET, KV_OP_MSET,
     KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE, KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT,
     KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE,
     KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED,
-    KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
+    KV_RESULT_COMPACTED, KV_RESULT_IDEMPOTENT_LOOKUP, KV_RESULT_INTEGER, KV_RESULT_INTERNAL,
+    KV_RESULT_NOT_FOUND, KV_RESULT_OK,
     KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN, KV_RESULT_TXN_PENDING,
     KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET, PUT_FLAG_KEEPTTL, PUT_FLAG_NX,
     PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER, TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL,
@@ -1023,6 +1025,24 @@ pub trait Materializer {
     ///   current values, so the only "history" it holds is the present.
     fn read_horizon(&self) -> u64;
 
+    /// The revision at or below which a record's ABSENCE proves nothing,
+    /// because floor-respecting compaction may already have reclaimed it.
+    /// This is NOT [`read_horizon`](Self::read_horizon): that is the MVCC
+    /// history depth (the memory provider reports its current revision for
+    /// it), whereas this is the garbage-collection reclaim floor.
+    ///
+    /// - Memory provider: `0`. It holds one live version per key and runs
+    ///   no floor-driven reclamation, so a live record — an idempotency
+    ///   identity among them — is present until overwritten or deleted;
+    ///   absence therefore always means "never written".
+    /// - Disk provider: the committed GC floor it was last handed.
+    ///
+    /// Used by `txn::interpret_lookup` to separate `DidNotHappen` from
+    /// `Indeterminate`.
+    fn reclaim_floor(&self) -> u64 {
+        0
+    }
+
     /// Point read of `key` as of `revision` (`0` = latest, and then
     /// byte-identical to [`get_live`](Self::get_live)). Expiry-filtered
     /// with the same rule as the latest path.
@@ -1202,6 +1222,7 @@ pub fn apply_mat_ctx<M: Materializer>(
         KV_OP_TXN_RESOLVE => apply_txn_resolve(store, body, out_body, now_ms),
         KV_OP_TXN_RECORD => apply_txn_record(store, body, out_body, now_ms),
         KV_OP_IDEMPOTENT => apply_idempotent(store, body, out_body, now_ms),
+        KV_OP_IDEMPOTENT_LOOKUP => apply_idempotent_lookup(store, body, out_body, now_ms),
         KV_OP_FLUSH => {
             if store.flush_all() {
                 (KV_RESULT_OK, 0)
@@ -2634,6 +2655,12 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
     /// floor it was last handed (§18 — the floor is trusted, never
     /// computed here).
     fn read_horizon(&self) -> u64 {
+        self.store.state.compaction_floor
+    }
+
+    /// The committed GC floor: below it, floor-respecting compaction may
+    /// have reclaimed a record, so its absence is `Indeterminate`.
+    fn reclaim_floor(&self) -> u64 {
         self.store.state.compaction_floor
     }
 
@@ -4539,7 +4566,7 @@ fn apply_txn_resolve<M: Materializer>(
 fn apply_txn_record<M: Materializer>(
     store: &mut M,
     body: &[u8],
-    _out: &mut [u8],
+    out: &mut [u8],
     now_ms: u64,
 ) -> (u8, usize) {
     let Some(incoming) = txn::TransactionRecord::decode(body) else {
@@ -4566,6 +4593,16 @@ fn apply_txn_record<M: Materializer>(
         // expiry sweep working from an old read, and a recovered
         // participant replaying an abort all arrive here and all bounce.
         if txn::validate_status_transition(prev.status, incoming.status).is_err() {
+            // Carry the EXISTING status back in the reply body. A refused
+            // reopening `Pending` write is how a restarted coordinator
+            // discovers a decision it made and then crashed mid-resolve;
+            // the status byte lets it RESUME resolution rather than
+            // conclude the outcome is unknown. A caller reading only the
+            // result code ignores the extra byte.
+            if let Some(slot) = out.first_mut() {
+                *slot = prev.status as u8;
+                return (KV_RESULT_CAS_FAILED, 1);
+            }
             return (KV_RESULT_CAS_FAILED, 0);
         }
         if !store.update_existing(rk, body) {
@@ -4653,4 +4690,51 @@ fn apply_idempotent<M: Materializer>(
         return (KV_RESULT_INTERNAL, 0);
     }
     (result, len)
+}
+
+/// `KV_OP_IDEMPOTENT_LOOKUP`: read an idempotency identity WITHOUT running
+/// anything. The rediscovery route §21 owes — a caller that lost its reply
+/// but kept its intent asks whether the mutation committed, and is told
+/// `Committed`/`DidNotHappen`/`Indeterminate` rather than made to re-submit
+/// the whole op to find out. Purely read-only; writes no record.
+fn apply_idempotent_lookup<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let mut off = 0usize;
+    let Some(id) = read_u64(body, &mut off) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let Some(identity_revision) = read_u64(body, &mut off) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    // A zero identity is not an identity — the same refusal the capture
+    // path makes, for the same reason (every unidentified caller would
+    // collapse onto one record).
+    if id == 0 {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+
+    let mut ik = [0u8; MAX_KEY_LEN];
+    let ik_len = idempotency_key_bytes(&mut ik, id);
+    let mut rbuf = [0u8; txn::IDEMPOTENCY_RECORD_WIRE_LEN];
+    let record = match store.get_live(&ik[..ik_len], now_ms, &mut rbuf) {
+        GetOutcome::Found { value_len, .. } => match txn::IdempotencyRecord::decode(&rbuf[..value_len])
+        {
+            Some(rec) => Some(rec),
+            None => return (KV_RESULT_INTERNAL, 0),
+        },
+        GetOutcome::Absent => None,
+        GetOutcome::TooBig | GetOutcome::Fault => return (KV_RESULT_INTERNAL, 0),
+    };
+
+    // The reclaim floor — NOT the read horizon — is what separates a
+    // truthful "did not happen" from the honest "I can no longer tell".
+    let outcome = txn::interpret_lookup(record.as_ref(), identity_revision, store.reclaim_floor());
+    match outcome.encode(out) {
+        Some(n) => (KV_RESULT_IDEMPOTENT_LOOKUP, n),
+        None => (KV_RESULT_INTERNAL, 0),
+    }
 }

@@ -1,10 +1,8 @@
-//! Cross-range transaction coordinator (RFC database foundation §13,
-//! Phase 5).
+//! Cross-range transaction coordinator (RFC database foundation §13).
 //!
-//! Drives ONE declared cross-range transaction through §13.2 against a
-//! live graph, using the decision machine in
-//! `modules/common/txn_coordinator.rs` and the participant ops added in
-//! Phase 5a:
+//! Drives a cross-range transaction through the §13.2 two-phase decision,
+//! using the decision machine in `modules/common/txn_coordinator.rs` and
+//! the participant ops:
 //!
 //! ```text
 //!   KV_OP_TXN_RECORD    write/advance the home record (the authority)
@@ -12,41 +10,37 @@
 //!   KV_OP_TXN_RESOLVE   make the staged writes real, or drop them
 //! ```
 //!
-//! Every send goes to a NAMED partition through `KV_OP_TARGETED`, the
-//! same door `range_supervisor` uses. That is the point: a cross-range
-//! transaction must address participants directly, because the routing
-//! map deliberately refuses to route one op to two ranges. Addressing
-//! by partition is exactly the capability that makes this module the
-//! only thing in the graph allowed to do so.
+//! Two modes select how the transaction arrives and how its participant
+//! ops reach their ranges:
 //!
-//! **The declaration model, and why.** The transaction is DECLARED in
-//! the graph config — two keys, two partitions, two values — and runs
-//! `start_delay_ms` after boot. It is not a client-facing transaction
-//! API. That is not a shortcut around the hard part; the hard part is
-//! the decision protocol, and the protocol is identical either way.
-//! What a declared transaction buys is that the whole of §13.2 becomes
-//! observable on a real graph with real Raft and real disk, using
-//! nothing but the existing clients to read the result — which is how
-//! every other phase in this project was proved. Accepting transactions
-//! from a connector is plumbing on top of a protocol that has to work
-//! first.
+//! - **Declared (`mode 1`)** — one transaction named in the graph config
+//!   (keys, partitions, values, read timestamp), run `start_delay_ms`
+//!   after boot. Participant ops are addressed to a NAMED partition
+//!   through `KV_OP_TARGETED`, the one door the routing map allows to
+//!   reach a chosen range, so the whole of §13.2 is observable on a real
+//!   graph with ordinary clients reading the result.
+//! - **Dynamic (`mode 2`)** — a transaction submitted at runtime by
+//!   `relational_executor` over `MSG_TXN_SUBMIT`: a `KV_OP_TXN` body the
+//!   router refused as single-range. The coordinator splits it into one
+//!   participant per row and drives §13.2 with NON-targeted participant
+//!   ops the router routes by key — so it needs no partition map — then
+//!   answers the outcome on `MSG_TXN_SUBMIT_RESULT`. One transaction runs
+//!   at a time; a second submit waits behind the first.
 //!
-//! **What this module does NOT do**, named rather than implied:
+//! **Resume.** A coordinator that replicated a decision and then crashed
+//! before resolving every intent rebuilds straight into resolution: its
+//! reopening `Pending` write is refused with the durable status, and it
+//! re-resolves under that decision (`Coordinator::resume_decided`) instead
+//! of reporting the outcome unknown.
 //!
-//! - It does not help — but a reader is no longer stranded. Helping
-//!   lives in `kv_request_router` (`maybe_start_help`): a
-//!   `KV_RESULT_TXN_PENDING` reply carries the txn id, and the router
-//!   reads the home record and resolves the intent under the decision
-//!   it finds there. What this module still does not do is RESUME: on
-//!   restart it constructs a new machine from its declaration rather
-//!   than discovering the durable home record of a transaction it left
-//!   in flight.
-//! - It runs one transaction, not a stream of them. The machine is
-//!   per-transaction and the module holds one.
-//! - It does not lease timestamps from `timestamp_allocator`; the
-//!   declared read timestamp is taken from config. `may_commit` still
-//!   refuses zero, so an unleased transaction cannot commit, but the
-//!   pairing proof `txn::timestamps_leased` offers is not yet wired.
+//! **Helping** lives in `kv_request_router` (`maybe_start_help`): a
+//! `KV_RESULT_TXN_PENDING` reply carries the txn id, and the router reads
+//! the home record and resolves the stranded intent under the decision it
+//! finds there.
+//!
+//! The read timestamp comes from the declaration or the submit, never from
+//! `timestamp_allocator`; `may_commit` refuses zero, so an unleased
+//! transaction cannot commit.
 
 #![no_std]
 #![allow(
@@ -83,8 +77,12 @@ use coord::{Coordinator, Participant, Phase, Step, TransactionRecord, TxnOutcome
 use types::{
     KV_OP_PUT, KV_OP_TARGETED, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE,
     KV_RESULT_CAS_FAILED, KV_RESULT_INTEGER, KV_RESULT_OK, PROTO_INTERNAL_LIFECYCLE,
+    TXN_CMP_MOD_EQUAL,
 };
-use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
+use wire::{
+    MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_TXN_SUBMIT, MSG_TXN_SUBMIT_RESULT, TXN_SUBMIT_ABORTED,
+    TXN_SUBMIT_COMMITTED, TXN_SUBMIT_ERROR,
+};
 
 /// Bound on a declared key or value. Small on purpose: this declares a
 /// transaction, not a payload.
@@ -132,9 +130,28 @@ struct CoordState {
     val: [[u8; OPERAND_MAX]; PARTICIPANTS],
     val_len: [u16; PARTICIPANTS],
 
+    // ── Dynamic mode (mode 2): cross-range txns submitted at runtime by
+    //    relational_executor over `submit_in`, answered on `result_out` ──
+    submit_in: i32,
+    result_out: i32,
+    /// True while a dynamic transaction is in flight, so its terminal
+    /// outcome is reported back to the submitter exactly once.
+    dyn_active: bool,
+    dyn_reported: bool,
+    dyn_client_corr: u64,
+    dyn_proto: u8,
+    dyn_conn: u8,
+    /// Monotonic id source for dynamic transactions (the config `txn_id`
+    /// is a single declared transaction; dynamic ones need distinct ids).
+    dyn_seq: u64,
+
     // ── Runtime ──────────────────────────────────────────────────────
     machine: Coordinator,
     state: u8,
+    /// True for a dynamic (mode 2) transaction: participant ops are sent
+    /// NON-targeted so the router routes each by key, and every prepare
+    /// carries the row's absence comparison (INSERT semantics).
+    dynamic: bool,
     boot_ms: u64,
     corr: u64,
     /// What the outstanding request was, so the reply can be
@@ -156,6 +173,15 @@ impl CoordState {
         self.kv_in = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
+        self.submit_in = -1;
+        self.result_out = -1;
+        self.dyn_active = false;
+        self.dyn_reported = false;
+        self.dyn_client_corr = 0;
+        self.dyn_proto = 0;
+        self.dyn_conn = 0;
+        self.dyn_seq = 0;
+        self.dynamic = false;
         self.mode = 0;
         self.start_delay_ms = 3_000;
         self.txn_id_lo = 0;
@@ -310,6 +336,41 @@ fn kv_send_targeted(s: &mut CoordState, partition: u16, inner_op: u8, inner_len:
     }
 }
 
+/// Send one PLAIN (non-targeted) KV request with `inner_len` bytes staged
+/// at `INNER_AT`, op `inner_op`. The router routes it by the op's OWN key
+/// — which is what a dynamic participant op needs, since the coordinator
+/// holds no map. The staged content is shifted down over the 3-byte
+/// TARGETED slot (`INNER_AT` = `BODY_AT + 3`) the helpers leave room for.
+fn kv_send_plain(s: &mut CoordState, inner_op: u8, inner_len: usize) -> bool {
+    s.corr = s.corr.wrapping_add(1).max(1);
+    let corr = s.corr;
+    const REQ_HEAD: usize = 18;
+    let at = wire::ENVELOPE_HDR;
+    if at + REQ_HEAD + inner_len > s.env.len() {
+        return false;
+    }
+    s.env.copy_within(INNER_AT..INNER_AT + inner_len, BODY_AT);
+    s.env[at..at + 8].copy_from_slice(&corr.to_le_bytes());
+    s.env[at + 8] = PROTO_INTERNAL_LIFECYCLE;
+    s.env[at + 9..at + 13].copy_from_slice(&0u32.to_le_bytes());
+    s.env[at + 13] = 0;
+    s.env[at + 14] = 0;
+    s.env[at + 15] = inner_op;
+    s.env[at + 16..at + 18].copy_from_slice(&(inner_len as u16).to_le_bytes());
+    // SAFETY: `syscalls` non-null (checked at init and each step).
+    unsafe {
+        let sys = s.syscalls;
+        !sys.is_null()
+            && write_envelope(
+                &*sys,
+                s.kv_out,
+                MSG_KV_REQUEST,
+                REQ_HEAD + inner_len,
+                &mut s.env,
+            )
+    }
+}
+
 /// Stage + send `KV_OP_TXN_RECORD` at `status` to the home partition.
 fn send_record(s: &mut CoordState, status: TxnStatus) -> bool {
     let mut rec = s.machine.record;
@@ -322,8 +383,13 @@ fn send_record(s: &mut CoordState, status: TxnStatus) -> bool {
         return false;
     }
     s.env[INNER_AT..INNER_AT + n].copy_from_slice(&buf[..n]);
-    let home = s.partition[0];
-    kv_send_targeted(s, home, KV_OP_TXN_RECORD, n)
+    if s.dynamic {
+        // The router routes a record by `[KS_TXN_RECORD || txn_id]`, so a
+        // plain send lands it on the right range with no map.
+        kv_send_plain(s, KV_OP_TXN_RECORD, n)
+    } else {
+        kv_send_targeted(s, s.partition[0], KV_OP_TXN_RECORD, n)
+    }
 }
 
 /// Stage + send `KV_OP_TXN_PREPARE` to participant `i`.
@@ -338,7 +404,10 @@ fn send_prepare(s: &mut CoordState, i: usize) -> bool {
     let vl = s.val_len[i] as usize;
     // PUT body: [klen:u16][key][vlen:u32][val][flags:u8][expiry:u64]
     let put_len = 2 + kl + 4 + vl + 1 + 8;
-    let need = 16 + 16 + 8 + 4 + 2 + 2 + 1 + 2 + put_len + 2;
+    // A dynamic (SQL INSERT) participant also carries a one-comparison
+    // absence check: [cmp_op:u8][klen:u16][key][witness:u64].
+    let cmp_len = if s.dynamic { 1 + 2 + kl + 8 } else { 0 };
+    let need = 16 + 16 + 8 + 4 + 2 + cmp_len + 2 + 1 + 2 + put_len + 2;
     if INNER_AT + need > s.env.len() {
         return false;
     }
@@ -356,11 +425,26 @@ fn send_prepare(s: &mut CoordState, i: usize) -> bool {
     p += 8;
     s.env[p..p + 4].copy_from_slice(&epoch.to_le_bytes());
     p += 4;
-    // cmp_count = 0. The comparisons a cross-range transaction needs
-    // are per-participant and this declared form has none; a
-    // participant with no comparisons votes on staging alone.
-    s.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
-    p += 2;
+    if s.dynamic {
+        // cmp_count = 1: the row's key MUST be absent (INSERT). A failed
+        // comparison is this participant's vote to abort, which is how a
+        // cross-range duplicate key is refused without writing half a row.
+        s.env[p..p + 2].copy_from_slice(&1u16.to_le_bytes());
+        p += 2;
+        s.env[p] = types::TXN_CMP_MOD_EQUAL;
+        p += 1;
+        s.env[p..p + 2].copy_from_slice(&(kl as u16).to_le_bytes());
+        p += 2;
+        s.env[p..p + kl].copy_from_slice(&s.key[i][..kl]);
+        p += kl;
+        s.env[p..p + 8].copy_from_slice(&0u64.to_le_bytes()); // witness 0 = absent
+        p += 8;
+    } else {
+        // cmp_count = 0. The declared form carries no comparisons; a
+        // participant with none votes on staging alone.
+        s.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
+        p += 2;
+    }
     // then_count = 1
     s.env[p..p + 2].copy_from_slice(&1u16.to_le_bytes());
     p += 2;
@@ -385,8 +469,13 @@ fn send_prepare(s: &mut CoordState, i: usize) -> bool {
     p += 2;
 
     let inner_len = p - INNER_AT;
-    let part = s.partition[i];
-    kv_send_targeted(s, part, KV_OP_TXN_PREPARE, inner_len)
+    if s.dynamic {
+        // Non-targeted: the router routes the prepare by its own key, so
+        // the coordinator needs no map to place it.
+        kv_send_plain(s, KV_OP_TXN_PREPARE, inner_len)
+    } else {
+        kv_send_targeted(s, s.partition[i], KV_OP_TXN_PREPARE, inner_len)
+    }
 }
 
 /// Stage + send `KV_OP_TXN_RESOLVE` to participant `i`.
@@ -420,8 +509,151 @@ fn send_resolve(s: &mut CoordState, i: usize, committed: bool) -> bool {
     p += kl;
 
     let inner_len = p - INNER_AT;
-    let part = s.partition[i];
-    kv_send_targeted(s, part, KV_OP_TXN_RESOLVE, inner_len)
+    if s.dynamic {
+        kv_send_plain(s, KV_OP_TXN_RESOLVE, inner_len)
+    } else {
+        kv_send_targeted(s, s.partition[i], KV_OP_TXN_RESOLVE, inner_len)
+    }
+}
+
+/// A read u16/u32/etc. helper over a cursor.
+fn take_u16(b: &[u8], p: &mut usize) -> Option<u16> {
+    let v = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?);
+    *p += 2;
+    Some(v)
+}
+
+/// Begin a dynamic (mode 2) cross-range transaction from a
+/// `MSG_TXN_SUBMIT` payload. Splits the forwarded `KV_OP_TXN` body into
+/// one participant per PUT (INSERT shape: `cmp_count == then_count`),
+/// builds the machine, and enters `S_RUNNING`. On any malformed or
+/// out-of-scope input it reports `TXN_SUBMIT_ERROR` and stays idle rather
+/// than staging half a transaction.
+fn start_dynamic_txn(s: &mut CoordState, payload: &[u8]) {
+    // Header: [client_corr:8][proto:1][conn:1][read_ts:8][body_len:2].
+    if payload.len() < 20 {
+        return;
+    }
+    s.dyn_client_corr = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
+    s.dyn_proto = payload[8];
+    s.dyn_conn = payload[9];
+    let read_ts = u64::from_le_bytes(payload[10..18].try_into().unwrap_or([0; 8]));
+    let body_len = u16::from_le_bytes(payload[18..20].try_into().unwrap_or([0; 2])) as usize;
+    s.dyn_reported = false;
+
+    let ok = (|| -> Option<()> {
+        let body = payload.get(20..20 + body_len)?;
+        let mut p = 0usize;
+        let cmp_count = take_u16(body, &mut p)? as usize;
+        // Skip the comparisons: [op:1][klen:2][key][witness:8]. The
+        // coordinator regenerates an absence comparison per participant,
+        // so it only needs the PUT key/val, but it must step past these.
+        for _ in 0..cmp_count {
+            let _op = *body.get(p)?;
+            p += 1;
+            let klen = take_u16(body, &mut p)? as usize;
+            p += klen + 8;
+        }
+        let then_count = take_u16(body, &mut p)? as usize;
+        // This driver handles the INSERT shape: one comparison and one PUT
+        // per row, at most `PARTICIPANTS` rows. A body with index entries
+        // (then_count > cmp_count) or more rows than participant ports is
+        // declined, not mis-split.
+        if then_count == 0 || then_count > PARTICIPANTS || then_count != cmp_count {
+            return None;
+        }
+        for i in 0..then_count {
+            let op = *body.get(p)?;
+            p += 1;
+            if op != KV_OP_PUT {
+                return None;
+            }
+            let put_len = take_u16(body, &mut p)? as usize;
+            let put_end = p + put_len;
+            let klen = take_u16(body, &mut p)? as usize;
+            let key = body.get(p..p + klen)?;
+            p += klen;
+            let vlen = u32::from_le_bytes(body.get(p..p + 4)?.try_into().ok()?) as usize;
+            p += 4;
+            let val = body.get(p..p + vlen)?;
+            if klen > OPERAND_MAX || vlen > OPERAND_MAX {
+                return None;
+            }
+            s.key[i][..klen].copy_from_slice(key);
+            s.key_len[i] = klen as u16;
+            s.val[i][..vlen].copy_from_slice(val);
+            s.val_len[i] = vlen as u16;
+            // A participant identity distinct per row, consistent with the
+            // record. Routing is by key (plain sends), so this need only
+            // be unique, not a real range id.
+            s.partition[i] = i as u16;
+            p = put_end; // past flags+expiry, whatever their exact width
+        }
+        // A fresh id per dynamic transaction.
+        s.dyn_seq = s.dyn_seq.wrapping_add(1);
+        s.txn_id_lo = 0x1000_0000_0000_0000u64.wrapping_add(s.dyn_seq);
+        let n = then_count;
+        let record = TransactionRecord::begin(txn_id(s), home_range(s), read_ts, 0, 1, 0, 0).ok()?;
+        let mut participants = [Participant {
+            range_id: [0; 16],
+            generation: 1,
+            prepared: false,
+        }; PARTICIPANTS];
+        for (i, part) in participants.iter_mut().enumerate().take(n) {
+            part.range_id = range_id(s.partition[i]);
+        }
+        let machine = Coordinator::begin(record, &participants[..n]).ok()?;
+        s.machine = machine;
+        Some(())
+    })();
+
+    if ok.is_some() {
+        s.dynamic = true;
+        s.dyn_active = true;
+        s.inflight = Step::Wait;
+        s.state = S_RUNNING;
+    } else {
+        // Malformed / out of scope: answer once, stay idle.
+        s.dyn_active = true; // so report runs, then clears it
+        report_dynamic_error(s);
+    }
+}
+
+/// Report a dynamic transaction's terminal outcome to the submitter and
+/// return to idle for the next one.
+fn report_dynamic_result(s: &mut CoordState) {
+    let outcome = match s.machine.outcome() {
+        Some(TxnOutcome::Committed) => TXN_SUBMIT_COMMITTED,
+        Some(TxnOutcome::Aborted) => TXN_SUBMIT_ABORTED,
+        _ => TXN_SUBMIT_ERROR,
+    };
+    emit_dynamic_result(s, outcome);
+}
+
+/// Report an immediate error (bad submit) without running a machine.
+fn report_dynamic_error(s: &mut CoordState) {
+    emit_dynamic_result(s, TXN_SUBMIT_ERROR);
+}
+
+fn emit_dynamic_result(s: &mut CoordState, outcome: u8) {
+    let at = wire::ENVELOPE_HDR;
+    if at + 11 <= s.env.len() {
+        s.env[at..at + 8].copy_from_slice(&s.dyn_client_corr.to_le_bytes());
+        s.env[at + 8] = s.dyn_proto;
+        s.env[at + 9] = s.dyn_conn;
+        s.env[at + 10] = outcome;
+        // SAFETY: `syscalls` non-null (checked each step).
+        unsafe {
+            let sys = s.syscalls;
+            if !sys.is_null() {
+                write_envelope(&*sys, s.result_out, MSG_TXN_SUBMIT_RESULT, 11, &mut s.env);
+            }
+        }
+    }
+    s.dyn_reported = true;
+    s.dyn_active = false;
+    s.dynamic = false;
+    s.state = S_IDLE;
 }
 
 /// Issue whatever the machine asks for next, one request at a time.
@@ -497,8 +729,10 @@ fn pump(s: &mut CoordState) {
     }
 }
 
-/// Interpret a reply to the outstanding request.
-fn on_kv_response(s: &mut CoordState, result: u8) {
+/// Interpret a reply to the outstanding request. `record_status` is the
+/// first response-body byte — meaningful only on a refused record write,
+/// where the store returns the EXISTING record's status.
+fn on_kv_response(s: &mut CoordState, result: u8, record_status: u8) {
     let step = s.inflight;
     s.inflight = Step::Wait;
     match step {
@@ -512,11 +746,36 @@ fn on_kv_response(s: &mut CoordState, result: u8) {
                     TxnStatus::Aborted => 4,
                 };
             } else if result == KV_RESULT_CAS_FAILED {
-                // The lattice refused the status move: another
-                // authority already decided this transaction. Not an
-                // abort — that authority may have committed.
-                s.machine.on_record_refused();
-                s.m_errors += 1;
+                // The lattice refused the status move: another authority
+                // already advanced this record. If THIS write was the
+                // reopening `Pending` (a restart) and the record is
+                // already DECIDED, the authority is a previous incarnation
+                // of THIS coordinator — resume resolution under the
+                // decision it durably made rather than concluding the
+                // outcome is unknown (the intents would otherwise wait for
+                // a router helper). Any other case is a genuine
+                // not-the-authority: stand down.
+                let resumed = if status == TxnStatus::Pending {
+                    match TxnStatus::from_u8(record_status) {
+                        Some(TxnStatus::Committed) => {
+                            s.machine.resume_decided(true);
+                            s.m_phase = 3;
+                            true
+                        }
+                        Some(TxnStatus::Aborted) => {
+                            s.machine.resume_decided(false);
+                            s.m_phase = 4;
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !resumed {
+                    s.machine.on_record_refused();
+                    s.m_errors += 1;
+                }
             } else {
                 s.m_errors += 1;
             }
@@ -596,6 +855,21 @@ pub extern "C" fn module_new(
     }
 
     if s.mode == 0 {
+        s.state = S_IDLE;
+        return 0;
+    }
+    if s.mode == 2 {
+        // Dynamic cross-range transactions from relational_executor. No
+        // declaration: sit idle until a `MSG_TXN_SUBMIT` arrives on
+        // `submit_in`, drive it, and answer on `result_out`.
+        // SAFETY: sys_ptr non-null, checked above.
+        unsafe {
+            s.submit_in = dev_channel_port(&*sys_ptr, 0, 1);
+            s.result_out = dev_channel_port(&*sys_ptr, 1, 2);
+        }
+        if s.submit_in < 0 || s.result_out < 0 {
+            return -1;
+        }
         s.state = S_IDLE;
         return 0;
     }
@@ -713,7 +987,27 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if msg == MSG_KV_RESPONSE && payload.len() >= 20 {
                 let corr = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
                 if corr == s.corr {
-                    on_kv_response(s, payload[9]);
+                    // First response-body byte, if any: on a refused
+                    // record write it carries the existing record's
+                    // status, which the RESUME path reads.
+                    let body_first = payload.get(20).copied().unwrap_or(0);
+                    on_kv_response(s, payload[9], body_first);
+                }
+            }
+        }
+    }
+
+    // Dynamic mode: accept one submitted cross-range transaction when
+    // idle. Serial by design — one transaction at a time, like the
+    // declared path; a second submit waits behind the first.
+    if s.mode == 2 && !s.dyn_active {
+        // SAFETY: sys_ptr non-null; `env` module-owned.
+        unsafe {
+            let sys = &*sys_ptr;
+            let mut env = [0u8; ENV_BUF];
+            if let Some((msg, payload)) = read_one_envelope(sys, s.submit_in, &mut env) {
+                if msg == MSG_TXN_SUBMIT {
+                    start_dynamic_txn(s, payload);
                 }
             }
         }
@@ -729,6 +1023,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             pump(s);
             if s.machine.phase() == Phase::Done {
                 pump(s);
+            }
+            // Dynamic transactions report their terminal outcome to the
+            // submitter once, then return to idle for the next one.
+            if s.dynamic && s.machine.phase() == Phase::Done && !s.dyn_reported {
+                report_dynamic_result(s);
             }
         }
         _ => {}

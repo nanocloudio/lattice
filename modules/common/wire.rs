@@ -159,6 +159,48 @@ pub const MSG_SQL_REQUEST: u8 = 0xC4;
 /// originating slot without a lookup, exactly as on the KV path.
 pub const MSG_SQL_RESPONSE: u8 = 0xC5;
 
+/// relational_executor → txn_coordinator: submit a cross-range write set
+/// for two-phase commit. The executor reaches this after the router
+/// refuses its single-range `KV_OP_TXN` with `KV_RESULT_CROSS_RANGE`. The
+/// executor forwards the SAME `KV_OP_TXN` body it built (a set of
+/// mod-revision comparisons and a set of PUTs); the coordinator splits it
+/// per row — one participant per (comparison, PUT) pair — and drives
+/// §13.2 with non-targeted participant ops the router routes by key, so
+/// the coordinator needs no partition map. It answers
+/// `MSG_TXN_SUBMIT_RESULT` with the outcome.
+///
+/// Payload: `[client_corr:u64 LE][proto:u8][conn:u8][read_ts:u64 LE]
+///           [txn_body_len:u16 LE][txn_body…]`, where `txn_body` is a
+/// `KV_OP_TXN` body: `[cmp_count:u16][cmps…][then_count:u16][puts…]
+/// [else_count:u16][elses…]`. The initial coordinator handles the
+/// INSERT shape — `cmp_count == then_count`, each comparison a
+/// `TXN_CMP_MOD_EQUAL` absence check paired by order with its PUT.
+pub const MSG_TXN_SUBMIT: u8 = 0xC6;
+
+/// txn_coordinator → relational_executor: the outcome of a submitted
+/// cross-range transaction. `client_corr`/`proto`/`conn` echo the submit
+/// so the executor finds the originating statement.
+/// Payload: `[client_corr:u64 LE][proto:u8][conn:u8][outcome:u8]`
+/// where outcome: 0 = committed, 1 = aborted (a comparison failed —
+/// duplicate key), 2 = error (fault; no decision reached).
+pub const MSG_TXN_SUBMIT_RESULT: u8 = 0xC7;
+
+/// Outcome bytes for `MSG_TXN_SUBMIT_RESULT`.
+pub const TXN_SUBMIT_COMMITTED: u8 = 0;
+pub const TXN_SUBMIT_ABORTED: u8 = 1;
+pub const TXN_SUBMIT_ERROR: u8 = 2;
+
+/// placement_advisor → range_supervisor: execute a split at
+/// `split_key` NOW. The advisor emits this only under an explicit
+/// `auto_execute` opt-in (§12.4: execution stays operator-gated — the
+/// operator both enables the automation and pre-declares the split key,
+/// so the recommender never invents a split point). It automates the
+/// *timing* (fire when load crosses the policy threshold), not the
+/// judgement of where to split. The supervisor honours it only when
+/// idle and configured to accept runtime commands (`op_kind = 4`).
+/// Payload: `[split_key_len:u16 LE][split_key…]`.
+pub const MSG_PLACEMENT_SPLIT_CMD: u8 = 0xCD;
+
 // ── Watch service (registry ↔ fanout ↔ anchor) ─────────────────────────
 
 /// Anchor → registry: create/cancel/resume control.
@@ -427,7 +469,8 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 // `modules/common/mvcc.rs`), 0xE5 applied position, 0xE8/0xE9 adapter
 // metrics. 0xEA..0xEF were free; three are allocated here, and
 // 0xED/0xEE carry the CDC pump↔sink frames (MSG_PUBLISH / MSG_ACK — see
-// the fluxor SDK contract `modules/sdk/contracts/exchange.rs`).
+// the fluxor SDK contract, source `modules/sdk/contracts/exchange.rs` in
+// the fluxor repo, `deps/fluxor/` in this checkout).
 //
 // Why these exist when MSG_RETENTION_FLOOR / MSG_COMPACTION_FLOOR
 // already do: those two are a purely LOCAL aggregation — a source
@@ -498,6 +541,7 @@ pub const MSG_GC_FLOOR_COMMITTED: u8 = 0xEB;
 //
 //   durability → worker : MSG_APP_SNAPSHOT_REQUEST (capture now)
 //   worker → durability : MSG_APP_SNAPSHOT_CHUNK   (encoded state)
+//   durability → worker : MSG_APP_SNAPSHOT_DURABLE (export now persisted)
 //   durability → worker : MSG_APP_SNAPSHOT_RESET   (discard state)
 //                              then MSG_APP_SNAPSHOT_CHUNK stream
 //
@@ -529,6 +573,18 @@ pub const MSG_APP_SNAPSHOT_REQUEST: u8 = 0x58;
 /// snapshot ahead of the app's apply position follows.
 /// Payload: `[term:u64 LE][last_included_index:u64 LE]`.
 pub const MSG_APP_SNAPSHOT_RESET: u8 = 0x59;
+
+/// durability → app: the exported snapshot at `last_included_index` is now
+/// DURABLE (body written crash-atomically AND its boot pointer persisted).
+/// Payload: `[term:u64 LE][last_included_index:u64 LE]`.
+///
+/// The acknowledgement a GC-snapshot-mode worker requires before it may
+/// advance `gc_snapshot_revision` past `last_included_index`: local export
+/// completion is NOT proof of durability, and a floor advanced onto a
+/// not-yet-durable snapshot is read back as `Compacted` after a crash
+/// (see `kv_store` replay). Leader-local, like the durable snapshot itself.
+/// Clustor-defined (0x5B); mirrored here verbatim, not renumbered.
+pub const MSG_APP_SNAPSHOT_DURABLE: u8 = 0x5B;
 
 /// `MSG_APP_SNAPSHOT_CHUNK` fixed header size; body follows.
 pub const APP_SNAPSHOT_HDR: usize = 28;

@@ -22,6 +22,14 @@ name = "kv_in"
 direction = "input"
 content_type = "OctetStream"
 
+# op_kind 4 only: MSG_PLACEMENT_SPLIT_CMD from placement_advisor (§12.4
+# opt-in automation). Input index 1; unwired (and the runtime-split path
+# inert) in the declared modes 0/1/2.
+[[ports]]
+name = "cmd_in"
+direction = "input"
+content_type = "OctetStream"
+
 # MSG_KV_REQUEST to kv_request_router.internal_lifecycle_in. The only
 # ingress allowed to carry KV_OP_TARGETED.
 [[ports]]

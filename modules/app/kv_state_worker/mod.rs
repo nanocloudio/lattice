@@ -106,8 +106,9 @@ use types::{
     KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_INTEGER, KV_RESULT_OK,
 };
 use wire::{
-    APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_REQUEST,
-    MSG_APP_SNAPSHOT_RESET, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_LEASE_TICK,
+    APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_DURABLE,
+    MSG_APP_SNAPSHOT_REQUEST, MSG_APP_SNAPSHOT_RESET, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED,
+    MSG_KV_COMMAND, MSG_LEASE_TICK,
     MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REQUEST,
     MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
 };
@@ -435,9 +436,17 @@ struct WorkerState {
     gc_floor_commits: u64,
     /// Retention claims published (manifest id 16).
     gc_claims_published: u64,
-    /// Engine revision at the last snapshot export — the tighter
-    /// active-read claim under `gc_claim_mode = snapshot`.
+    /// Engine revision certified DURABLE by the last acknowledged snapshot
+    /// — the tighter active-read claim under `gc_claim_mode = snapshot`.
+    /// Advanced only on `MSG_APP_SNAPSHOT_DURABLE`, never on local export.
     gc_snapshot_revision: u64,
+    /// The raft index a complete-but-not-yet-acknowledged export labeled,
+    /// and the engine revision it represents. Promoted into
+    /// `gc_snapshot_revision` when a durable ack at or past this index
+    /// arrives; a superseding export overwrites the pair. Zero index means
+    /// nothing awaits acknowledgement.
+    gc_snapshot_pending_index: u64,
+    gc_snapshot_pending_revision: u64,
     gc_claim_seq: u32,
     gc_claim_mode: u8,
     gc_claim_kpg: u16,
@@ -619,6 +628,8 @@ impl WorkerState {
         self.gc_floor_commits = 0;
         self.gc_claims_published = 0;
         self.gc_snapshot_revision = 0;
+        self.gc_snapshot_pending_index = 0;
+        self.gc_snapshot_pending_revision = 0;
         self.gc_claim_seq = 0;
         self.gc_claim_mode = GC_CLAIM_MODE_PIN;
         self.gc_claim_kpg = 0;
@@ -2830,6 +2841,22 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             worker.import_len = 0;
             worker.importing = true;
         }
+        MSG_APP_SNAPSHOT_DURABLE => {
+            // Durability certifies the snapshot at `index` is persisted
+            // (body written crash-atomically AND its boot pointer). Only
+            // now may the GC-snapshot claim advance. Promote the pending
+            // export iff this ack covers the position it was labelled with;
+            // a superseding export left a higher pending index and waits
+            // for its own ack, and an ack for a snapshot this worker never
+            // labelled (pending == 0) is ignored. Under-advancing is safe;
+            // over-advancing past a non-durable snapshot is the bug.
+            if worker.gc_snapshot_pending_index != 0
+                && index >= worker.gc_snapshot_pending_index
+            {
+                worker.gc_snapshot_revision = worker.gc_snapshot_pending_revision;
+                worker.gc_snapshot_pending_index = 0;
+            }
+        }
         MSG_APP_SNAPSHOT_CHUNK => {
             if !worker.importing || payload_len < APP_SNAPSHOT_HDR {
                 return;
@@ -3084,12 +3111,20 @@ unsafe fn emit_snapshot_chunks(worker: &mut WorkerState, sys: &SyscallTable) {
         sent += chunk;
         if done {
             // The engine revision this snapshot body represents. Under
-            // `gc_claim_mode = snapshot` this becomes the worker's
-            // active-read claim: nothing below it is needed to
-            // reconstruct the range from this snapshot plus the WAL
-            // tail. Recorded only on a COMPLETE stream — a partial one
-            // reconstructs nothing.
-            worker.gc_snapshot_revision = if worker.state_store == STATE_STORE_DISK {
+            // `gc_claim_mode = snapshot` this is the candidate active-read
+            // claim: nothing below it is needed to reconstruct the range
+            // from this snapshot plus the WAL tail. Recorded only on a
+            // COMPLETE stream — a partial one reconstructs nothing.
+            //
+            // It is held PENDING against `index` (the raft position this
+            // body is labelled with), NOT promoted into the live claim
+            // here: a completed export is not yet a DURABLE snapshot, and
+            // advancing the GC floor onto one a crash could lose lets WAL
+            // replay read compacted-away state. `MSG_APP_SNAPSHOT_DURABLE`
+            // from durability promotes it once the body and its boot
+            // pointer are persisted.
+            worker.gc_snapshot_pending_index = index;
+            worker.gc_snapshot_pending_revision = if worker.state_store == STATE_STORE_DISK {
                 worker.disk_revision
             } else {
                 worker.store.revision

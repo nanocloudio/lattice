@@ -1,9 +1,13 @@
 //! The CDC event envelope a `cdc_pump` publishes.
 //!
 //! This file owns the ENVELOPE and nothing else. The transport it rides —
-//! the `stream.ordered_ack` port pair — is a fluxor SDK contract
-//! (`modules/sdk/contracts/exchange.rs`), mounted and re-exported below so
-//! existing `cdc_wire::Publish` call sites keep resolving.
+//! the `stream.ordered_ack` port pair — is a fluxor SDK contract, NOT a
+//! lattice file: its source is `modules/sdk/contracts/exchange.rs` in the
+//! fluxor repo (`deps/fluxor/modules/sdk/contracts/exchange.rs` in this
+//! checkout), and PIC modules mount the built copy `fluxor build` vendors
+//! into `target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`. It is
+//! re-exported below so existing `cdc_wire::Publish` call sites keep
+//! resolving. Edits to the frame layout go to the fluxor SDK, never here.
 //!
 //! The surface moved because it was never a CDC concept: quantum implements
 //! it for MQTT, Kafka and AMQP, wave for HTTP, and the CDC RFC forbids
@@ -56,7 +60,8 @@
 //!
 //! # The sink contract
 //!
-//! Not defined here. See `modules/sdk/contracts/exchange.rs` for the
+//! Not defined here. See the fluxor SDK contract
+//! `modules/sdk/contracts/exchange.rs` (in `deps/fluxor/` here) for the
 //! authoritative port pair, the optional `reply_out` that makes the surface
 //! an exchange, the status vocabulary, and the size envelope
 //! (`PAYLOAD_MAX` and friends). A provider declares
@@ -284,9 +289,9 @@ pub fn sink_msg_key(table_id: u32, key: &[u8], out: &mut [u8]) -> Option<usize> 
 // ── The surface this envelope rides ───────────────────────────────────
 //
 // NOT DEFINED HERE, and deliberately not re-exported either. The
-// `stream.ordered_ack` frames live in the fluxor SDK
-// (`modules/sdk/contracts/exchange.rs`) and every consumer mounts them
-// DIRECTLY:
+// `stream.ordered_ack` frames live in the fluxor SDK — source
+// `modules/sdk/contracts/exchange.rs` in the fluxor repo (`deps/fluxor/`
+// here) — and every consumer mounts the built copy DIRECTLY:
 //
 //   #[path = "…/sdk/contracts/exchange.rs"]
 //   mod exchange;
