@@ -1,13 +1,21 @@
-//! CDC egress wire contracts — the event envelope a
-//! `cdc_pump` publishes and the `stream.sink.ordered_ack` port-pair
-//! contract a sink provider implements.
+//! The CDC event envelope a `cdc_pump` publishes.
 //!
-//! Dual-target facade: `#[path]`-mounted by the PIC modules
-//! (`cdc_pump`, `loopback_sink`, out-of-repo providers) and by the
-//! host conformance suite (`tests/harness/tests/contract_cdc_wire.rs`,
-//! plus the provider-repo conformance vectors). This file is the ONE
-//! place either layout lives; providers that hand-roll offsets have
-//! already failed conformance.
+//! This file owns the ENVELOPE and nothing else. The transport it rides —
+//! the `stream.ordered_ack` port pair — is a fluxor SDK contract
+//! (`modules/sdk/contracts/exchange.rs`), mounted and re-exported below so
+//! existing `cdc_wire::Publish` call sites keep resolving.
+//!
+//! The surface moved because it was never a CDC concept: quantum implements
+//! it for MQTT, Kafka and AMQP, wave for HTTP, and the CDC RFC forbids
+//! lattice depending on quantum — so a contract owned here was one those
+//! providers could not name. CDC is ONE producer of the surface, and the
+//! envelope below is one possible `payload`.
+//!
+//! Dual-target facade: `#[path]`-mounted by the PIC modules (`cdc_pump`,
+//! `loopback_sink`) and by the host conformance suite
+//! (`tests/harness/tests/contract_cdc_wire.rs`). This file is the ONE place
+//! the ENVELOPE layout lives; the frame layout lives in the SDK contract, and
+//! a provider that hand-rolls either has already failed conformance.
 //!
 //! # The envelope
 //!
@@ -33,7 +41,7 @@
 //!
 //! A `resolved` event carries `[frontier_ts:u64 LE]` as its 8-byte
 //! value with an empty key, and is published with
-//! [`SINK_FLAG_BROADCAST`] (the watermark must reach EVERY
+//! [`FLAG_BROADCAST`] (the watermark must reach EVERY
 //! ordering unit of the destination). `backfill_complete` and
 //! `topology` carry an empty key; `topology`'s value is
 //! provider-opaque notice bytes.
@@ -48,21 +56,22 @@
 //!
 //! # The sink contract
 //!
-//! Declared in a provider manifest as
-//! `capabilities = ["stream.sink.ordered_ack"]`. Port pair:
+//! Not defined here. See `modules/sdk/contracts/exchange.rs` for the
+//! authoritative port pair, the optional `reply_out` that makes the surface
+//! an exchange, the status vocabulary, and the size envelope
+//! (`PAYLOAD_MAX` and friends). A provider declares
+//! `capabilities = ["stream.ordered_ack"]` and the terms it offers as
+//! capability facts.
 //!
-//! ```text
-//! publish_in (input):  [corr:u64][flags:u8][msg_key_len:u16][msg_key…]
-//!                      [payload_len:u16][payload…]
-//! ack_out    (output): [corr:u64][status:u8]
-//! ```
+//! What follows is the CDC-specific reading of that surface — what a pump
+//! puts in a publish and what it does with an ack.
 //!
 //! `corr` is never 0 on a publish. Ack statuses: 0 = durably accepted
 //! by the backend at the strongest level its configuration offers;
 //! 1..=15 typed refusals; and two `corr = 0` LINK-STATE signals that
-//! are not replies: [`SINK_STATUS_LINK_DOWN`] (every unacked corr is
+//! are not replies: [`STATUS_LINK_DOWN`] (every unacked corr is
 //! now unknowable — the pump MUST re-publish all of them after the
-//! next LINK_UP) and [`SINK_STATUS_LINK_UP`]. Contract terms a
+//! next LINK_UP) and [`STATUS_LINK_UP`]. Contract terms a
 //! conforming provider must satisfy (the conformance vectors assert
 //! them): ack = durable acceptance; per-key order within a connection;
 //! no silent drops (every non-zero corr answered or invalidated by
@@ -83,7 +92,6 @@
 pub const CDC_ENVELOPE_FORMAT: u16 = 1;
 
 /// The capability string a conforming sink provider declares.
-pub const CAP_STREAM_SINK_ORDERED_ACK: &str = "stream.sink.ordered_ack";
 
 // ── Event kinds ───────────────────────────────────────────────────────
 
@@ -233,7 +241,7 @@ impl<'a> CdcEvent<'a> {
 }
 
 /// Build a `resolved` watermark event. Published with
-/// [`SINK_FLAG_BROADCAST`]; the frontier rides as the 8-byte value.
+/// [`FLAG_BROADCAST`]; the frontier rides as the 8-byte value.
 pub fn resolved_event(feed_id: u64, frontier_ts: u64, scratch: &mut [u8; 8]) -> CdcEvent<'_> {
     *scratch = frontier_ts.to_le_bytes();
     CdcEvent {
@@ -273,158 +281,23 @@ pub fn sink_msg_key(table_id: u32, key: &[u8], out: &mut [u8]) -> Option<usize> 
     Some(need)
 }
 
-// ── stream.sink.ordered_ack port frames ─────────────────────────
-
-/// Publish flags.
-pub const SINK_FLAG_BROADCAST: u8 = 0x01;
-
-/// Ack statuses. `0` = durably accepted; `1..=15` typed refusals;
-/// `16`/`17` link-state signals carried with `corr = 0`.
-pub const SINK_STATUS_OK: u8 = 0;
-pub const SINK_REFUSE_OVERSIZE: u8 = 1;
-pub const SINK_REFUSE_UNROUTABLE: u8 = 2;
-/// Connection lost: every corr issued and not yet acked is now
-/// unknowable; the pump MUST re-publish all of them after LINK_UP.
-pub const SINK_STATUS_LINK_DOWN: u8 = 16;
-/// (Re)connected and writable.
-pub const SINK_STATUS_LINK_UP: u8 = 17;
-
-/// A publish frame on `publish_in`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SinkPublish<'a> {
-    /// Correlation id; never 0.
-    pub corr: u64,
-    pub flags: u8,
-    pub msg_key: &'a [u8],
-    pub payload: &'a [u8],
-}
-
-/// Fixed publish-frame overhead: corr(8)+flags(1)+klen(2)+plen(2).
-pub const SINK_PUBLISH_OVERHEAD: usize = 8 + 1 + 2 + 2;
-/// Worst-case publish frame (message key = table id + max key).
-pub const SINK_PUBLISH_MAX: usize = SINK_PUBLISH_OVERHEAD + 4 + CDC_MAX_KEY_LEN + CDC_ENVELOPE_MAX;
-
-impl<'a> SinkPublish<'a> {
-    pub fn wire_len(&self) -> usize {
-        SINK_PUBLISH_OVERHEAD + self.msg_key.len() + self.payload.len()
-    }
-
-    /// Encode. `None` on a zero corr, an over-length field, or a
-    /// too-small buffer.
-    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
-        if self.corr == 0
-            || self.msg_key.len() > u16::MAX as usize
-            || self.payload.len() > u16::MAX as usize
-        {
-            return None;
-        }
-        let need = self.wire_len();
-        if out.len() < need {
-            return None;
-        }
-        let mut p = 0usize;
-        out[p..p + 8].copy_from_slice(&self.corr.to_le_bytes());
-        p += 8;
-        out[p] = self.flags;
-        p += 1;
-        out[p..p + 2].copy_from_slice(&(self.msg_key.len() as u16).to_le_bytes());
-        p += 2;
-        out[p..p + 2].copy_from_slice(&(self.payload.len() as u16).to_le_bytes());
-        p += 2;
-        out[p..p + self.msg_key.len()].copy_from_slice(self.msg_key);
-        p += self.msg_key.len();
-        out[p..p + self.payload.len()].copy_from_slice(self.payload);
-        p += self.payload.len();
-        Some(p)
-    }
-
-    pub fn decode(src: &'a [u8]) -> Option<Self> {
-        if src.len() < SINK_PUBLISH_OVERHEAD {
-            return None;
-        }
-        let corr = u64::from_le_bytes(src[0..8].try_into().ok()?);
-        if corr == 0 {
-            return None;
-        }
-        let flags = src[8];
-        let klen = u16::from_le_bytes([src[9], src[10]]) as usize;
-        let plen = u16::from_le_bytes([src[11], src[12]]) as usize;
-        let p = SINK_PUBLISH_OVERHEAD;
-        let msg_key = src.get(p..p + klen)?;
-        let payload = src.get(p + klen..p + klen + plen)?;
-        if p + klen + plen != src.len() {
-            return None;
-        }
-        Some(Self {
-            corr,
-            flags,
-            msg_key,
-            payload,
-        })
-    }
-}
-
-/// An ack (or link-state) frame on `ack_out`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SinkAck {
-    /// `0` = link-state signal, otherwise the answered publish.
-    pub corr: u64,
-    pub status: u8,
-}
-
-pub const SINK_ACK_WIRE_LEN: usize = 9;
-
-impl SinkAck {
-    /// A per-publish reply. Refuses the reserved link-state statuses —
-    /// those never answer a corr.
-    pub fn reply(corr: u64, status: u8) -> Option<Self> {
-        if corr == 0 || status >= SINK_STATUS_LINK_DOWN {
-            return None;
-        }
-        Some(Self { corr, status })
-    }
-
-    /// A link-state signal (corr 0).
-    pub fn link(status: u8) -> Option<Self> {
-        if status != SINK_STATUS_LINK_DOWN && status != SINK_STATUS_LINK_UP {
-            return None;
-        }
-        Some(Self { corr: 0, status })
-    }
-
-    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < SINK_ACK_WIRE_LEN {
-            return None;
-        }
-        out[0..8].copy_from_slice(&self.corr.to_le_bytes());
-        out[8] = self.status;
-        Some(SINK_ACK_WIRE_LEN)
-    }
-
-    pub fn decode(src: &[u8]) -> Option<Self> {
-        if src.len() != SINK_ACK_WIRE_LEN {
-            return None;
-        }
-        Some(Self {
-            corr: u64::from_le_bytes(src[0..8].try_into().ok()?),
-            status: src[8],
-        })
-    }
-
-    /// Is this a link-state signal rather than a reply?
-    pub fn is_link_state(&self) -> bool {
-        self.corr == 0
-    }
-}
-
-// ── Channel message types ─────────────────────────────────────────────
+// ── The surface this envelope rides ───────────────────────────────────
 //
-// The pump↔sink pair rides the standard 3-byte envelope
-// (`[msg_type:u8][len:u16 LE]`). These live in lattice's 0xC0..0xEF
-// band; providers in other repos inline the two byte values (the
-// pattern the bridge uses for mvcc constants).
-
-/// A `SinkPublish` frame, pump → sink.
-pub const MSG_CDC_PUBLISH: u8 = 0xED;
-/// A `SinkAck` frame, sink → pump.
-pub const MSG_CDC_ACK: u8 = 0xEE;
+// NOT DEFINED HERE, and deliberately not re-exported either. The
+// `stream.ordered_ack` frames live in the fluxor SDK
+// (`modules/sdk/contracts/exchange.rs`) and every consumer mounts them
+// DIRECTLY:
+//
+//   #[path = "…/sdk/contracts/exchange.rs"]
+//   mod exchange;
+//
+// An earlier version re-exported them from here so call sites would not have
+// to change when the contract moved. That worked, but it left two paths to
+// one set of types — `cdc_wire::Publish` and `exchange::Publish` — and a
+// lattice-flavoured alias (`MSG_CDC_ACK` for `MSG_ACK`) that made a portable
+// contract look like a CDC one. Both are gone: this file owns the ENVELOPE,
+// the SDK owns the FRAME, and nothing owns both.
+//
+// `PUBLISH_FRAME_MAX` from the contract is the worst-case frame; there is no
+// CDC-specific ceiling to state, because the envelope is bounded by the
+// payload the contract already sizes.

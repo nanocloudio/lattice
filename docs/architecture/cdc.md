@@ -37,7 +37,7 @@ broadcast to every ordering unit: a consumer that has seen
 ## The sink contract
 
 Events leave the graph as `SinkPublish` frames on a channel to any
-module declaring the `stream.sink.ordered_ack` capability. The sink
+module declaring the `stream.ordered_ack` capability. The sink
 answers each frame with a `SinkAck`: status 0 means durably
 accepted, non-zero statuses are typed refusals, and correlation 0
 carries link-down/link-up signals that force republication of every

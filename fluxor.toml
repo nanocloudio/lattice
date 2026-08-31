@@ -25,7 +25,7 @@ fluxor  = "0.0.1"
 wave   = "0.0.1"
 clustor = "0.0.1"
 # The bare-metal CDC composition (configs/bare-metal-pi5-cdc.yaml)
-# consumes quantum's mqtt_sink as its `stream.sink.ordered_ack` provider.
+# consumes quantum's mqtt_sink as its `stream.ordered_ack` provider.
 quantum = "0.0.1"
 
 [ci]

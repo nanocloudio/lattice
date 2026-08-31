@@ -1,4 +1,4 @@
-//! loopback_sink — reference `stream.sink.ordered_ack` provider. See
+//! loopback_sink — reference `stream.ordered_ack` provider. See
 //! manifest.toml for the contract stance; the wire layouts and
 //! contract text live in `modules/common/cdc_wire.rs`.
 //!
@@ -31,20 +31,26 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/cdc_wire.rs"]
 mod cdc_wire;
 
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
+mod exchange;
+
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
 use cdc_wire::{
-    resolved_frontier, CdcEvent, SinkAck, SinkPublish, CDC_FLAG_BACKFILL, CDC_KIND_DELETE,
-    CDC_KIND_PUT, CDC_KIND_RESOLVED, MSG_CDC_ACK, MSG_CDC_PUBLISH, SINK_REFUSE_UNROUTABLE,
-    SINK_STATUS_LINK_DOWN, SINK_STATUS_LINK_UP, SINK_STATUS_OK,
+    resolved_frontier, CdcEvent, CDC_FLAG_BACKFILL, CDC_KIND_DELETE, CDC_KIND_PUT,
+    CDC_KIND_RESOLVED,
+};
+use exchange::{
+    Ack, Publish, MSG_ACK, MSG_PUBLISH, REFUSE_UNROUTABLE, STATUS_LINK_DOWN, STATUS_LINK_UP,
+    STATUS_OK,
 };
 
 /// Publishes consumed per step — bounded, never a drain-until-empty.
 const PER_STEP_BUDGET: u32 = 8;
 
 /// Scratch: one worst-case publish frame plus envelope headroom.
-const SCRATCH: usize = cdc_wire::SINK_PUBLISH_MAX + 16;
+const SCRATCH: usize = exchange::PUBLISH_FRAME_MAX + 16;
 
 const EMIT_EVERY: u64 = 5000;
 
@@ -160,10 +166,10 @@ unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Op
     Some((mt, len))
 }
 
-unsafe fn send_ack(s: &mut SinkState, sys: &SyscallTable, ack: SinkAck) -> bool {
-    let mut buf = [0u8; 3 + cdc_wire::SINK_ACK_WIRE_LEN];
-    buf[0] = MSG_CDC_ACK;
-    buf[1] = cdc_wire::SINK_ACK_WIRE_LEN as u8;
+unsafe fn send_ack(s: &mut SinkState, sys: &SyscallTable, ack: Ack) -> bool {
+    let mut buf = [0u8; 3 + exchange::ACK_WIRE_LEN];
+    buf[0] = MSG_ACK;
+    buf[1] = exchange::ACK_WIRE_LEN as u8;
     buf[2] = 0;
     if ack.encode(&mut buf[3..]).is_none() {
         return false;
@@ -210,7 +216,7 @@ fn put_dec(buf: &mut [u8], at: usize, v: u64) -> usize {
 /// lapse-relatch legitimately re-delivers old timestamps under the
 /// `CDC_FLAG_BACKFILL` flag). A violation is counted AND logged so the
 /// live suite can assert its absence from the boot log alone.
-unsafe fn check_envelope(s: &mut SinkState, sys: &SyscallTable, publ: &SinkPublish<'_>) {
+unsafe fn check_envelope(s: &mut SinkState, sys: &SyscallTable, publ: &Publish<'_>) {
     let Some(ev) = CdcEvent::decode(publ.payload) else {
         // Not a CDC envelope — the port contract is generic ordered
         // ack, so opaque payloads pass through unchecked.
@@ -317,8 +323,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.down_steps_left > 0 {
             s.down_steps_left -= 1;
         }
-        if s.down_steps_left == 0
-            && unsafe { send_ack(s, sys, SinkAck::link(SINK_STATUS_LINK_UP).unwrap()) }
+        if s.down_steps_left == 0 && unsafe { send_ack(s, sys, Ack::link(STATUS_LINK_UP).unwrap()) }
         {
             s.link_up = true;
             unsafe {
@@ -335,7 +340,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let Some((mt, len)) = (unsafe { read_envelope(sys, s.publish_in, &mut scratch) }) else {
             break;
         };
-        if mt != MSG_CDC_PUBLISH {
+        if mt != MSG_PUBLISH {
             continue;
         }
         if !s.link_up {
@@ -345,7 +350,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.m_dropped_down = s.m_dropped_down.wrapping_add(1);
             continue;
         }
-        let Some(publ) = SinkPublish::decode(&scratch[..len]) else {
+        let Some(publ) = Publish::decode(&scratch[..len]) else {
             // Malformed frame with no recoverable corr — count it;
             // there is nothing addressable to refuse.
             s.m_refused = s.m_refused.wrapping_add(1);
@@ -353,13 +358,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         };
         if publ.msg_key.is_empty() {
             // No routing key: typed refusal, never a silent drop.
-            if unsafe {
-                send_ack(
-                    s,
-                    sys,
-                    SinkAck::reply(publ.corr, SINK_REFUSE_UNROUTABLE).unwrap(),
-                )
-            } {
+            if unsafe { send_ack(s, sys, Ack::reply(publ.corr, REFUSE_UNROUTABLE).unwrap()) } {
                 s.m_refused = s.m_refused.wrapping_add(1);
             }
             continue;
@@ -370,7 +369,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.m_bytes = s.m_bytes.wrapping_add(publ.payload.len() as u64);
         s.m_key_hash = fnv_fold(fnv_fold(s.m_key_hash, publ.msg_key), publ.payload);
         unsafe { check_envelope(s, sys, &publ) };
-        if unsafe { send_ack(s, sys, SinkAck::reply(publ.corr, SINK_STATUS_OK).unwrap()) } {
+        if unsafe { send_ack(s, sys, Ack::reply(publ.corr, STATUS_OK).unwrap()) } {
             s.m_acked = s.m_acked.wrapping_add(1);
             // Scripted outage AFTER acking: every corr the pump has in
             // flight beyond this point becomes unknowable.
@@ -378,7 +377,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.acks_since_down += 1;
                 if s.acks_since_down >= s.linkdown_every {
                     s.acks_since_down = 0;
-                    if unsafe { send_ack(s, sys, SinkAck::link(SINK_STATUS_LINK_DOWN).unwrap()) } {
+                    if unsafe { send_ack(s, sys, Ack::link(STATUS_LINK_DOWN).unwrap()) } {
                         s.link_up = false;
                         s.down_steps_left = s.linkdown_hold_steps.max(1);
                         s.m_linkdowns = s.m_linkdowns.wrapping_add(1);

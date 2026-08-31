@@ -15,8 +15,8 @@
 //! `KV_OP_SNAPSHOT_VERSIONS`, and checkpoints with `KV_OP_GET` /
 //! `KV_OP_PUT` / `KV_OP_CAS` — the same surface any external feed
 //! consumer sees, with no privileged read path. Events leave as
-//! `cdc_wire::CdcEvent` envelopes wrapped in `SinkPublish` frames; the
-//! sink answers with `SinkAck`s, and the DURABLE checkpoint advances
+//! `cdc_wire::CdcEvent` envelopes wrapped in `Publish` frames; the
+//! sink answers with `Ack`s, and the DURABLE checkpoint advances
 //! only past the contiguous acknowledged prefix.
 
 #![no_std]
@@ -49,7 +49,7 @@ mod hex_core;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
-use cdc_feed::cdc_wire::{SinkAck, MSG_CDC_ACK};
+use cdc_feed::exchange::{Ack, MSG_ACK};
 use cdc_feed::wire::{FenceTail, MSG_KV_RESPONSE};
 use cdc_feed::{FeedCore, FeedIo, KEY_MAX, SCRATCH};
 
@@ -308,10 +308,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let Some((mt, len)) = (unsafe { read_envelope(sys, s.ack_in, &mut buf) }) else {
             break;
         };
-        if mt != MSG_CDC_ACK {
+        if mt != MSG_ACK {
             continue;
         }
-        let Some(ack) = SinkAck::decode(&buf[..len]) else {
+        let Some(ack) = Ack::decode(&buf[..len]) else {
             continue;
         };
         s.core.on_sink_ack(&mut io, &ack);

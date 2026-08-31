@@ -6,7 +6,7 @@ hardware_targets = ["bcm2712"]
 # The egress pump. Reads committed change-feed windows from the KV
 # surface (an ordinary anchor-pair client — no privileged read path),
 # translates versions into the versioned CDC envelope
-# (modules/common/cdc_wire.rs), publishes to a `stream.sink.ordered_ack`
+# (modules/common/cdc_wire.rs), publishes to a `stream.ordered_ack`
 # provider, and checkpoints past the contiguous acknowledged prefix
 # through the normal KV path (the generation-pointer protocol).
 #
@@ -51,8 +51,13 @@ name = "publish_out"
 index = 1
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 32768
-max_record = 8192
+# The consumer half of the capability registry: whatever this edge is wired
+# to must declare it provides the surface. A module-level requirement would
+# only ask whether SOME module in the graph declares it — this asks the peer
+# on this wire, which is what the requirement actually means.
+requires_capability = "stream.ordered_ack"
+buffer_size = 34868
+max_record = 8717
 
 # MSG_RETENTION_CLAIM to compaction_coordinator (GC budget).
 [[ports]]
@@ -87,3 +92,8 @@ metrics = [
     "cursor_revision",
     "frontier",
 ]
+
+# What this pump SENDS, against what a sink's backend TAKES. Fact against
+# fact: `max_record` above frames a whole record, this is the payload alone.
+[capability_facts."stream.ordered_ack"]
+max_payload = 8192

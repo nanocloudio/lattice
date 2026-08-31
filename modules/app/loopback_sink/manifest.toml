@@ -4,7 +4,7 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # The in-repo REFERENCE implementation of the
-# `stream.sink.ordered_ack` capability (modules/common/cdc_wire.rs),
+# `stream.ordered_ack` capability (modules/common/cdc_wire.rs),
 # and the sink lattice's own CI runs the cdc_pump against so no gate
 # needs a broker. The "backend" is the module itself: a publish is
 # durably accepted the moment it is validated, and acked status 0 in
@@ -19,7 +19,7 @@ hardware_targets = ["bcm2712"]
 # they were already invalidated by the LINK_DOWN, which is exactly the
 # hole the replay rule exists to cover.
 
-capabilities = ["stream.sink.ordered_ack"]
+capabilities = ["stream.ordered_ack.sink"]
 
 # MSG_CDC_PUBLISH `SinkPublish` frames from the pump.
 [[ports]]

@@ -90,6 +90,12 @@ pub mod wire;
 #[path = "cdc_wire.rs"]
 pub mod cdc_wire;
 
+// The single mount of the SDK contract for this tree. Consumers that mount
+// `cdc_feed` reach it as `cdc_feed::exchange` rather than mounting the file a
+// second time, which rustc would treat as an unrelated module.
+#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
+pub mod exchange;
+
 #[path = "db_ops.rs"]
 pub mod db_ops;
 
@@ -97,11 +103,12 @@ pub mod db_ops;
 pub mod compaction_floor;
 
 use cdc_wire::{
-    resolved_event, sink_msg_key, CdcEvent, SinkAck, SinkPublish, CDC_FLAG_BACKFILL,
-    CDC_KIND_DELETE, CDC_KIND_PUT, MSG_CDC_PUBLISH, SINK_FLAG_BROADCAST, SINK_STATUS_LINK_DOWN,
-    SINK_STATUS_LINK_UP, SINK_STATUS_OK,
+    resolved_event, sink_msg_key, CdcEvent, CDC_FLAG_BACKFILL, CDC_KIND_DELETE, CDC_KIND_PUT,
 };
 use compaction_floor::{RetentionClaim, CLAIM_SOURCE_WATCH, GC_CLAIM_WIRE_LEN};
+use exchange::{
+    Ack, Publish, FLAG_BROADCAST, MSG_PUBLISH, STATUS_LINK_DOWN, STATUS_LINK_UP, STATUS_OK,
+};
 use types::{
     KV_OP_CAS, KV_OP_GET, KV_OP_PUT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS,
     KV_RESULT_CAS_FAILED, KV_RESULT_COMPACTED, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
@@ -119,7 +126,7 @@ pub trait FeedIo {
     /// slice is `&mut` because the kernel channel-write ABI takes a
     /// mutable pointer; implementations must not actually mutate it.
     fn send_kv(&mut self, frame: &mut [u8]) -> bool;
-    /// Ship a `MSG_CDC_PUBLISH` frame toward the sink.
+    /// Ship a `MSG_PUBLISH` frame toward the sink.
     fn ship(&mut self, frame: &mut [u8]) -> bool;
     /// Ship a `MSG_RETENTION_CLAIM` frame toward the GC coordinator.
     fn send_claim(&mut self, frame: &mut [u8]) -> bool;
@@ -201,7 +208,7 @@ pub struct Unacked {
     pub len: u16,
     pub acked: bool,
     pub refused: bool,
-    pub frame: [u8; cdc_wire::SINK_PUBLISH_MAX],
+    pub frame: [u8; exchange::PUBLISH_FRAME_MAX],
 }
 
 /// The whole feed machine. The module shell owns one inside its state
@@ -399,7 +406,7 @@ impl FeedCore {
                 len: 0,
                 acked: false,
                 refused: false,
-                frame: [0; cdc_wire::SINK_PUBLISH_MAX],
+                frame: [0; exchange::PUBLISH_FRAME_MAX],
             };
             i += 1;
         }
@@ -564,9 +571,9 @@ impl FeedCore {
             Some(n) => n,
             None => return false,
         };
-        let publ = SinkPublish {
+        let publ = Publish {
             corr,
-            flags: if broadcast { SINK_FLAG_BROADCAST } else { 0 },
+            flags: if broadcast { FLAG_BROADCAST } else { 0 },
             msg_key: &mkey[..mklen],
             payload: &payload[..plen],
         };
@@ -599,8 +606,8 @@ impl FeedCore {
 
     fn ship_frame(&mut self, io: &mut impl FeedIo, slot: usize, len: usize) -> bool {
         let total = 3 + len;
-        let mut buf = [0u8; 3 + cdc_wire::SINK_PUBLISH_MAX];
-        buf[0] = MSG_CDC_PUBLISH;
+        let mut buf = [0u8; 3 + exchange::PUBLISH_FRAME_MAX];
+        buf[0] = MSG_PUBLISH;
         buf[1] = (len & 0xFF) as u8;
         buf[2] = ((len >> 8) & 0xFF) as u8;
         buf[3..total].copy_from_slice(&self.ring[slot].frame[..len]);
@@ -632,13 +639,13 @@ impl FeedCore {
     /// Fold one sink frame in: link-state signals drive the replay
     /// contract, replies advance the contiguous acked prefix and the
     /// checkpoint candidate.
-    pub fn on_sink_ack(&mut self, io: &mut impl FeedIo, ack: &SinkAck) {
+    pub fn on_sink_ack(&mut self, io: &mut impl FeedIo, ack: &Ack) {
         if ack.is_link_state() {
             match ack.status {
-                SINK_STATUS_LINK_DOWN => {
+                STATUS_LINK_DOWN => {
                     self.link_up = false;
                 }
-                SINK_STATUS_LINK_UP => {
+                STATUS_LINK_UP => {
                     let was_up = self.link_up;
                     self.link_up = true;
                     if !was_up {
@@ -654,7 +661,7 @@ impl FeedCore {
         while i != self.ring_head {
             let slot = (i as usize) % UNACKED_CAP;
             if self.ring[slot].corr == ack.corr {
-                if ack.status == SINK_STATUS_OK {
+                if ack.status == STATUS_OK {
                     self.ring[slot].acked = true;
                     self.m_acked = self.m_acked.wrapping_add(1);
                     self.acked_since_ck = self.acked_since_ck.wrapping_add(1);

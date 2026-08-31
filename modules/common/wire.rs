@@ -426,8 +426,8 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 // 0xE3/0xE4/0xE6/0xE7 timestamp-allocator lease traffic (see
 // `modules/common/mvcc.rs`), 0xE5 applied position, 0xE8/0xE9 adapter
 // metrics. 0xEA..0xEF were free; three are allocated here, and
-// 0xED/0xEE carry the CDC pump↔sink frames (MSG_CDC_PUBLISH /
-// MSG_CDC_ACK — see `modules/common/cdc_wire.rs`).
+// 0xED/0xEE carry the CDC pump↔sink frames (MSG_PUBLISH / MSG_ACK — see
+// the fluxor SDK contract `modules/sdk/contracts/exchange.rs`).
 //
 // Why these exist when MSG_RETENTION_FLOOR / MSG_COMPACTION_FLOOR
 // already do: those two are a purely LOCAL aggregation — a source

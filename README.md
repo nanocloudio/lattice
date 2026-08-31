@@ -105,7 +105,7 @@ What is not implemented is listed under
 The `cdc_pump` module streams committed changes out of a running
 graph: it reads change windows through the ordinary router path,
 emits one event per change to any sink module declaring the
-`stream.sink.ordered_ack` capability, and advances a durable
+`stream.ordered_ack` capability, and advances a durable
 checkpoint only past the contiguous acknowledged prefix, so delivery
 is at-least-once and survives sink outages. The in-repo reference
 sink is `loopback_sink`; MQTT delivery lives in quantum. See
