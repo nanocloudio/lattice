@@ -52,7 +52,8 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 | Partition-map key bound | Shape | `MAX_KEY_BOUND_LEN` | modules/common/partition_map.rs | 256 | Rejects an unrepresentable range boundary. |
 | Replicas in placement | Topology | `MAX_REPLICAS` | modules/common/partition_map.rs | 5 | Rejects/clamps larger placement; also below Clustor's seven-node identifier envelope. |
 | Ranges in a partition map | Topology | `MAX_RANGES` | modules/common/partition_map.rs | 64 | Rejects an overfull map. Scale beyond it by composing partition groups/maps, not by adding replicas to one group. |
-| Partition ports on one request router | Topology | `MAX_PARTITION_PORTS` | modules/app/kv_request_router/mod.rs | 2 | Map load refuses any binding to port 2 or above. This is the immediate obstacle to one router spanning many groups. |
+| Partition ports on one request router | Topology | `MAX_PARTITION_PORTS` | modules/app/kv_request_router/mod.rs | 2 | Map load refuses any binding to port 2 or above. With `partition_fanout` enabled, keyed traffic for partitions beyond 0 shares one tagged port and `partition_demux` fans it out, so the keyed-path ceiling becomes the demux's; targeted lifecycle operations still address the direct ports and keep this bound. |
+| Local partitions behind one demux | Topology | `MAX_LOCAL_PARTITIONS` | modules/app/partition_demux/mod.rs | 8 | A frame tagged at or above the configured partition count is dropped and counted; its port is not wired. |
 | Concurrent routed requests | Capacity | `MAX_INFLIGHT` | modules/app/kv_request_router/mod.rs | 256 | Rejects busy; caller retries. |
 | Linearizable-read slots | Semantic | `LIN_READ_SLOTS` | modules/app/kv_request_router/mod.rs | 32 | Current code falls back to the snapshot path when full. That silently weakens a requested guarantee and should be changed to backpressure or explicit failure before claiming strict linearizability under load. |
 | Linearizable-read response bytes | Shape | `LIN_READ_BUF` | modules/app/kv_request_router/mod.rs | 300 | Oversize read state cannot use the linearizable fast path. |
@@ -63,6 +64,13 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 | Tracked ranges for router metrics | Observability | `MAX_TRACKED_RANGES` | modules/app/kv_request_router/mod.rs | 8 | Additional ranges still route but lose per-range telemetry; this is not a data-plane topology limit. |
 | Hot-key telemetry slots | Observability | `HOT_KEY_SLOTS` | modules/app/kv_request_router/mod.rs | 4 | Evicts/aggregates observations; requests are unaffected. |
 | Lifecycle ranges per operation | Shape | `MAX_LIFECYCLE_RANGES` | modules/common/range_lifecycle.rs | 2 | Bounds split/merge lifecycle payloads; larger changes must be decomposed. |
+| Nodes in a relocation survey | Topology | `MAX_NODES` | modules/common/placement.rs | 32 | Distinct leaseholder nodes beyond the table are left out of the load tally; an untallied node cannot be recommended as busiest or quietest. |
+| Rebalancer range-map parameter | Shape | `RANGE_MAP_PARAM_MAX` | modules/app/rebalancer/mod.rs | 2048 | Rejects an oversized encoded map. |
+| Elastic-split span bound | Shape | `KEY_MAX` | modules/app/elastic_split_driver/mod.rs | 256 | Rejects a longer span boundary key. |
+| Elastic-split cutover map | Shape | `MAP_MAX` | modules/app/elastic_split_driver/mod.rs | 2048 | Rejects an oversized encoded cutover map. |
+| Courier frame | Shape | `FRAME_MAX` | modules/app/span_courier/mod.rs | 8192 | A larger envelope cannot cross; the stream drops whole and the downstream install aborts on the gap (fail closed, counted). |
+| Courier pre-dial pending bytes | Capacity | `PEND_BUF` | modules/app/span_courier/mod.rs | 16384 | Overflow before the dial completes drops the pending stream whole; the install aborts on the gap. |
+| Courier reassembly buffer | Capacity | `RASM_BUF` | modules/app/span_courier/mod.rs | — | Derived as `2 * FRAME_MAX` (16384). Overflow drops the inbound stream whole; the install aborts on the gap. |
 | Transaction participants | Topology | `MAX_PARTICIPANTS` | modules/common/txn.rs | 8 | Rejects a wider transaction. |
 | Transaction operand | Shape | `OPERAND_MAX` | modules/app/txn_coordinator/mod.rs | 64 | Rejects an oversized coordinator operand. |
 | Timestamp-allocation holds | Capacity | `HOLD_CAPACITY` | modules/app/timestamp_allocator/mod.rs | 32 | Backpressures/defer allocation while held work drains. |
@@ -135,13 +143,23 @@ must expose any overrides and keep them consistent at every participant.
 | Vector dimensions | Shape | `MAX_DIMS` | modules/app/model_edge_anchor/mod.rs | 64 | Rejects a wider vector. |
 | Vector top-k | Shape | `MAX_K` | modules/app/model_edge_anchor/mod.rs | 16 | Rejects a larger result request. |
 | Time-series downsample buckets | Shape | `MAX_DS_BUCKETS` | modules/app/model_edge_anchor/mod.rs | 64 | Rejects a larger result request. |
+| Graph vertex id | Shape | `MAX_VERTEX_ID` | modules/app/model_edge_anchor/mod.rs | 32 | Rejects a longer vertex id (`ERR vertex id length`). |
+| Graph path hops | Shape | `MAX_PATH_HOPS` | modules/app/model_edge_anchor/mod.rs | — | Typed `u8`, value 16. Rejects a `GRAPH.PATH` asking for a deeper search (`ERR maxhops exceeds bound`). |
+| Metrics connections | Capacity | `MAX_CONNS` | modules/app/prometheus_edge_anchor/mod.rs | 8 | Drops/refuses excess accepts. |
+| Metrics series per query | Capacity | `MAX_SERIES_Q` | modules/app/prometheus_edge_anchor/mod.rs | 32 | Refuses the query whole (`too many series`, HTTP 422) rather than answer from a truncated series set. |
+| Metrics query grid steps | Shape | `MAX_STEPS_Q` | modules/app/prometheus_edge_anchor/mod.rs | 128 | Rejects the query (`query grid too large`). |
+| Metrics samples per series window | Capacity | `MAX_SAMPLES_Q` | modules/app/prometheus_edge_anchor/mod.rs | 2048 | Refuses the query (`window too dense`, HTTP 422) rather than fold a truncated window; narrow the range or coarsen the step. |
+| Metrics query grid points | Shape | `MAX_POINTS` | modules/common/tsquery_core.rs | 1024 | Refuses the query by name (`TooManyPoints`); the anchor's step cap binds first. |
+| Metrics label matchers | Shape | `MAX_MATCHERS` | modules/common/tsquery_core.rs | 16 | Refuses a query with more matchers by name. |
+| Metrics grouping labels | Shape | `MAX_LABELS` | modules/common/tsquery_core.rs | 32 | Refuses a wider grouping by name. |
 | Redis command arguments | Shape | `MAX_ARGS` | modules/common/redis_codec.rs | 32 | Rejects a command with more arguments. |
 
 Connection limits are per anchor module instance, not process-wide promises.
 Fluxor's target-wide TCP table (currently 256 on host/aarch64 profiles) can bind
 before the sum of several anchors. Receive/send buffers also impose protocol
 message limits: Redis 4096/4096, Memcached 8192/8192, etcd 4096/4096,
-PostgreSQL 8192/32768, and MySQL 8192/32768 bytes.
+PostgreSQL 8192/32768, MySQL 8192/32768, and the Prometheus HTTP
+anchor 16384/20480 bytes.
 
 ## Relational and model execution
 

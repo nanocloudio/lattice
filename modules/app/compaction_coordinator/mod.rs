@@ -352,7 +352,7 @@ unsafe fn handle(s: &mut CompState, sys: &SyscallTable, mt: u8, body: &[u8]) {
 /// Write one GC floor proposal on `gc_propose_out` — bare
 /// (`MSG_GC_FLOOR_PROPOSE`, the contract-test surface) or, with
 /// `propose_wrap`, wrapped for clustor's gateway as
-/// `MSG_CLIENT_PROPOSAL [conn_id=0][LATTICE_RECORD_TAG]
+/// `MSG_CLIENT_PROPOSAL [conn_id:u16=0][LATTICE_RECORD_TAG]
 /// [MSG_GC_FLOOR_COMMITTED][record…]` so the committed entry demuxes
 /// at `lattice_apply_bridge.records_out` with exactly the envelope
 /// the worker and this module's committed input consume.
@@ -360,19 +360,21 @@ unsafe fn write_gc_proposal(s: &mut CompState, sys: &SyscallTable, record: &[u8]
     if s.propose_wrap == 0 {
         return write_envelope(sys, s.gc_propose_out, MSG_GC_FLOOR_PROPOSE, record);
     }
-    let payload_len = 3 + record.len();
+    let payload_len = 4 + record.len();
     let total = 3 + payload_len;
-    let mut buf = [0u8; 3 + 3 + GC_FLOOR_WIRE_LEN];
+    let mut buf = [0u8; 3 + 4 + GC_FLOOR_WIRE_LEN];
     if total > buf.len() {
         return false;
     }
     buf[0] = MSG_CLIENT_PROPOSAL;
     buf[1] = (payload_len & 0xFF) as u8;
     buf[2] = ((payload_len >> 8) & 0xFF) as u8;
-    buf[3] = 0; // conn_id: coordinator-originated, no client connection
-    buf[4] = LATTICE_RECORD_TAG;
-    buf[5] = MSG_GC_FLOOR_COMMITTED;
-    buf[6..6 + record.len()].copy_from_slice(record);
+    // conn_id u16 = 0: coordinator-originated, no client connection.
+    buf[3] = 0;
+    buf[4] = 0;
+    buf[5] = LATTICE_RECORD_TAG;
+    buf[6] = MSG_GC_FLOOR_COMMITTED;
+    buf[7..7 + record.len()].copy_from_slice(record);
     (sys.channel_write)(s.gc_propose_out, buf.as_mut_ptr(), total) == total as i32
 }
 

@@ -4,7 +4,8 @@ Lattice is a multi-protocol data store built as a graph of
 cooperative [fluxor](../../fluxor/) modules on the clustor Raft
 substrate. Protocol anchor modules translate client wire protocols
 — Redis RESP, Memcached ASCII, etcd v3 gRPC, SQL, documents, CQL,
-RESP models — into one KV request envelope; a router shards by key
+RESP models, Prometheus metrics — into one KV request envelope; a
+router shards by key
 and drives writes through Raft commit; a deterministic MVCC state
 machine applies them in log order. Durability, quorum, leadership,
 and snapshots belong to the substrate; lattice never writes a
@@ -49,3 +50,5 @@ durable channel of its own.
   surface: command set, differences, errors
 - [guides/etcd.md](guides/etcd.md) — the etcd v3 surface: RPCs,
   differences, errors
+- [guides/metrics.md](guides/metrics.md) — the Prometheus metrics
+  surface: endpoints, the PromQL/MetricsQL/KQL query subsets, bounds

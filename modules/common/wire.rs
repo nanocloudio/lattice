@@ -201,6 +201,15 @@ pub const TXN_SUBMIT_ERROR: u8 = 2;
 /// Payload: `[split_key_len:u16 LE][split_key…]`.
 pub const MSG_PLACEMENT_SPLIT_CMD: u8 = 0xCD;
 
+/// Rebalancer → range_supervisor: relocate a range's replica set from
+/// one node to another. Like the split command it carries only the
+/// *decision*, not consensus: an ARMED op_kind-3 supervisor (no
+/// `reloc_*` declaration, `cmd_in` wired) takes the move from this
+/// command and runs the `RelocatePhase` machine against clustor's
+/// membership. Payload:
+/// `[partition_id:u16 LE][source_node:u8][target_node:u8]`.
+pub const MSG_PLACEMENT_RELOCATE_CMD: u8 = 0xCE;
+
 // ── Watch service (registry ↔ fanout ↔ anchor) ─────────────────────────
 
 /// Anchor → registry: create/cancel/resume control.
@@ -574,6 +583,16 @@ pub const MSG_APP_SNAPSHOT_REQUEST: u8 = 0x58;
 /// Payload: `[term:u64 LE][last_included_index:u64 LE]`.
 pub const MSG_APP_SNAPSHOT_RESET: u8 = 0x59;
 
+/// orchestrator → app (elastic split): capture
+/// ONLY the keys in a half-open span and ship them as a `MSG_APP_SNAPSHOT_CHUNK`
+/// stream, so a span can be moved to a demand-provisioned partition without
+/// copying the whole store. Payload:
+/// `[term:u64 LE][last_included_index:u64 LE][start_len:u16 LE][start…][end_len:u16 LE][end…]`
+/// (bounds are STORED-key bytes; empty start = MIN, empty end = MAX). The
+/// chunk stream and the target's install path are identical to the whole-store
+/// snapshot — a span snapshot is a whole-store snapshot of just the span.
+pub const MSG_APP_SNAPSHOT_SPAN_REQUEST: u8 = 0x5A;
+
 /// durability → app: the exported snapshot at `last_included_index` is now
 /// DURABLE (body written crash-atomically AND its boot pointer persisted).
 /// Payload: `[term:u64 LE][last_included_index:u64 LE]`.
@@ -585,6 +604,13 @@ pub const MSG_APP_SNAPSHOT_RESET: u8 = 0x59;
 /// (see `kv_store` replay). Leader-local, like the durable snapshot itself.
 /// Clustor-defined (0x5B); mirrored here verbatim, not renumbered.
 pub const MSG_APP_SNAPSHOT_DURABLE: u8 = 0x5B;
+
+/// app → orchestrator: a snapshot install completed and the installed
+/// state is resident and serving. Emitted on the state worker's
+/// `install_ack_out` (unwired in most graphs); the elastic-split driver
+/// gates its routing cutover on this ack rather than a wall-clock guess.
+/// Payload: `[partition_id:u16 LE][applied_index:u64 LE]`.
+pub const MSG_APP_SNAPSHOT_INSTALLED: u8 = 0x5C;
 
 /// `MSG_APP_SNAPSHOT_CHUNK` fixed header size; body follows.
 pub const APP_SNAPSHOT_HDR: usize = 28;

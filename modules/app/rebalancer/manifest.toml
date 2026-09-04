@@ -1,0 +1,45 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Cluster-wide rebalancer — the placement advisor
+# generalised from range 0 to EVERY range. Each poll it surveys the key
+# count of every range in the map (a bounded RANGE_SCAN per range on the
+# job path), reads each range's leaseholder from the map, and reports
+# split/merge advice per range (via modules/common/placement.rs) PLUS a
+# cluster-wide relocation recommendation that evens node load. Advice-only
+# by default; with `auto_execute = 1` AND `exec_out` wired it emits at most
+# one relocation command per survey — the same operator-gated contract the
+# advisor uses; split/merge findings stay advice.
+
+# KV responses from the router's job egress.
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# RANGE_SCAN survey requests to the router's job ingress.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# Opt-in execution: the recommended relocation as a command frame.
+# Output index 2; unwired unless the operator opts in, so the rebalancer
+# is advice-only by default.
+[[ports]]
+name = "exec_out"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+#   0 surveys          completed all-range surveys
+#   1 recommendations  actionable recommendations produced
+#   2 ranges_surveyed  ranges counted in the last survey
+metrics = ["surveys", "recommendations", "ranges_surveyed"]

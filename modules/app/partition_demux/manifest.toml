@@ -1,0 +1,83 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Partition demultiplexer — dense partition hosting.
+#
+# Lifts the kv_request_router's static 2-partition ceiling. The router is
+# hard against fluxor's 16-output-port cap, so it cannot grow one output
+# pair per partition. Instead, in `partition_fanout` mode it keeps
+# partition 0 on its direct ports and prefixes every frame bound for a
+# higher partition with `[partition_id:u16 LE]`, writing it to ONE
+# multiplexed output; this module strips that tag and fans the frame to
+# the owning partition's instance. One instance sits on the proposal path
+# (→ per-partition `gateway`), another on the worker/read path
+# (→ per-partition `kv_state_worker`). N partitions cost the router ONE
+# output port instead of N.
+#
+# The tag is on the ENVELOPE PAYLOAD, not a new envelope type: the frame
+# is `[msg_type][len][partition_id:u16][original_payload…]`, and the
+# egress re-emits `[msg_type][len-2][original_payload…]` unchanged — the
+# downstream module sees exactly the bytes it always did.
+
+# Tagged frames from the router: payload is `[partition_id:u16][body]`.
+[[ports]]
+name = "tagged_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-partition egress. `part<i>_out` receives frames tagged for
+# partition i, tag stripped. Up to 8 partitions per demux instance
+# (fluxor allows 16 outputs; 8 leaves head-room for a metrics port).
+# The router never tags partition 0 (it keeps its direct ports), so
+# `part0_out` carries traffic only from a producer that tags it.
+[[ports]]
+name = "part0_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part1_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part2_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part3_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part4_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part5_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part6_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "part7_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+#   0 routed    frames fanned to a partition egress
+#   1 dropped   frames with an out-of-range or unwired partition tag
+metrics = ["routed", "dropped"]

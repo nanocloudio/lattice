@@ -52,8 +52,11 @@ use wire::{
 /// build-time coupling to a sibling crate's source path.
 const MSG_COMMITTED_ENTRY: u8 = 0x24;
 
-/// `[term:u64 LE][index:u64 LE]` = 16 bytes before the body.
-const COMMITTED_HEADER_LEN: usize = 16;
+/// `[partition_id:u16 LE][term:u64 LE][index:u64 LE]` = 18 bytes before
+/// the body (clustor `wire::COMMITTED_ENTRY_HDR`). The partition id leads
+/// the header as of the multi-slot engine; a single-partition consumer
+/// skips it but must account for its 2 bytes.
+const COMMITTED_HEADER_LEN: usize = 18;
 
 const SCRATCH: usize = 4096;
 
@@ -355,19 +358,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             processed += 1;
             continue;
         }
+        // Skip the 2-byte partition id; term/index follow it.
         let term = u64::from_le_bytes([
-            scratch[0], scratch[1], scratch[2], scratch[3], scratch[4], scratch[5], scratch[6],
-            scratch[7],
+            scratch[2], scratch[3], scratch[4], scratch[5], scratch[6], scratch[7], scratch[8],
+            scratch[9],
         ]);
         let index = u64::from_le_bytes([
-            scratch[8],
-            scratch[9],
             scratch[10],
             scratch[11],
             scratch[12],
             scratch[13],
             scratch[14],
             scratch[15],
+            scratch[16],
+            scratch[17],
         ]);
         // Gap detection — raft commits arrive in strict index order.
         if s.last_index != 0 && index != s.last_index.wrapping_add(1) {

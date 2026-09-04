@@ -175,6 +175,19 @@ index = 6
 direction = "output"
 content_type = "OctetStream"
 
+# Install-complete ack. After a snapshot chunk stream finishes
+# installing (a span copy for an elastic split, or any snapshot
+# install), the worker emits MSG_APP_SNAPSHOT_INSTALLED
+# `[partition_id:u16][applied_index:u64]` here so an orchestrator can
+# gate cutover on the span actually being resident. Unwired (index 7 =
+# -1) in every graph but the elastic split, so it costs nothing
+# elsewhere.
+[[ports]]
+name = "install_ack_out"
+index = 7
+direction = "output"
+content_type = "OctetStream"
+
 # ── Observability (Phase 14) ──────────────────────────────────────────
 # Module-scope metrics emitted on `metrics` at a ~1 s WALL-CLOCK cadence
 # (NOT a step cadence — see the emitter's docs: a step cadence goes

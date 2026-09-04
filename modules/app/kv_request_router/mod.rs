@@ -248,7 +248,10 @@ struct PendingLinRead {
     /// ordering accounting and to route a fail-closed error on reject.
     proto: u8,
     conn: u8,
-    _pad: [u8; 3],
+    _pad: u8,
+    /// The partition this read is fenced against — its applied index is
+    /// the one `LIN_FENCED` waits on. Set when the read routes.
+    fence_partition: u16,
     /// Wall-clock stash deadline: an AWAITING slot older than this is
     /// treated as REJECTED (fail closed). Covers the residue where
     /// consensus's reject for an evicted/lost read never arrived —
@@ -272,7 +275,8 @@ impl PendingLinRead {
             state: LIN_FREE,
             proto: 0,
             conn: 0,
-            _pad: [0; 3],
+            _pad: 0,
+            fence_partition: 0,
             deadline_ms: 0,
             fence_index: 0,
             buf: [0; LIN_READ_BUF],
@@ -673,6 +677,15 @@ fn ordered_partitions_reachable(router: &RouterState) -> bool {
         .iter()
         .filter(|d| d.binding.cluster_id == router.local_cluster_domain)
         .all(|d| {
+            // Fanout mode: partition 0 keeps its direct port; every other
+            // partition rides the element-1 demux feed. A range is reachable
+            // iff its port (and, on a replicated graph, its proposal port) is
+            // wired — the per-partition port cap does not apply above 0.
+            if router.partition_fanout != 0 {
+                let idx = if d.binding.partition_id == 0 { 0 } else { 1 };
+                return router.kv_outs[idx] >= 0
+                    && (router.replicated == 0 || router.proposal_outs[idx] >= 0);
+            }
             let p = d.binding.partition_id as usize;
             p < MAX_PARTITION_PORTS
                 && router.kv_outs[p] >= 0
@@ -1166,6 +1179,18 @@ define_params! {
     // KV_RESULT_CROSS_DOMAIN redirect rather than a wrong local answer.
     // Default 0 is the single-domain deployment: every existing map
     // binds cluster_id 0, so nothing routes cross-domain.
+    // Dense hosting. 0 = classic per-partition ports (partition p
+    // uses the p-th kv_out/proposal_out pair, capped at MAX_PARTITION_PORTS).
+    // 1 = fanout: partition 0 keeps its direct ports; every frame bound
+    // for a higher partition is prefixed with `[partition_id:u16 LE]` and
+    // written to the p1 port pair (kv1_out / proposal1_out), which a
+    // `partition_demux` fans to N per-partition instances — lifting the
+    // 2-partition ceiling the 16-output-port cap imposes on the keyed
+    // data path (TARGETED lifecycle ops still address direct ports only).
+    // Default 0 keeps the classic port layout, untagged.
+    7, partition_fanout, u8, 0
+        => |s, d, len| { s.partition_fanout = p_u8(d, len, 0, 0); };
+
     6, local_cluster_domain, u32, 0
         => |s, d, len| { s.local_cluster_domain = p_u32(d, len, 0, 0); };
 
@@ -1319,6 +1344,10 @@ struct RouterState {
     /// Proposal ports by partition, same scheme (element 0 =
     /// `proposal_out`).
     proposal_outs: [i32; MAX_PARTITION_PORTS],
+    /// Dense hosting: when 1, every partition-bound frame is tagged
+    /// `[partition_id:u16]` and written to the element-1 port pair (the
+    /// `partition_demux` feed) instead of a per-partition port.
+    partition_fanout: u8,
     /// Ordered-mode refusals of cross-range key sets (metric 6).
     m_cross_range_rejects: u64,
     /// Requests refused because their key's home range lives in another
@@ -1388,14 +1417,16 @@ struct RouterState {
     /// waits, which is the correct direction to be wrong in.
     ///
     /// One value, not one per partition: the fence path releases to
-    /// `kv_out` (the partition-0 alias) only, so a fenced read is always
-    /// a partition-0 read today. Multi-partition fenced reads need the
-    /// report to carry a partition id and this to become an array.
-    worker_applied_index: u64,
-    /// The term that position was reached in. Paired with the index
+    /// Per-partition applied index, indexed by `partition_id % MAX_TRACKED_RANGES`.
+    /// Each worker stamps its partition into `MSG_APP_APPLIED_POS`, so a
+    /// fenced read is satisfied by the SAME partition it must observe — not
+    /// the max across a dense host's partitions, which could release a read
+    /// against a store that has not applied the write it must see.
+    worker_applied_index: [u64; MAX_TRACKED_RANGES],
+    /// The term each position was reached in. Paired with the index
     /// because §21 invariant 11 wants a fence's epoch travelling with
     /// it: an applied index from a stale term is a stale fence.
-    worker_applied_term: u64,
+    worker_applied_term: [u64; MAX_TRACKED_RANGES],
     /// Linearizable reads that reached their deadline still waiting for
     /// the worker to apply through the fence index, and failed closed.
     /// A persistently non-zero value means apply is lagging the commit
@@ -1499,6 +1530,7 @@ impl RouterState {
         self.range_map_param_len = 0;
         self.kv_outs = [-1; MAX_PARTITION_PORTS];
         self.proposal_outs = [-1; MAX_PARTITION_PORTS];
+        self.partition_fanout = 0;
         self.m_cross_range_rejects = 0;
         self.m_cross_domain_rejects = 0;
         self.m_proposal_drops = 0;
@@ -1518,8 +1550,8 @@ impl RouterState {
         self.hot_key_count = [[0; HOT_KEY_SLOTS]; MAX_TRACKED_RANGES];
         self.m_rejects = 0;
         self.m_lin_reads = 0;
-        self.worker_applied_index = 0;
-        self.worker_applied_term = 0;
+        self.worker_applied_index = [0; MAX_TRACKED_RANGES];
+        self.worker_applied_term = [0; MAX_TRACKED_RANGES];
         self.m_fence_timeouts = 0;
         self.m_inflight_timeouts = 0;
         self.m_not_leader_rejects = 0;
@@ -1580,6 +1612,73 @@ unsafe fn write_envelope_raw(
     }
     let n = (sys.channel_write)(chan, scratch.as_mut_ptr(), total);
     n == total as i32
+}
+
+/// Dense hosting: the worker (KV command) port and the partition tag for
+/// `partition`. In fanout mode every partition rides the element-1
+/// demux-feed port, tagged with its id; classic mode returns the
+/// per-partition port with no tag.
+fn worker_port_tag(router: &RouterState, partition: u16) -> (i32, Option<u16>) {
+    if router.partition_fanout != 0 && partition != 0 {
+        // Overflow partitions (>0) ride the element-1 demux feed, tagged;
+        // partition 0 keeps its own direct port so the primary `kv_out`
+        // is never left idle.
+        (router.kv_outs[1], Some(partition))
+    } else {
+        (
+            router.kv_outs[partition as usize % MAX_PARTITION_PORTS],
+            None,
+        )
+    }
+}
+
+/// Dense hosting: the proposal port and partition tag for `partition`, mirroring
+/// [`worker_port_tag`].
+fn proposal_port_tag(router: &RouterState, partition: u16) -> (i32, Option<u16>) {
+    if router.partition_fanout != 0 && partition != 0 {
+        (router.proposal_outs[1], Some(partition))
+    } else {
+        (
+            router.proposal_outs[partition as usize % MAX_PARTITION_PORTS],
+            None,
+        )
+    }
+}
+
+/// Write a router-framed envelope with, or without, a `[partition:u16]`
+/// tag spliced onto its payload for the `partition_demux`.
+/// `src[..total]` holds a finished `[msg_type][len][payload]`. With no tag
+/// it is written verbatim; with a tag the frame is rebuilt in `dest` with
+/// the tag after the header and the length bumped by 2, so the demux can
+/// route it and hand the downstream module the ORIGINAL bytes. `dest` must
+/// differ from `src`.
+unsafe fn write_envelope_maybe_tagged(
+    sys: &SyscallTable,
+    chan: i32,
+    src: &mut [u8],
+    total: usize,
+    tag: Option<u16>,
+    dest: &mut [u8],
+) -> bool {
+    let Some(partition) = tag else {
+        return write_envelope_raw(sys, chan, src, total);
+    };
+    if chan < 0 || total < wire::ENVELOPE_HDR {
+        return false;
+    }
+    let payload_len = total - wire::ENVELOPE_HDR;
+    let new_payload = payload_len + 2;
+    let new_total = wire::ENVELOPE_HDR + new_payload;
+    if new_payload > u16::MAX as usize || new_total > dest.len() {
+        return false;
+    }
+    dest[0] = src[0]; // msg_type unchanged
+    dest[1] = (new_payload & 0xFF) as u8;
+    dest[2] = ((new_payload >> 8) & 0xFF) as u8;
+    dest[wire::ENVELOPE_HDR..wire::ENVELOPE_HDR + 2].copy_from_slice(&partition.to_le_bytes());
+    dest[wire::ENVELOPE_HDR + 2..new_total].copy_from_slice(&src[wire::ENVELOPE_HDR..total]);
+    let n = (sys.channel_write)(chan, dest.as_mut_ptr(), new_total);
+    n == new_total as i32
 }
 
 /// Drain one MSG_KV_REQUEST from a given ingress port. Returns true
@@ -1875,9 +1974,10 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
 
     // Port pair of the owning partition. Element 0 aliases the classic
     // `kv_out`/`proposal_out`, so legacy and fenced modes see exactly
-    // the bytes they always did.
-    let kv_port = router.kv_outs[kpg_id as usize % MAX_PARTITION_PORTS];
-    let proposal_port = router.proposal_outs[kpg_id as usize % MAX_PARTITION_PORTS];
+    // the bytes they always did. In fanout mode a partition above 0
+    // rides the element-1 demux feed, tagged with `kpg_id`.
+    let (kv_port, kv_tag) = worker_port_tag(router, kpg_id);
+    let (proposal_port, proposal_tag) = proposal_port_tag(router, kpg_id);
     if kv_port < 0 {
         // A validated map never binds an unwired partition; this is
         // structural corruption, answered rather than dropped.
@@ -2019,7 +2119,9 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     if use_consensus {
         // Build the MSG_CLIENT_PROPOSAL envelope for clustor's
         // gateway.client_requests input. Payload shape:
-        //   [conn_id:u8][LATTICE_ENTRY_TAG:u8][kv_command_payload…]
+        //   [conn_id:u16 LE][LATTICE_ENTRY_TAG:u8][kv_command_payload…]
+        // (conn ids are u16 on every clustor client surface; lattice's
+        // own conn ids are u8-ranged, so the high byte is zero.)
         // where the body is the MSG_KV_COMMAND PAYLOAD bytes
         // (cmd_payload_len bytes from offset 3 of router.scratch).
         // The 3-byte envelope prefix on the outer MSG_CLIENT_PROPOSAL
@@ -2031,7 +2133,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         // is what keeps byte 0 out of clustor's marker space — see
         // `wire::LATTICE_ENTRY_TAG` for why omitting it removes the node
         // from its own voter set on the 460th write.
-        let cp_payload_len = 2 + cmd_payload_len;
+        let cp_payload_len = 3 + cmd_payload_len;
         let cp_total = 3 + cp_payload_len;
         if cp_payload_len > u16::MAX as usize || cp_total > router.scratch.len() {
             // ANSWER it. This used to drop silently, which is
@@ -2052,12 +2154,20 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         cp_buf[0] = MSG_CLIENT_PROPOSAL;
         cp_buf[1] = (cp_payload_len & 0xFF) as u8;
         cp_buf[2] = ((cp_payload_len >> 8) & 0xFF) as u8;
-        cp_buf[3] = conn_id;
-        cp_buf[4] = LATTICE_ENTRY_TAG;
+        cp_buf[3..5].copy_from_slice(&u16::from(conn_id).to_le_bytes());
+        cp_buf[5] = LATTICE_ENTRY_TAG;
         // Copy MSG_KV_COMMAND payload (everything after the 3-byte
         // outer header) into the proposal body.
-        cp_buf[5..5 + cmd_payload_len].copy_from_slice(&router.scratch[3..3 + cmd_payload_len]);
-        if !write_envelope_raw(sys, proposal_port, &mut cp_buf[..], cp_total) {
+        cp_buf[6..6 + cmd_payload_len].copy_from_slice(&router.scratch[3..3 + cmd_payload_len]);
+        let mut cp_tag_buf = [0u8; SCRATCH_BUF_SIZE];
+        if !write_envelope_maybe_tagged(
+            sys,
+            proposal_port,
+            &mut cp_buf[..],
+            cp_total,
+            proposal_tag,
+            &mut cp_tag_buf[..],
+        ) {
             // Same reasoning as above: backpressure on the proposal
             // port is a retryable condition the caller can act on, and
             // silence is not.
@@ -2096,12 +2206,24 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
             // Submit the fence FIRST — only stash once the request is
             // actually in flight, so a backpressured fence degrades
             // cleanly instead of leaking a slot.
-            let mut rr = [0u8; 3 + 8];
+            // In fanout mode the probe rides a `partition_demux` to the
+            // owning partition's consensus instance, so it carries the
+            // partition tag the demux strips; the grant needs no tag —
+            // it echoes `corr_id`, which is attribution enough for the
+            // fanned-in `read_release` stream.
+            let mut rr = [0u8; 3 + 10];
+            let tagged = router.partition_fanout != 0;
+            let plen: usize = if tagged { 10 } else { 8 };
             rr[0] = MSG_CLIENT_READ_REQUEST;
-            rr[1] = 8;
+            rr[1] = plen as u8;
             rr[2] = 0;
-            rr[3..11].copy_from_slice(&corr_id.to_le_bytes());
-            if write_envelope_raw(sys, router.lin_read_out, &mut rr[..], 11) {
+            if tagged {
+                rr[3..5].copy_from_slice(&kpg_id.to_le_bytes());
+                rr[5..13].copy_from_slice(&corr_id.to_le_bytes());
+            } else {
+                rr[3..11].copy_from_slice(&corr_id.to_le_bytes());
+            }
+            if write_envelope_raw(sys, router.lin_read_out, &mut rr[..], 3 + plen) {
                 // Admitted a ReadIndex-fenced linearizable read (before the
                 // pending_lin sub-borrow below).
                 router.m_lin_reads = router.m_lin_reads.wrapping_add(1);
@@ -2114,6 +2236,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
                 p.state = LIN_AWAITING;
                 p.proto = protocol;
                 p.conn = conn_id;
+                p.fence_partition = kpg_id;
                 p.deadline_ms = dev_millis(sys) + LIN_STASH_TIMEOUT_MS;
                 p.buf[..cmd_total].copy_from_slice(&router.scratch[..cmd_total]);
                 note_dispatched(
@@ -2136,7 +2259,15 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         }
     }
 
-    if !write_envelope_raw(sys, kv_port, &mut router.scratch[..], cmd_total) {
+    let mut kv_tag_buf = [0u8; SCRATCH_BUF_SIZE];
+    if !write_envelope_maybe_tagged(
+        sys,
+        kv_port,
+        &mut router.scratch[..],
+        cmd_total,
+        kv_tag,
+        &mut kv_tag_buf[..],
+    ) {
         // Backpressure: undo inflight and let the anchor's retry path
         // surface to the client. Phase 1 drops; Phase 5 would emit a
         // throttle event.
@@ -2389,7 +2520,7 @@ unsafe fn maybe_start_help(
     if home_partition == stuck_partition {
         return;
     }
-    let kv_port = router.kv_outs[home_partition as usize % MAX_PARTITION_PORTS];
+    let (kv_port, kv_tag) = worker_port_tag(router, home_partition);
     if kv_port < 0 {
         return;
     }
@@ -2419,6 +2550,7 @@ unsafe fn maybe_start_help(
     if !send_help_command(
         router,
         kv_port,
+        kv_tag,
         corr,
         types::KV_OP_GET,
         &body,
@@ -2454,7 +2586,7 @@ unsafe fn on_help_reply(router: &mut RouterState, corr: u64, result: u8, body: &
                 txn::TxnStatus::Aborted => false,
                 _ => return true,
             };
-            let stuck_port = router.kv_outs[h.stuck_partition as usize % MAX_PARTITION_PORTS];
+            let (stuck_port, stuck_tag) = worker_port_tag(router, h.stuck_partition);
             if stuck_port < 0 {
                 return true;
             }
@@ -2489,6 +2621,7 @@ unsafe fn on_help_reply(router: &mut RouterState, corr: u64, result: u8, body: &
             if send_help_command(
                 router,
                 stuck_port,
+                stuck_tag,
                 corr2,
                 types::KV_OP_TXN_RESOLVE,
                 &body2[..p],
@@ -2520,6 +2653,7 @@ unsafe fn on_help_reply(router: &mut RouterState, corr: u64, result: u8, body: &
 unsafe fn send_help_command(
     router: &mut RouterState,
     kv_port: i32,
+    kv_tag: Option<u16>,
     corr: u64,
     op: u8,
     body: &[u8],
@@ -2557,7 +2691,15 @@ unsafe fn send_help_command(
     .encode(&mut out[3..]);
     let p = 3 + wire::KvCommandHead::LEN;
     out[p..p + body.len()].copy_from_slice(body);
-    write_envelope_raw(sys, kv_port, &mut router.scratch[..], total)
+    let mut tag_buf = [0u8; SCRATCH_BUF_SIZE];
+    write_envelope_maybe_tagged(
+        sys,
+        kv_port,
+        &mut router.scratch[..],
+        total,
+        kv_tag,
+        &mut tag_buf[..],
+    )
 }
 
 /// How long an op may sit in the inflight table before it is answered
@@ -2665,13 +2807,15 @@ unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
         }
         // `gateway/surface.rs::send_response` framing — conn-tagged,
         // NOT the standard 3-byte envelope:
-        //   [conn_id:u8][msg_type:u8][len:u16 LE][payload…]
-        let mut hdr = [0u8; 4];
-        if (sys.channel_read)(router.gateway_reject_in, hdr.as_mut_ptr(), 4) < 4 {
+        //   [conn_id:u16 LE][msg_type:u8][len:u16 LE][payload…]
+        // Lattice conn ids are u8-ranged, so the u16 narrows losslessly.
+        let mut hdr = [0u8; 5];
+        if (sys.channel_read)(router.gateway_reject_in, hdr.as_mut_ptr(), 5) < 5 {
             break;
         }
-        let (conn_id, msg_type) = (hdr[0], hdr[1]);
-        let plen = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        let conn_id = (u16::from_le_bytes([hdr[0], hdr[1]]) & 0xFF) as u8;
+        let msg_type = hdr[2];
+        let plen = u16::from_le_bytes([hdr[3], hdr[4]]) as usize;
         let mut payload = [0u8; 64];
         let take = plen.min(payload.len());
         if take > 0
@@ -2924,10 +3068,12 @@ unsafe fn emit_reject_with_body(
     // durability byte stay at their zero/weakest values. The applied
     // position IS reported — it is a property of this router's worker,
     // not of the request that was turned away, and a caller refreshing
-    // its view after a rejection is exactly who needs it.
+    // its view after a rejection is exactly who needs it. A turned-away
+    // request never resolved a partition, so partition 0's position (the
+    // single-partition value) is the honest representative here.
     wire::FenceTail {
-        applied_index: router.worker_applied_index,
-        applied_term: router.worker_applied_term,
+        applied_index: router.worker_applied_index[0],
+        applied_term: router.worker_applied_term[0],
         source_id: 0,
         durability: 0x01, // Durability::Volatile
         catalog_generation: 0,
@@ -3025,27 +3171,29 @@ unsafe fn drain_read_release(router: &mut RouterState) {
                 // Consensus applied through `fence_index`; this worker
                 // may not have. Move to LIN_FENCED and let the applied
                 // -index check below decide when the read may be served.
-                let fence_index = if take >= 16 {
-                    u64::from_le_bytes([
+                let explicit_index = if take >= 16 {
+                    Some(u64::from_le_bytes([
                         body[8], body[9], body[10], body[11], body[12], body[13], body[14],
                         body[15],
-                    ])
+                    ]))
                 } else {
-                    // A grant without an index cannot be fenced against
-                    // anything. Rather than silently degrade to the old
-                    // release-on-grant behaviour — which is exactly the
-                    // false-absence bug this closes — demand that the
-                    // worker be caught up to everything it has told us
-                    // about. That is the strongest claim available from
-                    // a grant that named no index, and it fails closed
-                    // at the deadline if even that is not met.
-                    router.worker_applied_index
+                    None
                 };
+                // A grant without an index cannot be fenced against
+                // anything explicit. Rather than silently degrade to the
+                // old release-on-grant behaviour — the false-absence bug
+                // this closes — demand the worker be caught up to
+                // everything it has told us about FOR THIS READ'S
+                // PARTITION. `Copy` snapshot so the fence read below does
+                // not alias the `pending_lin` mutable borrow.
+                let applied = router.worker_applied_index;
                 for p in router.pending_lin.iter_mut() {
                     if p.state == LIN_AWAITING && p.corr_id == corr {
                         if hdr[0] == MSG_CLIENT_READ_RESPONSE {
                             p.state = LIN_FENCED;
-                            p.fence_index = fence_index;
+                            p.fence_index = explicit_index.unwrap_or_else(|| {
+                                applied[p.fence_partition as usize % MAX_TRACKED_RANGES]
+                            });
                         } else {
                             p.state = LIN_REJECTED;
                         }
@@ -3072,7 +3220,10 @@ unsafe fn drain_read_release(router: &mut RouterState) {
             // still waiting on apply.
             let resolvable = match p.state {
                 LIN_RELEASED | LIN_REJECTED => true,
-                LIN_FENCED => router.worker_applied_index >= p.fence_index,
+                LIN_FENCED => {
+                    router.worker_applied_index[p.fence_partition as usize % MAX_TRACKED_RANGES]
+                        >= p.fence_index
+                }
                 _ => false,
             };
             if resolvable && p.seq < best_seq {
@@ -3088,7 +3239,15 @@ unsafe fn drain_read_release(router: &mut RouterState) {
         if state == LIN_RELEASED || state == LIN_FENCED {
             let mut env = [0u8; LIN_READ_BUF];
             env[..len].copy_from_slice(&router.pending_lin[i].buf[..len]);
-            if !write_envelope_raw(sys, router.kv_out, &mut env[..], len) {
+            // The released read goes to ITS OWN partition's worker —
+            // via the tagged demux feed in fanout mode, exactly as the
+            // unfenced dispatch would have sent it. Forwarding to the
+            // direct `kv_out` would serve every fenced read from
+            // partition 0's store, absence and all.
+            let fence_partition = router.pending_lin[i].fence_partition;
+            let (port, tag) = worker_port_tag(router, fence_partition);
+            let mut tagged = [0u8; LIN_READ_BUF + 8];
+            if !write_envelope_maybe_tagged(sys, port, &mut env[..len], len, tag, &mut tagged) {
                 return; // retry next step, keeping order
             }
             // Forwarded to the worker: the op is STILL outstanding on
@@ -3237,34 +3396,36 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
         return false;
     }
     if hdr[0] == MSG_APP_APPLIED_POS {
-        // The worker's applied position: `[term:u64][index:u64]`. This
-        // is the applied-index half of the linearizable-read fence —
-        // see `LIN_FENCED`. Consume the payload rather than returning
-        // early on the header, or the next read starts mid-message.
+        // The worker's applied position: `[partition_id:u16][term:u64]
+        // [index:u64]`. This is the applied-index half of the
+        // linearizable-read fence — see `LIN_FENCED`. Consume the payload
+        // rather than returning early on the header, or the next read
+        // starts mid-message.
         let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        if payload_len != 16 {
+        if payload_len != 18 {
             return false;
         }
-        let mut pos = [0u8; 16];
-        if ((sys.channel_read)(router.kv_in, pos.as_mut_ptr(), 16) as usize) < 16 {
+        let mut pos = [0u8; 18];
+        if ((sys.channel_read)(router.kv_in, pos.as_mut_ptr(), 18) as usize) < 18 {
             return false;
         }
+        let partition = u16::from_le_bytes([pos[0], pos[1]]) as usize % MAX_TRACKED_RANGES;
         let term = u64::from_le_bytes([
-            pos[0], pos[1], pos[2], pos[3], pos[4], pos[5], pos[6], pos[7],
+            pos[2], pos[3], pos[4], pos[5], pos[6], pos[7], pos[8], pos[9],
         ]);
         let index = u64::from_le_bytes([
-            pos[8], pos[9], pos[10], pos[11], pos[12], pos[13], pos[14], pos[15],
+            pos[10], pos[11], pos[12], pos[13], pos[14], pos[15], pos[16], pos[17],
         ]);
-        // Monotonic: a report that went backwards (a restored snapshot
-        // republishing an older position) must never retire a fence it
-        // does not actually satisfy.
-        if index > router.worker_applied_index {
-            router.worker_applied_index = index;
+        // Monotonic PER PARTITION: a report that went backwards (a
+        // restored snapshot republishing an older position) must never
+        // retire a fence it does not actually satisfy.
+        if index > router.worker_applied_index[partition] {
+            router.worker_applied_index[partition] = index;
             // The term moves with the index and only with it. Taking a
             // newer term while rejecting its index would pair a fresh
             // epoch with a stale position, which is exactly the
             // misattributed fence §21 invariant 11 forbids.
-            router.worker_applied_term = term;
+            router.worker_applied_term[partition] = term;
         }
         return true;
     }
@@ -3432,10 +3593,12 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
     p += body_len;
 
     // Fence tail. The identity is the group that actually answered —
-    // taken from this reply, not from what the caller asked for.
+    // taken from this reply, not from what the caller asked for — and the
+    // applied position is that same partition's, so a separated compute
+    // reading its own write fences against the partition that served it.
     wire::FenceTail {
-        applied_index: router.worker_applied_index,
-        applied_term: router.worker_applied_term,
+        applied_index: router.worker_applied_index[kpg_id as usize % MAX_TRACKED_RANGES],
+        applied_term: router.worker_applied_term[kpg_id as usize % MAX_TRACKED_RANGES],
         source_id: kpg_id as u32,
         durability: durability_for_path(meta.path),
         catalog_generation,
@@ -3589,17 +3752,19 @@ pub extern "C" fn module_new(
     if router.lin_reads != 0 && (router.lin_read_out < 0 || router.read_release_in < 0) {
         return -1;
     }
-    // The applied-index half of the fence tracks ONE worker position
-    // (`worker_applied_index`). Every worker reports on the shared
-    // `kv_in`, and the reports carry no partition id, so with a second
-    // partition wired the router would take the maximum across both —
-    // and could satisfy a partition-0 fence with partition-1's progress,
-    // releasing a read against a store that has not applied the write it
-    // must observe. That is the exact failure the fence exists to
-    // prevent, so refuse the combination outright rather than serve a
-    // fence that is only sometimes a fence. Lifting this needs the
-    // report to name its partition and this to become an array.
-    if router.lin_reads != 0 && router.kv_outs[1] >= 0 {
+    // The fence has two halves, and both must be partition-aware before
+    // lin reads may span local partitions. The applied-index half is:
+    // every worker stamps its `partition_id` into `MSG_APP_APPLIED_POS`,
+    // `worker_applied_index` is an array, and a `LIN_FENCED` read waits
+    // on its own partition's slot (`fence_partition`). The ReadIndex-
+    // GRANT half is partition-aware only in FANOUT mode, where the probe
+    // carries a partition tag and a `partition_demux` routes it to the
+    // owning partition's `consensus.read` (grants fan back in and match
+    // by corr id). With direct multi-partition ports the probe still
+    // reaches a single consensus instance — a partition-1 read would
+    // fence against partition-0's grant index (meaningless across
+    // independent index spaces) — so that combination stays refused.
+    if router.lin_reads != 0 && router.kv_outs[1] >= 0 && router.partition_fanout == 0 {
         return -1;
     }
     // One graph, one compute placement.

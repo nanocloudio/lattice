@@ -68,10 +68,14 @@
 //!   the operator's split key; execution then runs the split machine
 //!   exactly as a declared split does. Automating WHEN a split fires
 //!   without giving up the operator's choice of WHERE (§12.4).
-//! - Relocation: not driven. It changes replicas, not key bounds, and a
-//!   single-node static composition has nowhere to relocate TO — so
-//!   `op_kind: 3` refuses at init rather than pretending. Named, not
-//!   hidden.
+//! - Relocation (`op_kind: 3`): changes replicas, not key bounds — the
+//!   supervisor drives clustor's Raft membership through the committed
+//!   `RelocatePhase` machine. Declared form: `reloc_partition`/
+//!   `reloc_source`/`reloc_target` params start the move at boot. Armed
+//!   form (params absent): the supervisor publishes its map, then waits
+//!   idle for a `MSG_PLACEMENT_RELOCATE_CMD` on `cmd_in` (the
+//!   rebalancer's opt-in egress) supplying partition/source/target —
+//!   automating WHEN a move fires without giving up WHERE it goes.
 //! - One operation at a time, like the executor: the record slot is
 //!   singular by design.
 
@@ -108,6 +112,12 @@ mod wire;
 #[path = "../../common/range_lifecycle.rs"]
 mod range_lifecycle;
 
+// The relocation driver core carries its own `range_lifecycle` copy (its
+// `RelocatePhase` is used only on the relocation path); this coexists with the
+// direct mount above, which serves split/merge. The two never exchange values.
+#[path = "../../common/relocation_driver.rs"]
+mod relocation_driver;
+
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
@@ -123,7 +133,7 @@ use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_TARGETED, KV_RESULT_NOT_FOUND,
     KV_RESULT_OK, KV_RESULT_RANGE, PROTO_INTERNAL_LIFECYCLE,
 };
-use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_PLACEMENT_SPLIT_CMD};
+use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_PLACEMENT_RELOCATE_CMD, MSG_PLACEMENT_SPLIT_CMD};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -165,6 +175,13 @@ const S_SETTLE: u8 = 6; // waiting out SETTLE_TICKS after a frame
 const S_TOMB_SCAN: u8 = 7; // tombstone: scan page in flight
 const S_TOMB_DEL: u8 = 8; // tombstone: delete in flight
 const S_FAULT: u8 = 9; // refused config / stuck; logged once
+const S_RELOC: u8 = 10; // op_kind 3: relocation driver active
+
+/// op_kind 3: ticks between re-issuing a pending membership op while it awaits
+/// its confirming commit. The promotion gate silently rejects ADD_VOTER until
+/// the learner is caught up and there is no admin-response channel, so the op is
+/// simply re-sent on this cadence until the JOINT/NEW commit lands.
+const RELOC_REISSUE_TICKS: u32 = 200;
 
 define_params! {
     SupState;
@@ -207,6 +224,15 @@ define_params! {
                 s.range_map_hex_len = (at + len) as u16;
             } else { s.range_map_hex_len = u16::MAX; }
         };
+
+    // Relocation (op_kind 3): move the range on partition `reloc_partition`
+    // from replica `reloc_source` to replica `reloc_target`.
+    6, reloc_source, u8, 0
+        => |s, d, len| { s.reloc_source = p_u8(d, len, 0, 0); };
+    7, reloc_target, u8, 0
+        => |s, d, len| { s.reloc_target = p_u8(d, len, 0, 0); };
+    8, reloc_partition, u16, 0
+        => |s, d, len| { s.reloc_partition = p_u16(d, len, 0, 0); };
 }
 
 #[repr(C)]
@@ -216,7 +242,9 @@ struct SupState {
     kv_out: i32,
     map_out: i32,
     metrics_out: i32,
-    /// op_kind 4 only: `MSG_PLACEMENT_SPLIT_CMD` from placement_advisor.
+    /// Runtime command intake: op_kind 4 takes `MSG_PLACEMENT_SPLIT_CMD`
+    /// from placement_advisor; armed op_kind 3 takes
+    /// `MSG_PLACEMENT_RELOCATE_CMD` from the rebalancer.
     cmd_in: i32,
 
     op_kind: u8,
@@ -258,6 +286,22 @@ struct SupState {
     barrier_up: u8,
     /// Parent (source) partition, from the initial map.
     source_partition: u16,
+
+    /// op_kind 3 (relocation) ports and driver state.
+    committed_in: i32,
+    admin_out: i32,
+    reloc_source: u8,
+    reloc_target: u8,
+    reloc_partition: u16,
+    /// Latest completed `RelocatePhase` as a byte (0 = not started, else
+    /// 1..=7 per `RelocatePhase`). The driver issues the action for this phase
+    /// and advances when its committed CONFIG_CHANGE is observed.
+    reloc_phase: u8,
+    /// Ticks since the current admin op was last (re)issued — the op is
+    /// re-sent on a cadence until its confirming commit lands, so the
+    /// promotion gate's rejections are handled by clustor's idempotent
+    /// re-acceptance rather than a response channel.
+    reloc_reissue_ctr: u32,
 
     env: [u8; ENV_BUF],
 
@@ -304,6 +348,13 @@ impl SupState {
         self.loaded_once = 0;
         self.barrier_up = 0;
         self.source_partition = 0;
+        self.committed_in = -1;
+        self.admin_out = -1;
+        self.reloc_source = 0;
+        self.reloc_target = 0;
+        self.reloc_partition = 0;
+        self.reloc_phase = 0;
+        self.reloc_reissue_ctr = 0;
         self.env = [0; ENV_BUF];
         self.m_phase = 0;
         self.m_copied = 0;
@@ -702,6 +753,212 @@ fn send_published_map(sup: &mut SupState) -> bool {
     unsafe {
         let sys = sup.syscalls;
         !sys.is_null() && write_envelope(&*sys, sup.map_out, MSG_RANGE_MAP_UPDATE, fl, &mut sup.env)
+    }
+}
+
+/// Publish the relocated map (op_kind 3, at `DescriptorPublished`): the range
+/// whose binding is on `reloc_partition` gets its `reloc_source` replica
+/// replaced by `reloc_target` as a voter, its leaseholder moved to the target,
+/// and its placement epoch + generation bumped — the publication point,
+/// forward-only. Every other descriptor is republished unchanged.
+fn publish_relocated_map(sup: &mut SupState) -> bool {
+    use partition_map::{RangeDescriptor, Replica, ReplicaRole};
+    let src_node = sup.reloc_source as u32;
+    let tgt_node = sup.reloc_target as u32;
+    let mut out = OrderedRangeMap::new(sup.initial_map.routing_epoch);
+    let mut moved = false;
+    for d in sup.initial_map.ranges() {
+        if d.binding.partition_id != sup.reloc_partition {
+            if out.push(*d).is_none() {
+                return false;
+            }
+            continue;
+        }
+        // Rebuild the replica set: source → target, role Voter, keep the
+        // target's slot if it was already the learner we added.
+        let mut replicas = [Replica::EMPTY; partition_map::MAX_REPLICAS];
+        let mut n = 0usize;
+        let mut seen_target = false;
+        for r in d.replicas() {
+            if r.node_id == src_node {
+                continue; // source voter removed by the joint exit
+            }
+            if r.node_id == tgt_node {
+                // The learner we added, now a full voter.
+                replicas[n] = Replica {
+                    node_id: tgt_node,
+                    role: ReplicaRole::Voter,
+                    failure_domain: r.failure_domain,
+                };
+                seen_target = true;
+            } else {
+                replicas[n] = *r;
+            }
+            n += 1;
+        }
+        if !seen_target {
+            if n >= partition_map::MAX_REPLICAS {
+                return false;
+            }
+            replicas[n] = Replica {
+                node_id: tgt_node,
+                role: ReplicaRole::Voter,
+                failure_domain: 0,
+            };
+            n += 1;
+        }
+        let mut binding = d.binding;
+        binding.placement_epoch = binding.placement_epoch.wrapping_add(1);
+        let Some(nd) = RangeDescriptor::new(
+            d.database_id,
+            d.partition_map_id,
+            d.routing_kind,
+            d.range_id,
+            d.start_key(),
+            d.end_key(),
+            d.generation.wrapping_add(1),
+            d.lifecycle,
+            binding,
+            &replicas[..n],
+            tgt_node,
+        ) else {
+            return false;
+        };
+        if out.push(nd).is_none() {
+            return false;
+        }
+        moved = true;
+    }
+    if !moved {
+        return false; // no range bound to reloc_partition — refuse to publish
+    }
+    let mut frame = [0u8; RANGE_MAP_PARAM_MAX];
+    let Some(fl) = encode_range_map_update(out.ranges(), &mut frame) else {
+        return false;
+    };
+    let at = wire::ENVELOPE_HDR;
+    if at + fl > sup.env.len() {
+        return false;
+    }
+    sup.env[at..at + fl].copy_from_slice(&frame[..fl]);
+    unsafe {
+        let sys = sup.syscalls;
+        !sys.is_null() && write_envelope(&*sys, sup.map_out, MSG_RANGE_MAP_UPDATE, fl, &mut sup.env)
+    }
+}
+
+/// Issue one clustor membership op on `admin_out`
+/// (`[conn_id:u16=0][op][replica]` under `MSG_ADMIN_COMMAND`).
+fn issue_admin(sup: &mut SupState, op: u8, replica: u8) -> bool {
+    let at = wire::ENVELOPE_HDR;
+    let mut body = [0u8; 4];
+    let Some(n) = relocation_driver::encode_admin_command(&mut body, 0, op, replica) else {
+        return false;
+    };
+    if at + n > sup.env.len() {
+        return false;
+    }
+    sup.env[at..at + n].copy_from_slice(&body[..n]);
+    unsafe {
+        let sys = sup.syscalls;
+        !sys.is_null()
+            && write_envelope(
+                &*sys,
+                sup.admin_out,
+                relocation_driver::MSG_ADMIN_COMMAND,
+                n,
+                &mut sup.env,
+            )
+    }
+}
+
+/// Advance the relocation driver one tick (op_kind 3): observe committed config
+/// changes on `committed_in`, advance the `RelocatePhase`, and issue the next
+/// membership op or publish the moved descriptor. Re-issues the pending admin op
+/// on a cadence so the promotion gate's silent rejections resolve without an
+/// admin-response channel. Returns once at `S_IDLE` (relocation complete).
+fn drive_relocation(sup: &mut SupState) {
+    use relocation_driver::{action_for, advance, committed_config_change, config_confirms};
+    use relocation_driver::{range_lifecycle::RelocatePhase, DriverAction, Relocation};
+
+    let r = Relocation {
+        partition: sup.reloc_partition,
+        source: sup.reloc_source,
+        target: sup.reloc_target,
+    };
+    let cur = |b: u8| RelocatePhase::from_u8(b); // 0 → None
+
+    // 1) Observe up to a few committed entries; advance on the confirming one.
+    unsafe {
+        let sys = sup.syscalls;
+        if sys.is_null() {
+            return;
+        }
+        let sys = &*sys;
+        for _ in 0..4 {
+            let mut env = [0u8; ENV_BUF];
+            let Some((msg, payload)) = read_one_envelope(sys, sup.committed_in, &mut env) else {
+                break;
+            };
+            if msg != relocation_driver::MSG_COMMITTED_ENTRY {
+                continue;
+            }
+            let Some((partition, cc)) = committed_config_change(payload) else {
+                continue;
+            };
+            if partition != sup.reloc_partition {
+                continue;
+            }
+            if config_confirms(cur(sup.reloc_phase), &r, &cc) {
+                let next = advance(cur(sup.reloc_phase));
+                sup.reloc_phase = next.map(|p| p as u8).unwrap_or(0);
+                sup.reloc_reissue_ctr = 0; // act on the new phase immediately
+            }
+        }
+    }
+
+    // 2) Fold local phases and issue/publish for the current phase.
+    loop {
+        match action_for(cur(sup.reloc_phase), &r) {
+            DriverAction::IssueAdmin { op, replica, .. } => {
+                if sup.reloc_reissue_ctr == 0 {
+                    let _ = issue_admin(sup, op, replica);
+                }
+                sup.reloc_reissue_ctr = sup.reloc_reissue_ctr.wrapping_add(1);
+                if sup.reloc_reissue_ctr >= RELOC_REISSUE_TICKS {
+                    sup.reloc_reissue_ctr = 0; // re-issue next tick
+                }
+                break; // wait for the confirming commit
+            }
+            // Catch-up is enforced by clustor's promotion gate (ADD_VOTER
+            // stays rejected until caught up); locally we just move on so the
+            // next iteration issues ADD_VOTER, which probes it.
+            DriverAction::AwaitCatchup => {
+                sup.reloc_phase = advance(cur(sup.reloc_phase)).map(|p| p as u8).unwrap_or(0);
+            }
+            // Epoch is folded into the published descriptor's placement_epoch.
+            DriverAction::AdvanceEpoch => {
+                sup.reloc_phase = advance(cur(sup.reloc_phase)).map(|p| p as u8).unwrap_or(0);
+            }
+            DriverAction::PublishDescriptor => {
+                if !publish_relocated_map(sup) {
+                    break; // retry the publish next tick
+                }
+                sup.m_copied = sup.m_copied.wrapping_add(1); // published-map counter
+                sup.reloc_phase = advance(cur(sup.reloc_phase)).map(|p| p as u8).unwrap_or(0);
+            }
+            // Retention floors are a GC concern; the move is committed and
+            // published, so the operation is done from the supervisor's view.
+            DriverAction::AwaitRetention => {
+                sup.reloc_phase = advance(cur(sup.reloc_phase)).map(|p| p as u8).unwrap_or(0);
+            }
+            DriverAction::Done => {
+                sup.state = S_IDLE;
+                sup.m_phase = sup.reloc_phase as u64;
+                break;
+            }
+        }
+        sup.m_phase = sup.reloc_phase as u64;
     }
 }
 
@@ -1393,9 +1650,46 @@ pub extern "C" fn module_new(
         sup.state = S_IDLE;
         return 0;
     }
+    if sup.op_kind == 3 {
+        // Relocation: move the range on `reloc_partition` from `reloc_source`
+        // to `reloc_target` by driving clustor's Raft membership through the
+        // committed `RelocatePhase` machine. Wire the admin/committed-entry
+        // ports and load the map so the moved Binding can be published.
+        unsafe {
+            sup.cmd_in = dev_channel_port(&*sys_ptr, 0, 1);
+            sup.committed_in = dev_channel_port(&*sys_ptr, 0, 2);
+            sup.admin_out = dev_channel_port(&*sys_ptr, 1, 3);
+        }
+        if sup.committed_in < 0 || sup.admin_out < 0 {
+            return -1;
+        }
+        if !decode_range_map(sup) {
+            return -1;
+        }
+        sup.reloc_phase = 0; // not started
+        sup.reloc_reissue_ctr = 0;
+        if sup.reloc_source == sup.reloc_target {
+            // A DECLARED move whose source equals its target is a
+            // configuration error, not an arming request — refuse it
+            // rather than silently waiting for a command that reads the
+            // declaration differently than the operator wrote it.
+            if sup.reloc_source != 0 {
+                return -1;
+            }
+            // No declared move (all reloc_* at their zero defaults):
+            // ARMED. Publish the map, then wait idle for a
+            // `MSG_PLACEMENT_RELOCATE_CMD` supplying the move. Armed
+            // with no command intake can never act — refuse.
+            if sup.cmd_in < 0 {
+                return -1;
+            }
+            sup.state = S_IDLE;
+        } else {
+            sup.state = S_RELOC; // relocation runs its own driver in module_step
+        }
+        return 0;
+    }
     if sup.op_kind != 1 && sup.op_kind != 2 {
-        // Relocation: contract-complete, no target on a single-node
-        // static composition (see the module docs).
         return -1;
     }
     let (hex_len, map_hex_len) = (sup.split_key_hex_len, sup.range_map_hex_len);
@@ -1504,10 +1798,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // unchanged initial map once, then accept one runtime split command
     // while idle. `loaded_once` doubles as the published flag here; the
     // command handler resets it so the armed split re-probes the record.
-    if sup.op_kind == 4 && sup.state == S_IDLE && sup.loaded_once == 0 {
-        if send_initial_map(sup) {
-            sup.loaded_once = 1;
-        }
+    if sup.op_kind == 4 && sup.state == S_IDLE && sup.loaded_once == 0 && send_initial_map(sup) {
+        sup.loaded_once = 1;
     }
     if sup.op_kind == 4 && sup.state == S_IDLE && sup.cmd_in >= 0 {
         // SAFETY: sys_ptr non-null; `env` module-owned.
@@ -1538,6 +1830,48 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
+    }
+
+    // op_kind 3, armed: publish the initial map once (releasing a router
+    // running `await_map: 1`), then wait idle for one
+    // `MSG_PLACEMENT_RELOCATE_CMD` supplying the move. The command names
+    // WHERE (partition, source, target); the operator armed WHETHER by
+    // wiring `cmd_in` and leaving the declaration absent.
+    if sup.op_kind == 3 && sup.state == S_IDLE {
+        if sup.loaded_once == 0 && send_initial_map(sup) {
+            sup.loaded_once = 1;
+        }
+        // SAFETY: sys_ptr non-null; `env` stack-owned.
+        unsafe {
+            let sys = &*sys_ptr;
+            let mut env = [0u8; ENV_BUF];
+            if let Some((msg, payload)) = read_one_envelope(sys, sup.cmd_in, &mut env) {
+                if msg == MSG_PLACEMENT_RELOCATE_CMD && payload.len() >= 4 {
+                    let partition = u16::from_le_bytes([payload[0], payload[1]]);
+                    let (source, target) = (payload[2], payload[3]);
+                    // A command that names no real move leaves the
+                    // supervisor armed for a valid one.
+                    if source != target {
+                        sup.reloc_partition = partition;
+                        sup.reloc_source = source;
+                        sup.reloc_target = target;
+                        sup.reloc_phase = 0;
+                        sup.reloc_reissue_ctr = 0;
+                        sup.state = S_RELOC;
+                    }
+                }
+            }
+        }
+    }
+
+    // op_kind 3: publish the initial map once so a router running
+    // `await_map: 1` is released before the move begins (the moved binding is
+    // republished at DescriptorPublished), then pump the relocation driver.
+    if sup.op_kind == 3 && sup.state == S_RELOC {
+        if sup.loaded_once == 0 && send_initial_map(sup) {
+            sup.loaded_once = 1;
+        }
+        drive_relocation(sup);
     }
 
     match sup.state {

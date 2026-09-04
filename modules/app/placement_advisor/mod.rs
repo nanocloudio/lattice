@@ -497,14 +497,16 @@ fn on_kv_response(a: &mut AdvisorState, result: u8, body: &[u8]) {
     // fire the operator's pre-declared split command exactly once. The
     // recommendation itself is unchanged — this only acts on it when the
     // operator has both enabled `auto_execute` and wired `exec_out`.
-    if a.auto_execute == 1 && !a.auto_fired && matches!(r, Recommendation::Split { .. }) {
-        if emit_split_command(a) {
-            a.auto_fired = true;
-            unsafe {
-                if !a.syscalls.is_null() {
-                    let m = b"[padv] auto_execute: split command emitted (operator-declared key)";
-                    dev_log(&*a.syscalls, 2, m.as_ptr(), m.len());
-                }
+    if a.auto_execute == 1
+        && !a.auto_fired
+        && matches!(r, Recommendation::Split { .. })
+        && emit_split_command(a)
+    {
+        a.auto_fired = true;
+        unsafe {
+            if !a.syscalls.is_null() {
+                let m = b"[padv] auto_execute: split command emitted (operator-declared key)";
+                dev_log(&*a.syscalls, 2, m.as_ptr(), m.len());
             }
         }
     }

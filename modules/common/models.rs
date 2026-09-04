@@ -393,6 +393,92 @@ pub const KS_VECTOR_META: u32 = 0x8006_0005;
 pub const KS_MODEL_CATALOG: u32 = 0x8007_0001;
 pub const KS_MODEL_PROJECTION: u32 = 0x8007_0002;
 
+/// Redis hash fields: `hash/<hash-id>/<field>`. Deliberately UNOWNED (not a
+/// reserved model keyspace) — a hash is a key-value surface feature, not a
+/// separate model, so `keyspace_owner` returns `None` for it and it is written
+/// on the ordinary KV path. Layout `[hash_id:u32 BE][field bytes]`, field to
+/// the end; a `HGETALL` is the prefix scan of one `hash_id`.
+pub const KS_HASH: u32 = 0x800a_0001;
+
+/// `hash/<hash-id>/<field>` user key: `[hash_id:u32 BE][field]`.
+pub fn encode_hash_field_key(out: &mut [u8], hash_id: u32, field: &[u8]) -> Option<usize> {
+    let need = 4 + field.len();
+    if out.len() < need {
+        return None;
+    }
+    out[0..4].copy_from_slice(&hash_id.to_be_bytes());
+    out[4..need].copy_from_slice(field);
+    Some(need)
+}
+
+/// Redis list elements: `list/<list-id>/<index>`. UNOWNED, like the hash
+/// keyspace. `[list_id:u32 BE][index]` where the signed index is encoded
+/// order-preserving (sign bit flipped) so a forward scan yields elements
+/// head→tail — an `LPUSH` grows the index downward (into negatives), an
+/// `RPUSH` upward.
+pub const KS_LIST: u32 = 0x800a_0002;
+/// Redis list head/tail hint: `list-meta/<list-id>` → `[head:i64 LE][tail:i64
+/// LE]`. Only a hint — the correctness guard is a CAS that the target element
+/// slot is absent, so a stale hint costs a retry, never a lost element.
+pub const KS_LIST_META: u32 = 0x800a_0003;
+
+/// Order-preserving encoding of a signed list index.
+pub fn list_index_key_component(index: i64) -> [u8; 8] {
+    ((index as u64) ^ 0x8000_0000_0000_0000).to_be_bytes()
+}
+
+/// `list/<list-id>/<index>` user key: `[list_id:u32 BE][index:8 order-preserving]`.
+pub fn encode_list_entry_key(out: &mut [u8], list_id: u32, index: i64) -> Option<usize> {
+    if out.len() < 12 {
+        return None;
+    }
+    out[0..4].copy_from_slice(&list_id.to_be_bytes());
+    out[4..12].copy_from_slice(&list_index_key_component(index));
+    Some(12)
+}
+
+/// `list-meta/<list-id>` user key: `[list_id:u32 BE]`.
+pub fn encode_list_meta_key(out: &mut [u8], list_id: u32) -> Option<usize> {
+    if out.len() < 4 {
+        return None;
+    }
+    out[0..4].copy_from_slice(&list_id.to_be_bytes());
+    Some(4)
+}
+
+/// Redis sorted-set member→score directory: `zmember/<set-id>/<member>` →
+/// `[score:i64 LE]`. UNOWNED. `ZSCORE` is a point read; `ZADD` reads it to
+/// find a member's prior score before re-indexing.
+pub const KS_ZMEMBER: u32 = 0x800a_0004;
+/// Redis sorted-set score index: `zscore/<set-id>/<score>/<member>` (empty
+/// value). UNOWNED. `[set_id:u32 BE][score:8 order-preserving][member]`, so a
+/// forward scan yields members in ascending score order — `ZRANGE`.
+pub const KS_ZSCORE: u32 = 0x800a_0005;
+
+/// `zmember/<set-id>/<member>` user key: `[set_id:u32 BE][member]`.
+pub fn encode_zmember_key(out: &mut [u8], set_id: u32, member: &[u8]) -> Option<usize> {
+    let need = 4 + member.len();
+    if out.len() < need {
+        return None;
+    }
+    out[0..4].copy_from_slice(&set_id.to_be_bytes());
+    out[4..need].copy_from_slice(member);
+    Some(need)
+}
+
+/// `zscore/<set-id>/<score>/<member>` user key:
+/// `[set_id:u32 BE][score:8 order-preserving][member]`.
+pub fn encode_zscore_key(out: &mut [u8], set_id: u32, score: i64, member: &[u8]) -> Option<usize> {
+    let need = 12 + member.len();
+    if out.len() < need {
+        return None;
+    }
+    out[0..4].copy_from_slice(&set_id.to_be_bytes());
+    out[4..12].copy_from_slice(&list_index_key_component(score));
+    out[12..need].copy_from_slice(member);
+    Some(need)
+}
+
 /// Which capability owns writes to `keyspace`, or `None` if it is not a
 /// reserved model keyspace.
 ///

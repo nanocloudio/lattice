@@ -89,13 +89,36 @@ content_type = "OctetStream"
 
 # ── Observability (Phase 14) ──────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
-# Declaration order IS the id contract (id N = the Nth name); the emitter
-# in module_step passes values in this exact order.
+# Declaration order IS the id contract (id N = the Nth name). Ids 0-4 are
+# counters emitted on the `metrics` port in this exact order; ids 5+ ride
+# the kernel telemetry ring only (the id is still the position here).
 [observability]
+# ids are positional and append-only. 7 is the query-latency histogram
+# (`LAT_HIST_RING_ID` in mod.rs pins the position — count before
+# reordering).
 metrics = [
     "statements",
     "rows_returned",
     "rows_written",
     "errors",
     "queue_rejects",
+    "stale_name_retries",
+    "stmt_timeouts",
+    "query_latency_us",
 ]
+
+# Bounds MUST match `LAT_BOUNDS_US` in mod.rs — the id-table ships the
+# declaration to consumers; the record carries counts only. The dimension is
+# the statement's operation kind; session-control statements are untimed by
+# design (protocol chatter, not queries), and a raw statement text or hash is
+# deliberately NOT a dimension — unbounded label values are forbidden.
+[[observability.instrument]]
+name      = "query_latency_us"
+kind      = "histogram16"
+bounds_us = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000,
+             100000, 250000, 500000, 1000000, 2500000]
+
+[[observability.instrument.dimension]]
+key    = "db.operation.name"
+domain = "enum"
+values = ["select", "insert", "update", "delete", "ddl"]

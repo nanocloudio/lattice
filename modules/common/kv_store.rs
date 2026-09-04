@@ -31,16 +31,14 @@ use disk_store::{DiskStore, BATCH_FORMAT_VERSION, BATCH_HDR_LEN, BATCH_MAGIC, RE
 use types::{
     KV_ARRAY_ELEMENT_NULL, KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS,
     KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_IDEMPOTENT_LOOKUP, KV_OP_INCR,
-    KV_OP_MGET, KV_OP_MSET,
-    KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE, KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT,
-    KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE,
-    KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED,
+    KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE, KV_OP_RANGE_SCAN, KV_OP_SCAN,
+    KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS, KV_OP_STRLEN, KV_OP_TXN,
+    KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED,
     KV_RESULT_COMPACTED, KV_RESULT_IDEMPOTENT_LOOKUP, KV_RESULT_INTEGER, KV_RESULT_INTERNAL,
-    KV_RESULT_NOT_FOUND, KV_RESULT_OK,
-    KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN, KV_RESULT_TXN_PENDING,
-    KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET, PUT_FLAG_KEEPTTL, PUT_FLAG_NX,
-    PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER, TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL,
-    VERSION_KIND_DELETE, VERSION_KIND_PUT,
+    KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN,
+    KV_RESULT_TXN_PENDING, KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET,
+    PUT_FLAG_KEEPTTL, PUT_FLAG_NX, PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER,
+    TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL, VERSION_KIND_DELETE, VERSION_KIND_PUT,
 };
 
 // ── Capacities ────────────────────────────────────────────────────────
@@ -479,6 +477,81 @@ impl KvStore {
                 out[p..p + vlen].copy_from_slice(&r.value[..vlen]);
                 p += vlen;
                 count += 1;
+            }
+            i += 1;
+        }
+
+        out[0..4].copy_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        out[6..8].copy_from_slice(&0u16.to_le_bytes()); // flags
+        out[8..16].copy_from_slice(&self.revision.to_le_bytes());
+        out[16..20].copy_from_slice(&count.to_le_bytes());
+        out[20..24].copy_from_slice(&0u32.to_le_bytes()); // reserved
+        out[24..32].copy_from_slice(&clock_ms.to_le_bytes());
+        Some(p)
+    }
+
+    /// Encode ONLY the records whose key lies in the half-open span
+    /// `[start, end)` — the elastic split's span-scoped snapshot.
+    ///
+    /// The elastic split ships a span's bytes to a demand-provisioned
+    /// partition (possibly on another node) by streaming this body over
+    /// the app-snapshot chunk path, then restoring it with
+    /// [`snapshot_restore`] on the target. The wire format is byte-identical
+    /// to [`snapshot_encode`] — a span snapshot is a whole-store snapshot of
+    /// exactly the span — so the target installs it with no new decode path.
+    ///
+    /// Bounds are USER-key bytes, ordered lexicographically. An empty
+    /// `start` is unbounded below, an empty `end` unbounded above (so an
+    /// empty/empty span is the whole store, matching `snapshot_encode`).
+    /// Fails closed (returns `None`) on a corrupt record or an undersized
+    /// `out`, exactly as `snapshot_encode` does — a truncated span body
+    /// would silently drop keys the cutover then loses.
+    pub fn snapshot_encode_span(
+        &self,
+        out: &mut [u8],
+        clock_ms: u64,
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<usize> {
+        if out.len() < SNAPSHOT_HDR_LEN {
+            return None;
+        }
+        let mut p = SNAPSHOT_HDR_LEN;
+        let mut count: u32 = 0;
+
+        let mut i = 0;
+        while i < MAX_KEYS {
+            let r = &self.records[i];
+            if r.used {
+                let klen = r.key_len as usize;
+                let vlen = r.value_len as usize;
+                if klen > MAX_KEY_LEN || vlen > MAX_VALUE_LEN {
+                    return None;
+                }
+                let key = &r.key[..klen];
+                // Half-open [start, end): >= start, and < end unless end
+                // is empty (unbounded above).
+                let in_span = key >= start && (end.is_empty() || key < end);
+                if in_span {
+                    let need = SNAPSHOT_REC_FIXED + klen + vlen;
+                    if p + need > out.len() {
+                        return None; // fail closed
+                    }
+                    out[p..p + 2].copy_from_slice(&r.key_len.to_le_bytes());
+                    out[p + 2..p + 6].copy_from_slice(&r.value_len.to_le_bytes());
+                    out[p + 6..p + 14].copy_from_slice(&r.create_revision.to_le_bytes());
+                    out[p + 14..p + 22].copy_from_slice(&r.mod_revision.to_le_bytes());
+                    out[p + 22..p + 30].copy_from_slice(&r.version.to_le_bytes());
+                    out[p + 30..p + 38].copy_from_slice(&r.lease_id.to_le_bytes());
+                    out[p + 38..p + 46].copy_from_slice(&r.expiry_ms.to_le_bytes());
+                    p += SNAPSHOT_REC_FIXED;
+                    out[p..p + klen].copy_from_slice(&r.key[..klen]);
+                    p += klen;
+                    out[p..p + vlen].copy_from_slice(&r.value[..vlen]);
+                    p += vlen;
+                    count += 1;
+                }
             }
             i += 1;
         }
@@ -2749,6 +2822,133 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
 }
 
 impl<S: RunStorage> DiskMaterializer<'_, S> {
+    /// Span export for the elastic split, disk provider: stream the
+    /// CURRENT record of every key in the half-open span `[start, end)`
+    /// into the portable span-snapshot body
+    /// ([`KvStore::snapshot_encode_span`]'s wire format, so the target
+    /// installs it with no new decode path). Bounds are STORED-key bytes
+    /// (12-byte identity ++ user key), exactly as the memory provider
+    /// takes them; empty = unbounded.
+    ///
+    /// MVCC history does not travel: the destination partition's
+    /// revision space is independent of the source's, so porting version
+    /// history would be semantically wrong — a span moves as its current
+    /// state, the same contract the memory provider ships. Historical
+    /// reads of the moved span on the target answer from the move
+    /// onward.
+    ///
+    /// Fails closed (`None`) on a provider fault, a corrupt record, or
+    /// an out-of-budget body — a truncated span would silently drop keys
+    /// the cutover then loses.
+    pub fn snapshot_encode_span(
+        &mut self,
+        out: &mut [u8],
+        clock_ms: u64,
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<usize> {
+        if out.len() < SNAPSHOT_HDR_LEN {
+            return None;
+        }
+        // A stored-key bound (identity ++ user key) converts to the
+        // provider's encoded-key form: escaping is order-preserving and
+        // the identity prefix rides fixed-width at the front of both
+        // forms, so the half-open semantics carry over unchanged.
+        fn encoded_bound(bound: &[u8], buf: &mut [u8]) -> Option<usize> {
+            if bound.is_empty() {
+                return Some(0);
+            }
+            if bound.len() < IDENT_LEN {
+                return None;
+            }
+            let t = u32::from_be_bytes(bound[0..4].try_into().ok()?);
+            let d = u32::from_be_bytes(bound[4..8].try_into().ok()?);
+            let k = u32::from_be_bytes(bound[8..12].try_into().ok()?);
+            internal_key::encode_prefix(buf, t, d, k, &bound[IDENT_LEN..])
+        }
+        let mut sb = [0u8; disk_store::MAX_ENCODED_KEY];
+        let mut eb = [0u8; disk_store::MAX_ENCODED_KEY];
+        let sn = encoded_bound(start, &mut sb)?;
+        let en = encoded_bound(end, &mut eb)?;
+        let span = disk_store::state_store::KeySpan {
+            start: &sb[..sn],
+            end: &eb[..en],
+        };
+
+        let mut p = SNAPSHOT_HDR_LEN;
+        let mut count: u32 = 0;
+        let mut resume = 0u64;
+        let mut sbuf = [0u8; DISK_SCAN_BUF];
+        loop {
+            let prog = match self.store.scan_at(span, 0, resume, &mut sbuf) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.fault = true;
+                    return None;
+                }
+            };
+            let mut at = 0usize;
+            for _ in 0..prog.entries {
+                let klen = u16::from_le_bytes([sbuf[at], sbuf[at + 1]]) as usize;
+                let vlen =
+                    u32::from_le_bytes([sbuf[at + 2], sbuf[at + 3], sbuf[at + 4], sbuf[at + 5]])
+                        as usize;
+                at += 6;
+                let key = &sbuf[at..at + klen];
+                let val = &sbuf[at + klen..at + klen + vlen];
+                at += klen + vlen;
+                resume += 1;
+                let mut ubuf = [0u8; MAX_KEY_LEN];
+                let dec = internal_key::decode(key, &mut ubuf)?;
+                let meta = decode_disk_meta(val)?;
+                let user = &ubuf[..dec.user_key_len];
+                let public = &val[DISK_META_LEN..];
+                let stored_klen = IDENT_LEN + user.len();
+                if stored_klen > MAX_KEY_LEN {
+                    return None; // uninstallable on any target — refuse whole
+                }
+                let need = SNAPSHOT_REC_FIXED + stored_klen + public.len();
+                if p + need > out.len() {
+                    return None; // fail closed — never a truncated span
+                }
+                out[p..p + 2].copy_from_slice(&(stored_klen as u16).to_le_bytes());
+                out[p + 2..p + 6].copy_from_slice(&(public.len() as u32).to_le_bytes());
+                out[p + 6..p + 14].copy_from_slice(&meta.create_revision.to_le_bytes());
+                out[p + 14..p + 22].copy_from_slice(&meta.mod_revision.to_le_bytes());
+                out[p + 22..p + 30].copy_from_slice(&meta.version.to_le_bytes());
+                out[p + 30..p + 38].copy_from_slice(&meta.lease_id.to_le_bytes());
+                out[p + 38..p + 46].copy_from_slice(&meta.expiry_ms.to_le_bytes());
+                p += SNAPSHOT_REC_FIXED;
+                out[p..p + 4].copy_from_slice(&dec.tenant.to_be_bytes());
+                out[p + 4..p + 8].copy_from_slice(&dec.database.to_be_bytes());
+                out[p + 8..p + 12].copy_from_slice(&dec.keyspace.to_be_bytes());
+                out[p + 12..p + 12 + user.len()].copy_from_slice(user);
+                p += stored_klen;
+                out[p..p + public.len()].copy_from_slice(public);
+                p += public.len();
+                count += 1;
+            }
+            match prog.progress {
+                Progress::Done => break,
+                Progress::InProgress { .. } => {
+                    if prog.entries == 0 {
+                        // No forward progress possible — refuse rather
+                        // than spin.
+                        return None;
+                    }
+                }
+            }
+        }
+        out[0..4].copy_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        out[6..8].copy_from_slice(&0u16.to_le_bytes()); // flags
+        out[8..16].copy_from_slice(&self.revision.to_le_bytes());
+        out[16..20].copy_from_slice(&count.to_le_bytes());
+        out[20..24].copy_from_slice(&0u32.to_le_bytes()); // reserved
+        out[24..32].copy_from_slice(&clock_ms.to_le_bytes());
+        Some(p)
+    }
+
     /// The merged ordered walk behind both `scan_op` and `scan_as_of`.
     /// `at_rev` is the MVCC revision to serve at (`0` = latest);
     /// `force_empty` short-circuits the "nothing existed yet" case the
@@ -4721,11 +4921,12 @@ fn apply_idempotent_lookup<M: Materializer>(
     let ik_len = idempotency_key_bytes(&mut ik, id);
     let mut rbuf = [0u8; txn::IDEMPOTENCY_RECORD_WIRE_LEN];
     let record = match store.get_live(&ik[..ik_len], now_ms, &mut rbuf) {
-        GetOutcome::Found { value_len, .. } => match txn::IdempotencyRecord::decode(&rbuf[..value_len])
-        {
-            Some(rec) => Some(rec),
-            None => return (KV_RESULT_INTERNAL, 0),
-        },
+        GetOutcome::Found { value_len, .. } => {
+            match txn::IdempotencyRecord::decode(&rbuf[..value_len]) {
+                Some(rec) => Some(rec),
+                None => return (KV_RESULT_INTERNAL, 0),
+            }
+        }
         GetOutcome::Absent => None,
         GetOutcome::TooBig | GetOutcome::Fault => return (KV_RESULT_INTERNAL, 0),
     };

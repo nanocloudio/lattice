@@ -213,20 +213,22 @@ unsafe fn maybe_propose_tick(sched: &mut TtlState) {
     let ok = if sched.propose_wrap == 0 {
         write_envelope(sys, sched.propose_out, MSG_LEASE_TICK, &body)
     } else {
-        // `MSG_CLIENT_PROPOSAL [conn_id=0][LATTICE_RECORD_TAG]
+        // `MSG_CLIENT_PROPOSAL [conn_id:u16=0][LATTICE_RECORD_TAG]
         // [MSG_LEASE_TICK][tick_ms:u64]` — the same record envelope
         // `timestamp_allocator` uses, so the committed entry demuxes at
-        // `lattice_apply_bridge` with no new entry kind.
-        let payload_len = 3 + body.len();
+        // `lattice_apply_bridge` with no new entry kind. Conn ids are
+        // u16 on clustor's client surface; 0 = no client connection.
+        let payload_len = 4 + body.len();
         let total = 3 + payload_len;
         let mut buf = [0u8; 32];
         buf[0] = wire::MSG_CLIENT_PROPOSAL;
         buf[1] = (payload_len & 0xFF) as u8;
         buf[2] = ((payload_len >> 8) & 0xFF) as u8;
         buf[3] = 0;
-        buf[4] = wire::LATTICE_RECORD_TAG;
-        buf[5] = MSG_LEASE_TICK;
-        buf[6..6 + body.len()].copy_from_slice(&body);
+        buf[4] = 0;
+        buf[5] = wire::LATTICE_RECORD_TAG;
+        buf[6] = MSG_LEASE_TICK;
+        buf[7..7 + body.len()].copy_from_slice(&body);
         (sys.channel_write)(sched.propose_out, buf.as_mut_ptr(), total) == total as i32
     };
     if ok {

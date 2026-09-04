@@ -1,0 +1,44 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Prometheus-compatible metrics surface: remote-write ingest and PromQL
+# over the Prometheus HTTP API, one dialect surface over the canonical KV
+# store's time-series keyspace (KS_TIMESERIES_*). A metrics query, whatever
+# the language, lowers onto one engine (common/tsquery_core.rs); this anchor
+# terminates the HTTP transport, resolves series through the series
+# directory, folds each series' window, and streams the matrix result a
+# Prometheus datasource renders.
+#
+# Router pairing: POSITIONAL pair #2 (the "memcached_*" port names) stamped
+# PROTO_MEMCACHED — the router routes the data path by key bytes regardless
+# of proto; the proto byte only steers the reply back to this one anchor.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["sessions", "commands", "errors"]

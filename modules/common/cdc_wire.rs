@@ -96,8 +96,6 @@
 /// refuse unknown versions rather than guessing offsets.
 pub const CDC_ENVELOPE_FORMAT: u16 = 1;
 
-/// The capability string a conforming sink provider declares.
-
 // ── Event kinds ───────────────────────────────────────────────────────
 
 pub const CDC_KIND_PUT: u8 = 1;

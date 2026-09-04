@@ -28,6 +28,11 @@
 //!   half-edge.
 //!   `GRAPH.OUT g v` / `GRAPH.IN g v` — bounded adjacency expansion
 //!   as a prefix scan (the key layout makes the bound structural).
+//!   `GRAPH.PATH g src dst maxhops` — bounded breadth-first shortest-path
+//!   distance over out-edges, `-1` when `dst` is unreachable within
+//!   `maxhops`. Read-only; each hop is one adjacency scan and the
+//!   frontier/visited sets are capped, so the whole traversal is bounded
+//!   work — pattern matching and unbounded walks stay out.
 //! - `SEARCH.INDEX idx doc text…`  — tokenized postings, ALL terms in
 //!   ONE transaction (§14.20: postings move with the document).
 //!   `SEARCH.QUERY idx term`       — one term's posting scan, doc ids
@@ -116,6 +121,7 @@ use redis_codec::{
 use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_TXN, KV_RESULT_INTEGER,
     KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, KV_RESULT_TXN, PROTO_MEMCACHED,
+    TXN_CMP_MOD_EQUAL,
 };
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -130,6 +136,10 @@ const SCRATCH_BUF: usize = 16384;
 const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 6380;
 const KEY_MAX: usize = 512;
+/// Max vertex-id length (mirrors `models::MAX_VERTEX_ID_LEN`), for GRAPH.PATH.
+const MAX_VERTEX_ID: usize = 32;
+/// GRAPH.PATH: hard cap on hops so a query is bounded work.
+const MAX_PATH_HOPS: u8 = 16;
 /// Search: max terms per document / vector: max dimensions.
 const MAX_TERMS: usize = 32;
 const MAX_DIMS: usize = 64;
@@ -157,6 +167,14 @@ const D_DV_IN_SCAN: u8 = 13; // DELVERTEX: a page of the vertex's in-edges
 const D_DV_IN_DEL: u8 = 14; // DELVERTEX: in-edge page removed → re-scan
 const D_SRCH_ISECT: u8 = 15; // SEARCH multi-term: a later term's page to intersect
 const D_VMETA_SCAN: u8 = 16; // VECTOR.SIMWHERE: collect the tag's entity set
+const D_PATH_SCAN: u8 = 17; // GRAPH.PATH: a BFS frontier vertex's out-edges
+const D_HSET: u8 = 18; // HSET: a TXN of hash-field puts awaiting ack → reply count
+const D_LIST_READ: u8 = 19; // LPUSH/RPUSH: read the list head/tail hint
+const D_LIST_WRITE: u8 = 20; // LPUSH/RPUSH: CAS-append the element
+const D_LLEN: u8 = 21; // LLEN: read the head/tail hint → reply length
+const D_ZADD_READ: u8 = 22; // ZADD: read a member's prior score
+const D_ZADD_WRITE: u8 = 23; // ZADD: (re)index the member by score
+const D_ROLLUP_WRITE: u8 = 24; // TS.ROLLUP: persist the downsampled buckets
 
 const PHASE_INIT: u8 = 0;
 const PHASE_WAIT_BOUND: u8 = 1;
@@ -289,9 +307,55 @@ struct AnchorState {
     ds_sum: [f32; MAX_DS_BUCKETS],
     ds_count: [u32; MAX_DS_BUCKETS],
 
+    /// TS.ROLLUP: when set, the downsample buckets are PERSISTED to the rollup
+    /// keyspace (`ts_rollup_series`/`ts_rollup_res`) instead of replied — a
+    /// pre-materialised rollup a periodic caller refreshes and `TS.GETROLLUP`
+    /// reads cheaply.
+    ts_rollup_persist: bool,
+    ts_rollup_series: u64,
+    ts_rollup_res: u32,
+
     /// VECTOR.SIMWHERE: when set, the SIM scan keeps only entities present
     /// in `feed` (the tag's membership set collected first).
     vfilter: bool,
+
+    /// GRAPH.PATH bounded BFS. The queue holds `[depth:u8][vlen:u8][vbytes]`
+    /// entries consumed FIFO from `path_head`; `path_visited` is the seen set
+    /// as `[vlen:u8][vbytes]`. `path_depth` is the depth of the vertex whose
+    /// out-edges the in-flight scan is expanding.
+    path_graph: u32,
+    path_dst: [u8; MAX_VERTEX_ID],
+    path_dst_len: u8,
+    path_maxhops: u8,
+    path_depth: u8,
+    path_queue: [u8; 4096],
+    path_queue_len: u16,
+    path_head: u16,
+    path_visited: [u8; 4096],
+    path_visited_len: u16,
+
+    /// Redis list push/read. `list_op` 0 = RPUSH (grow tail), 1 = LPUSH
+    /// (grow head). `list_head`/`list_tail` are the read hint; the element
+    /// is CAS-written into an absent slot, retried on collision. `lrange_*`
+    /// bound an `LRANGE` slice.
+    list_op: u8,
+    list_id: u32,
+    list_val: [u8; 512],
+    list_val_len: u16,
+    list_retries: u8,
+    list_head: i64,
+    list_tail: i64,
+    lrange_start: i64,
+    lrange_stop: i64,
+
+    /// Redis sorted-set `ZADD`: the target member, its new score, and the
+    /// prior score read back so the old score-index entry can be removed.
+    z_set_id: u32,
+    z_member: [u8; MAX_VERTEX_ID],
+    z_member_len: u8,
+    z_score: i64,
+    z_old_score: i64,
+    z_old_exists: bool,
 
     kv_corr: u64,
     env: [u8; SCRATCH_BUF],
@@ -320,6 +384,22 @@ const ID_TS_AGG: u8 = 3;
 /// Time-series downsample: fold each sample into a fixed-width time
 /// bucket, replying one aggregate per bucket.
 const ID_TS_DS: u8 = 4;
+/// Redis hash: emit TWO records per entry — the field (decoded from the key)
+/// then its value — so `HGETALL` renders a flat `[field, value, …]` array.
+const ID_HASH_PAIR: u8 = 5;
+/// Redis hash single field: emit only the value; `HGET` renders one bulk
+/// string, or nil when the field is absent.
+const ID_HASH_GET: u8 = 6;
+/// Redis list element: emit only the value; `LRANGE` renders a (sliced) array.
+const ID_LIST_VALUE: u8 = 7;
+/// Sorted-set member (decoded from the score-index key tail); `ZRANGE` renders
+/// a (sliced) array of members in ascending score order.
+const ID_ZMEMBER: u8 = 8;
+/// Sorted-set score value; `ZSCORE` renders the integer score as a bulk string.
+const ID_ZSCORE: u8 = 9;
+/// Persisted rollup bucket: emit the bucket timestamp (from the key) then its
+/// value — `TS.GETROLLUP` renders a flat `[bucket_ts, value, …]` array.
+const ID_ROLLUP: u8 = 10;
 const MAX_DS_BUCKETS: usize = 64;
 
 /// Vector distance metrics.
@@ -388,7 +468,35 @@ impl AnchorState {
         self.ds_from = 0;
         self.ds_bucket = 0;
         self.ds_n = 0;
+        self.ts_rollup_persist = false;
+        self.ts_rollup_series = 0;
+        self.ts_rollup_res = 0;
         self.vfilter = false;
+        self.path_graph = 0;
+        self.path_dst = [0; MAX_VERTEX_ID];
+        self.path_dst_len = 0;
+        self.path_maxhops = 0;
+        self.path_depth = 0;
+        self.path_queue = [0; 4096];
+        self.path_queue_len = 0;
+        self.path_head = 0;
+        self.path_visited = [0; 4096];
+        self.path_visited_len = 0;
+        self.list_op = 0;
+        self.list_id = 0;
+        self.list_val = [0; 512];
+        self.list_val_len = 0;
+        self.list_retries = 0;
+        self.list_head = 0;
+        self.list_tail = 0;
+        self.lrange_start = 0;
+        self.lrange_stop = 0;
+        self.z_set_id = 0;
+        self.z_member = [0; MAX_VERTEX_ID];
+        self.z_member_len = 0;
+        self.z_score = 0;
+        self.z_old_score = 0;
+        self.z_old_exists = false;
         self.kv_corr = 0;
         self.env = [0; SCRATCH_BUF];
         self.scratch = [0; SCRATCH_BUF];
@@ -966,6 +1074,286 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
             models::KS_GRAPH_EDGE_IN
         };
         if !start_id_scan(anchor, ks, &body[..bn], ID_EDGE_SECOND) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    // `GRAPH.PATH g src dst maxhops` — bounded breadth-first shortest-path
+    // distance from `src` to `dst` following out-edges, up to `maxhops`.
+    // Replies the hop distance, or -1 if `dst` is not reachable within the
+    // bound. Read-only; every hop is a bounded adjacency scan, and the
+    // frontier/visited sets are capped so the whole traversal is bounded
+    // work — a pattern-match or unbounded walk is deliberately NOT offered.
+    if eq_ci(cmd, b"GRAPH.PATH") {
+        if argv.count != 5 {
+            reply_error_str(anchor, b"ERR GRAPH.PATH graph src dst maxhops");
+            return;
+        }
+        let g = id32(arg(recv, argv, 1));
+        let src = arg(recv, argv, 2);
+        let dst = arg(recv, argv, 3);
+        let Some(maxhops) = parse_u64_dec(arg(recv, argv, 4)) else {
+            reply_error_str(anchor, b"ERR maxhops is a decimal u64");
+            return;
+        };
+        if src.is_empty()
+            || dst.is_empty()
+            || src.len() > MAX_VERTEX_ID
+            || dst.len() > MAX_VERTEX_ID
+        {
+            reply_error_str(anchor, b"ERR vertex id length");
+            return;
+        }
+        if maxhops > MAX_PATH_HOPS as u64 {
+            reply_error_str(anchor, b"ERR maxhops exceeds bound");
+            return;
+        }
+        if src == dst {
+            reply_int(anchor, 0);
+            return;
+        }
+        anchor.path_graph = g;
+        anchor.path_dst[..dst.len()].copy_from_slice(dst);
+        anchor.path_dst_len = dst.len() as u8;
+        anchor.path_maxhops = maxhops as u8;
+        anchor.path_queue_len = 0;
+        anchor.path_head = 0;
+        anchor.path_visited_len = 0;
+        let _ = path_visited_add(anchor, src);
+        if !path_enqueue(anchor, 0, src) {
+            reply_error_str(anchor, b"ERR path too large");
+            return;
+        }
+        path_dequeue_and_scan(anchor);
+        return;
+    }
+
+    // ── Redis hashes ────────────────────────────────────────────────
+    // `HSET h field value [field value …]` — write each field; reply the
+    // number of fields written. A hash field is `KS_HASH[hash_id][field]`,
+    // so HGET is a point read and HGETALL a bounded prefix scan.
+    if eq_ci(cmd, b"HSET") {
+        if argv.count < 4 || !(argv.count - 2).is_multiple_of(2) {
+            reply_error_str(anchor, b"ERR HSET hash field value [field value ...]");
+            return;
+        }
+        let h = id32(arg(recv, argv, 1));
+        let pairs = (argv.count as usize - 2) / 2;
+        anchor.reply_kind = R_OK;
+        let end_guard = BODY_AT + 3800;
+        let mut p = BODY_AT;
+        anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // 0 comparisons
+        p += 2;
+        anchor.env[p..p + 2].copy_from_slice(&(pairs as u16).to_le_bytes()); // THEN
+        p += 2;
+        for i in 0..pairs {
+            let field = arg(recv, argv, 2 + i * 2);
+            let value = arg(recv, argv, 3 + i * 2);
+            if field.len() > MAX_VERTEX_ID || value.len() > 512 {
+                reply_error_str(anchor, b"ERR field or value too long");
+                return;
+            }
+            let mut body = [0u8; KEY_MAX];
+            let Some(bn) = models::encode_hash_field_key(&mut body, h as u32, field) else {
+                reply_error_str(anchor, b"ERR internal");
+                return;
+            };
+            let mut key = [0u8; KEY_MAX + 8];
+            let Some(kn) = user_key(&mut key, models::KS_HASH, &body[..bn]) else {
+                reply_error_str(anchor, b"ERR internal");
+                return;
+            };
+            let mut vbuf = [0u8; 512];
+            vbuf[..value.len()].copy_from_slice(value);
+            let Some(np) = txn_put(anchor, p, end_guard, &key[..kn], &vbuf[..value.len()]) else {
+                reply_error_str(anchor, b"ERR too large");
+                return;
+            };
+            p = np;
+        }
+        anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // ELSE
+        p += 2;
+        // A HSET reply is the field count; stash it so the ack renders it.
+        anchor.del_count = pairs as u64;
+        if !kv_send(anchor, KV_OP_TXN, p - BODY_AT, D_HSET) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    if eq_ci(cmd, b"HGET") {
+        if argv.count != 3 {
+            reply_error_str(anchor, b"ERR HGET hash field");
+            return;
+        }
+        let h = id32(arg(recv, argv, 1));
+        let field = arg(recv, argv, 2);
+        if field.len() > MAX_VERTEX_ID {
+            reply_error_str(anchor, b"ERR field too long");
+            return;
+        }
+        let mut body = [0u8; KEY_MAX];
+        let Some(bn) = models::encode_hash_field_key(&mut body, h as u32, field) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        if !start_id_scan(anchor, models::KS_HASH, &body[..bn], ID_HASH_GET) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    if eq_ci(cmd, b"HGETALL") {
+        if argv.count != 2 {
+            reply_error_str(anchor, b"ERR HGETALL hash");
+            return;
+        }
+        let h = id32(arg(recv, argv, 1));
+        let body = (h as u32).to_be_bytes();
+        if !start_id_scan(anchor, models::KS_HASH, &body, ID_HASH_PAIR) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    // ── Redis lists ─────────────────────────────────────────────────
+    // `RPUSH k v` / `LPUSH k v` append/prepend one element and reply the new
+    // length. The element is CAS-written into an absent index slot, so
+    // concurrent pushers never lose an element — a slot collision just
+    // retries against a re-read head/tail hint.
+    if eq_ci(cmd, b"RPUSH") || eq_ci(cmd, b"LPUSH") {
+        if argv.count != 3 {
+            reply_error_str(anchor, b"ERR PUSH key value");
+            return;
+        }
+        let value = arg(recv, argv, 2);
+        if value.len() > 512 {
+            reply_error_str(anchor, b"ERR value too long");
+            return;
+        }
+        anchor.list_op = if eq_ci(cmd, b"LPUSH") { 1 } else { 0 };
+        anchor.list_id = id32(arg(recv, argv, 1));
+        anchor.list_val[..value.len()].copy_from_slice(value);
+        anchor.list_val_len = value.len() as u16;
+        anchor.list_retries = 0;
+        list_start_read(anchor);
+        return;
+    }
+
+    if eq_ci(cmd, b"LLEN") {
+        if argv.count != 2 {
+            reply_error_str(anchor, b"ERR LLEN key");
+            return;
+        }
+        anchor.list_id = id32(arg(recv, argv, 1));
+        let mut body = [0u8; KEY_MAX];
+        let Some(bn) = models::encode_list_meta_key(&mut body, anchor.list_id) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        if !stage_single_scan(anchor, models::KS_LIST_META, &body[..bn], D_LLEN) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    if eq_ci(cmd, b"LRANGE") {
+        if argv.count != 4 {
+            reply_error_str(anchor, b"ERR LRANGE key start stop");
+            return;
+        }
+        let (Some(start), Some(stop)) = (
+            parse_i64_dec(arg(recv, argv, 2)),
+            parse_i64_dec(arg(recv, argv, 3)),
+        ) else {
+            reply_error_str(anchor, b"ERR start/stop are integers");
+            return;
+        };
+        anchor.list_id = id32(arg(recv, argv, 1));
+        anchor.lrange_start = start;
+        anchor.lrange_stop = stop;
+        let body = anchor.list_id.to_be_bytes();
+        if !start_id_scan(anchor, models::KS_LIST, &body, ID_LIST_VALUE) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    // ── Redis sorted sets (integer scores) ──────────────────────────
+    // `ZADD set score member` indexes `member` by `score` (re-scoring first
+    // removes the stale index entry); `ZSCORE` point-reads a score; `ZRANGE`
+    // returns members in ascending score order.
+    if eq_ci(cmd, b"ZADD") {
+        if argv.count != 4 {
+            reply_error_str(anchor, b"ERR ZADD set score member");
+            return;
+        }
+        let Some(score) = parse_i64_dec(arg(recv, argv, 2)) else {
+            reply_error_str(anchor, b"ERR score is an integer");
+            return;
+        };
+        let member = arg(recv, argv, 3);
+        if member.is_empty() || member.len() > MAX_VERTEX_ID {
+            reply_error_str(anchor, b"ERR member length");
+            return;
+        }
+        anchor.z_set_id = id32(arg(recv, argv, 1));
+        anchor.z_member[..member.len()].copy_from_slice(member);
+        anchor.z_member_len = member.len() as u8;
+        anchor.z_score = score;
+        anchor.z_old_exists = false;
+        anchor.z_old_score = 0;
+        let mut body = [0u8; KEY_MAX];
+        let Some(bn) = models::encode_zmember_key(&mut body, anchor.z_set_id, member) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        if !stage_single_scan(anchor, models::KS_ZMEMBER, &body[..bn], D_ZADD_READ) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    if eq_ci(cmd, b"ZSCORE") {
+        if argv.count != 3 {
+            reply_error_str(anchor, b"ERR ZSCORE set member");
+            return;
+        }
+        let set = id32(arg(recv, argv, 1));
+        let member = arg(recv, argv, 2);
+        if member.len() > MAX_VERTEX_ID {
+            reply_error_str(anchor, b"ERR member too long");
+            return;
+        }
+        let mut body = [0u8; KEY_MAX];
+        let Some(bn) = models::encode_zmember_key(&mut body, set, member) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        if !start_id_scan(anchor, models::KS_ZMEMBER, &body[..bn], ID_ZSCORE) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    if eq_ci(cmd, b"ZRANGE") {
+        if argv.count != 4 {
+            reply_error_str(anchor, b"ERR ZRANGE set start stop");
+            return;
+        }
+        let (Some(start), Some(stop)) = (
+            parse_i64_dec(arg(recv, argv, 2)),
+            parse_i64_dec(arg(recv, argv, 3)),
+        ) else {
+            reply_error_str(anchor, b"ERR start/stop are integers");
+            return;
+        };
+        let set = id32(arg(recv, argv, 1));
+        anchor.lrange_start = start;
+        anchor.lrange_stop = stop;
+        let body = set.to_be_bytes();
+        if !start_id_scan(anchor, models::KS_ZSCORE, &body, ID_ZMEMBER) {
             reply_error_str(anchor, b"ERR internal");
         }
         return;
@@ -1648,11 +2036,113 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
         anchor.ds_from = from;
         anchor.ds_bucket = bucket;
         anchor.ds_n = n as u16;
+        anchor.ts_rollup_persist = false;
         for i in 0..n {
             anchor.ds_sum[i] = 0.0;
             anchor.ds_count[i] = 0;
         }
         if start_ts_scan(anchor, series, from, to, ID_TS_DS) != Some(true) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    // `TS.ROLLUP series from to bucket` — like TS.DOWNSAMPLE, but PERSISTS the
+    // downsampled buckets into the rollup keyspace and replies the count. A
+    // periodic caller refreshes rollups so `TS.GETROLLUP` reads them cheaply
+    // (the pre-materialisation the raw-sample scan avoids on every query).
+    if eq_ci(cmd, b"TS.ROLLUP") {
+        if argv.count != 5 {
+            reply_error_str(anchor, b"ERR TS.ROLLUP series from to bucket");
+            return;
+        }
+        let series = id32(arg(recv, argv, 1)) as u64;
+        let (Some(from), Some(to), Some(bucket)) = (
+            parse_u64_dec(arg(recv, argv, 2)),
+            parse_u64_dec(arg(recv, argv, 3)),
+            parse_u64_dec(arg(recv, argv, 4)),
+        ) else {
+            reply_error_str(anchor, b"ERR from/to/bucket are decimal u64");
+            return;
+        };
+        if from > to || bucket == 0 {
+            reply_error_str(anchor, b"ERR window/bucket invalid");
+            return;
+        }
+        let n = ((to - from) / bucket.max(1)) as usize + 1;
+        if n > MAX_DS_BUCKETS {
+            reply_error_str(anchor, b"ERR too many buckets for one window");
+            return;
+        }
+        anchor.ds_from = from;
+        anchor.ds_bucket = bucket;
+        anchor.ds_n = n as u16;
+        anchor.ts_rollup_persist = true;
+        anchor.ts_rollup_series = series;
+        anchor.ts_rollup_res = bucket as u32;
+        for i in 0..n {
+            anchor.ds_sum[i] = 0.0;
+            anchor.ds_count[i] = 0;
+        }
+        if start_ts_scan(anchor, series, from, to, ID_TS_DS) != Some(true) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+
+    // `TS.GETROLLUP series resolution from to` — read the pre-materialised
+    // rollup buckets for a series at a resolution, as `[bucket_ts, avg, …]`.
+    if eq_ci(cmd, b"TS.GETROLLUP") {
+        if argv.count != 5 {
+            reply_error_str(anchor, b"ERR TS.GETROLLUP series resolution from to");
+            return;
+        }
+        let series = id32(arg(recv, argv, 1)) as u64;
+        let (Some(res), Some(from), Some(to)) = (
+            parse_u64_dec(arg(recv, argv, 2)),
+            parse_u64_dec(arg(recv, argv, 3)),
+            parse_u64_dec(arg(recv, argv, 4)),
+        ) else {
+            reply_error_str(anchor, b"ERR resolution/from/to are decimal u64");
+            return;
+        };
+        let mut sbody = [0u8; models::TIMESERIES_ROLLUP_KEY_LEN];
+        let mut ebody = [0u8; models::TIMESERIES_ROLLUP_KEY_LEN];
+        let (Some(sbn), Some(ebn)) = (
+            models::encode_timeseries_rollup_key(&mut sbody, series, res as u32, from),
+            models::encode_timeseries_rollup_key(
+                &mut ebody,
+                series,
+                res as u32,
+                to.saturating_add(1),
+            ),
+        ) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        let mut start = [0u8; KEY_MAX];
+        let mut end = [0u8; KEY_MAX];
+        let (Some(sn), Some(en)) = (
+            user_key(&mut start, models::KS_TIMESERIES_ROLLUP, &sbody[..sbn]),
+            user_key(&mut end, models::KS_TIMESERIES_ROLLUP, &ebody[..ebn]),
+        ) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        anchor.scan_start[..sn].copy_from_slice(&start[..sn]);
+        anchor.scan_start_len = sn as u16;
+        anchor.scan_end[..en].copy_from_slice(&end[..en]);
+        anchor.scan_end_len = en as u16;
+        anchor.cursor = 0;
+        anchor.ids_len = 0;
+        anchor.ids_count = 0;
+        anchor.id_mode = ID_ROLLUP;
+        anchor.reply_kind = R_IDS;
+        let Some(bn) = stage_scan_bounds(anchor) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        if !kv_send(anchor, KV_OP_RANGE_SCAN, bn, D_SCAN_OUT) {
             reply_error_str(anchor, b"ERR internal");
         }
         return;
@@ -1758,6 +2248,107 @@ fn start_id_scan(anchor: &mut AnchorState, keyspace: u32, prefix_body: &[u8], mo
         return false;
     };
     kv_send(anchor, KV_OP_RANGE_SCAN, bn, D_SCAN_OUT)
+}
+
+// ── GRAPH.PATH bounded BFS ────────────────────────────────────────────
+
+/// Append `[depth][vlen][vbytes]` to the frontier queue. `false` if full.
+fn path_enqueue(anchor: &mut AnchorState, depth: u8, v: &[u8]) -> bool {
+    let at = anchor.path_queue_len as usize;
+    if v.len() > 255 || at + 2 + v.len() > anchor.path_queue.len() {
+        return false;
+    }
+    anchor.path_queue[at] = depth;
+    anchor.path_queue[at + 1] = v.len() as u8;
+    anchor.path_queue[at + 2..at + 2 + v.len()].copy_from_slice(v);
+    anchor.path_queue_len = (at + 2 + v.len()) as u16;
+    true
+}
+
+fn path_visited_has(anchor: &AnchorState, v: &[u8]) -> bool {
+    let mut p = 0usize;
+    while p < anchor.path_visited_len as usize {
+        let l = anchor.path_visited[p] as usize;
+        p += 1;
+        if p + l <= anchor.path_visited.len() && &anchor.path_visited[p..p + l] == v {
+            return true;
+        }
+        p += l;
+    }
+    false
+}
+
+/// Mark `v` seen. Idempotent; `false` only if the set is full.
+fn path_visited_add(anchor: &mut AnchorState, v: &[u8]) -> bool {
+    if path_visited_has(anchor, v) {
+        return true;
+    }
+    let at = anchor.path_visited_len as usize;
+    if v.len() > 255 || at + 1 + v.len() > anchor.path_visited.len() {
+        return false;
+    }
+    anchor.path_visited[at] = v.len() as u8;
+    anchor.path_visited[at + 1..at + 1 + v.len()].copy_from_slice(v);
+    anchor.path_visited_len = (at + 1 + v.len()) as u16;
+    true
+}
+
+/// Pop the next frontier vertex and scan its out-edges. An empty queue means
+/// `dst` was not reached within `maxhops` → reply -1. A vertex already at the
+/// hop limit is not expanded (it is skipped).
+fn path_dequeue_and_scan(anchor: &mut AnchorState) {
+    loop {
+        let head = anchor.path_head as usize;
+        if head + 2 > anchor.path_queue_len as usize {
+            reply_int(anchor, -1);
+            return;
+        }
+        let depth = anchor.path_queue[head];
+        let vlen = anchor.path_queue[head + 1] as usize;
+        let voff = head + 2;
+        anchor.path_head = (voff + vlen) as u16;
+        if depth as u32 >= anchor.path_maxhops as u32 {
+            continue;
+        }
+        let mut vbuf = [0u8; MAX_VERTEX_ID];
+        if vlen > MAX_VERTEX_ID {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        }
+        vbuf[..vlen].copy_from_slice(&anchor.path_queue[voff..voff + vlen]);
+        let mut body = [0u8; KEY_MAX];
+        let Some(bn) = models::encode_graph_vertex_key(&mut body, anchor.path_graph, &vbuf[..vlen])
+        else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        anchor.path_depth = depth;
+        if !start_path_scan(anchor, &body[..bn]) {
+            reply_error_str(anchor, b"ERR internal");
+        }
+        return;
+    }
+}
+
+/// Stage a scan of one vertex's out-edge adjacency for the BFS.
+fn start_path_scan(anchor: &mut AnchorState, prefix_body: &[u8]) -> bool {
+    let mut start = [0u8; KEY_MAX];
+    let Some(sn) = user_key(&mut start, models::KS_GRAPH_EDGE_OUT, prefix_body) else {
+        return false;
+    };
+    let mut end = [0u8; KEY_MAX];
+    let Some(en) = prefix_successor(&start[..sn], &mut end) else {
+        return false;
+    };
+    anchor.scan_start[..sn].copy_from_slice(&start[..sn]);
+    anchor.scan_start_len = sn as u16;
+    anchor.scan_end[..en].copy_from_slice(&end[..en]);
+    anchor.scan_end_len = en as u16;
+    anchor.cursor = 0;
+    let Some(bn) = stage_scan_bounds(anchor) else {
+        return false;
+    };
+    kv_send(anchor, KV_OP_RANGE_SCAN, bn, D_PATH_SCAN)
 }
 
 /// The (offset, len) of the idx-th stashed SEARCH term.
@@ -1867,6 +2458,450 @@ fn reply_ids(anchor: &mut AnchorState) {
     let mut f = [0u8; SEND_BUF];
     f[..n].copy_from_slice(&out[..n]);
     reply_raw(anchor, &f[..n]);
+}
+
+/// Persist the folded downsample buckets into the rollup keyspace as a single
+/// transaction: one record per non-empty bucket,
+/// `KS_TIMESERIES_ROLLUP[series][resolution][bucket_ts] = avg`.
+fn persist_rollup(anchor: &mut AnchorState) {
+    let mut nonempty: u16 = 0;
+    for i in 0..anchor.ds_n as usize {
+        if anchor.ds_count[i] > 0 {
+            nonempty += 1;
+        }
+    }
+    let end_guard = BODY_AT + 3800;
+    let mut p = BODY_AT;
+    anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // cmp_count
+    p += 2;
+    anchor.env[p..p + 2].copy_from_slice(&nonempty.to_le_bytes()); // then_count
+    p += 2;
+    for i in 0..anchor.ds_n as usize {
+        if anchor.ds_count[i] == 0 {
+            continue;
+        }
+        let bucket_ts = anchor.ds_from + (i as u64) * anchor.ds_bucket;
+        let avg = anchor.ds_sum[i] / anchor.ds_count[i] as f32;
+        let mut rkbody = [0u8; models::TIMESERIES_ROLLUP_KEY_LEN];
+        let Some(rbn) = models::encode_timeseries_rollup_key(
+            &mut rkbody,
+            anchor.ts_rollup_series,
+            anchor.ts_rollup_res,
+            bucket_ts,
+        ) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        let mut rkey = [0u8; KEY_MAX];
+        let Some(rkn) = user_key(&mut rkey, models::KS_TIMESERIES_ROLLUP, &rkbody[..rbn]) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        let mut vb = [0u8; 32];
+        let vn = fmt_f32(avg, &mut vb);
+        let Some(np) = txn_put(anchor, p, end_guard, &rkey[..rkn], &vb[..vn]) else {
+            reply_error_str(anchor, b"ERR too large");
+            return;
+        };
+        p = np;
+    }
+    anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // else_count
+    p += 2;
+    anchor.del_count = nonempty as u64;
+    if !kv_send(anchor, KV_OP_TXN, p - BODY_AT, D_ROLLUP_WRITE) {
+        reply_error_str(anchor, b"ERR internal");
+    }
+}
+
+// ── Redis lists ───────────────────────────────────────────────────────
+
+fn parse_i64_dec(b: &[u8]) -> Option<i64> {
+    if b.is_empty() {
+        return None;
+    }
+    let (neg, digits) = if b[0] == b'-' {
+        (true, &b[1..])
+    } else {
+        (false, b)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut n: i64 = 0;
+    for &c in digits {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+    }
+    Some(if neg { -n } else { n })
+}
+
+/// Stage a bounded scan of one key's prefix under `phase`.
+fn stage_single_scan(
+    anchor: &mut AnchorState,
+    keyspace: u32,
+    prefix_body: &[u8],
+    phase: u8,
+) -> bool {
+    let mut start = [0u8; KEY_MAX];
+    let Some(sn) = user_key(&mut start, keyspace, prefix_body) else {
+        return false;
+    };
+    let mut end = [0u8; KEY_MAX];
+    let Some(en) = prefix_successor(&start[..sn], &mut end) else {
+        return false;
+    };
+    anchor.scan_start[..sn].copy_from_slice(&start[..sn]);
+    anchor.scan_start_len = sn as u16;
+    anchor.scan_end[..en].copy_from_slice(&end[..en]);
+    anchor.scan_end_len = en as u16;
+    anchor.cursor = 0;
+    let Some(bn) = stage_scan_bounds(anchor) else {
+        return false;
+    };
+    kv_send(anchor, KV_OP_RANGE_SCAN, bn, phase)
+}
+
+fn list_start_read(anchor: &mut AnchorState) {
+    let mut body = [0u8; KEY_MAX];
+    let Some(bn) = models::encode_list_meta_key(&mut body, anchor.list_id) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+    if !stage_single_scan(anchor, models::KS_LIST_META, &body[..bn], D_LIST_READ) {
+        reply_error_str(anchor, b"ERR internal");
+    }
+}
+
+/// Extract `(head, tail)` from a single-key meta scan page; an empty page is
+/// an empty list at `(0, 0)`.
+fn parse_list_meta(body: &[u8]) -> (i64, i64) {
+    if body.len() < 10 {
+        return (0, 0);
+    }
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    if count == 0 {
+        return (0, 0);
+    }
+    let at = 10usize;
+    let Some(klen) = body
+        .get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    else {
+        return (0, 0);
+    };
+    let koff = at + 2;
+    let voff = koff + klen;
+    let Some(vlen) = body
+        .get(voff..voff + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    else {
+        return (0, 0);
+    };
+    if vlen < 16 || voff + 4 + 16 > body.len() {
+        return (0, 0);
+    }
+    let v = &body[voff + 4..voff + 4 + 16];
+    let head = i64::from_le_bytes(v[0..8].try_into().unwrap_or([0; 8]));
+    let tail = i64::from_le_bytes(v[8..16].try_into().unwrap_or([0; 8]));
+    (head, tail)
+}
+
+/// Append `[cmp_op][key_len u16][key][witness u64]` to the TXN body.
+fn txn_cmp(
+    anchor: &mut AnchorState,
+    mut p: usize,
+    end_guard: usize,
+    op: u8,
+    key: &[u8],
+    witness: u64,
+) -> Option<usize> {
+    if p + 1 + 2 + key.len() + 8 > end_guard {
+        return None;
+    }
+    anchor.env[p] = op;
+    p += 1;
+    anchor.env[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    p += 2;
+    anchor.env[p..p + key.len()].copy_from_slice(key);
+    p += key.len();
+    anchor.env[p..p + 8].copy_from_slice(&witness.to_le_bytes());
+    p += 8;
+    Some(p)
+}
+
+/// Build the CAS append: the element is written only if its index slot is
+/// absent (witness mod_revision 0), and the head/tail hint is refreshed in the
+/// same transaction. A slot collision runs the empty ELSE branch → a retry.
+fn do_list_write(anchor: &mut AnchorState) {
+    let (index, new_head, new_tail) = if anchor.list_op == 1 {
+        let h = anchor.list_head - 1;
+        (h, h, anchor.list_tail)
+    } else {
+        let t = anchor.list_tail;
+        (t, anchor.list_head, t + 1)
+    };
+    let mut ekbody = [0u8; 12];
+    let Some(ebn) = models::encode_list_entry_key(&mut ekbody, anchor.list_id, index) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+    let mut ekey = [0u8; KEY_MAX];
+    let Some(ekn) = user_key(&mut ekey, models::KS_LIST, &ekbody[..ebn]) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+    let mut mkbody = [0u8; 4];
+    let Some(mbn) = models::encode_list_meta_key(&mut mkbody, anchor.list_id) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+    let mut mkey = [0u8; KEY_MAX];
+    let Some(mkn) = user_key(&mut mkey, models::KS_LIST_META, &mkbody[..mbn]) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+    let mut meta_val = [0u8; 16];
+    meta_val[0..8].copy_from_slice(&new_head.to_le_bytes());
+    meta_val[8..16].copy_from_slice(&new_tail.to_le_bytes());
+    let mut vbuf = [0u8; 512];
+    let vlen = anchor.list_val_len as usize;
+    vbuf[..vlen].copy_from_slice(&anchor.list_val[..vlen]);
+
+    let end_guard = BODY_AT + 3800;
+    let mut p = BODY_AT;
+    anchor.env[p..p + 2].copy_from_slice(&1u16.to_le_bytes()); // cmp_count
+    p += 2;
+    let Some(np) = txn_cmp(anchor, p, end_guard, TXN_CMP_MOD_EQUAL, &ekey[..ekn], 0) else {
+        reply_error_str(anchor, b"ERR too large");
+        return;
+    };
+    p = np;
+    anchor.env[p..p + 2].copy_from_slice(&2u16.to_le_bytes()); // then_count
+    p += 2;
+    let Some(np) = txn_put(anchor, p, end_guard, &ekey[..ekn], &vbuf[..vlen]) else {
+        reply_error_str(anchor, b"ERR too large");
+        return;
+    };
+    p = np;
+    let Some(np) = txn_put(anchor, p, end_guard, &mkey[..mkn], &meta_val) else {
+        reply_error_str(anchor, b"ERR too large");
+        return;
+    };
+    p = np;
+    anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // else_count
+    p += 2;
+    anchor.del_count = (new_tail - new_head) as u64;
+    if !kv_send(anchor, KV_OP_TXN, p - BODY_AT, D_LIST_WRITE) {
+        reply_error_str(anchor, b"ERR internal");
+    }
+}
+
+/// Render `LRANGE`/`ZRANGE`: the collected `[sortkey:8][len][payload]` records
+/// sorted by their order-preserving key, then sliced to `[start, stop]` (Redis
+/// semantics: negatives count from the end). Sorting here (not relying on the
+/// store's scan order) keeps the result correct on the slot-ordered memory
+/// store as well as the sorted disk store.
+fn reply_lrange(anchor: &mut AnchorState) {
+    // Index the records.
+    let mut offs = [0u16; 256];
+    let mut noff = 0usize;
+    let mut at = 0usize;
+    while noff < offs.len() && at + 9 <= anchor.ids_len as usize {
+        offs[noff] = at as u16;
+        let l = anchor.ids[at + 8] as usize;
+        at += 9 + l;
+        noff += 1;
+    }
+    // Insertion sort by the 8-byte big-endian sort key.
+    let mut i = 1;
+    while i < noff {
+        let mut j = i;
+        while j > 0 {
+            let a = offs[j - 1] as usize;
+            let b = offs[j] as usize;
+            if anchor.ids[a..a + 8] > anchor.ids[b..b + 8] {
+                offs.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    let n = noff as i64;
+    let s = if anchor.lrange_start < 0 {
+        (n + anchor.lrange_start).max(0)
+    } else {
+        anchor.lrange_start
+    };
+    let e = if anchor.lrange_stop < 0 {
+        n + anchor.lrange_stop
+    } else {
+        anchor.lrange_stop.min(n - 1)
+    };
+    if n == 0 || s > e || s >= n {
+        let mut out = [0u8; 16];
+        let mut m = 0usize;
+        let _ = enc_array_header(&mut out, &mut m, 0);
+        let mut f = [0u8; 16];
+        f[..m].copy_from_slice(&out[..m]);
+        reply_raw(anchor, &f[..m]);
+        return;
+    }
+    let out_count = e - s + 1;
+    let mut out = [0u8; SEND_BUF];
+    let mut m = 0usize;
+    let _ = enc_array_header(&mut out, &mut m, out_count);
+    let mut rank = s;
+    while rank <= e {
+        let off = offs[rank as usize] as usize;
+        let l = anchor.ids[off + 8] as usize;
+        let mut vb = [0u8; 128];
+        let take = l.min(vb.len());
+        vb[..take].copy_from_slice(&anchor.ids[off + 9..off + 9 + take]);
+        let _ = enc_bulk(&mut out, &mut m, &vb[..take]);
+        rank += 1;
+    }
+    let mut f = [0u8; SEND_BUF];
+    f[..m].copy_from_slice(&out[..m]);
+    reply_raw(anchor, &f[..m]);
+}
+
+// ── Redis sorted sets ─────────────────────────────────────────────────
+
+fn fmt_i64(v: i64, out: &mut [u8]) -> usize {
+    if v < 0 && !out.is_empty() {
+        out[0] = b'-';
+        1 + fmt_u64(v.unsigned_abs(), &mut out[1..])
+    } else {
+        fmt_u64(v as u64, out)
+    }
+}
+
+/// The first record's value as an `i64` from a single-key scan page, if any.
+fn parse_zmember_score(body: &[u8]) -> Option<i64> {
+    if body.len() < 10 {
+        return None;
+    }
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    if count == 0 {
+        return None;
+    }
+    let at = 10usize;
+    let klen = body
+        .get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)?;
+    let voff = at + 2 + klen;
+    let vlen = body
+        .get(voff..voff + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)?;
+    if vlen < 8 || voff + 4 + 8 > body.len() {
+        return None;
+    }
+    Some(i64::from_le_bytes(
+        body[voff + 4..voff + 12].try_into().unwrap_or([0; 8]),
+    ))
+}
+
+/// Append a `KV_OP_DELETE` of one key as a TXN then-op.
+fn txn_delete(
+    anchor: &mut AnchorState,
+    mut p: usize,
+    end_guard: usize,
+    key: &[u8],
+) -> Option<usize> {
+    let del_body = 2 + 2 + key.len(); // key_count + key_len + key
+    if p + 3 + del_body > end_guard {
+        return None;
+    }
+    anchor.env[p] = KV_OP_DELETE;
+    p += 1;
+    anchor.env[p..p + 2].copy_from_slice(&(del_body as u16).to_le_bytes());
+    p += 2;
+    anchor.env[p..p + 2].copy_from_slice(&1u16.to_le_bytes()); // one key
+    p += 2;
+    anchor.env[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    p += 2;
+    anchor.env[p..p + key.len()].copy_from_slice(key);
+    p += key.len();
+    Some(p)
+}
+
+/// (Re)index the member by score: put the member→score directory record and
+/// the score-index entry, removing a prior score-index entry when the score
+/// changed. Reply is the added count (1 for a new member, 0 for a re-score).
+fn do_zadd_write(anchor: &mut AnchorState) {
+    let member_len = anchor.z_member_len as usize;
+    let mut mbuf = [0u8; MAX_VERTEX_ID];
+    mbuf[..member_len].copy_from_slice(&anchor.z_member[..member_len]);
+    let member = &mbuf[..member_len];
+
+    let mut mkbody = [0u8; KEY_MAX];
+    let mut mkey = [0u8; KEY_MAX];
+    let mut nskbody = [0u8; KEY_MAX];
+    let mut nskey = [0u8; KEY_MAX];
+    let (Some(mbn), Some(nsbn)) = (
+        models::encode_zmember_key(&mut mkbody, anchor.z_set_id, member),
+        models::encode_zscore_key(&mut nskbody, anchor.z_set_id, anchor.z_score, member),
+    ) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+    let (Some(mkn), Some(nskn)) = (
+        user_key(&mut mkey, models::KS_ZMEMBER, &mkbody[..mbn]),
+        user_key(&mut nskey, models::KS_ZSCORE, &nskbody[..nsbn]),
+    ) else {
+        reply_error_str(anchor, b"ERR internal");
+        return;
+    };
+
+    let rescore = anchor.z_old_exists && anchor.z_old_score != anchor.z_score;
+    let end_guard = BODY_AT + 3800;
+    let mut p = BODY_AT;
+    anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // cmp_count
+    p += 2;
+    let then_count: u16 = if rescore { 3 } else { 2 };
+    anchor.env[p..p + 2].copy_from_slice(&then_count.to_le_bytes());
+    p += 2;
+    if rescore {
+        let mut oskbody = [0u8; KEY_MAX];
+        let mut oskey = [0u8; KEY_MAX];
+        let Some(osbn) =
+            models::encode_zscore_key(&mut oskbody, anchor.z_set_id, anchor.z_old_score, member)
+        else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        let Some(oskn) = user_key(&mut oskey, models::KS_ZSCORE, &oskbody[..osbn]) else {
+            reply_error_str(anchor, b"ERR internal");
+            return;
+        };
+        let Some(np) = txn_delete(anchor, p, end_guard, &oskey[..oskn]) else {
+            reply_error_str(anchor, b"ERR too large");
+            return;
+        };
+        p = np;
+    }
+    let score_bytes = anchor.z_score.to_le_bytes();
+    let Some(np) = txn_put(anchor, p, end_guard, &mkey[..mkn], &score_bytes) else {
+        reply_error_str(anchor, b"ERR too large");
+        return;
+    };
+    p = np;
+    let Some(np) = txn_put(anchor, p, end_guard, &nskey[..nskn], &[]) else {
+        reply_error_str(anchor, b"ERR too large");
+        return;
+    };
+    p = np;
+    anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // else_count
+    p += 2;
+    anchor.del_count = if anchor.z_old_exists { 0 } else { 1 };
+    if !kv_send(anchor, KV_OP_TXN, p - BODY_AT, D_ZADD_WRITE) {
+        reply_error_str(anchor, b"ERR internal");
+    }
 }
 
 /// Scan one adjacency direction of the stashed DELVERTEX target
@@ -2156,6 +3191,135 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
             KV_RESULT_OK => reply_ok(anchor),
             _ => reply_error_str(anchor, b"ERR store unavailable"),
         },
+        D_HSET => match result {
+            KV_RESULT_TXN if !body.is_empty() && body[0] == 1 => {
+                reply_int(anchor, anchor.del_count as i64)
+            }
+            KV_RESULT_OK => reply_int(anchor, anchor.del_count as i64),
+            _ => reply_error_str(anchor, b"ERR store unavailable"),
+        },
+        D_ROLLUP_WRITE => match result {
+            KV_RESULT_TXN if !body.is_empty() && body[0] == 1 => {
+                reply_int(anchor, anchor.del_count as i64)
+            }
+            KV_RESULT_OK => reply_int(anchor, anchor.del_count as i64),
+            _ => reply_error_str(anchor, b"ERR store unavailable"),
+        },
+        D_LIST_READ => {
+            if result != KV_RESULT_RANGE {
+                reply_error_str(anchor, b"ERR store unavailable");
+                return;
+            }
+            let (h, t) = parse_list_meta(body);
+            anchor.list_head = h;
+            anchor.list_tail = t;
+            do_list_write(anchor);
+        }
+        D_LIST_WRITE => {
+            if result == KV_RESULT_TXN && !body.is_empty() && body[0] == 1 {
+                reply_int(anchor, anchor.del_count as i64);
+            } else if result == KV_RESULT_TXN {
+                // The ELSE branch ran: a concurrent pusher took the slot.
+                // Re-read the hint and retry a bounded number of times.
+                if anchor.list_retries < 8 {
+                    anchor.list_retries += 1;
+                    list_start_read(anchor);
+                } else {
+                    reply_error_str(anchor, b"ERR list contention");
+                }
+            } else {
+                reply_error_str(anchor, b"ERR store unavailable");
+            }
+        }
+        D_LLEN => {
+            if result != KV_RESULT_RANGE {
+                reply_error_str(anchor, b"ERR store unavailable");
+                return;
+            }
+            let (h, t) = parse_list_meta(body);
+            reply_int(anchor, t - h);
+        }
+        D_ZADD_READ => {
+            if result != KV_RESULT_RANGE {
+                reply_error_str(anchor, b"ERR store unavailable");
+                return;
+            }
+            if let Some(old) = parse_zmember_score(body) {
+                anchor.z_old_exists = true;
+                anchor.z_old_score = old;
+            }
+            do_zadd_write(anchor);
+        }
+        D_ZADD_WRITE => match result {
+            KV_RESULT_TXN if !body.is_empty() && body[0] == 1 => {
+                reply_int(anchor, anchor.del_count as i64)
+            }
+            KV_RESULT_OK => reply_int(anchor, anchor.del_count as i64),
+            _ => reply_error_str(anchor, b"ERR store unavailable"),
+        },
+        D_PATH_SCAN => {
+            if result != KV_RESULT_RANGE || body.len() < 10 {
+                reply_error_str(anchor, b"ERR store unavailable");
+                return;
+            }
+            anchor.cursor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
+            let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+            let mut at = 10usize;
+            for _ in 0..count {
+                let Some(klen) = body
+                    .get(at..at + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                else {
+                    reply_error_str(anchor, b"ERR page corrupt");
+                    return;
+                };
+                let koff = at + 2;
+                let voff = koff + klen;
+                let Some(vlen) = body
+                    .get(voff..voff + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                else {
+                    reply_error_str(anchor, b"ERR page corrupt");
+                    return;
+                };
+                let vend = voff + 4 + vlen;
+                if vend > body.len() || klen < 4 {
+                    reply_error_str(anchor, b"ERR page corrupt");
+                    return;
+                }
+                let kbody = &body[koff + 4..koff + klen];
+                let mut a = [0u8; MAX_VERTEX_ID];
+                let mut nb = [0u8; MAX_VERTEX_ID];
+                if let Some((_, _, _, blen)) = models::decode_graph_edge_key(kbody, &mut a, &mut nb)
+                {
+                    let neighbor = &nb[..blen];
+                    if neighbor == &anchor.path_dst[..anchor.path_dst_len as usize] {
+                        reply_int(anchor, anchor.path_depth as i64 + 1);
+                        return;
+                    }
+                    if !path_visited_has(anchor, neighbor) {
+                        let _ = path_visited_add(anchor, neighbor);
+                        let d = anchor.path_depth + 1;
+                        if !path_enqueue(anchor, d, neighbor) {
+                            reply_error_str(anchor, b"ERR path too large");
+                            return;
+                        }
+                    }
+                }
+                at = vend;
+            }
+            if anchor.cursor != 0 {
+                let Some(bn) = stage_scan_bounds(anchor) else {
+                    reply_error_str(anchor, b"ERR internal");
+                    return;
+                };
+                if !kv_send(anchor, KV_OP_RANGE_SCAN, bn, D_PATH_SCAN) {
+                    reply_error_str(anchor, b"ERR internal");
+                }
+                return;
+            }
+            path_dequeue_and_scan(anchor);
+        }
         D_SCAN_OUT => {
             if result != KV_RESULT_RANGE || body.len() < 10 {
                 reply_error_str(anchor, b"ERR store unavailable");
@@ -2213,6 +3377,105 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                     anchor.ids[w2 + 1..w2 + 1 + value.len()].copy_from_slice(value);
                     anchor.ids_len = (w2 + 1 + value.len()) as u16;
                     anchor.ids_count += 2; // ts record + value record
+                    at = vend;
+                    continue;
+                }
+                if anchor.id_mode == ID_ROLLUP {
+                    // Bucket timestamp (from the key) then the stored value.
+                    let Some((_series, _res, bucket)) = models::decode_timeseries_rollup_key(kbody)
+                    else {
+                        reply_error_str(anchor, b"ERR key corrupt");
+                        return;
+                    };
+                    let mut tsb = [0u8; 24];
+                    let tn = fmt_u64(bucket, &mut tsb);
+                    let value = &body[voff + 4..vend];
+                    let w = anchor.ids_len as usize;
+                    if tn > 127 || value.len() > 127 || w + 2 + tn + value.len() > anchor.ids.len()
+                    {
+                        reply_error_str(anchor, b"ERR result exceeds one batch");
+                        return;
+                    }
+                    anchor.ids[w] = tn as u8;
+                    anchor.ids[w + 1..w + 1 + tn].copy_from_slice(&tsb[..tn]);
+                    let w2 = w + 1 + tn;
+                    anchor.ids[w2] = value.len() as u8;
+                    anchor.ids[w2 + 1..w2 + 1 + value.len()].copy_from_slice(value);
+                    anchor.ids_len = (w2 + 1 + value.len()) as u16;
+                    anchor.ids_count += 2;
+                    at = vend;
+                    continue;
+                }
+                if anchor.id_mode == ID_HASH_PAIR {
+                    // Field (the key tail after the 4-byte hash id) then value.
+                    let field = if kbody.len() > 4 {
+                        &kbody[4..]
+                    } else {
+                        &kbody[0..0]
+                    };
+                    let value = &body[voff + 4..vend];
+                    let w = anchor.ids_len as usize;
+                    if field.len() > 127
+                        || value.len() > 127
+                        || w + 2 + field.len() + value.len() > anchor.ids.len()
+                    {
+                        reply_error_str(anchor, b"ERR result exceeds one batch");
+                        return;
+                    }
+                    anchor.ids[w] = field.len() as u8;
+                    anchor.ids[w + 1..w + 1 + field.len()].copy_from_slice(field);
+                    let w2 = w + 1 + field.len();
+                    anchor.ids[w2] = value.len() as u8;
+                    anchor.ids[w2 + 1..w2 + 1 + value.len()].copy_from_slice(value);
+                    anchor.ids_len = (w2 + 1 + value.len()) as u16;
+                    anchor.ids_count += 2; // field record + value record
+                    at = vend;
+                    continue;
+                }
+                if anchor.id_mode == ID_HASH_GET || anchor.id_mode == ID_ZSCORE {
+                    let value = &body[voff + 4..vend];
+                    let w = anchor.ids_len as usize;
+                    if value.len() > 127 || w + 1 + value.len() > anchor.ids.len() {
+                        reply_error_str(anchor, b"ERR result exceeds one batch");
+                        return;
+                    }
+                    anchor.ids[w] = value.len() as u8;
+                    anchor.ids[w + 1..w + 1 + value.len()].copy_from_slice(value);
+                    anchor.ids_len = (w + 1 + value.len()) as u16;
+                    anchor.ids_count += 1;
+                    at = vend;
+                    continue;
+                }
+                // LRANGE/ZRANGE: store `[sortkey:8][len][payload]` so the reply
+                // can order by index/score in the anchor — the memory store's
+                // range scan is slot-ordered, not key-ordered, so sorting here
+                // (as the relational executor does for ORDER BY) makes the
+                // order correct on every store.
+                if anchor.id_mode == ID_LIST_VALUE || anchor.id_mode == ID_ZMEMBER {
+                    // The 8-byte order-preserving sort key is the index/score
+                    // component that follows the 4-byte id in the user key.
+                    let (sortkey, payload): (&[u8], &[u8]) = if anchor.id_mode == ID_LIST_VALUE {
+                        (&kbody[4..12], &body[voff + 4..vend])
+                    } else {
+                        (
+                            &kbody[4..12],
+                            if kbody.len() > 12 {
+                                &kbody[12..]
+                            } else {
+                                &kbody[0..0]
+                            },
+                        )
+                    };
+                    let w = anchor.ids_len as usize;
+                    if payload.len() > 127 || w + 9 + payload.len() > anchor.ids.len() {
+                        reply_error_str(anchor, b"ERR result exceeds one batch");
+                        return;
+                    }
+                    anchor.ids[w..w + 8].copy_from_slice(sortkey);
+                    anchor.ids[w + 8] = payload.len() as u8;
+                    anchor.ids[w + 9..w + 9 + payload.len()].copy_from_slice(payload);
+                    anchor.ids_len = (w + 9 + payload.len()) as u16;
+                    anchor.ids_count += 1;
                     at = vend;
                     continue;
                 }
@@ -2291,6 +3554,10 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                     reply_error_str(anchor, b"ERR internal");
                 }
             } else {
+                if anchor.id_mode == ID_TS_DS && anchor.ts_rollup_persist {
+                    persist_rollup(anchor);
+                    return;
+                }
                 if anchor.id_mode == ID_TS_DS {
                     // Render the non-empty buckets as a flat
                     // `[bucket_start_ts, avg, …]` array, oldest first.
@@ -2345,6 +3612,58 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                     let mut f = [0u8; SEND_BUF];
                     f[..n].copy_from_slice(&out[..n]);
                     reply_raw(anchor, &f[..n]);
+                    return;
+                }
+                // LRANGE / ZRANGE: the collected elements/members, sliced to
+                // [start, stop] with Redis semantics (negatives from the end).
+                if anchor.id_mode == ID_LIST_VALUE || anchor.id_mode == ID_ZMEMBER {
+                    reply_lrange(anchor);
+                    return;
+                }
+                // ZSCORE: one member's integer score as a bulk string, or nil.
+                if anchor.id_mode == ID_ZSCORE {
+                    if anchor.ids_count >= 1 && anchor.ids[0] as usize >= 8 {
+                        let score =
+                            i64::from_le_bytes(anchor.ids[1..9].try_into().unwrap_or([0; 8]));
+                        let mut sb = [0u8; 24];
+                        let sn = fmt_i64(score, &mut sb);
+                        let mut out = [0u8; 40];
+                        let mut n = 0usize;
+                        let _ = enc_bulk(&mut out, &mut n, &sb[..sn]);
+                        let mut f = [0u8; 40];
+                        f[..n].copy_from_slice(&out[..n]);
+                        reply_raw(anchor, &f[..n]);
+                    } else {
+                        let mut out = [0u8; 16];
+                        let mut n = 0usize;
+                        let _ = enc_null_bulk(&mut out, &mut n);
+                        let mut f = [0u8; 16];
+                        f[..n].copy_from_slice(&out[..n]);
+                        reply_raw(anchor, &f[..n]);
+                    }
+                    return;
+                }
+                // HGET: one field's value as a single bulk, or nil if absent.
+                if anchor.id_mode == ID_HASH_GET {
+                    if anchor.ids_count >= 1 {
+                        let l = anchor.ids[0] as usize;
+                        let mut vb = [0u8; 128];
+                        let take = l.min(vb.len());
+                        vb[..take].copy_from_slice(&anchor.ids[1..1 + take]);
+                        let mut out = [0u8; 160];
+                        let mut n = 0usize;
+                        let _ = enc_bulk(&mut out, &mut n, &vb[..take]);
+                        let mut f = [0u8; 160];
+                        f[..n].copy_from_slice(&out[..n]);
+                        reply_raw(anchor, &f[..n]);
+                    } else {
+                        let mut out = [0u8; 16];
+                        let mut n = 0usize;
+                        let _ = enc_null_bulk(&mut out, &mut n);
+                        let mut f = [0u8; 16];
+                        f[..n].copy_from_slice(&out[..n]);
+                        reply_raw(anchor, &f[..n]);
+                    }
                     return;
                 }
                 // SEARCH multi-term AND: term 0 is now in `ids`; scan each

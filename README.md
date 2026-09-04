@@ -4,8 +4,9 @@ Lattice is a multi-protocol data store for the nanocloud products,
 built on the clustor Raft replication substrate and the
 [fluxor](../fluxor/) runtime. Familiar client protocols — Redis
 RESP, Memcached ASCII, etcd v3 gRPC, the PostgreSQL and MySQL wire
-protocols, MongoDB documents, Cassandra CQL, and RESP-based
-graph/search/vector/time-series models — map onto one MVCC key-value
+protocols, MongoDB documents, Cassandra CQL, RESP-based
+graph/search/vector/time-series models, and the Prometheus
+remote-write/query HTTP API — map onto one MVCC key-value
 state machine with a shared revision model, replicated and made
 durable by the substrate.
 
@@ -95,7 +96,8 @@ guides carry the detail.
 | **Relational SQL** | `pg_edge_anchor`, `mysql_edge_anchor` → `relational_executor` | SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE/DROP INDEX, ALTER TABLE ADD — over the PostgreSQL and MySQL/MariaDB server wire protocols |
 | **Document** | `doc_edge_anchor` | MongoDB wire: find, insert, update, delete, hello/ismaster/ping/buildInfo |
 | **Wide-column** | `wide_edge_anchor` | Cassandra CQL v4: SELECT, INSERT, UPDATE, DELETE, CREATE TABLE |
-| **Models (RESP)** | `model_edge_anchor` | `GRAPH.*` (VERTEX/EDGE/IN/OUT/DELVERTEX/DELEDGE), `SEARCH.*` (INDEX/QUERY/DELETE), `VECTOR.*` (ADD/COS/SIM/SIMWHERE/ANN/GET/DEL/TAG), `TS.*` (ADD/RANGE/AGG/DOWNSAMPLE/TRIM), `FEED.READ` |
+| **Models (RESP)** | `model_edge_anchor` | `GRAPH.*` (VERTEX/EDGE/IN/OUT/PATH/DELVERTEX/DELEDGE), `SEARCH.*` (INDEX/QUERY/DELETE), `VECTOR.*` (ADD/COS/SIM/SIMWHERE/ANN/GET/DEL/TAG), `TS.*` (ADD/RANGE/AGG/DOWNSAMPLE/ROLLUP/GETROLLUP/TRIM), hashes (HSET/HGET/HGETALL), lists (LPUSH/RPUSH/LRANGE/LLEN), sorted sets (ZADD/ZRANGE/ZSCORE), `FEED.READ` |
+| **Metrics** (Prometheus HTTP) | `prometheus_edge_anchor` | Remote-write ingest (`/api/v1/write`), PromQL/MetricsQL `query`/`query_range`, KQL (`/api/v1/kql`), labels/series discovery |
 
 What is not implemented is listed under
 [Not implemented](#not-implemented).
@@ -180,7 +182,8 @@ The full mapping is in the
 - [`docs/architecture/`](docs/architecture/) — the specification,
   CDC, and the limit register.
 - [`docs/guides/`](docs/guides/) — deployment, high availability,
-  tuning, and the per-protocol guides (Redis, Memcached, etcd).
+  tuning, and the per-protocol guides (Redis, Memcached, etcd,
+  metrics).
 
 ## License
 

@@ -346,7 +346,7 @@ unsafe fn send_reject(s: &mut AllocState, sys: &SyscallTable, corr_id: u64, reas
 /// Write one record proposal on `propose_out` — bare (`[record_type]`
 /// envelope, the contract-test surface) or, with `propose_wrap`,
 /// wrapped for clustor's gateway as
-/// `MSG_CLIENT_PROPOSAL [conn_id=0][LATTICE_RECORD_TAG][record_type]
+/// `MSG_CLIENT_PROPOSAL [conn_id:u16=0][LATTICE_RECORD_TAG][record_type]
 /// [record…]` so the committed entry body demuxes at
 /// `lattice_apply_bridge` (see `wire::LATTICE_RECORD_TAG`).
 unsafe fn write_record_proposal(
@@ -358,7 +358,7 @@ unsafe fn write_record_proposal(
     if s.propose_wrap == 0 {
         return write_envelope(sys, s.propose_out, record_type, record);
     }
-    let payload_len = 3 + record.len();
+    let payload_len = 4 + record.len();
     let total = 3 + payload_len;
     let mut buf = [0u8; SCRATCH + 16];
     if total > buf.len() {
@@ -367,10 +367,12 @@ unsafe fn write_record_proposal(
     buf[0] = wire::MSG_CLIENT_PROPOSAL;
     buf[1] = (payload_len & 0xFF) as u8;
     buf[2] = ((payload_len >> 8) & 0xFF) as u8;
-    buf[3] = 0; // conn_id: allocator-originated, no client connection
-    buf[4] = wire::LATTICE_RECORD_TAG;
-    buf[5] = record_type;
-    buf[6..6 + record.len()].copy_from_slice(record);
+    // conn_id u16 = 0: allocator-originated, no client connection.
+    buf[3] = 0;
+    buf[4] = 0;
+    buf[5] = wire::LATTICE_RECORD_TAG;
+    buf[6] = record_type;
+    buf[7..7 + record.len()].copy_from_slice(record);
     (sys.channel_write)(s.propose_out, buf.as_mut_ptr(), total) == total as i32
 }
 

@@ -593,7 +593,8 @@ fn start_dynamic_txn(s: &mut CoordState, payload: &[u8]) {
         s.dyn_seq = s.dyn_seq.wrapping_add(1);
         s.txn_id_lo = 0x1000_0000_0000_0000u64.wrapping_add(s.dyn_seq);
         let n = then_count;
-        let record = TransactionRecord::begin(txn_id(s), home_range(s), read_ts, 0, 1, 0, 0).ok()?;
+        let record =
+            TransactionRecord::begin(txn_id(s), home_range(s), read_ts, 0, 1, 0, 0).ok()?;
         let mut participants = [Participant {
             range_id: [0; 16],
             generation: 1,

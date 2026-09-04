@@ -226,6 +226,20 @@ const TIMER_SET: u32 = 0x0605;
 const TIMER_CANCEL: u32 = 0x0606;
 
 const P_IDLE: u8 = 0;
+
+/// `query_latency_us` bucket upper bounds, µs — 50 µs to 2.5 s. MUST match
+/// the manifest's `[[observability.instrument]] bounds_us` row: the id-table
+/// ships the declaration; the record carries counts only. Sized for an
+/// embedded SQL-over-KV executor: a cached point read lands in the low
+/// buckets, a cross-range 2PC in the middle, and a wedged KV round-trip is
+/// caught by the watchdog before the top bucket lies about it.
+const LAT_BOUNDS_US: [u64; 15] = [
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000,
+];
+/// Ring-telemetry id of `query_latency_us` — its POSITION in the manifest's
+/// `[observability].metrics` list. Count before reordering.
+const LAT_HIST_RING_ID: u16 = 7;
 /// Waiting for the name-index lookup that resolves a table name to its id.
 /// Longest table name the executor will cache. Longer names simply do
 /// not get cached; they still work, they just pay the lookup.
@@ -302,6 +316,15 @@ const P_DT_IXLIST: u8 = 35;
 /// Cross-range INSERT: forwarded to `txn_coordinator`, awaiting the
 /// `MSG_TXN_SUBMIT_RESULT` two-phase-commit outcome.
 const P_TXN_COORD: u8 = 36;
+/// JOIN: full-scanning the OUTER table, buffering its raw rows.
+const P_JOIN_LEFT: u8 = 37;
+/// JOIN: full-scanning the INNER table, probing the outer buffer per row.
+const P_JOIN_RIGHT: u8 = 38;
+
+/// JOIN: max outer rows buffered, and the bytes to hold them. A join whose
+/// outer side exceeds either refuses rather than truncating.
+const MAX_JOIN_ROWS: usize = 128;
+const JOIN_BUF: usize = 16384;
 
 // ── State ─────────────────────────────────────────────────────────────
 
@@ -463,6 +486,26 @@ struct ExecState {
     /// In-flight CREATE/DROP INDEX id.
     index_id: u32,
     td: TableDescriptor,
+
+    /// JOIN state. `join_stage` 0 = no join, 1 = outer table, 2 = inner
+    /// table. `td_left` keeps the outer descriptor while the inner is
+    /// resolved; `join_lcol`/`join_rcol` are the resolved join column ids;
+    /// `join_left` buffers the outer table's raw rows to probe as inner rows
+    /// stream in. The join is `SELECT *`, so the result is every outer column
+    /// then every inner column.
+    join_stage: u8,
+    td_left: TableDescriptor,
+    join_lcol: u16,
+    join_rcol: u16,
+    join_lname: [u8; 64],
+    join_lname_len: u8,
+    join_uname: [u8; 64],
+    join_uname_len: u8,
+    join_utable: [u8; 64],
+    join_utable_len: u8,
+    join_left: [u8; JOIN_BUF],
+    join_left_off: [u16; MAX_JOIN_ROWS + 1],
+    join_left_count: u16,
     /// The table's readable synchronous indexes, loaded per statement
     /// (one bounded catalog page). Small on purpose: a table carrying
     /// more secondary indexes than this refuses at CREATE INDEX time.
@@ -583,6 +626,21 @@ struct ExecState {
     /// returned. Non-zero means the storage path dropped a reply (or
     /// wedged) and the executor reclaimed the slot to stay live.
     m_stmt_timeouts: u64,
+    /// `dev_micros` at `begin_statement`, for the query-latency histogram.
+    stmt_start_us: u64,
+    /// Declared-dimension index of the statement in flight — the position in
+    /// the manifest's `db.operation.name` enum (0=select 1=insert 2=update
+    /// 3=delete 4=ddl); `0xFF` = untimed (session control, empty).
+    stmt_kind: u8,
+    /// `query_latency_us` (METRIC_HISTOGRAM_16) accumulation, one 16-bucket
+    /// row per declared operation kind. Bucket i counts durations in
+    /// `(LAT_BOUNDS_US[i-1], LAT_BOUNDS_US[i]]`; last = +Inf. Per-bucket
+    /// counts, monotonic since boot (cumulative temporality): the OTLP
+    /// encoder ships them verbatim as `bucket_counts` and derives the
+    /// datapoint `count` as their sum.
+    lat_hist: [[u64; 16]; 5],
+    /// Throttle (`dev_millis` of the last kernel-ring emit round).
+    last_ring_tlm_ms: u64,
     step_ctr: u64,
     /// `dev_millis` when the in-flight statement issued its outstanding KV
     /// request. The watchdog measures `now - inflight_since_ms` against
@@ -616,6 +674,10 @@ impl ExecState {
         self.txn_slots = [TxnSlot::empty(); MAX_TXN_SLOTS];
         self.committing_slot = -1;
         self.phase = P_IDLE;
+        self.stmt_start_us = 0;
+        self.stmt_kind = 0xFF;
+        self.lat_hist = [[0; 16]; 5];
+        self.last_ring_tlm_ms = 0;
         self.from_mysql = false;
         self.corr_id = 0;
         self.conn_id = 0;
@@ -626,6 +688,15 @@ impl ExecState {
         self.table_id = 0;
         self.index_id = 0;
         self.td = TableDescriptor::EMPTY;
+        self.join_stage = 0;
+        self.td_left = TableDescriptor::EMPTY;
+        self.join_lcol = 0;
+        self.join_rcol = 0;
+        self.join_lname_len = 0;
+        self.join_uname_len = 0;
+        self.join_utable_len = 0;
+        self.join_left_count = 0;
+        self.join_left_off[0] = 0;
         self.idx = [relational::IndexDescriptor::EMPTY; MAX_TABLE_INDEXES];
         self.idx_count = 0;
         self.drop_cascade = false;
@@ -938,6 +1009,21 @@ fn ship(exec: &mut ExecState, payload_len: Option<usize>, from_mysql: bool) {
 
 /// Clear the job and start the next queued statement, if any.
 fn finish_job(exec: &mut ExecState) {
+    // Close the latency bracket opened in `begin_statement`: classify the
+    // elapsed µs into the kind's 16-bucket row. Untimed kinds (session
+    // control) and a missing clock leave no sample.
+    if exec.stmt_kind < 5 && exec.stmt_start_us != 0 && !exec.syscalls.is_null() {
+        let now = unsafe { dev_micros(&*exec.syscalls) };
+        let dur = now.wrapping_sub(exec.stmt_start_us);
+        let mut bi = 0usize;
+        while bi < LAT_BOUNDS_US.len() && dur > LAT_BOUNDS_US[bi] {
+            bi += 1;
+        }
+        exec.lat_hist[exec.stmt_kind as usize][bi] =
+            exec.lat_hist[exec.stmt_kind as usize][bi].wrapping_add(1);
+    }
+    exec.stmt_kind = 0xFF;
+    exec.stmt_start_us = 0;
     exec.phase = P_IDLE;
     // The statement is done; stop the wake timer so its (level-triggered)
     // expiry does not keep re-stepping an idle executor. A dequeued
@@ -951,6 +1037,10 @@ fn finish_job(exec: &mut ExecState) {
     exec.affected = 0;
     exec.row_index = 0;
     exec.cursor = 0;
+    // Clear the JOIN machine so the next statement's catalog load is not
+    // misrouted into the inner-table probe.
+    exec.join_stage = 0;
+    exec.join_left_count = 0;
     if exec.queue_len > 0 {
         let next = exec.queue[0];
         let n = exec.queue_len;
@@ -1285,6 +1375,16 @@ fn begin_statement(exec: &mut ExecState, from_mysql: bool, len: usize, payload: 
     exec.sql[..sl].copy_from_slice(&req.sql[..sl]);
     exec.sql_len = sl as u16;
     exec.m_statements = exec.m_statements.wrapping_add(1);
+    // Latency bracket opens here; the kind is classified after parse
+    // (`step_statement`) and `finish_job` closes the bracket.
+    exec.stmt_kind = 0xFF;
+    exec.stmt_start_us = unsafe {
+        if exec.syscalls.is_null() {
+            0
+        } else {
+            dev_micros(&*exec.syscalls)
+        }
+    };
     // Per-STATEMENT: whether this job's result needs generation
     // validation is a property of this statement, not of the module's
     // lifetime.
@@ -1314,6 +1414,20 @@ fn step_statement(exec: &mut ExecState) {
             reply_simple(exec, error_code(e), TAG_EMPTY, 0);
             return;
         }
+    };
+    // Classify for the query-latency histogram's declared dimension
+    // (manifest `db.operation.name` enum order). Session control and empty
+    // statements are protocol chatter, not queries — untimed (0xFF).
+    exec.stmt_kind = match &stmt {
+        Statement::Select(_) => 0,
+        Statement::Insert(_) => 1,
+        Statement::Update(_) => 2,
+        Statement::Delete(_) => 3,
+        Statement::CreateTable(_)
+        | Statement::DropTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::DropIndex { .. } => 4,
+        _ => 0xFF,
     };
     // Transaction gate: inside an open BEGIN … COMMIT, only INSERT
     // (buffered) and the session verbs are honoured. A read cannot see the
@@ -1518,6 +1632,8 @@ fn on_kv_response(exec: &mut ExecState, payload: &[u8]) {
         P_SEL_IX => after_sel_ix(exec, result, &body[..body_len]),
         P_SEL_IXROW => after_sel_ixrow(exec, result, &body[..body_len]),
         P_SEL_SCAN => after_sel_scan(exec, result, &body[..body_len]),
+        P_JOIN_LEFT => after_join_left(exec, result, &body[..body_len]),
+        P_JOIN_RIGHT => after_join_right(exec, result, &body[..body_len]),
         P_AGG_SCAN => after_agg_scan(exec, result, &body[..body_len]),
         P_ALTER_WRITE => match result {
             KV_RESULT_OK => reply_simple(exec, OUTCOME_OK, TAG_ALTER, 0),
@@ -1780,6 +1896,14 @@ fn after_descr(exec: &mut ExecState, result: u8, body: &[u8]) {
         return;
     };
     exec.td = td;
+
+    // JOIN inner table: its descriptor is now loaded — begin the probe scan
+    // rather than re-routing the statement (the outer table is already
+    // buffered, and a join needs no index survey).
+    if exec.join_stage == 2 {
+        start_join_right(exec);
+        return;
+    }
 
     let mut text = [0u8; sql_core::MAX_SQL_LEN];
     let n = statement_text(exec, &mut text);
@@ -2061,7 +2185,10 @@ fn commit_txn(exec: &mut ExecState) {
         return;
     }
     // Assemble `[cmp_count][cmps][then_count][puts][else_count=0]` into env.
-    let (cl, pl) = (exec.txn_slots[i].cmp_len as usize, exec.txn_slots[i].put_len as usize);
+    let (cl, pl) = (
+        exec.txn_slots[i].cmp_len as usize,
+        exec.txn_slots[i].put_len as usize,
+    );
     let total = 2 + cl + 2 + pl + 2;
     if BODY_AT + total > exec.env.len() {
         // Too large to send in one entry. The transaction stays open for
@@ -2959,9 +3086,7 @@ fn send_insert_row(exec: &mut ExecState) {
     // command instead of a resumable PUT loop. Inside an open `BEGIN …
     // COMMIT` EVERY insert takes the TXN path too, so its comparisons and
     // PUTs are buffered into the transaction rather than written now.
-    if (ins.row_count() > 1
-        || exec.idx_count > 0
-        || find_active_slot(exec, exec.conn_id).is_some())
+    if (ins.row_count() > 1 || exec.idx_count > 0 || find_active_slot(exec, exec.conn_id).is_some())
         && exec.row_index == 0
     {
         send_insert_txn(exec, &ins);
@@ -3069,6 +3194,12 @@ fn after_ins_row(exec: &mut ExecState, result: u8) {
 // ── SELECT ────────────────────────────────────────────────────────────
 
 fn start_select(exec: &mut ExecState, s: &sql_core::Select<'_>) {
+    // A JOIN runs a separate two-table path: buffer the outer table's rows,
+    // then stream the inner table probing the buffer by the join key.
+    if let Some(j) = s.join {
+        start_join(exec, s, &j);
+        return;
+    }
     // An aggregate/grouped query computes its result columns rather than
     // projecting stored ones, so it takes a separate path.
     if let sql_core::Projection::Aggregate { .. } = s.projection {
@@ -3331,6 +3462,303 @@ fn start_full_scan(exec: &mut ExecState) {
 
 fn send_scan(exec: &mut ExecState, start: &[u8], end: &[u8], phase: u8) {
     send_scan_paged(exec, start, end, phase, SCAN_PAGE);
+}
+
+/// Case-insensitive ASCII byte equality — SQL identifiers are folded.
+fn ci_eq(a: &[u8], b: &[u8]) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Begin a JOIN: map the `ON` refs to the outer (`s.table`) and inner
+/// (`j.table`) columns, resolve the outer join column against the loaded
+/// descriptor, stash the outer descriptor, and full-scan the outer table into
+/// the row buffer (phase `P_JOIN_LEFT`).
+fn start_join(exec: &mut ExecState, s: &sql_core::Select<'_>, j: &sql_core::Join<'_>) {
+    let (lname, uname): (&[u8], &[u8]) =
+        if ci_eq(j.left_table, s.table) && ci_eq(j.right_table, j.table) {
+            (j.left_col, j.right_col)
+        } else if ci_eq(j.left_table, j.table) && ci_eq(j.right_table, s.table) {
+            (j.right_col, j.left_col)
+        } else {
+            // The ON qualifiers don't name the two joined tables.
+            reply_simple(exec, sql_exec::ERR_UNSUPPORTED, TAG_EMPTY, 0);
+            return;
+        };
+    let lcol = match sql_core::resolve_column(&exec.td, lname) {
+        Ok(c) => c.column_id,
+        Err(e) => {
+            reply_simple(exec, error_code(e), TAG_EMPTY, 0);
+            return;
+        }
+    };
+    if lname.len() > 64 || uname.len() > 64 || j.table.len() > 64 {
+        reply_simple(exec, sql_exec::ERR_NAME_TOO_LONG, TAG_EMPTY, 0);
+        return;
+    }
+    exec.td_left = exec.td;
+    exec.join_lcol = lcol;
+    exec.join_lname[..lname.len()].copy_from_slice(lname);
+    exec.join_lname_len = lname.len() as u8;
+    exec.join_uname[..uname.len()].copy_from_slice(uname);
+    exec.join_uname_len = uname.len() as u8;
+    exec.join_utable[..j.table.len()].copy_from_slice(j.table);
+    exec.join_utable_len = j.table.len() as u8;
+    exec.join_stage = 1;
+    exec.join_left_count = 0;
+    exec.join_left_off[0] = 0;
+    exec.row_count = 0;
+    exec.rows_len = 0;
+    exec.cursor = 0;
+
+    let mut start = [0u8; MAX_KV_KEY];
+    let mut end = [0u8; MAX_KV_KEY];
+    let Some((sn, en)) = table_bounds(exec.table_id, &mut start, &mut end) else {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    };
+    send_scan(exec, &start[..sn], &end[..en], P_JOIN_LEFT);
+}
+
+/// A page of the outer table: buffer each raw row, then page or (when the scan
+/// ends) resolve the inner table's catalog to begin the probe.
+fn after_join_left(exec: &mut ExecState, result: u8, body: &[u8]) {
+    if result != KV_RESULT_RANGE || body.len() < 10 {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    }
+    let next_cursor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    let mut p = 10usize;
+    for _ in 0..count {
+        let Some((row, np)) = read_scan_row(body, p) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        p = np;
+        // Buffer the raw row.
+        let i = exec.join_left_count as usize;
+        let at = exec.join_left_off[i] as usize;
+        if i >= MAX_JOIN_ROWS || at + row.len() > exec.join_left.len() {
+            reply_simple(exec, ERR_RESULT_TOO_LARGE, TAG_EMPTY, 0);
+            return;
+        }
+        exec.join_left[at..at + row.len()].copy_from_slice(row);
+        exec.join_left_off[i + 1] = (at + row.len()) as u16;
+        exec.join_left_count += 1;
+    }
+    if next_cursor != 0 {
+        exec.cursor = next_cursor;
+        let mut start = [0u8; MAX_KV_KEY];
+        let mut end = [0u8; MAX_KV_KEY];
+        let Some((sn, en)) = table_bounds(exec.table_id, &mut start, &mut end) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        send_scan(exec, &start[..sn], &end[..en], P_JOIN_LEFT);
+        return;
+    }
+    // Outer table buffered → resolve the inner table's catalog.
+    exec.join_stage = 2;
+    let mut name = [0u8; 64];
+    let n = exec.join_utable_len as usize;
+    name[..n].copy_from_slice(&exec.join_utable[..n]);
+    start_name_lookup(exec, &name[..n]);
+}
+
+/// Begin the inner-table full scan once its descriptor is loaded (into
+/// `exec.td`). Resolves the inner join column and starts phase `P_JOIN_RIGHT`.
+fn start_join_right(exec: &mut ExecState) {
+    let mut uname = [0u8; 64];
+    let un = exec.join_uname_len as usize;
+    uname[..un].copy_from_slice(&exec.join_uname[..un]);
+    let rcol = match sql_core::resolve_column(&exec.td, &uname[..un]) {
+        Ok(c) => c.column_id,
+        Err(e) => {
+            reply_simple(exec, error_code(e), TAG_EMPTY, 0);
+            return;
+        }
+    };
+    exec.join_rcol = rcol;
+    exec.cursor = 0;
+    let mut start = [0u8; MAX_KV_KEY];
+    let mut end = [0u8; MAX_KV_KEY];
+    let Some((sn, en)) = table_bounds(exec.table_id, &mut start, &mut end) else {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    };
+    send_scan(exec, &start[..sn], &end[..en], P_JOIN_RIGHT);
+}
+
+/// A page of the inner table: for each inner row, probe the buffered outer
+/// rows by the join key and stage a combined row per match. Reply when done.
+fn after_join_right(exec: &mut ExecState, result: u8, body: &[u8]) {
+    if result != KV_RESULT_RANGE || body.len() < 10 {
+        reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+        return;
+    }
+    let next_cursor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    let mut p = 10usize;
+    for _ in 0..count {
+        let Some((urow, np)) = read_scan_row(body, p) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        p = np;
+        let mut ukey = [0u8; relational::MAX_ORDERED_VALUE_LEN];
+        let Some(ukn) = join_key_bytes(&exec.td, urow, exec.join_rcol, &mut ukey) else {
+            continue; // NULL join key never matches
+        };
+        // Probe every buffered outer row.
+        for i in 0..exec.join_left_count as usize {
+            let lo = exec.join_left_off[i] as usize;
+            let hi = exec.join_left_off[i + 1] as usize;
+            let mut lrow = [0u8; MAX_ROW_BYTES];
+            let ln = (hi - lo).min(lrow.len());
+            lrow[..ln].copy_from_slice(&exec.join_left[lo..lo + ln]);
+            let mut lkey = [0u8; relational::MAX_ORDERED_VALUE_LEN];
+            let Some(lkn) = join_key_bytes(&exec.td_left, &lrow[..ln], exec.join_lcol, &mut lkey)
+            else {
+                continue;
+            };
+            if lkey[..lkn] == ukey[..ukn] && !stage_join_row(exec, &lrow[..ln], urow) {
+                reply_simple(exec, ERR_RESULT_TOO_LARGE, TAG_EMPTY, 0);
+                return;
+            }
+        }
+    }
+    if next_cursor != 0 {
+        exec.cursor = next_cursor;
+        let mut start = [0u8; MAX_KV_KEY];
+        let mut end = [0u8; MAX_KV_KEY];
+        let Some((sn, en)) = table_bounds(exec.table_id, &mut start, &mut end) else {
+            reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
+            return;
+        };
+        send_scan(exec, &start[..sn], &end[..en], P_JOIN_RIGHT);
+        return;
+    }
+    reply_join(exec);
+}
+
+/// Extract one scan-page record's row (value) bytes, returning (row, next-p).
+fn read_scan_row(body: &[u8], p: usize) -> Option<(&[u8], usize)> {
+    let klen = u16::from_le_bytes([*body.get(p)?, *body.get(p + 1)?]) as usize;
+    let voff = p + 2 + klen;
+    let vlen = u32::from_le_bytes([
+        *body.get(voff)?,
+        *body.get(voff + 1)?,
+        *body.get(voff + 2)?,
+        *body.get(voff + 3)?,
+    ]) as usize;
+    let vstart = voff + 4;
+    let vend = vstart + vlen;
+    if vend > body.len() {
+        return None;
+    }
+    Some((&body[vstart..vend], vend))
+}
+
+/// The order-preserving encoding of a row's join column, or `None` for NULL.
+fn join_key_bytes(td: &TableDescriptor, row: &[u8], col_id: u16, out: &mut [u8]) -> Option<usize> {
+    let col = td.column(col_id)?;
+    match relational::row_lookup(row, col_id, col.ty) {
+        Some(relational::ColumnLookup::Present(v)) if !v.is_null() => {
+            relational::encode_value_ordered(out, col.ty, v)
+        }
+        _ => None,
+    }
+}
+
+/// Stage a combined join row: every outer column (from `lrow`) then every
+/// inner column (from `urow`), in `stage_row`'s cell encoding.
+fn stage_join_row(exec: &mut ExecState, lrow: &[u8], urow: &[u8]) -> bool {
+    let ncol_l = exec.td_left.columns().len();
+    let ncol_r = exec.td.columns().len();
+    let mut cell = [0u8; relational::MAX_PLAIN_VALUE_LEN];
+    for side in 0..2 {
+        let n = if side == 0 { ncol_l } else { ncol_r };
+        for ci in 0..n {
+            let (col_id, ty) = if side == 0 {
+                let c = exec.td_left.columns()[ci];
+                (c.column_id, c.ty)
+            } else {
+                let c = exec.td.columns()[ci];
+                (c.column_id, c.ty)
+            };
+            let raw: &[u8] = if side == 0 { lrow } else { urow };
+            let (marker, cn) = match relational::row_lookup(raw, col_id, ty) {
+                Some(relational::ColumnLookup::Present(v)) if !v.is_null() => {
+                    match relational::encode_value_plain(&mut cell, ty, v) {
+                        Some(k) => (k as u32, k),
+                        None => return false,
+                    }
+                }
+                _ => (sql_exec::NULL_CELL, 0),
+            };
+            if exec.rows_len + 4 + cn > exec.rows.len() {
+                return false;
+            }
+            let at = exec.rows_len;
+            exec.rows[at..at + 4].copy_from_slice(&marker.to_le_bytes());
+            exec.rows_len += 4;
+            if marker != sql_exec::NULL_CELL {
+                let at = exec.rows_len;
+                exec.rows[at..at + cn].copy_from_slice(&cell[..cn]);
+                exec.rows_len += cn;
+            }
+        }
+    }
+    exec.row_count += 1;
+    true
+}
+
+/// Reply a JOIN result: the column descriptors are every outer column then
+/// every inner column, and the staged rows already match that shape.
+fn reply_join(exec: &mut ExecState) {
+    let (corr, conn, from_mysql) = (exec.corr_id, exec.conn_id, exec.from_mysql);
+    let (count, rows_len) = (exec.row_count, exec.rows_len);
+    let mut cols: [&ColumnDescriptor; MAX_COLUMNS] = [&ColumnDescriptor::EMPTY; MAX_COLUMNS];
+    let mut ncols = 0usize;
+    for c in exec.td_left.columns() {
+        if ncols >= MAX_COLUMNS {
+            reply_simple(exec, ERR_RESULT_TOO_LARGE, TAG_EMPTY, 0);
+            return;
+        }
+        cols[ncols] = c;
+        ncols += 1;
+    }
+    for c in exec.td.columns() {
+        if ncols >= MAX_COLUMNS {
+            reply_simple(exec, ERR_RESULT_TOO_LARGE, TAG_EMPTY, 0);
+            return;
+        }
+        cols[ncols] = c;
+        ncols += 1;
+    }
+    let n = {
+        let (resp, rows) = (&mut exec.resp, &exec.rows);
+        match ResponseBuilder::new(
+            resp,
+            corr,
+            conn,
+            OUTCOME_OK,
+            TAG_SELECT,
+            u64::from(count),
+            &cols[..ncols],
+        ) {
+            Some(b) => b.finish_with_rows(count, &rows[..rows_len]),
+            None => None,
+        }
+    };
+    match n {
+        Some(_) => {
+            exec.m_rows_returned = exec.m_rows_returned.wrapping_add(u64::from(count));
+            ship(exec, n, from_mysql);
+            finish_job(exec);
+        }
+        None => reply_simple(exec, ERR_RESULT_TOO_LARGE, TAG_EMPTY, 0),
+    }
 }
 
 /// `send_scan` with an explicit page size. A DELETE/UPDATE must scan in
@@ -5369,6 +5797,56 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*sys_ptr;
+
+        // Kernel-ring telemetry: the declared instruments, every 5 s, only
+        // while a consumer is subscribed (zero-cost otherwise). Scalars by
+        // manifest position; the latency histogram emits one hist16 record
+        // per operation kind that has samples, kind = the declared-dimension
+        // index.
+        if dev_telemetry_enabled(sys) {
+            let now_ms = dev_millis(sys);
+            if now_ms.wrapping_sub(exec.last_ring_tlm_ms) >= 5000 {
+                exec.last_ring_tlm_ms = now_ms;
+                let me = dev_self_index(sys);
+                if me >= 0 {
+                    let midx = me as u16;
+                    let t = dev_micros(sys);
+                    let c = abi::contracts::telemetry::METRIC_COUNTER;
+                    dev_telemetry_metric(sys, -1, midx, t, c, 0, exec.m_statements);
+                    dev_telemetry_metric(sys, -1, midx, t, c, 1, exec.m_rows_returned);
+                    dev_telemetry_metric(sys, -1, midx, t, c, 2, exec.m_rows_written);
+                    dev_telemetry_metric(sys, -1, midx, t, c, 3, exec.m_errors);
+                    dev_telemetry_metric(sys, -1, midx, t, c, 4, exec.m_queue_rejects);
+                    dev_telemetry_metric(sys, -1, midx, t, c, 5, exec.m_stale_name_retries);
+                    dev_telemetry_metric(sys, -1, midx, t, c, 6, exec.m_stmt_timeouts);
+                    let mut k = 0usize;
+                    while k < 5 {
+                        let row = &exec.lat_hist[k];
+                        let mut any = false;
+                        let mut b = 0usize;
+                        while b < 16 {
+                            if row[b] != 0 {
+                                any = true;
+                                break;
+                            }
+                            b += 1;
+                        }
+                        if any {
+                            dev_telemetry_histogram16(
+                                sys,
+                                -1,
+                                midx,
+                                t,
+                                LAT_HIST_RING_ID,
+                                k as u16,
+                                row,
+                            );
+                        }
+                        k += 1;
+                    }
+                }
+            }
+        }
 
         // KV replies first: they advance the statement in flight, and
         // draining them before accepting new work keeps the queue from

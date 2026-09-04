@@ -1,0 +1,53 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Elastic-split driver.
+#
+# Orchestrates moving a key SPAN onto a demand-provisioned partition by
+# the app-snapshot chunk stream, then cutting the routing map over to it —
+# barrier-fenced, so a write concurrent with the move is captured or
+# refused retryably, never lost. `start_delay_ms` after boot: a bulk span
+# copy (`MSG_APP_SNAPSHOT_SPAN_REQUEST` to the SOURCE worker; writes keep
+# flowing). On the target's install ack (`MSG_APP_SNAPSHOT_INSTALLED`):
+# raise the router's `MSG_SPAN_BARRIER` over the span; `barrier_settle_ms`
+# later, a second (quiesced) span copy recaptures every write that landed
+# after the first capture; on its ack, publish the cutover
+# `MSG_RANGE_MAP_UPDATE` and clear the barrier on the same channel.
+# `settle_ms` is only a per-phase fallback timeout for a graph that leaves
+# the ack unwired (which degrades to the unfenced timed cutover).
+# Execution stays operator-declared.
+
+# The target worker's install-complete ack (MSG_APP_SNAPSHOT_INSTALLED),
+# once per copy pass: the first ack raises the span barrier, the second
+# (after the quiesced catch-up copy) releases the cutover. `settle_ms` is
+# only a per-phase fallback timeout if no ack comes.
+[[ports]]
+name = "ack_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_APP_SNAPSHOT_SPAN_REQUEST to the SOURCE kv_state_worker.snapshot_import.
+[[ports]]
+name = "snap_ctl_out"
+direction = "output"
+content_type = "OctetStream"
+
+# To kv_request_router.map_update: the SPAN_BARRIER set/clear frames and
+# the cutover MSG_RANGE_MAP_UPDATE, in fence order on one channel.
+[[ports]]
+name = "map_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+#   0 span_requests   span-copy requests issued (2 on the fenced path:
+#                     the bulk copy and the quiesced catch-up copy)
+#   1 cutovers        cutover maps published (0 or 1)
+metrics = ["span_requests", "cutovers"]

@@ -22,9 +22,11 @@ name = "kv_in"
 direction = "input"
 content_type = "OctetStream"
 
-# op_kind 4 only: MSG_PLACEMENT_SPLIT_CMD from placement_advisor (§12.4
-# opt-in automation). Input index 1; unwired (and the runtime-split path
-# inert) in the declared modes 0/1/2.
+# Runtime command intake, input index 1. op_kind 4 takes
+# MSG_PLACEMENT_SPLIT_CMD from placement_advisor; ARMED op_kind 3 (no
+# reloc_* declaration) takes MSG_PLACEMENT_RELOCATE_CMD from the
+# rebalancer's opt-in exec_out. Unwired (and the runtime paths inert)
+# in the declared modes.
 [[ports]]
 name = "cmd_in"
 direction = "input"
@@ -46,6 +48,23 @@ content_type = "OctetStream"
 
 [[ports]]
 name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# op_kind 3 (relocation) only. `committed_in` observes clustor's
+# consensus.committed_entries so the driver advances RelocatePhase when the
+# membership CONFIG_CHANGE it issued commits. Input index 2; unwired in the
+# split/merge modes.
+[[ports]]
+name = "committed_in"
+direction = "input"
+content_type = "OctetStream"
+
+# op_kind 3 (relocation) only. `admin_out` submits MSG_ADMIN_COMMAND
+# membership ops (ADD_LEARNER/ADD_VOTER/REMOVE_VOTER) to
+# clustor operations.admin_requests. Output index 3; unwired otherwise.
+[[ports]]
+name = "admin_out"
 direction = "output"
 content_type = "OctetStream"
 

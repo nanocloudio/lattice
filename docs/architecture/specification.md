@@ -109,8 +109,61 @@ copied, a span barrier refuses writes into the moving span during
 cutover, a catch-up pass drains the delta, and the new map publishes
 with a bumped routing epoch. `placement_advisor`
 (`modules/common/placement.rs`) recommends splits from observed load
-but deliberately has no port to the supervisor: recommendations are
-operator input, not autonomous action.
+and is advice-only by default: autonomous execution requires both an
+explicit opt-in param and a deliberately wired command port, and even
+then one command is in flight at a time.
+
+A range's replica set can be **relocated** to a different node.
+`range_supervisor` (core logic in
+`modules/common/relocation_driver.rs`) drives the substrate's Raft
+membership changes — add the destination as a learner, wait for
+snapshot catch-up, promote it to voter through joint consensus,
+remove the source voter — advancing a phase only when the
+corresponding configuration change reports committed, never on
+acceptance. The moved binding and leaseholder then publish with a
+bumped placement epoch. The move is named either by declaration
+(`reloc_*` params, starting at boot) or at runtime: a supervisor
+armed with no declaration waits for a relocation command on its
+command intake and takes partition, source, and target from it.
+
+An **elastic split** (`elastic_split_driver`) moves one key span onto
+another partition without copying the whole store, fencing concurrent
+writes as it goes: a bulk span copy streams over the app-snapshot
+chunk path while writes keep flowing; on the target's
+install-complete acknowledgement the router's span barrier rises
+(new writes into the span refuse retryably); after a drain window
+sized to cover the graph's route-to-apply latency, a second, quiesced
+copy recaptures everything that landed after the first capture; and
+on its acknowledgement the cutover map publishes and the barrier
+lifts. Within that drain bound an acknowledged write is captured or
+retried onto the new owner, and the map never points at a span that
+is not yet resident. Both providers export the span (the disk provider
+merge-scans it into the same portable body; version history stays
+behind, since the destination partition's revision space is
+independent). Across nodes, the `span_courier` pair carries the same
+chunk stream and returning acknowledgement over one TCP connection,
+byte-for-byte; transport loss fails closed (an incomplete stream
+aborts the install, no acknowledgement returns, the cutover never
+fires).
+
+The **rebalancer** (`modules/app/rebalancer/mod.rs`) asks the
+cluster-level questions a single range cannot: it surveys the key
+count of every range, reads each range's leaseholder from the map,
+and reports per-range split/merge advice plus a relocation
+recommendation that evens load across nodes. It follows the same
+advice-only, opt-in, one-command-at-a-time contract as the advisor;
+its opt-in port emits the recommended relocation as the command an
+armed supervisor consumes.
+
+**Dense hosting** lifts the router's per-partition port cost. In
+`partition_fanout` mode the router prefixes each partition-bound
+frame with a `[partition_id:u16]` tag and writes one multiplexed
+output; `partition_demux` strips the tag and fans each frame to its
+partition's port, so N partitions cost the router one output pair
+instead of N. Partition 0 keeps its direct ports, targeted lifecycle
+operations still address the direct ports only, and a graph that
+leaves the mode off uses classic per-partition ports with untagged
+frames.
 
 ## Read and write semantics
 
@@ -129,7 +182,14 @@ The `replicated` param is checked against the wiring at init: a
 graph that declares replication but leaves `proposal_out` unwired
 refuses to start rather than silently serving writes locally. The
 same fail-closed check applies to `lin_reads` without the fence
-edges.
+edges. On a graph hosting several local partitions the fence is
+partition-aware end to end in fanout mode: the router tags each
+ReadIndex probe with the read's partition, a demux routes it to that
+partition's consensus instance, the grant streams fan back in
+(matched by correlation id), and the applied-index wait and the
+released read's forward both target the read's own partition. With
+direct multi-partition ports the probe would reach a single consensus
+instance, so that combination is refused at init.
 
 Two consequences worth stating plainly:
 
@@ -261,7 +321,13 @@ does not select a tenant.
 
 Every module emits positional counters on its `metrics` port; the
 declaration order in each module's manifest is the id contract
-(`modules/common/telemetry.rs`). Lattice app modules fan in through
+(`modules/common/telemetry.rs`). A module may additionally declare
+richer instruments — histograms with fixed bucket bounds and
+enumerated dimensions — in its manifest's `[observability]` table
+(`relational_executor`'s `query_latency_us` is one). The declaration
+is the contract: records carry counts only and are resolved through
+the graph's exported id-table (`fluxor id-table`), riding the kernel
+telemetry ring rather than the metrics port. Lattice app modules fan in through
 `adapter_metrics`; substrate modules feed `operations` directly,
 which serves the binary `/metrics` export and `/readyz` (one byte;
 200 when telemetry is fresh and every Raft instance reports ready).

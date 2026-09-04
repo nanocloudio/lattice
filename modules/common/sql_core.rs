@@ -500,6 +500,16 @@ impl<'a> Parser<'a> {
     /// while pretending to support multiple schemas would be the silent
     /// approximation §14.3 forbids. A qualifier that is not the
     /// well-known default is refused below.
+    /// A qualified column reference `table.column` — both idents required.
+    fn qualified(&mut self) -> Result<(&'a [u8], &'a [u8]), SqlError> {
+        let t = self.ident()?;
+        if !self.eat_punct(b'.')? {
+            return Err(SqlError::Syntax);
+        }
+        let c = self.ident()?;
+        Ok((t, c))
+    }
+
     fn table_name(&mut self) -> Result<&'a [u8], SqlError> {
         let first = self.ident()?;
         if self.eat_punct(b'.')? {
@@ -743,6 +753,21 @@ pub struct Select<'a> {
     pub order: Option<OrderBy<'a>>,
     /// `LIMIT n`, if given.
     pub limit: Option<u32>,
+    /// An inner `JOIN … ON a.x = b.y`, if given. When present the projection
+    /// is `*` and the other clauses are absent (the v1 join grammar). The
+    /// executor runs a separate two-table path.
+    pub join: Option<Join<'a>>,
+}
+
+/// `JOIN <table> ON <lt>.<lc> = <rt>.<rc>` — an inner equi-join on one
+/// qualified column pair. `table` is the joined (right-hand) relation.
+#[derive(Clone, Copy)]
+pub struct Join<'a> {
+    pub table: &'a [u8],
+    pub left_table: &'a [u8],
+    pub left_col: &'a [u8],
+    pub right_table: &'a [u8],
+    pub right_col: &'a [u8],
 }
 
 /// `ORDER BY column [ASC|DESC]`. A single sort key — the subset does not
@@ -1712,6 +1737,44 @@ fn parse_select<'a>(p: &mut Parser<'a>) -> Result<Statement<'a>, SqlError> {
     }
     let table = p.table_name()?;
 
+    // `JOIN <t2> ON <a>.<x> = <b>.<y>` — the v1 join grammar: `SELECT *`, a
+    // single equi-join on one qualified column pair, and nothing else. Parsed
+    // as an early return so the single-table clause parsing below is untouched.
+    if p.eat_kw(b"join")? {
+        if !is_star {
+            return Err(SqlError::Unsupported);
+        }
+        let jtable = p.table_name()?;
+        if !p.eat_kw(b"on")? {
+            return Err(SqlError::Syntax);
+        }
+        let (lt, lc) = p.qualified()?;
+        if !p.eat_punct(b'=')? {
+            return Err(SqlError::Syntax);
+        }
+        let (rt, rc) = p.qualified()?;
+        return finish(
+            p,
+            Statement::Select(Select {
+                table,
+                projection: Projection::Star,
+                where_: Where::EMPTY,
+                group_by: None,
+                distinct: false,
+                offset: None,
+                order: None,
+                limit: None,
+                join: Some(Join {
+                    table: jtable,
+                    left_table: lt,
+                    left_col: lc,
+                    right_table: rt,
+                    right_col: rc,
+                }),
+            }),
+        );
+    }
+
     let predicate = parse_where(p)?;
 
     // `GROUP BY column`. A grouped query is an aggregate query even if it
@@ -1801,6 +1864,7 @@ fn parse_select<'a>(p: &mut Parser<'a>) -> Result<Statement<'a>, SqlError> {
             order,
             limit,
             offset,
+            join: None,
         }),
     )
 }
@@ -3009,20 +3073,35 @@ mod tests {
     }
 
     /// Clauses that would change the answer are refused rather than
-    /// ignored. An ignored WHERE returns extra rows; an ignored JOIN or
-    /// GROUP BY answers a different question entirely.
+    /// ignored. An ignored WHERE returns extra rows; an ignored GROUP BY
+    /// answers a different question entirely. (`JOIN` is now parsed into a
+    /// `Join` and executed — see `single_equi_join_parses`.)
     #[test]
     fn answer_changing_clauses_are_refused_not_ignored() {
-        for sql in [
-            "SELECT * FROM t JOIN u ON t.a = u.a",
-            "SELECT * FROM t WHERE a = 1 OR b = 2",
-        ] {
+        for sql in ["SELECT * FROM t WHERE a = 1 OR b = 2"] {
             let e = pg(sql).unwrap_err();
             assert!(
                 matches!(e, SqlError::Unsupported | SqlError::Syntax),
                 "{sql} gave {e:?}"
             );
         }
+    }
+
+    /// A single-column equi-join parses into a `Join` (SELECT * only).
+    #[test]
+    fn single_equi_join_parses() {
+        let Statement::Select(s) = pg("SELECT * FROM t JOIN u ON t.a = u.b").unwrap() else {
+            panic!("not a select");
+        };
+        let j = s.join.expect("join present");
+        assert_eq!(s.table, b"t");
+        assert_eq!(j.table, b"u");
+        assert_eq!(j.left_table, b"t");
+        assert_eq!(j.left_col, b"a");
+        assert_eq!(j.right_table, b"u");
+        assert_eq!(j.right_col, b"b");
+        // A non-`*` join projection is refused in v1.
+        assert!(pg("SELECT t.a FROM t JOIN u ON t.a = u.b").is_err());
     }
 
     /// Every comparison operator parses into a predicate carrying that

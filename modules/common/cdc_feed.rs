@@ -482,7 +482,21 @@ impl FeedCore {
         if total > self.scratch.len() {
             return false;
         }
-        self.kv_corr = self.kv_corr.wrapping_add(1).max(1);
+        // Namespaced correlation ids. The router's inflight table is
+        // keyed by corr_id alone and is SHARED by every requester on the
+        // graph, so a producer that counts 1, 2, 3… collides with any
+        // other that does the same (the relational executor does exactly
+        // that) — a collision drops one request at dispatch or routes
+        // its reply to the other requester's channel. Bit 61 keeps this
+        // feed's ids disjoint both from small-integer requesters and
+        // from the router's own help space (bit 63); the low bits still
+        // count monotonically. Translating corr ids into a router-unique
+        // space at dispatch would remove the shared-namespace hazard for
+        // every producer at once; until a producer-blind translation
+        // exists, each internal requester owns a namespace bit.
+        const CDC_CORR_BASE: u64 = 0x2000_0000_0000_0000;
+        let next = (self.kv_corr.wrapping_add(1)) & 0x0FFF_FFFF_FFFF_FFFF;
+        self.kv_corr = CDC_CORR_BASE | next.max(1);
         let payload = REQ_HEAD + body_len;
         self.scratch[0] = MSG_KV_REQUEST;
         self.scratch[1] = (payload & 0xFF) as u8;

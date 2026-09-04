@@ -211,6 +211,137 @@ pub fn recommend(
     Recommendation::None
 }
 
+// ── Cluster-wide relocation (the rebalancer) ──────────────────────────
+//
+// `recommend` above sizes ONE range for split/merge. A rebalancer also
+// answers a question a single range cannot: is the CLUSTER's load spread
+// evenly across nodes? That decision is about placement, not size — it
+// reads each range's leaseholder node and moves a range off an
+// over-loaded node onto an under-loaded one, using the same advice-only,
+// one-op-at-a-time, operator-gated contract as split/merge.
+
+/// The relocation the rebalancer recommends: move the range at
+/// `range_index` from `from_node` (over-loaded) to `to_node`
+/// (under-loaded). These are exactly the `reloc_source`/`reloc_target`
+/// the `range_supervisor` relocation op consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelocationAdvice {
+    pub range_index: u8,
+    pub from_node: u32,
+    pub to_node: u32,
+}
+
+/// What the cluster-wide recommender is willing to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterRecommendation {
+    /// Load is within `skew` ranges across nodes — nothing to move.
+    Balanced,
+    /// Move one range to even the load out.
+    Relocate(RelocationAdvice),
+    /// An operation is already in flight; placement holds still while the
+    /// topology moves (same refusal as `recommend`).
+    OperationInFlight,
+}
+
+/// One range's placement input: which node currently holds its lease.
+/// `range_index` is the range's position in the ordered map so the
+/// advice names the same index the supervisor and router use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangePlacement {
+    pub range_index: u8,
+    pub leaseholder: u32,
+}
+
+/// Recommend at most one relocation to reduce node-load imbalance.
+///
+/// The load metric is deliberately the simplest defensible one: the
+/// COUNT of ranges a node leads. Byte/key-weighted balancing is a
+/// refinement, but range count is what the placement map alone can prove
+/// and it is monotone — moving a range off the busiest node never makes
+/// the imbalance worse.
+///
+/// `skew` is the operator's tolerance: the recommender stays silent
+/// until the busiest node leads at least `skew` more ranges than the
+/// quietest candidate. `skew < 2` is meaningless (a difference of one
+/// range cannot be evened by a single move), so it is clamped up to 2.
+///
+/// Refuses (returns `Balanced`) when there is nothing to move: fewer
+/// than two nodes, or the imbalance is within `skew`. Refuses
+/// (`OperationInFlight`) while any lifecycle op is running, so a
+/// rebalance never stacks onto a moving topology.
+pub fn recommend_relocation(
+    placements: &[RangePlacement],
+    skew: u32,
+    operations_in_flight: u8,
+    max_concurrent: u8,
+) -> ClusterRecommendation {
+    if operations_in_flight >= max_concurrent {
+        return ClusterRecommendation::OperationInFlight;
+    }
+    let skew = if skew < 2 { 2 } else { skew };
+    if placements.is_empty() {
+        return ClusterRecommendation::Balanced;
+    }
+
+    // Tally ranges per node. A small fixed table, not a map: a
+    // placement plane hosts a bounded node set and `no_std` has no
+    // allocator. Nodes beyond the table are ignored (they cannot be the
+    // busiest without appearing in it).
+    const MAX_NODES: usize = 32;
+    let mut node_ids = [0u32; MAX_NODES];
+    let mut counts = [0u32; MAX_NODES];
+    let mut n_nodes = 0usize;
+    for p in placements {
+        let mut i = 0;
+        while i < n_nodes {
+            if node_ids[i] == p.leaseholder {
+                break;
+            }
+            i += 1;
+        }
+        if i == n_nodes {
+            if n_nodes == MAX_NODES {
+                continue; // table full; ignore the overflow node
+            }
+            node_ids[n_nodes] = p.leaseholder;
+            n_nodes += 1;
+        }
+        counts[i] += 1;
+    }
+    if n_nodes < 2 {
+        return ClusterRecommendation::Balanced;
+    }
+
+    // Busiest and quietest nodes.
+    let (mut hi, mut lo) = (0usize, 0usize);
+    for i in 1..n_nodes {
+        if counts[i] > counts[hi] {
+            hi = i;
+        }
+        if counts[i] < counts[lo] {
+            lo = i;
+        }
+    }
+    if counts[hi].saturating_sub(counts[lo]) < skew {
+        return ClusterRecommendation::Balanced;
+    }
+
+    // Move the first range led by the busiest node onto the quietest.
+    // "First" is deterministic and enough: any one of its ranges reduces
+    // the imbalance by the same unit, and determinism keeps the advice
+    // stable across identical surveys (no oscillation).
+    for p in placements {
+        if p.leaseholder == node_ids[hi] {
+            return ClusterRecommendation::Relocate(RelocationAdvice {
+                range_index: p.range_index,
+                from_node: node_ids[hi],
+                to_node: node_ids[lo],
+            });
+        }
+    }
+    ClusterRecommendation::Balanced
+}
+
 // ── Capacity forecasting (Phase 10) ──────────────────────────────────
 
 /// How long until a range reaches a ceiling, or why that question has

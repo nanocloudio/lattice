@@ -1,0 +1,54 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Span courier — cross-node transport for the elastic split's chunk
+# stream. Carries app-snapshot envelopes (RESET/CHUNK one way, the
+# install-complete ack the other) over ONE TCP connection, byte-for-byte
+# and unparsed, so the worker-side contract is identical to the
+# in-process wiring. `mode: 0` (ship) dials `endpoint` from the source
+# node; `mode: 1` (receive) listens on `listen_port` on the target node.
+# Transport loss fails closed: an incomplete stream is dropped whole,
+# the target's strict chunk accumulation aborts the install, no ack is
+# returned, and the split driver's cutover never fires.
+
+# NET provider events (BOUND/ACCEPTED/CONNOK/DATA/CLOSED/ERROR).
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Local envelopes to ship: ship mode = the source worker's
+# snapshot_export stream; receive mode = the target worker's
+# install_ack_out. Input index 1.
+[[ports]]
+name = "local_in"
+direction = "input"
+content_type = "OctetStream"
+
+# NET provider commands (BIND/CONNECT/SEND).
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Reassembled envelopes from the peer: ship mode = acks to the split
+# driver's ack_in; receive mode = the chunk stream to the target
+# worker's snapshot_import. Output index 1.
+[[ports]]
+name = "local_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Positional counters: shipped, delivered, dropped.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+#   0 shipped     local envelopes streamed to the peer
+#   1 delivered   complete envelopes reassembled and forwarded locally
+#   2 dropped     streams dropped whole (no connection, torn frame, overflow)
+metrics = ["shipped", "delivered", "dropped"]

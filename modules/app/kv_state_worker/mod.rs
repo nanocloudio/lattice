@@ -107,10 +107,11 @@ use types::{
 };
 use wire::{
     APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_DURABLE,
-    MSG_APP_SNAPSHOT_REQUEST, MSG_APP_SNAPSHOT_RESET, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED,
-    MSG_KV_COMMAND, MSG_LEASE_TICK,
-    MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REQUEST,
-    MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
+    MSG_APP_SNAPSHOT_INSTALLED, MSG_APP_SNAPSHOT_REQUEST, MSG_APP_SNAPSHOT_RESET,
+    MSG_APP_SNAPSHOT_SPAN_REQUEST, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND,
+    MSG_LEASE_TICK, MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT,
+    MSG_TS_LEASE_REQUEST, MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT,
+    TS_LEASE_GRANT_WIRE_LEN,
 };
 
 #[path = "../../common/compaction_floor.rs"]
@@ -280,9 +281,8 @@ define_params! {
     3, gc_claim_mode, u8, 0, enum { pin=0, snapshot=1 }
         => |s, d, len| { s.gc_claim_mode = p_u8(d, len, 0, 0); };
 
-    // KPG id stamped on the retention claim this worker publishes.
     // Which disk store this worker instance owns. Multi-range graphs
-    // (RFC §11, Phase 3) run one worker per range in one process; each
+    // run one worker per range in one process; each
     // needs its own file namespace: 0 = the historical `kv/`,
     // 1..=9 = `kv<id>/`. Refused at init on the FAT32 root layout
     // (root_path = 1) with a non-zero id — two stores at the FS root
@@ -290,8 +290,17 @@ define_params! {
     5, store_id, u8, 0
         => |s, d, len| { s.store_id = p_u8(d, len, 0, 0); };
 
+    // KPG id stamped on the retention claim this worker publishes.
     4, gc_claim_kpg, u16, 0
         => |s, d, len| { s.gc_claim_kpg = p_u16(d, len, 0, 0); };
+
+    // The Raft partition this worker serves. Stamped into every applied-
+    // position report so the router's linearizable-read fence can track a
+    // per-partition applied index and satisfy a read against the SAME
+    // partition it must observe — not the max across a dense host's
+    // partitions. Default 0 for single-partition graphs.
+    6, partition_id, u16, 0
+        => |s, d, len| { s.partition_id = p_u16(d, len, 0, 0); };
 }
 
 /// Steps between retention-claim republications. The claim carries a
@@ -330,6 +339,8 @@ struct WorkerState {
     snapshot_export_out: i32,
     metrics_out: i32,
     expiry_out: i32,
+    /// Elastic-split install-complete ack (index 7); -1 unless wired.
+    install_ack_out: i32,
 
     /// The one clock this state machine has: the millisecond reading
     /// carried by the most recent committed `MSG_LEASE_TICK`, which
@@ -375,6 +386,9 @@ struct WorkerState {
     state_store: u8,
     root_path: u8,
     store_id: u8,
+    /// Raft partition served (param 6); stamped into applied-position
+    /// reports for the router's per-partition lin-read fence.
+    partition_id: u16,
     /// Disk-provider lifecycle (`DISK_PHASE_*`). Meaningless in
     /// memory mode.
     disk_phase: u8,
@@ -592,6 +606,7 @@ impl WorkerState {
         self.snapshot_export_out = -1;
         self.metrics_out = -1;
         self.expiry_out = -1;
+        self.install_ack_out = -1;
         self.committed_now_ms = 0;
         self.reap_cursor = 0;
         self.reap_remaining = 0;
@@ -613,6 +628,7 @@ impl WorkerState {
         self.state_store = STATE_STORE_MEMORY;
         self.root_path = 0;
         self.store_id = 0;
+        self.partition_id = 0;
         self.disk_phase = DISK_PHASE_RECOVERING;
         self.disk_revision = 0;
         self.disk_replay_floor = 0;
@@ -1322,6 +1338,7 @@ pub extern "C" fn module_new(
         worker.metrics_out = dev_channel_port(sys, 1, 4);
         worker.lease_request_out = dev_channel_port(sys, 1, 5);
         worker.expiry_out = dev_channel_port(sys, 1, 6);
+        worker.install_ack_out = dev_channel_port(sys, 1, 7);
     }
     0
 }
@@ -1688,13 +1705,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         if worker.applied_index > worker.published_applied_index && worker.responses_out >= 0 {
             let sys = &*worker.syscalls;
-            let mut env = [0u8; 19];
+            // Payload `[partition_id:u16][term:u64][index:u64]` (18 bytes).
+            // The partition leads so the router fences per-partition; a
+            // reader written before this field expected 16 bytes, but the
+            // only consumer is this repo's router, updated in lockstep.
+            let mut env = [0u8; 21];
             env[0] = MSG_APP_APPLIED_POS;
-            env[1] = 16;
+            env[1] = 18;
             env[2] = 0;
-            env[3..11].copy_from_slice(&worker.applied_term.to_le_bytes());
-            env[11..19].copy_from_slice(&worker.applied_index.to_le_bytes());
-            if (sys.channel_write)(worker.responses_out, env.as_mut_ptr(), 19) == 19 {
+            env[3..5].copy_from_slice(&worker.partition_id.to_le_bytes());
+            env[5..13].copy_from_slice(&worker.applied_term.to_le_bytes());
+            env[13..21].copy_from_slice(&worker.applied_index.to_le_bytes());
+            if (sys.channel_write)(worker.responses_out, env.as_mut_ptr(), 21) == 21 {
                 worker.published_applied_index = worker.applied_index;
             }
         }
@@ -2818,6 +2840,39 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             }
             emit_snapshot_chunks(worker, sys);
         }
+        MSG_APP_SNAPSHOT_SPAN_REQUEST => {
+            // Elastic split: ship ONLY the requested span to a
+            // demand-provisioned partition. Body after [term:8][index:8]:
+            // [start_len:u16][start][end_len:u16][end]. Bounds are copied
+            // out first because the emit path reuses `worker.scratch`.
+            // No applied_index gate: a span copy is labelled state, not a
+            // raft snapshot of THIS partition — a direct-apply source has a
+            // valid store at index 0.
+            if worker.snapshot_export_out < 0 {
+                return;
+            }
+            let mut start = [0u8; 256];
+            let mut end = [0u8; 256];
+            let (sl, el) = {
+                let p = &worker.scratch;
+                if payload_len < 20 {
+                    return;
+                }
+                let sl = u16::from_le_bytes([p[16], p[17]]) as usize;
+                let el_off = 18 + sl;
+                if sl > 256 || el_off + 2 > payload_len {
+                    return;
+                }
+                let el = u16::from_le_bytes([p[el_off], p[el_off + 1]]) as usize;
+                if el > 256 || el_off + 2 + el > payload_len {
+                    return;
+                }
+                start[..sl].copy_from_slice(&p[18..18 + sl]);
+                end[..el].copy_from_slice(&p[el_off + 2..el_off + 2 + el]);
+                (sl, el)
+            };
+            emit_span_snapshot_chunks(worker, sys, &start[..sl], &end[..el]);
+        }
         MSG_APP_SNAPSHOT_RESET => {
             if worker.state_store == STATE_STORE_DISK {
                 if worker.disk_phase != DISK_PHASE_SERVING {
@@ -2850,9 +2905,7 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             // for its own ack, and an ack for a snapshot this worker never
             // labelled (pending == 0) is ignored. Under-advancing is safe;
             // over-advancing past a non-durable snapshot is the bug.
-            if worker.gc_snapshot_pending_index != 0
-                && index >= worker.gc_snapshot_pending_index
-            {
+            if worker.gc_snapshot_pending_index != 0 && index >= worker.gc_snapshot_pending_index {
                 worker.gc_snapshot_revision = worker.gc_snapshot_pending_revision;
                 worker.gc_snapshot_pending_index = 0;
             }
@@ -3024,6 +3077,19 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                     // its clock and its expiry queue are arena-only, so
                     // nothing else rebuilds them.
                     resume_expiry_service(worker);
+                    // Elastic split: tell an orchestrator the install is
+                    // resident, so an elastic-split cutover gates on the
+                    // span actually landing rather than a wall-clock guess.
+                    // Unwired (index 7 < 0) in every graph but the split.
+                    if worker.install_ack_out >= 0 {
+                        let mut ack = [0u8; 3 + 10];
+                        ack[0] = MSG_APP_SNAPSHOT_INSTALLED;
+                        ack[1] = 10;
+                        ack[2] = 0;
+                        ack[3..5].copy_from_slice(&worker.partition_id.to_le_bytes());
+                        ack[5..13].copy_from_slice(&worker.applied_index.to_le_bytes());
+                        (sys.channel_write)(worker.install_ack_out, ack.as_mut_ptr(), 13);
+                    }
                 } else {
                     // The failed install left the store EMPTY (both
                     // providers guarantee this), so there is no partial
@@ -3129,6 +3195,96 @@ unsafe fn emit_snapshot_chunks(worker: &mut WorkerState, sys: &SyscallTable) {
             } else {
                 worker.store.revision
             };
+            return;
+        }
+    }
+}
+
+/// Elastic split: stream ONLY the keys in `[start, end)` as a
+/// `MSG_APP_SNAPSHOT_CHUNK` sequence — the elastic split's span copy to a
+/// demand-provisioned partition. Both providers export: the memory store
+/// encodes its records directly, the disk provider merge-scans the span
+/// and streams the same portable body (current state; version history
+/// stays behind, as the target's revision space is independent).
+///
+/// Unlike [`emit_snapshot_chunks`] this is a COPY to ANOTHER partition, not
+/// a snapshot of THIS worker's own state, so it deliberately touches none of
+/// this worker's GC-snapshot bookkeeping. An empty span still emits one
+/// header-only chunk, so the target's install path always runs.
+unsafe fn emit_span_snapshot_chunks(
+    worker: &mut WorkerState,
+    sys: &SyscallTable,
+    start: &[u8],
+    end: &[u8],
+) {
+    if worker.snapshot_export_out < 0 {
+        return;
+    }
+    let mut body = [0u8; SNAPSHOT_BODY_MAX];
+    let encoded = if worker.state_store == STATE_STORE_DISK {
+        let store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+        let mut mat = DiskMaterializer::new(store, worker.disk_revision, worker.disk_replay_floor);
+        mat.snapshot_encode_span(&mut body, worker.committed_now_ms, start, end)
+    } else {
+        worker
+            .store
+            .snapshot_encode_span(&mut body, worker.committed_now_ms, start, end)
+    };
+    let Some(total) = encoded else {
+        worker.m_snapshot_refusals = worker.m_snapshot_refusals.wrapping_add(1);
+        return;
+    };
+    // The target is a demand-provisioned (empty) partition: send a RESET
+    // first so its CHUNK path is armed (`importing`) and any prior state is
+    // discarded, then the span body. Labelled at (0, 0): this is a COPY of
+    // another range's keys, not a raft position the target should adopt —
+    // the target keeps its own apply position and simply gains the keys.
+    let (term, index) = (0u64, 0u64);
+    {
+        let reset_payload = APP_SNAPSHOT_HDR;
+        worker.scratch[0] = MSG_APP_SNAPSHOT_RESET;
+        worker.scratch[1] = (reset_payload & 0xFF) as u8;
+        worker.scratch[2] = ((reset_payload >> 8) & 0xFF) as u8;
+        worker.scratch[3..11].copy_from_slice(&term.to_le_bytes());
+        worker.scratch[11..19].copy_from_slice(&index.to_le_bytes());
+        // The RESET arm reads only term+index (16 bytes); pad the rest.
+        for b in worker.scratch[19..3 + reset_payload].iter_mut() {
+            *b = 0;
+        }
+        let n = (sys.channel_write)(
+            worker.snapshot_export_out,
+            worker.scratch.as_mut_ptr(),
+            3 + reset_payload,
+        );
+        if n != (3 + reset_payload) as i32 {
+            return;
+        }
+    }
+    let mut sent = 0usize;
+    loop {
+        let chunk = (total - sent).min(SNAPSHOT_CHUNK_MAX);
+        let done = sent + chunk == total;
+        let payload = APP_SNAPSHOT_HDR + chunk;
+        worker.scratch[0] = MSG_APP_SNAPSHOT_CHUNK;
+        worker.scratch[1] = (payload & 0xFF) as u8;
+        worker.scratch[2] = ((payload >> 8) & 0xFF) as u8;
+        worker.scratch[3..11].copy_from_slice(&term.to_le_bytes());
+        worker.scratch[11..19].copy_from_slice(&index.to_le_bytes());
+        worker.scratch[19..27].copy_from_slice(&(sent as u64).to_le_bytes());
+        worker.scratch[27] = u8::from(done);
+        worker.scratch[28..31].copy_from_slice(&[0, 0, 0]);
+        worker.scratch[31..31 + chunk].copy_from_slice(&body[sent..sent + chunk]);
+        let n = (sys.channel_write)(
+            worker.snapshot_export_out,
+            worker.scratch.as_mut_ptr(),
+            3 + payload,
+        );
+        if n != (3 + payload) as i32 {
+            return;
+        }
+        worker.m_snapshot_chunks = worker.m_snapshot_chunks.wrapping_add(1);
+        sent += chunk;
+        if done {
             return;
         }
     }
