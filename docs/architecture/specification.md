@@ -73,8 +73,9 @@ runs with recovery before serving).
   followed by the user key; MVCC versions order below it. Source:
   `modules/common/internal_key.rs`.
 - **Lease** — lease id → TTL, grant time, keepalive deadline,
-  attached keys, and a session epoch that increments on
-  revoke/recreate so stale keepalives are fenced. Source:
+  attached keys, and a per-session epoch that advances on each
+  authoritative rebind, so a keepalive carrying a stale epoch is fenced
+  rather than refreshing a lease whose session has moved. Source:
   `modules/app/lease_manager/mod.rs`.
 - **Watch state** — watch id → key range, filters, and
   `last_sent_revision`, the replay low-water mark. Source:
@@ -264,8 +265,9 @@ A graph that satisfies the port by wiring some other producer to it is
 refused with the reason.
 
 Lease keepalives move the keepalive deadline against the same clock; a
-revoked or recreated lease bumps its session epoch so stale keepalives
-are fenced. Watch delivery
+keepalive carrying a stale session epoch — one left behind when the
+lease was rebound to another worker — is fenced rather than refreshing
+the lease. Watch delivery
 (`watch_registry` + `watch_fanout`) replays a revision window
 through versioned scans: every version in `(from, to]` is delivered
 in order, tombstones included, and a compacted answer abandons the

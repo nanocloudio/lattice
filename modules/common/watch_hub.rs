@@ -12,9 +12,10 @@
 //!
 //! - **`watch_registry`** owns persisted state: which `WatchID` is
 //!   active, the per-watch key range / filter / start-revision /
-//!   `last_sent_revision`, the binding to a client-facing
-//!   `etcd_edge_anchor` slot, and the `session_epoch` that fences
-//!   stale frames after a rebind.
+//!   `last_sent_revision`, and the session binding — Fluxor's
+//!   `session_id` / `anchor_id` / `session_epoch` triple
+//!   (`session_core::SessionBinding`) that names the anchor fronting
+//!   the watch and fences stale frames after a rebind.
 //! - **`watch_fanout`** consumes durable mutation events from
 //!   `kv_state_worker`, walks the watch table, picks matching
 //!   watches, batches per-anchor frames, and hands them off to
@@ -30,7 +31,7 @@
 //! - Event buffering — events flow through immediately; if a slow
 //!   consumer needs replay, the registry consults the
 //!   `kv_state_worker` snapshot via `replay_plan` (which today is a
-//!   thin slot for what becomes a snapshot-restore in Phase 6).
+//!   `kv_state_worker` snapshot via `replay_plan`).
 //! - Lease attachment — that lives in `lease_manager` and only
 //!   surfaces here through the `LeaseId` carried on a `KeyValue`.
 //!
@@ -42,6 +43,15 @@
 )]
 
 use core::cmp::Ordering;
+
+#[path = "session_core.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "dual-target core mounted per consumer; each uses a subset"
+)]
+pub mod session_core;
+
+use session_core::{AnchorId, PlacementEpoch, SessionBinding, SessionId};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -56,11 +66,6 @@ pub const MAX_WATCHES: usize = 256;
 /// (where `range_end` is the next byte after the last byte of `key`).
 pub const WATCH_KEY_MAX: usize = 96;
 
-/// Reserved sentinel for "no anchor binding" (e.g. a watch whose
-/// anchor connection dropped — kept alive until session timeout
-/// for resume).
-pub const ANCHOR_UNBOUND: u32 = 0xFFFF_FFFF;
-
 // ── Event kinds (mirrors etcd v3 mvccpb.Event.EventType) ──────────────
 
 pub const WATCH_EVENT_PUT: u8 = 0;
@@ -73,23 +78,36 @@ pub const WATCH_FILTER_NOPUT: u8 = 1 << 0;
 /// Suppress DELETE events (`NODELETE` filter).
 pub const WATCH_FILTER_NODELETE: u8 = 1 << 1;
 
-// ── Anchor binding ────────────────────────────────────────────────────
+// ── Session phases (continuity) ───────────────────────────────────────
 
-/// `(conn_id, stream_id)` packed into a single u32 so the watch
-/// table doesn't need a separate field per axis. `conn_id` is u8
-/// (matches `types::ConnId`); `stream_id` is u24 (HTTP/2 stream
-/// ids are u31 on the wire but Lattice caps practically at ~16
-/// concurrent streams per conn, so 24 bits is generous).
-pub const fn pack_binding(conn_id: u8, stream_id: u32) -> u32 {
-    ((conn_id as u32) << 24) | (stream_id & 0x00FF_FFFF)
-}
+/// Bound and producing events.
+pub const WATCH_PHASE_ACTIVE: u8 = 0;
+/// `CMD_SC_DRAIN` received: no new events are emitted; the record
+/// declares `DRAINED` once every emitted event has been acked.
+pub const WATCH_PHASE_DRAINING: u8 = 1;
+/// `DRAINED` declared and state exported: this worker consumes nothing
+/// for the session until told to (`CMD_SC_RESUME` at the current
+/// epoch returns it to service; at a higher epoch it is gone).
+pub const WATCH_PHASE_DRAINED: u8 = 2;
+/// Imported from a handoff and dormant until `CMD_SC_RESUME` commits
+/// it at the new epoch.
+pub const WATCH_PHASE_IMPORTED: u8 = 3;
 
-pub const fn binding_conn_id(b: u32) -> u8 {
-    (b >> 24) as u8
-}
+// ── Handoff blob ──────────────────────────────────────────────────────
 
-pub const fn binding_stream_id(b: u32) -> u32 {
-    b & 0x00FF_FFFF
+/// Magic prefix of an exported watch record.
+pub const WATCH_EXPORT_MAGIC: &[u8; 4] = b"LWR1";
+/// Fixed header bytes of an exported watch record, before the key bytes.
+pub const WATCH_EXPORT_HDR: usize = 4 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 1 + 1 + 2 + 2 + 16 + 8;
+/// Largest exported watch record.
+pub const WATCH_EXPORT_MAX: usize = WATCH_EXPORT_HDR + WATCH_KEY_MAX;
+
+fn arr8(buf: &[u8], at: usize) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    if at + 8 <= buf.len() {
+        out.copy_from_slice(&buf[at..at + 8]);
+    }
+    out
 }
 
 // ── WatchRecord ───────────────────────────────────────────────────────
@@ -109,13 +127,24 @@ pub struct WatchRecord {
     /// Highest revision delivered to this watch's client. Bumped
     /// only after the fanout confirms the frame is on the wire.
     pub last_sent_revision: i64,
-    /// Generation counter — bumped on resume / rebind. Stale
-    /// frames carrying an older epoch are dropped.
-    pub session_epoch: u32,
-    /// `pack_binding(conn_id, stream_id)`. `ANCHOR_UNBOUND` when
-    /// the anchor connection has dropped and we're holding the
-    /// state for a resume.
-    pub anchor_binding: u32,
+    /// Fluxor session identity: `session_id`, the `anchor_id`
+    /// fronting the watch, and the per-session `session_epoch` that
+    /// advances on every authoritative rebind of this watch. Stale
+    /// frames carrying an older epoch are dropped. Presence
+    /// (`binding.bound`) is tracked apart from the anchor id.
+    pub binding: SessionBinding,
+    /// Continuity phase of the session this record is (see
+    /// `WATCH_PHASE_*`). Only an `ACTIVE` record produces events.
+    pub phase: u8,
+    /// Delivery cursor, inbound: control envelopes the anchor
+    /// forwarded for this session that this record accounts for.
+    pub in_consumed: u64,
+    /// Events this registry emitted toward the fanout for this watch.
+    pub out_emitted: u64,
+    /// Events the fanout confirmed it framed for this watch. Advances
+    /// in the same handler as `last_sent_revision`, so the delivery
+    /// cursor and the acked revision always describe the same prefix.
+    pub out_acked: u64,
     /// `(NOPUT | NODELETE)` bitset.
     pub filters: u8,
     /// True iff the watcher asked for progress notifications.
@@ -138,8 +167,11 @@ impl WatchRecord {
             tenant_id: 0,
             start_revision: 0,
             last_sent_revision: 0,
-            session_epoch: 0,
-            anchor_binding: ANCHOR_UNBOUND,
+            binding: SessionBinding::empty(),
+            phase: WATCH_PHASE_ACTIVE,
+            in_consumed: 0,
+            out_emitted: 0,
+            out_acked: 0,
             filters: 0,
             progress_notify: false,
             key_len: 0,
@@ -151,6 +183,100 @@ impl WatchRecord {
     /// True iff this slot is in use.
     pub fn in_use(&self) -> bool {
         self.watch_id != 0
+    }
+
+    /// The session's current epoch.
+    pub fn session_epoch(&self) -> u32 {
+        self.binding.session_epoch
+    }
+
+    /// True iff the session is in service: bound, active, not mid-handoff.
+    pub fn produces_events(&self) -> bool {
+        self.in_use() && self.phase == WATCH_PHASE_ACTIVE && self.binding.bound
+    }
+
+    /// True iff every event emitted for this watch has been acked by
+    /// the fanout — the point at which the delivery cursor and
+    /// `last_sent_revision` describe the same prefix.
+    pub fn outbound_settled(&self) -> bool {
+        self.out_emitted == self.out_acked
+    }
+
+    /// Serialise the record for `CMD_SC_EXPORT_*`. Layout (all LE
+    /// except identity bytes, which are copied raw):
+    ///   `[magic "LWR1":4][watch_id:8][tenant:4][start_rev:8]
+    ///    [last_sent:8][in_consumed:8][out_acked:8][epoch:4]
+    ///    [filters:1][progress:1][key_len:2][range_end_len:2]
+    ///    [session_id:16][anchor_id:8][key_buf: key_len+range_end_len]`
+    /// Returns the bytes written, or 0 when `out` is too short.
+    pub fn export(&self, out: &mut [u8]) -> usize {
+        let kl = self.key_len as usize + self.range_end_len as usize;
+        let need = WATCH_EXPORT_HDR + kl;
+        if out.len() < need {
+            return 0;
+        }
+        out[0..4].copy_from_slice(WATCH_EXPORT_MAGIC);
+        out[4..12].copy_from_slice(&self.watch_id.to_le_bytes());
+        out[12..16].copy_from_slice(&self.tenant_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.start_revision.to_le_bytes());
+        out[24..32].copy_from_slice(&self.last_sent_revision.to_le_bytes());
+        out[32..40].copy_from_slice(&self.in_consumed.to_le_bytes());
+        out[40..48].copy_from_slice(&self.out_acked.to_le_bytes());
+        out[48..52].copy_from_slice(&self.binding.session_epoch.to_le_bytes());
+        out[52] = self.filters;
+        out[53] = self.progress_notify as u8;
+        out[54..56].copy_from_slice(&self.key_len.to_le_bytes());
+        out[56..58].copy_from_slice(&self.range_end_len.to_le_bytes());
+        out[58..74].copy_from_slice(&self.binding.session_id);
+        out[74..82].copy_from_slice(&self.binding.anchor_id);
+        out[82..82 + kl].copy_from_slice(&self.key_buf[..kl]);
+        need
+    }
+
+    /// Rebuild a record from an exported blob. The result is
+    /// `WATCH_PHASE_IMPORTED`, bound to the exporter's anchor at the
+    /// exporter's epoch; `out_emitted` equals `out_acked` because the
+    /// exporter only exports once settled. `None` on a malformed blob.
+    pub fn import(src: &[u8]) -> Option<Self> {
+        if src.len() < WATCH_EXPORT_HDR || &src[0..4] != WATCH_EXPORT_MAGIC {
+            return None;
+        }
+        let key_len = u16::from_le_bytes([src[54], src[55]]);
+        let range_end_len = u16::from_le_bytes([src[56], src[57]]);
+        let kl = key_len as usize + range_end_len as usize;
+        if kl > WATCH_KEY_MAX || src.len() < WATCH_EXPORT_HDR + kl {
+            return None;
+        }
+        let watch_id = u64::from_le_bytes(arr8(src, 4));
+        if watch_id == 0 {
+            return None;
+        }
+        let mut session_id: SessionId = [0; 16];
+        session_id.copy_from_slice(&src[58..74]);
+        let mut anchor_id: AnchorId = [0; 8];
+        anchor_id.copy_from_slice(&src[74..82]);
+        let epoch = u32::from_le_bytes([src[48], src[49], src[50], src[51]]);
+        let binding = SessionBinding::imported(session_id, anchor_id, epoch)?;
+        let filters = src[52];
+        if filters & !(WATCH_FILTER_NOPUT | WATCH_FILTER_NODELETE) != 0 {
+            return None;
+        }
+        let mut rec = WatchRecord::free();
+        rec.watch_id = watch_id;
+        rec.tenant_id = u32::from_le_bytes([src[12], src[13], src[14], src[15]]);
+        rec.start_revision = i64::from_le_bytes(arr8(src, 16));
+        rec.last_sent_revision = i64::from_le_bytes(arr8(src, 24));
+        rec.in_consumed = u64::from_le_bytes(arr8(src, 32));
+        rec.out_acked = u64::from_le_bytes(arr8(src, 40));
+        rec.out_emitted = rec.out_acked;
+        rec.binding = binding;
+        rec.phase = WATCH_PHASE_IMPORTED;
+        rec.filters = filters;
+        rec.progress_notify = src[53] != 0;
+        rec.key_len = key_len;
+        rec.range_end_len = range_end_len;
+        rec.key_buf[..kl].copy_from_slice(&src[82..82 + kl]);
+        Some(rec)
     }
 
     /// Borrowed key bytes (single-key form) or `[key, range_end)`
@@ -227,12 +353,11 @@ pub struct WatchHub {
     /// sentinel).
     pub next_id: u64,
     /// Cluster-wide placement epoch as last reported by the substrate
-    /// `control_plane`. Each newly-registered watch stamps this
-    /// into its `session_epoch`; an `advance_cluster_epoch` bump
-    /// fences every active watch by promoting their epoch in lockstep.
-    /// Initial value 1 covers the pre-substrate single-node case
-    /// (until the first `MSG_PLACEMENT_EPOCH_EVENT` lands).
-    pub cluster_epoch: u32,
+    /// `control_plane`. Held here, never stamped into a record: a
+    /// placement event advances this and causes the directory to
+    /// rebind the sessions whose placement moved, each of which
+    /// advances its own `session_epoch` by one.
+    pub placement_epoch: u32,
 }
 
 impl WatchHub {
@@ -241,7 +366,7 @@ impl WatchHub {
             records: [WatchRecord::free(); MAX_WATCHES],
             registry_revision: 0,
             next_id: 1,
-            cluster_epoch: 1,
+            placement_epoch: PlacementEpoch::new().current,
         }
     }
 
@@ -253,32 +378,20 @@ impl WatchHub {
         }
         self.registry_revision = 0;
         self.next_id = 1;
-        self.cluster_epoch = 1;
+        self.placement_epoch = PlacementEpoch::new().current;
     }
 
-    /// Advance the hub's notion of cluster epoch and bump every active
-    /// watch's `session_epoch` to the new value. Returns the count of
-    /// active watches fenced. No-op when `new_epoch <= cluster_epoch`
-    /// (epochs are monotonic — out-of-order or duplicate events get
-    /// ignored).
-    pub fn advance_cluster_epoch(&mut self, new_epoch: u32) -> usize {
-        if new_epoch <= self.cluster_epoch {
-            return 0;
-        }
-        self.cluster_epoch = new_epoch;
-        let mut fenced = 0usize;
-        let mut i = 0;
-        while i < MAX_WATCHES {
-            if self.records[i].in_use() {
-                self.records[i].session_epoch = new_epoch;
-                fenced += 1;
-            }
-            i += 1;
-        }
-        if fenced > 0 {
-            self.registry_revision = self.registry_revision.wrapping_add(1);
-        }
-        fenced
+    /// Advance the hub's placement epoch. Touches no record: session
+    /// epochs move only through [`WatchHub::rebind`]. Returns whether
+    /// the event was a real advance (duplicates and out-of-order
+    /// events are ignored).
+    pub fn advance_placement_epoch(&mut self, new_epoch: u32) -> bool {
+        let mut p = PlacementEpoch {
+            current: self.placement_epoch,
+        };
+        let advanced = p.advance(new_epoch);
+        self.placement_epoch = p.current;
+        advanced
     }
 
     /// Number of watches currently active.
@@ -303,6 +416,36 @@ impl WatchHub {
             return None;
         }
         self.records.iter_mut().find(|r| r.watch_id == watch_id)
+    }
+
+    /// Lookup by session identity.
+    pub fn find_session(&self, session_id: &SessionId) -> Option<&WatchRecord> {
+        self.records
+            .iter()
+            .find(|r| r.in_use() && r.binding.is(session_id))
+    }
+
+    pub fn find_session_mut(&mut self, session_id: &SessionId) -> Option<&mut WatchRecord> {
+        self.records
+            .iter_mut()
+            .find(|r| r.in_use() && r.binding.is(session_id))
+    }
+
+    /// Adopt an imported record into a free slot. Refused when the
+    /// watch id or the session id is already held here.
+    pub fn adopt(&mut self, rec: WatchRecord) -> Result<(), WatchError> {
+        if !rec.in_use() {
+            return Err(WatchError::InvalidId);
+        }
+        if self.index_of(rec.watch_id).is_some()
+            || self.find_session(&rec.binding.session_id).is_some()
+        {
+            return Err(WatchError::InvalidId);
+        }
+        let idx = self.find_free().ok_or(WatchError::TableFull)?;
+        self.records[idx] = rec;
+        self.registry_revision = self.registry_revision.wrapping_add(1);
+        Ok(())
     }
 
     /// Issue the next free `watch_id`. Always non-zero. Wraps if
@@ -336,12 +479,10 @@ impl WatchHub {
     /// caller already knows the id from a prior `(watch_id,
     /// session_epoch)` pair.
     ///
-    /// `tenant_id`, `start_revision`, `filters`, `progress_notify`,
-    /// and `anchor_binding` populate the fresh record.
-    /// `last_sent_revision` is initialised to `start_revision`.
-    /// `session_epoch` is stamped with the hub's current
-    /// `cluster_epoch` (set by [`advance_cluster_epoch`] when a
-    /// `control_plane` event lands; default 1 pre-substrate).
+    /// `tenant_id`, `start_revision`, `filters` and `progress_notify`
+    /// populate the fresh record; `session_id` / `anchor_id` mint its
+    /// binding at `FIRST_EPOCH`. `last_sent_revision` is initialised to
+    /// `start_revision`. A `session_id` already held here is refused.
     #[expect(
         clippy::too_many_arguments,
         reason = "facade is intentionally explicit — each field has independent semantics, packing into a struct would obscure the wire contract"
@@ -355,10 +496,14 @@ impl WatchHub {
         start_revision: i64,
         filters: u8,
         progress_notify: bool,
-        anchor_binding: u32,
+        session_id: SessionId,
+        anchor_id: AnchorId,
     ) -> Result<u64, WatchError> {
         if filters & !(WATCH_FILTER_NOPUT | WATCH_FILTER_NODELETE) != 0 {
             return Err(WatchError::BadFilter);
+        }
+        if self.find_session(&session_id).is_some() {
+            return Err(WatchError::InvalidId);
         }
         if key.len() + range_end.len() > WATCH_KEY_MAX {
             return Err(WatchError::KeyTooLarge);
@@ -381,10 +526,8 @@ impl WatchHub {
         rec.tenant_id = tenant_id;
         rec.start_revision = start_revision;
         rec.last_sent_revision = start_revision;
-        // Stamp the current substrate-provided placement epoch so the
-        // ack carries the right value without a follow-up lookup.
-        rec.session_epoch = self.cluster_epoch;
-        rec.anchor_binding = anchor_binding;
+        rec.binding = SessionBinding::attach(session_id, anchor_id);
+        rec.phase = WATCH_PHASE_ACTIVE;
         rec.filters = filters;
         rec.progress_notify = progress_notify;
         rec.key_len = key.len() as u16;
@@ -406,27 +549,22 @@ impl WatchHub {
         Ok(last)
     }
 
-    /// Rebind a watch's `anchor_binding` (e.g. after a reconnect on
-    /// the same client). Bumps `session_epoch` so any in-flight
-    /// frames using the old binding get dropped at the anchor.
-    /// Returns the new epoch.
-    pub fn rebind(&mut self, watch_id: u64, new_binding: u32) -> Result<u32, WatchError> {
+    /// Authoritative rebind of a watch onto `anchor_id`. The session
+    /// epoch advances by one so any in-flight frames under the old
+    /// generation are dropped at the anchor. Returns the new epoch.
+    pub fn rebind(&mut self, watch_id: u64, anchor_id: AnchorId) -> Result<u32, WatchError> {
         let idx = self.index_of(watch_id).ok_or(WatchError::NotFound)?;
-        let rec = &mut self.records[idx];
-        rec.session_epoch = rec.session_epoch.wrapping_add(1);
-        if rec.session_epoch == 0 {
-            rec.session_epoch = 1;
-        }
-        rec.anchor_binding = new_binding;
+        let epoch = self.records[idx].binding.rebind(anchor_id);
         self.registry_revision = self.registry_revision.wrapping_add(1);
-        Ok(rec.session_epoch)
+        Ok(epoch)
     }
 
     /// Unbind without cancelling — the anchor connection dropped
-    /// but the client may resume later. Slot stays allocated.
+    /// but the client may resume later. Slot stays allocated;
+    /// identity and epoch are kept, only presence is cleared.
     pub fn unbind(&mut self, watch_id: u64) -> Result<(), WatchError> {
         let idx = self.index_of(watch_id).ok_or(WatchError::NotFound)?;
-        self.records[idx].anchor_binding = ANCHOR_UNBOUND;
+        self.records[idx].binding.unbind();
         self.registry_revision = self.registry_revision.wrapping_add(1);
         Ok(())
     }
@@ -434,13 +572,18 @@ impl WatchHub {
     /// Bump `last_sent_revision` once the fanout confirms `rev` has
     /// been written to the wire for `watch_id`. The registry uses
     /// the new value as the resume point if the connection drops.
+    ///
+    /// One ack is one framed event, so the delivery cursor
+    /// (`out_acked`) and the acked revision advance together here and
+    /// nowhere else — they cannot describe different prefixes.
     pub fn mark_delivered(&mut self, watch_id: u64, rev: i64) -> Result<(), WatchError> {
         let idx = self.index_of(watch_id).ok_or(WatchError::NotFound)?;
         let rec = &mut self.records[idx];
+        rec.out_acked = rec.out_acked.wrapping_add(1);
         if rev > rec.last_sent_revision {
             rec.last_sent_revision = rev;
-            self.registry_revision = self.registry_revision.wrapping_add(1);
         }
+        self.registry_revision = self.registry_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -470,12 +613,13 @@ impl Default for WatchHub {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchedWatch {
     pub watch_id: u64,
+    pub session_id: SessionId,
     pub session_epoch: u32,
-    pub anchor_binding: u32,
 }
 
-/// Iterate every active watch and call `sink` for those whose
-/// `(key_range × filter × start_revision)` admits this event.
+/// Iterate every in-service watch (bound, active, not mid-handoff)
+/// and call `sink` for those whose `(key_range × filter ×
+/// start_revision)` admits this event.
 /// `event_revision` is the worker-side commit revision; we drop
 /// the event for any watch where `event_revision <=
 /// start_revision`.
@@ -488,7 +632,7 @@ pub fn match_event<F: FnMut(MatchedWatch)>(
     mut sink: F,
 ) {
     for rec in hub.records.iter() {
-        if !rec.in_use() {
+        if !rec.produces_events() {
             continue;
         }
         if rec.tenant_id != tenant_id {
@@ -505,8 +649,8 @@ pub fn match_event<F: FnMut(MatchedWatch)>(
         }
         sink(MatchedWatch {
             watch_id: rec.watch_id,
-            session_epoch: rec.session_epoch,
-            anchor_binding: rec.anchor_binding,
+            session_id: rec.binding.session_id,
+            session_epoch: rec.binding.session_epoch,
         });
     }
 }
@@ -538,13 +682,13 @@ pub fn replay_plan(hub: &WatchHub, watch_id: u64, current_revision: i64) -> Opti
             watch_id,
             from_revision: from,
             to_revision: to,
-            session_epoch: rec.session_epoch,
+            session_epoch: rec.binding.session_epoch,
         }),
         Ordering::Equal | Ordering::Greater => Some(ReplayPlan {
             watch_id,
             from_revision: to,
             to_revision: to,
-            session_epoch: rec.session_epoch,
+            session_epoch: rec.binding.session_epoch,
         }),
     }
 }
@@ -554,6 +698,16 @@ pub fn replay_plan(hub: &WatchHub, watch_id: u64, current_revision: i64) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: AnchorId = *b"ANCHOR-A";
+    const B: AnchorId = *b"ANCHOR-B";
+
+    fn sid(n: u8) -> SessionId {
+        let mut s = [0u8; 16];
+        s[..8].copy_from_slice(&A);
+        s[15] = n;
+        s
+    }
 
     fn fresh() -> WatchHub {
         let mut h = WatchHub::new();
@@ -573,7 +727,7 @@ mod tests {
     fn register_single_key_then_match() {
         let mut h = fresh();
         let id = h
-            .register(0, 0, b"foo", b"", 0, 0, false, pack_binding(1, 3))
+            .register(0, 0, b"foo", b"", 0, 0, false, sid(1), A)
             .unwrap();
         assert_eq!(id, 1);
         assert_eq!(h.len(), 1);
@@ -583,7 +737,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].watch_id, id);
         assert_eq!(hits[0].session_epoch, 1);
-        assert_eq!(hits[0].anchor_binding, pack_binding(1, 3));
+        assert_eq!(hits[0].session_id, sid(1));
 
         let mut other = std::vec::Vec::new();
         match_event(&h, 0, 7, WATCH_EVENT_PUT, b"bar", |m| other.push(m));
@@ -594,7 +748,7 @@ mod tests {
     fn register_prefix_range_matches_in_range() {
         let mut h = fresh();
         // [b"a", b"f") — matches "a", "b", … "e"
-        h.register(0, 0, b"a", b"f", 0, 0, false, pack_binding(1, 1))
+        h.register(0, 0, b"a", b"f", 0, 0, false, sid(1), A)
             .unwrap();
         let mut hits = std::vec::Vec::new();
         for k in [&b"a"[..], b"d", b"e", b"f", b"foo"] {
@@ -606,9 +760,7 @@ mod tests {
     #[test]
     fn start_revision_gates_old_events() {
         let mut h = fresh();
-        let id = h
-            .register(0, 0, b"k", b"", 5, 0, false, pack_binding(1, 1))
-            .unwrap();
+        let id = h.register(0, 0, b"k", b"", 5, 0, false, sid(1), A).unwrap();
         let mut hits = std::vec::Vec::new();
         match_event(&h, 0, 5, WATCH_EVENT_PUT, b"k", |m| hits.push(m));
         match_event(&h, 0, 6, WATCH_EVENT_PUT, b"k", |m| hits.push(m));
@@ -619,7 +771,7 @@ mod tests {
     #[test]
     fn filters_suppress_specific_event_kinds() {
         let mut h = fresh();
-        h.register(0, 0, b"k", b"", 0, WATCH_FILTER_NOPUT, false, 0)
+        h.register(0, 0, b"k", b"", 0, WATCH_FILTER_NOPUT, false, sid(1), A)
             .unwrap();
         let mut hits = std::vec::Vec::new();
         match_event(&h, 0, 1, WATCH_EVENT_PUT, b"k", |m| hits.push(m));
@@ -628,46 +780,65 @@ mod tests {
     }
 
     #[test]
-    fn rebind_bumps_session_epoch() {
+    fn rebind_advances_session_epoch_and_names_the_anchor() {
         let mut h = fresh();
-        let id = h
-            .register(0, 0, b"k", b"", 0, 0, false, pack_binding(1, 3))
-            .unwrap();
-        assert_eq!(h.get(id).unwrap().session_epoch, 1);
-        let new_epoch = h.rebind(id, pack_binding(2, 5)).unwrap();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        assert_eq!(h.get(id).unwrap().session_epoch(), 1);
+        let new_epoch = h.rebind(id, B).unwrap();
         assert_eq!(new_epoch, 2);
         let rec = h.get(id).unwrap();
-        assert_eq!(rec.anchor_binding, pack_binding(2, 5));
+        assert_eq!(rec.binding.anchor_id, B);
+        assert!(rec.binding.bound);
     }
 
     #[test]
     fn unbind_keeps_record_alive_for_resume() {
         let mut h = fresh();
-        let id = h
-            .register(0, 0, b"k", b"", 0, 0, false, pack_binding(1, 3))
-            .unwrap();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
         h.unbind(id).unwrap();
         let rec = h.get(id).unwrap();
-        assert_eq!(rec.anchor_binding, ANCHOR_UNBOUND);
+        assert!(!rec.binding.bound);
+        assert_eq!(rec.binding.anchor_id, A, "identity survives unbind");
         assert_eq!(h.len(), 1);
+        // An unbound watch is not in service.
+        let mut hits = std::vec::Vec::new();
+        match_event(&h, 0, 1, WATCH_EVENT_PUT, b"k", |m| hits.push(m));
+        assert!(hits.is_empty());
     }
 
     #[test]
-    fn mark_delivered_only_advances() {
+    fn duplicate_session_id_is_refused() {
         let mut h = fresh();
-        let id = h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
+        h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        let err = h
+            .register(0, 0, b"k2", b"", 0, 0, false, sid(1), A)
+            .unwrap_err();
+        assert_eq!(err, WatchError::InvalidId);
+    }
+
+    #[test]
+    fn mark_delivered_advances_revision_and_cursor_together() {
+        let mut h = fresh();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
         h.mark_delivered(id, 5).unwrap();
         assert_eq!(h.get(id).unwrap().last_sent_revision, 5);
-        h.mark_delivered(id, 3).unwrap(); // older — must NOT regress
+        assert_eq!(h.get(id).unwrap().out_acked, 1);
+        h.mark_delivered(id, 3).unwrap(); // older revision — must NOT regress
         assert_eq!(h.get(id).unwrap().last_sent_revision, 5);
+        assert_eq!(
+            h.get(id).unwrap().out_acked,
+            2,
+            "but the frame was delivered"
+        );
         h.mark_delivered(id, 7).unwrap();
         assert_eq!(h.get(id).unwrap().last_sent_revision, 7);
+        assert_eq!(h.get(id).unwrap().out_acked, 3);
     }
 
     #[test]
     fn cancel_frees_slot_and_returns_last_sent() {
         let mut h = fresh();
-        let id = h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
         h.mark_delivered(id, 42).unwrap();
         let last = h.cancel(id).unwrap();
         assert_eq!(last, 42);
@@ -678,8 +849,8 @@ mod tests {
     #[test]
     fn retention_floor_is_min_last_sent() {
         let mut h = fresh();
-        let a = h.register(0, 0, b"a", b"", 0, 0, false, 0).unwrap();
-        let b = h.register(0, 0, b"b", b"", 0, 0, false, 0).unwrap();
+        let a = h.register(0, 0, b"a", b"", 0, 0, false, sid(1), A).unwrap();
+        let b = h.register(0, 0, b"b", b"", 0, 0, false, sid(2), A).unwrap();
         h.mark_delivered(a, 10).unwrap();
         h.mark_delivered(b, 7).unwrap();
         assert_eq!(h.retention_floor(), Some(7));
@@ -688,7 +859,7 @@ mod tests {
     #[test]
     fn replay_plan_describes_resume_interval() {
         let mut h = fresh();
-        let id = h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
         h.mark_delivered(id, 3).unwrap();
         let plan = replay_plan(&h, id, 10).unwrap();
         assert_eq!(plan.from_revision, 3);
@@ -699,7 +870,7 @@ mod tests {
     #[test]
     fn replay_plan_for_up_to_date_watch_is_noop() {
         let mut h = fresh();
-        let id = h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
         h.mark_delivered(id, 5).unwrap();
         let plan = replay_plan(&h, id, 5).unwrap();
         assert_eq!(plan.from_revision, plan.to_revision);
@@ -708,7 +879,9 @@ mod tests {
     #[test]
     fn register_rejects_bad_filter_bits() {
         let mut h = fresh();
-        let err = h.register(0, 0, b"k", b"", 0, 0xFF, false, 0).unwrap_err();
+        let err = h
+            .register(0, 0, b"k", b"", 0, 0xFF, false, sid(1), A)
+            .unwrap_err();
         assert_eq!(err, WatchError::BadFilter);
     }
 
@@ -716,17 +889,17 @@ mod tests {
     fn register_rejects_oversize_key() {
         let mut h = fresh();
         let big = std::vec::Vec::from([b'k'; WATCH_KEY_MAX + 1]);
-        let err = h.register(0, 0, &big, b"", 0, 0, false, 0).unwrap_err();
+        let err = h
+            .register(0, 0, &big, b"", 0, 0, false, sid(1), A)
+            .unwrap_err();
         assert_eq!(err, WatchError::KeyTooLarge);
     }
 
     #[test]
     fn cross_tenant_does_not_leak_events() {
         let mut h = fresh();
-        h.register(0, 0, b"k", b"", 0, 0, false, pack_binding(1, 0))
-            .unwrap();
-        h.register(0, 1, b"k", b"", 0, 0, false, pack_binding(2, 0))
-            .unwrap();
+        h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        h.register(0, 1, b"k", b"", 0, 0, false, sid(2), A).unwrap();
         let mut for_t0 = std::vec::Vec::new();
         let mut for_t1 = std::vec::Vec::new();
         match_event(&h, 0, 1, WATCH_EVENT_PUT, b"k", |m| for_t0.push(m));
@@ -734,7 +907,7 @@ mod tests {
         assert_eq!(for_t0.len(), 1);
         assert_eq!(for_t1.len(), 1);
         assert_ne!(
-            for_t0[0].anchor_binding, for_t1[0].anchor_binding,
+            for_t0[0].session_id, for_t1[0].session_id,
             "events MUST stay tenant-scoped",
         );
     }
@@ -744,54 +917,102 @@ mod tests {
         let mut h = fresh();
         let mut i = 0;
         while i < MAX_WATCHES {
-            h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
+            let mut s = sid(0);
+            s[14] = (i >> 8) as u8;
+            s[15] = i as u8;
+            h.register(0, 0, b"k", b"", 0, 0, false, s, A).unwrap();
             i += 1;
         }
-        let err = h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap_err();
+        let mut s = sid(0);
+        s[13] = 1;
+        let err = h.register(0, 0, b"k", b"", 0, 0, false, s, A).unwrap_err();
         assert_eq!(err, WatchError::TableFull);
     }
 
     #[test]
-    fn binding_pack_unpack_round_trip() {
-        let cases = [(0u8, 0u32), (1, 1), (255, 0x00FF_FFFF), (42, 12345)];
-        for (c, s) in cases {
-            let packed = pack_binding(c, s);
-            assert_eq!(binding_conn_id(packed), c);
-            assert_eq!(binding_stream_id(packed), s);
-        }
-    }
-
-    #[test]
-    fn cluster_epoch_advance_bumps_all_active_sessions() {
+    fn placement_advance_touches_no_session() {
         let mut h = fresh();
-        let a = h.register(0, 0, b"k1", b"", 0, 0, false, 0).unwrap();
-        let b = h.register(0, 0, b"k2", b"", 0, 0, false, 0).unwrap();
-        assert_eq!(h.get(a).unwrap().session_epoch, 1);
-        assert_eq!(h.get(b).unwrap().session_epoch, 1);
-
-        let fenced = h.advance_cluster_epoch(5);
-        assert_eq!(fenced, 2);
-        assert_eq!(h.cluster_epoch, 5);
-        assert_eq!(h.get(a).unwrap().session_epoch, 5);
-        assert_eq!(h.get(b).unwrap().session_epoch, 5);
-    }
-
-    #[test]
-    fn cluster_epoch_advance_is_monotonic() {
-        let mut h = fresh();
-        h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
-        assert_eq!(h.advance_cluster_epoch(3), 1);
+        let a = h
+            .register(0, 0, b"k1", b"", 0, 0, false, sid(1), A)
+            .unwrap();
+        let b = h
+            .register(0, 0, b"k2", b"", 0, 0, false, sid(2), A)
+            .unwrap();
+        assert!(h.advance_placement_epoch(5));
+        assert_eq!(h.placement_epoch, 5);
+        assert_eq!(h.get(a).unwrap().session_epoch(), 1);
+        assert_eq!(h.get(b).unwrap().session_epoch(), 1);
         // Stale / equal events are a no-op.
-        assert_eq!(h.advance_cluster_epoch(3), 0);
-        assert_eq!(h.advance_cluster_epoch(2), 0);
-        assert_eq!(h.cluster_epoch, 3);
+        assert!(!h.advance_placement_epoch(5));
+        assert!(!h.advance_placement_epoch(2));
+        assert_eq!(h.placement_epoch, 5);
     }
 
     #[test]
-    fn newly_registered_watch_stamps_current_cluster_epoch() {
+    fn export_import_round_trips_a_record() {
         let mut h = fresh();
-        h.advance_cluster_epoch(7);
-        let id = h.register(0, 0, b"k", b"", 0, 0, false, 0).unwrap();
-        assert_eq!(h.get(id).unwrap().session_epoch, 7);
+        let id = h
+            .register(
+                0,
+                3,
+                b"ab",
+                b"ac",
+                4,
+                WATCH_FILTER_NODELETE,
+                true,
+                sid(7),
+                A,
+            )
+            .unwrap();
+        h.rebind(id, B).unwrap();
+        h.mark_delivered(id, 9).unwrap();
+        h.get_mut(id).unwrap().in_consumed = 3;
+        let mut blob = [0u8; WATCH_EXPORT_MAX];
+        let n = h.get(id).unwrap().export(&mut blob);
+        assert_eq!(n, WATCH_EXPORT_HDR + 4);
+        let rec = WatchRecord::import(&blob[..n]).unwrap();
+        assert_eq!(rec.watch_id, id);
+        assert_eq!(rec.tenant_id, 3);
+        assert_eq!(rec.start_revision, 4);
+        assert_eq!(rec.last_sent_revision, 9);
+        assert_eq!(rec.in_consumed, 3);
+        assert_eq!(rec.out_acked, 1);
+        assert_eq!(rec.out_emitted, 1);
+        assert_eq!(rec.binding.session_id, sid(7));
+        assert_eq!(rec.binding.anchor_id, B);
+        assert_eq!(rec.session_epoch(), 2);
+        assert_eq!(rec.phase, WATCH_PHASE_IMPORTED);
+        assert_eq!(rec.filters, WATCH_FILTER_NODELETE);
+        assert!(rec.progress_notify);
+        assert_eq!(rec.key(), b"ab");
+        assert_eq!(rec.range_end(), b"ac");
+        // A dormant import produces nothing until resumed.
+        let mut h2 = fresh();
+        h2.adopt(rec).unwrap();
+        let mut hits = std::vec::Vec::new();
+        match_event(&h2, 3, 10, WATCH_EVENT_PUT, b"ab", |m| hits.push(m));
+        assert!(hits.is_empty());
+        h2.get_mut(id).unwrap().phase = WATCH_PHASE_ACTIVE;
+        match_event(&h2, 3, 10, WATCH_EVENT_PUT, b"ab", |m| hits.push(m));
+        assert_eq!(hits.len(), 1);
+        // Adopting the same identity twice is refused.
+        assert_eq!(h2.adopt(rec), Err(WatchError::InvalidId));
+    }
+
+    #[test]
+    fn import_refuses_malformed_blobs() {
+        assert!(WatchRecord::import(b"LWR1").is_none());
+        let mut blob = [0u8; WATCH_EXPORT_HDR];
+        blob[..4].copy_from_slice(b"XXXX");
+        assert!(WatchRecord::import(&blob).is_none());
+        blob[..4].copy_from_slice(WATCH_EXPORT_MAGIC);
+        // watch_id 0 and epoch 0 are both refused.
+        assert!(WatchRecord::import(&blob).is_none());
+        blob[4] = 1;
+        assert!(WatchRecord::import(&blob).is_none());
+        blob[48] = 1;
+        assert!(WatchRecord::import(&blob).is_some());
+        blob[54] = 200; // key_len past WATCH_KEY_MAX
+        assert!(WatchRecord::import(&blob).is_none());
     }
 }

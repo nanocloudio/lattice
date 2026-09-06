@@ -35,8 +35,8 @@ use types::{
     KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS, KV_OP_STRLEN, KV_OP_TXN,
     KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED,
     KV_RESULT_COMPACTED, KV_RESULT_IDEMPOTENT_LOOKUP, KV_RESULT_INTEGER, KV_RESULT_INTERNAL,
-    KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN,
-    KV_RESULT_TXN_PENDING, KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET,
+    KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR,
+    KV_RESULT_TXN, KV_RESULT_TXN_PENDING, KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET,
     PUT_FLAG_KEEPTTL, PUT_FLAG_NX, PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER,
     TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL, VERSION_KIND_DELETE, VERSION_KIND_PUT,
 };
@@ -1810,6 +1810,16 @@ const DISK_BATCH_MAX: usize =
 /// Scan staging buffer: at least one worst-case provider scan entry.
 const DISK_SCAN_BUF: usize = RECORD_FIXED + disk_store::MAX_ENCODED_KEY + disk_store::MAX_VALUE_LEN;
 
+/// Bytes a `KV_RESULT_VERSIONS` entry is guaranteed to be SMALLER than
+/// the raw record it is transcoded from. Raw: `[klen:2][vlen:4][key]
+/// [value]` where the encoded key carries the 12-byte identity, the
+/// 2-byte terminator and the 9-byte version suffix around the user key
+/// (escaping only lengthens it). Entry: 23 fixed bytes + user key +
+/// user value. So raw − entry ≥ 6 + 23 − 23 = 6 for a bare tombstone,
+/// and ≥ 60 for a put, whose value also drops `DISK_META_LEN`. The
+/// minimum is what the paging arithmetic may rely on.
+const VERSIONS_TRANSCODE_SLACK: usize = 6;
+
 /// Internal read-latest outcome (pre-expiry-filter).
 enum ReadLatest {
     Absent,
@@ -1905,6 +1915,12 @@ pub struct DiskMaterializer<'a, S: RunStorage> {
     /// one window where no more room can be made. The hosting module
     /// counts it as flush backpressure.
     pub backpressure: bool,
+    /// The revision this command's reply is AS-OF, when that differs
+    /// from the engine revision: a version scan pins its window ceiling
+    /// at open and answers every page of the window against it, so the
+    /// reply must name that ceiling, not whatever has landed since. `0`
+    /// = no override (report the engine revision).
+    pub reply_revision: u64,
     /// Canonical identity `(tenant, database, keyspace)` (§23) for the
     /// command in flight. Fed straight to `internal_key::encode`, so
     /// every physical key this materializer writes and every scan bound
@@ -1925,6 +1941,7 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
             flush_wanted: false,
             fault: false,
             backpressure: false,
+            reply_revision: 0,
             key_identity: (0, 0, 0),
             pending_commit_ts: 0,
         }
@@ -2378,7 +2395,6 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         if out.len() < 10 {
             return (KV_RESULT_INTERNAL, 0);
         }
-        let hi = normalize_to(w.to, self.read_revision());
         let (it, id, ik) = self.key_identity;
         let (_, ident_hi) = self.ident_span();
         let mut startbuf = [0u8; disk_store::MAX_ENCODED_KEY];
@@ -2408,26 +2424,107 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             start: &startbuf[..slen],
             end: &endbuf[..elen],
         };
+        // `to = 0` means "up to now", and "now" is PINNED at the
+        // window's open to the highest revision materialized: the walk
+        // may pause across steps with writes landing in between, and a
+        // window whose ceiling moved with them would count its ordinals
+        // against a different set of records on every call. While the
+        // provider's scan memo holds the window — a re-drive of a
+        // paused page, or the next page — an unversioned request
+        // resolves to the ceiling it was opened with. The pin is memo-
+        // scoped, so a caller that will retry or page past the walk's
+        // completion must name the ceiling explicitly; it is reported
+        // as the reply's revision for exactly that.
+        let hi = if w.to != 0 {
+            w.to
+        } else if let Some(pinned) = self.store.state.scan_window_ceiling(span, w.from) {
+            pinned
+        } else if self.in_replay() {
+            self.revision
+        } else {
+            self.store.state.highest_revision
+        };
+        self.reply_revision = hi;
 
         let mut out_off = 10usize;
         let mut emitted: u16 = 0;
         let mut resume = w.cursor;
         let mut done = false;
+        // A re-drive of a paused request takes back the prefix of the
+        // page already transcoded before the pause and continues it; a
+        // retry of a request already answered (the reply lost to a
+        // timeout upstream) is answered again from the parked page,
+        // without moving the walk.
+        if let Some((parked, n, complete, next_cursor)) =
+            self.store
+                .state
+                .scan_page_take(span, w.from, hi, w.cursor, &mut out[10..])
+        {
+            if complete {
+                out[0..8].copy_from_slice(&next_cursor.to_le_bytes());
+                out[8..10].copy_from_slice(&parked.to_le_bytes());
+                return (KV_RESULT_VERSIONS, 10 + n);
+            }
+            emitted = parked;
+            out_off += n;
+            resume = w.cursor + u64::from(parked);
+        }
+        // The page is capped at what can be parked across a pause, so
+        // parking can never refuse. Each store request is sized to the
+        // room left in the page, so a record the store hands over
+        // always fits; one that would not is pulled but STASHED in the
+        // provider (`scan.pending_*`) with the ordinal held at the
+        // page's, so the next call yields it first and the cursor never
+        // runs ahead of the caller. A transcoded
+        // entry is at least `VERSIONS_TRANSCODE_SLACK` bytes smaller
+        // than its raw record, so that much is added to the room
+        // without risk. When the room is smaller than one raw record
+        // the page closes — unless it is still empty, in which case
+        // the record is fetched whole and refused only if it truly
+        // does not fit (a reply buffer below the entry ceiling: a
+        // caller-sizing error, not a paging state).
+        let cap = out.len().min(10 + disk_store::SCAN_PAGE_MAX);
         let mut sbuf = [0u8; DISK_SCAN_BUF];
+        let mut whole = false;
         'outer: while !done && emitted < w.limit {
-            let p = match self
-                .store
-                .scan_versions(span, w.from, hi, resume, &mut sbuf)
-            {
-                Ok(p) => p,
-                Err(disk_store::state_store::StoreError::Compacted) => {
-                    return (KV_RESULT_COMPACTED, 0)
-                }
-                Err(_) => {
-                    self.fault = true;
-                    return (KV_RESULT_INTERNAL, 0);
-                }
+            let room = if whole {
+                DISK_SCAN_BUF
+            } else {
+                (cap - out_off + VERSIONS_TRANSCODE_SLACK).min(DISK_SCAN_BUF)
             };
+            // A whole-buffer fetch is for exactly ONE record: the page
+            // has no room for a second, and a pulled record must land.
+            let take = if whole {
+                1
+            } else {
+                usize::from(w.limit - emitted)
+            };
+            let p =
+                match self
+                    .store
+                    .scan_versions(span, w.from, hi, resume, take, &mut sbuf[..room])
+                {
+                    Ok(p) => p,
+                    Err(disk_store::state_store::StoreError::Compacted) => {
+                        return (KV_RESULT_COMPACTED, 0)
+                    }
+                    Err(disk_store::state_store::StoreError::OutputTooSmall) if out_off > 10 => {
+                        // The next record does not fit this page; the
+                        // provider stashed it against the held ordinal,
+                        // and the next page starts with it. This page
+                        // closes here.
+                        break 'outer;
+                    }
+                    Err(disk_store::state_store::StoreError::OutputTooSmall) if !whole => {
+                        whole = true;
+                        continue 'outer;
+                    }
+                    Err(_) => {
+                        self.fault = true;
+                        return (KV_RESULT_INTERNAL, 0);
+                    }
+                };
+            whole = false;
             let mut at = 0usize;
             for _ in 0..p.entries {
                 let klen = u16::from_le_bytes([sbuf[at], sbuf[at + 1]]) as usize;
@@ -2474,9 +2571,14 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 };
                 let ulen = dec.user_key_len;
                 let need = 8 + 8 + 1 + 2 + ulen + 4 + uval.len();
-                if out_off + need > out.len() {
-                    resume -= 1; // not emitted — do not consume the ordinal
-                    break 'outer;
+                if out_off + need > cap {
+                    // Only reachable for a page that cannot hold even
+                    // one record (a caller buffer smaller than the
+                    // entry ceiling). The record has been pulled, so the
+                    // store's position is a record ahead of any cursor
+                    // the caller holds: forget it, and refuse.
+                    self.store.state.scan_reset();
+                    return (KV_RESULT_INTERNAL, 0);
                 }
                 out[out_off..out_off + 8].copy_from_slice(&dec.mvcc_timestamp.to_le_bytes());
                 out_off += 8;
@@ -2499,6 +2601,18 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             }
             match p.progress {
                 Progress::Done => done = true,
+                Progress::InProgress { .. } if p.paused => {
+                    // Step budget spent mid-page. Park what has been
+                    // transcoded so far under this request's cursor and
+                    // hand the command back to the host unanswered; it
+                    // re-drives the same command next step, the parked
+                    // prefix is taken back above, and the provider
+                    // continues from where it stood.
+                    self.store
+                        .state
+                        .scan_page_park(w.cursor, emitted, &out[10..out_off], false, 0);
+                    return (KV_RESULT_PAUSED, 0);
+                }
                 Progress::InProgress { .. } => {
                     if p.entries == 0 {
                         self.fault = true;
@@ -2510,6 +2624,9 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         let new_cursor: u64 = if done { 0 } else { resume };
         out[0..8].copy_from_slice(&new_cursor.to_le_bytes());
         out[8..10].copy_from_slice(&emitted.to_le_bytes());
+        self.store
+            .state
+            .scan_page_park(w.cursor, emitted, &out[10..out_off], true, new_cursor);
         (KV_RESULT_VERSIONS, out_off)
     }
 
@@ -2561,7 +2678,13 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         let mut done = force_empty;
         let mut sbuf = [0u8; DISK_SCAN_BUF];
         'outer: while !done && emitted < q.limit {
-            let p = match self.store.scan_at(span, at, resume, &mut sbuf) {
+            let p = match self.store.scan_at(
+                span,
+                at,
+                resume,
+                usize::from(q.limit - emitted),
+                &mut sbuf,
+            ) {
                 Ok(p) => p,
                 Err(disk_store::state_store::StoreError::Compacted) => {
                     return (KV_RESULT_COMPACTED, 0)
@@ -2675,7 +2798,10 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 // Scan pinned at the pre-flush revision so the
                 // tombstones we add (ts = revn + 1) stay invisible to
                 // the walk and the visible-ordinal cursor stays stable.
-                let p = match self.store.scan_at(span, revn, resume, &mut sbuf) {
+                let p = match self
+                    .store
+                    .scan_at(span, revn, resume, usize::MAX, &mut sbuf)
+                {
                     Ok(p) => p,
                     Err(_) => {
                         self.fault = true;
@@ -2880,7 +3006,7 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         let mut resume = 0u64;
         let mut sbuf = [0u8; DISK_SCAN_BUF];
         loop {
-            let prog = match self.store.scan_at(span, 0, resume, &mut sbuf) {
+            let prog = match self.store.scan_at(span, 0, resume, usize::MAX, &mut sbuf) {
                 Ok(v) => v,
                 Err(_) => {
                     self.fault = true;
@@ -2982,7 +3108,13 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         };
         let mut sbuf = [0u8; DISK_SCAN_BUF];
         'outer: while !done && emitted < limit {
-            let p = match self.store.scan_at(span, at_rev, resume, &mut sbuf) {
+            let p = match self.store.scan_at(
+                span,
+                at_rev,
+                resume,
+                usize::from(limit - emitted),
+                &mut sbuf,
+            ) {
                 Ok(p) => p,
                 Err(_) => {
                     self.fault = true;
@@ -3107,7 +3239,13 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         let mut done = force_empty;
         let mut sbuf = [0u8; DISK_SCAN_BUF];
         'outer: while !done && emitted < limit {
-            let p = match self.store.scan_at(span, at_rev, resume, &mut sbuf) {
+            let p = match self.store.scan_at(
+                span,
+                at_rev,
+                resume,
+                usize::from(limit - emitted),
+                &mut sbuf,
+            ) {
                 Ok(p) => p,
                 Err(disk_store::state_store::StoreError::Compacted) => {
                     return (KV_RESULT_COMPACTED, 0)

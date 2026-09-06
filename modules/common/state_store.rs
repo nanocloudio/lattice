@@ -94,6 +94,24 @@ pub struct ScanProgress {
     pub bytes: usize,
     /// Whether the span is exhausted or the caller must resume.
     pub progress: Progress,
+    /// The provider stopped at its per-call step budget, not because
+    /// the output filled or the span ended. `progress` is
+    /// `InProgress` and may carry ZERO new entries; the caller re-calls
+    /// with the cursor it names, on a later step, and the provider
+    /// continues from where it stood. Never set with `Done`.
+    pub paused: bool,
+}
+
+impl ScanProgress {
+    /// The span is exhausted after `entries` entries / `bytes` bytes.
+    pub const fn done(entries: usize, bytes: usize) -> Self {
+        Self {
+            entries,
+            bytes,
+            progress: Progress::Done,
+            paused: false,
+        }
+    }
 }
 
 /// Result of applying one committed batch.
@@ -141,11 +159,16 @@ pub trait KvStateStore {
 
     /// Bounded ordered scan of `span` at `revision`. Writes length-
     /// prefixed entries into `out` and reports resumable progress.
+    /// `&mut self`: the provider keeps the position the next page
+    /// continues from. `limit` is the most entries the caller can take;
+    /// the provider stops exactly there so its position is the caller's
+    /// next cursor, never ahead of it.
     fn scan_at(
-        &self,
+        &mut self,
         span: KeySpan<'_>,
         revision: Revision,
         resume_cursor: u64,
+        limit: usize,
         out: &mut [u8],
     ) -> Result<ScanProgress, StoreError>;
 
@@ -174,12 +197,23 @@ pub trait KvStateStore {
     /// longer holds the window, and serving the part it still has would
     /// hand back a silently incomplete history that the caller could
     /// not distinguish from a complete one.
+    ///
+    /// Step-bounded. The walk is in key order over the whole span
+    /// (records are stored by key, not by revision), so a window's
+    /// qualifying records can be arbitrarily far apart; the provider
+    /// stops at its per-call budget and reports `paused`, keeping its
+    /// position, and the caller re-calls with the same cursor on a
+    /// later step. `&mut self` because that position is provider
+    /// state. `limit` is the most entries the caller can take: the
+    /// provider stops exactly there, so its position stays the
+    /// caller's next cursor rather than running ahead of it.
     fn scan_versions(
-        &self,
+        &mut self,
         span: KeySpan<'_>,
         from_revision: Revision,
         to_revision: Revision,
         resume_cursor: u64,
+        limit: usize,
         out: &mut [u8],
     ) -> Result<ScanProgress, StoreError>;
 

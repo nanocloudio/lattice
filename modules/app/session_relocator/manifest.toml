@@ -1,0 +1,39 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Placement-decision → worker-relocation driver. On a placement epoch
+# event (or an
+# operator command) it emits MSG_SESSION_RELOCATE{target_worker} to the
+# edge anchors, which drive a per-session SessionCtrlV1 handoff onto the
+# new worker — each rebind advancing only that session's epoch. Carries
+# no session state of its own.
+
+# Params (TLV): workers (tag 1, u8, default 2) — anchor worker count.
+
+# Placement epoch events from substrate control_plane.
+[[ports]]
+name = "epoch_events"
+direction = "input"
+content_type = "OctetStream"
+
+# Operator relocation commands (manual worker drain).
+[[ports]]
+name = "cmd_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_SESSION_RELOCATE out to the edge anchors.
+[[ports]]
+name = "relocate_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["relocations"]

@@ -1,37 +1,42 @@
-//! etcd_edge_anchor — gRPC/HTTP2 edge anchor for etcd v3 KV.
+//! etcd_edge_anchor — gRPC/HTTP2 edge anchor for the etcd v3 API.
 //!
-//! Continuity (per `.context/native_fluxor.md`):
-//! - Watch + LeaseKeepAlive: `edge_anchored` (deferred — Phase 4)
-//! - Unary KV (Range / Put / DeleteRange): `drain_only`
+//! Continuity classes:
+//! - Unary KV (Range / Put / DeleteRange): `drain_only`. CAS
+//!   correctness comes from `kv_state_worker` revision fences, not from
+//!   connection continuity.
+//! - Watch and LeaseKeepAlive: `edge_anchored`. Each is a SessionCtrlV1
+//!   session the anchor fronts; the watch and lease state live in a
+//!   worker (`watch_registry` / `lease_manager`) that can be handed off
+//!   to a standby without the client's stream breaking.
 //!
 //! ## What this module owns
 //!
-//! - TCP bind + accept against foundation/ip (same NET_CMD state
-//!   machine the redis anchor uses; collapses to a thin facade once
-//!   foundation `stream_anchor_core` is promoted).
-//! - Per-connection slot table with HTTP/2 state: preface check,
-//!   frame parser, HPACK decoder, per-stream request body buffer.
+//! - TCP bind + accept against foundation/ip.
+//! - Per-connection slot table with HTTP/2 state: preface check, frame
+//!   parser, HPACK decoder, per-stream request body buffer.
 //! - Translation of the etcd v3 KV subset
 //!   (`/etcdserverpb.KV/{Range,Put,DeleteRange}`) into protocol-neutral
 //!   `KV_OP_*` envelopes on `kv_out`. Responses arrive on `routed_in`
-//!   as `MSG_KV_RESPONSE` and get re-encoded back as gRPC HEADERS +
-//!   DATA + trailing HEADERS frames.
+//!   as `MSG_KV_RESPONSE` and are re-encoded as gRPC HEADERS + DATA +
+//!   trailing HEADERS frames.
+//! - The watch and lease session layers (`wsa` / `lsa`): identity
+//!   minting, ATTACH / DETACH, forwarding control to the serving
+//!   worker, and relaying a handoff between the active worker and a
+//!   standby. Watch events arrive framed on `watch_in` and route by
+//!   `watch_id`; lease state arrives on `lease_in` and routes by
+//!   `lease_id`.
 //!
 //! ## What this module does NOT own
 //!
-//! - HPACK dynamic table tracking — we advertise
-//!   `SETTINGS_HEADER_TABLE_SIZE = 0` so a conforming gRPC client
-//!   never emits dynamic-table references and the decoder stays a
-//!   pure function over the static table + literals (see
-//!   `modules/common/etcd_codec.rs §HPACK`).
-//! - Watch / Lease streams — those land in Phase 4 once the
-//!   `control_plane.epoch_events` substrate enhancement is in
-//!   place. The manifest exposes `watch_in` / `lease_in` ports so
-//!   the wiring is forward-compatible.
-//! - HTTP/2 strict compliance — PRIORITY / PUSH_PROMISE /
-//!   CONTINUATION are not implemented. etcd-client doesn't emit them.
-//! - TLS — handled upstream by foundation/tls when the secure
-//!   provides capability is wired in front of us.
+//! - HPACK dynamic-table tracking — it advertises
+//!   `SETTINGS_HEADER_TABLE_SIZE = 0`, so a conforming gRPC client never
+//!   emits dynamic-table references and the decoder stays a pure
+//!   function over the static table + literals (see
+//!   `modules/common/etcd_codec.rs`).
+//! - HTTP/2 strict compliance — PRIORITY / PUSH_PROMISE / CONTINUATION
+//!   are not implemented; etcd-client does not emit them.
+//! - TLS — terminated upstream by foundation/tls when a secure provider
+//!   is wired in front.
 
 #![no_std]
 #![allow(
@@ -66,6 +71,9 @@ mod etcd_codec;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/session_anchor.rs"]
+mod session_anchor;
+
 use etcd_codec::{
     build_grpc_trailers_block, build_lease_grant_response, build_lease_keepalive_response,
     build_lease_revoke_response, build_put_response, build_range_response,
@@ -76,22 +84,24 @@ use etcd_codec::{
     FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_HEADER_LEN, GRPC_FRAME_HEADER_LEN,
     GRPC_STATUS_COMPACTED, HTTP2_PREFACE_LEN,
 };
+use session_anchor::session_core::session_ctrl as sc;
+use session_anchor::session_core::{
+    anchor_id as make_anchor_id, mint_session_id, session_app_id, CLASS_LEASE, CLASS_WATCH,
+    FIRST_EPOCH, NO_WORKER,
+};
+use session_anchor::{AnchorAction, SessionAnchor, Target};
 use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_GET_AT, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_RESULT_COMPACTED,
     KV_RESULT_INTEGER, KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, PROTO_ETCD,
 };
 use wire::{
     MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_LEASE_CTRL, MSG_LEASE_STATE, MSG_WATCH_CTRL,
-    MSG_WATCH_FRAME,
+    MSG_WATCH_FRAME, WATCH_CTRL_DEFINE, WATCH_FRAME_OP_COMPACTED,
 };
 
 const LEASE_CTRL_GRANT: u8 = 0;
 const LEASE_CTRL_REVOKE: u8 = 1;
 const LEASE_CTRL_KEEPALIVE: u8 = 2;
-
-// MSG_WATCH_CTRL ctrl byte (see modules/common/wire.rs).
-const WATCH_CTRL_CREATE: u8 = 0;
-const WATCH_CTRL_CANCEL: u8 = 2;
 
 // ── NET protocol constants (foundation/ip Stream Surface v1) ──────────
 
@@ -345,6 +355,76 @@ enum AnchorPhase {
     Error = 0xFF,
 }
 
+/// Lease sessions the anchor can front (one per active lease).
+const LEASE_SESSIONS: usize = 128;
+/// Watch sessions the anchor can front (one per open watch stream).
+const WATCH_SESSIONS: usize = 64;
+
+/// Write one `[msg][len:2 LE][payload…]` envelope to `chan`.
+unsafe fn write_env(sys: *const SyscallTable, chan: i32, msg: u8, payload: &[u8]) -> bool {
+    if sys.is_null() || chan < 0 || payload.len() > u16::MAX as usize {
+        return false;
+    }
+    let mut buf = [0u8; SCRATCH_BUF_SIZE + 3];
+    let total = 3 + payload.len();
+    if total > buf.len() {
+        return false;
+    }
+    buf[0] = msg;
+    buf[1] = (payload.len() & 0xFF) as u8;
+    buf[2] = ((payload.len() >> 8) & 0xFF) as u8;
+    buf[3..total].copy_from_slice(payload);
+    ((*sys).channel_write)(chan, buf.as_mut_ptr(), total) == total as i32
+}
+
+/// A `SessionAnchor` sink over the two watch_registry control channels.
+macro_rules! watch_sink {
+    ($a:expr) => {{
+        let sys = $a.syscalls;
+        let c0 = $a.watch_ctrl_out;
+        let c1 = $a.watch_ctrl2_out;
+        move |t: Target, m: u8, p: &[u8]| -> bool {
+            let chan = match t {
+                Target::Worker(w) => {
+                    if w == 0 {
+                        c0
+                    } else if w == 1 {
+                        c1
+                    } else {
+                        -1
+                    }
+                }
+                Target::Directory => -1,
+            };
+            unsafe { write_env(sys, chan, m, p) }
+        }
+    }};
+}
+
+/// A `SessionAnchor` sink over the two lease_manager control channels.
+macro_rules! lease_sink {
+    ($a:expr) => {{
+        let sys = $a.syscalls;
+        let c0 = $a.lease_ctrl_out;
+        let c1 = $a.lease_ctrl2_out;
+        move |t: Target, m: u8, p: &[u8]| -> bool {
+            let chan = match t {
+                Target::Worker(w) => {
+                    if w == 0 {
+                        c0
+                    } else if w == 1 {
+                        c1
+                    } else {
+                        -1
+                    }
+                }
+                Target::Directory => -1,
+            };
+            unsafe { write_env(sys, chan, m, p) }
+        }
+    }};
+}
+
 #[repr(C)]
 struct AnchorState {
     syscalls: *const SyscallTable,
@@ -356,12 +436,31 @@ struct AnchorState {
     lease_in: i32,
     kv_out: i32,
     watch_ctrl_out: i32,
+    watch_ctrl2_out: i32,
     lease_ctrl_out: i32,
+    lease_ctrl2_out: i32,
     metrics_out: i32,
 
     listen_port: u16,
     phase: AnchorPhase,
     _pad0: u8,
+
+    /// This anchor's 8-byte SessionCtrlV1 identity, from its listen
+    /// port. Watch and lease sessions are minted under it.
+    anchor_id: [u8; 8],
+    /// SessionCtrlV1 replies from the two lease_managers (per worker),
+    /// and the relocation command that drives a lease handoff.
+    lease_sess0_in: i32,
+    lease_sess1_in: i32,
+    watch_sess0_in: i32,
+    watch_sess1_in: i32,
+    relocate_in: i32,
+    /// The session layer for watch sessions.
+    wsa: SessionAnchor<WATCH_SESSIONS>,
+    /// The session layer for lease sessions: identity, worker binding,
+    /// and the handoff relay that moves a lease (and its live keepalive
+    /// stream) between managers without expiring it.
+    lsa: SessionAnchor<LEASE_SESSIONS>,
 
     server_conn_id: u16,
     _pad1: [u8; 3],
@@ -370,7 +469,7 @@ struct AnchorState {
     lease_seq: u64,
     watch_seq: u64,
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=requests, 1=forwarded, 2=net_errors).
     m_requests: u64,
@@ -401,12 +500,20 @@ impl AnchorState {
         self.lease_in = -1;
         self.kv_out = -1;
         self.watch_ctrl_out = -1;
+        self.watch_ctrl2_out = -1;
         self.lease_ctrl_out = -1;
+        self.lease_ctrl2_out = -1;
         self.metrics_out = -1;
 
         self.listen_port = DEFAULT_LISTEN_PORT;
         self.phase = AnchorPhase::Init;
         self._pad0 = 0;
+        self.anchor_id = [0; 8];
+        self.lease_sess0_in = -1;
+        self.lease_sess1_in = -1;
+        self.watch_sess0_in = -1;
+        self.watch_sess1_in = -1;
+        self.relocate_in = -1;
         self.server_conn_id = 0;
         self._pad1 = [0; 3];
         self.corr_seq = 0;
@@ -529,6 +636,71 @@ impl AnchorState {
         // client-supplied ones at a glance in logs / pcaps.
         0xA000_0000_0000_0000 | self.lease_seq
     }
+}
+
+// ── SessionCtrlV1 session layer ───────────────────────────────────────
+//
+// Every watch stream and every lease is a session. Its identity is
+// deterministic — `session_id = [anchor_id:8][app_id:8 BE]`, where
+// `app_id` is the watch id or the lease id — so any stream can address
+// the session without per-stream bookkeeping. The anchor mints at
+// `FIRST_EPOCH` and does not rebind on its own; a worker move is driven
+// by a relocation command on `relocate_in`. Every session-scoped data
+// envelope opens with `[session_id:16][epoch:4 LE]`, and the worker
+// admits it only at the session's current epoch.
+
+/// Write `[msg][len][session_id:16][epoch:4]…]` framing prefix for a
+/// session identified by `app_id` into `anchor.scratch`, returning the
+/// offset just past the session header (envelope header + session
+/// header). The caller appends the body and calls `sc_finish`.
+fn sc_begin(anchor: &mut AnchorState, msg: u8, app_id: u64) -> usize {
+    let sid = mint_session_id(&anchor.anchor_id, app_id);
+    anchor.scratch[0] = msg;
+    // len patched by sc_finish
+    let hdr = sc::put_session_header(&mut anchor.scratch[3..], &sid, FIRST_EPOCH);
+    3 + hdr
+}
+
+/// Patch the length and write the envelope to `chan`. `end` is the
+/// total offset in `anchor.scratch` (including the 3-byte envelope
+/// header). Returns whether the channel took it.
+fn sc_finish(anchor: &mut AnchorState, chan: i32, end: usize) -> bool {
+    let body_len = end - 3;
+    anchor.scratch[1] = (body_len & 0xFF) as u8;
+    anchor.scratch[2] = ((body_len >> 8) & 0xFF) as u8;
+    let sys = anchor.syscalls;
+    if sys.is_null() || chan < 0 || end > anchor.scratch.len() {
+        return false;
+    }
+    unsafe { ((*sys).channel_write)(chan, anchor.scratch.as_mut_ptr(), end) == end as i32 }
+}
+
+/// Send `CMD_SC_ATTACH` for `app_id` on `chan`. Idempotent at the
+/// worker: a re-attach at the same epoch is accepted without reset.
+fn sc_attach(anchor: &mut AnchorState, chan: i32, app_id: u64) {
+    let sid = mint_session_id(&anchor.anchor_id, app_id);
+    let aid = anchor.anchor_id;
+    let mut body = [0u8; sc::ATTACH_PAYLOAD_LEN];
+    let n = sc::put_attach(
+        &mut body,
+        &sid,
+        &aid,
+        FIRST_EPOCH,
+        sc::CC_EDGE_ANCHORED,
+        &NO_WORKER,
+    );
+    anchor.scratch[0] = sc::CMD_SC_ATTACH;
+    anchor.scratch[1] = (n & 0xFF) as u8;
+    anchor.scratch[2] = ((n >> 8) & 0xFF) as u8;
+    anchor.scratch[3..3 + n].copy_from_slice(&body[..n]);
+    let _ = sc_finish(anchor, chan, 3 + n);
+}
+
+/// Send `CMD_SC_DETACH` for `app_id` on `chan`.
+fn sc_detach(anchor: &mut AnchorState, chan: i32, app_id: u64, reason: u8) {
+    let end = sc_begin(anchor, sc::CMD_SC_DETACH, app_id);
+    anchor.scratch[end] = reason;
+    let _ = sc_finish(anchor, chan, end + 1);
 }
 
 // ── Frame send helpers (into slot.send_buf, flushed in batch) ─────────
@@ -710,9 +882,8 @@ fn build_kv_op_body(method: GrpcMethod, grpc_body: &[u8], out: &mut [u8]) -> Opt
                 let n = etcd_codec::encode_range_scan_body(&req, out)?;
                 return Some((KV_OP_RANGE_SCAN, n));
             }
-            // `revision > 0` is a historical read (RFC §10/§20
-            // snapshot). The codec picks the body shape; we pick the
-            // op byte that matches it.
+            // `revision > 0` is a historical (snapshot) read. The codec
+            // picks the body shape; we pick the op byte that matches it.
             let (historical, n) = etcd_codec::encode_range_kv_body(&req, out)?;
             Some((if historical { KV_OP_GET_AT } else { KV_OP_GET }, n))
         }
@@ -1309,40 +1480,12 @@ fn dispatch_lease(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
         _ => return,
     };
 
-    // MSG_LEASE_CTRL payload: [ctrl:1][lease_id:8][ttl_ms:4][tenant_id:4] = 17 bytes
-    const ENVELOPE_HDR: usize = 3;
-    const CTRL_BODY: usize = 1 + 8 + 4 + 4;
-    let total = ENVELOPE_HDR + CTRL_BODY;
-    if total > anchor.scratch.len() {
-        send_grpc_error(anchor, slot_idx, stream_id, 13);
-        anchor.slots[slot_idx].free_stream(strm);
-        return;
-    }
-    anchor.scratch[0] = MSG_LEASE_CTRL;
-    anchor.scratch[1] = (CTRL_BODY & 0xFF) as u8;
-    anchor.scratch[2] = ((CTRL_BODY >> 8) & 0xFF) as u8;
-    let mut p = ENVELOPE_HDR;
-    anchor.scratch[p] = ctrl;
-    p += 1;
-    anchor.scratch[p..p + 8].copy_from_slice(&lease_id.to_le_bytes());
-    p += 8;
-    anchor.scratch[p..p + 4].copy_from_slice(&ttl_ms.to_le_bytes());
-    p += 4;
-    anchor.scratch[p..p + 4].copy_from_slice(&DEFAULT_TENANT.to_le_bytes());
-
-    let sys = anchor.syscalls;
-    let lease_out = anchor.lease_ctrl_out;
-    if sys.is_null() || lease_out < 0 {
+    if anchor.lease_ctrl_out < 0 {
         send_grpc_error(anchor, slot_idx, stream_id, 14);
         anchor.slots[slot_idx].free_stream(strm);
         return;
     }
-    let written = unsafe { ((*sys).channel_write)(lease_out, anchor.scratch.as_mut_ptr(), total) };
-    if written != total as i32 {
-        send_grpc_error(anchor, slot_idx, stream_id, 14);
-        anchor.slots[slot_idx].free_stream(strm);
-        return;
-    }
+    lease_session_ctrl(anchor, ctrl, lease_id, ttl_ms);
 
     // Stash lease_id for rendezvous when MSG_LEASE_STATE returns.
     // ttl_ms is also stashed in body_buf[0..4] for the response builder
@@ -1404,32 +1547,14 @@ fn dispatch_lease_keepalive_message(anchor: &mut AnchorState, slot_idx: usize, s
         anchor.slots[slot_idx].streams[strm].body_len = tail_len;
     }
 
-    // Build MSG_LEASE_CTRL ctrl=keepalive (ttl_ms=0; manager keeps the
-    // grant-time TTL — see lease_manager LEASE_CTRL_KEEPALIVE).
-    const ENVELOPE_HDR: usize = 3;
-    const CTRL_BODY: usize = 1 + 8 + 4 + 4;
-    let total = ENVELOPE_HDR + CTRL_BODY;
-    if total > anchor.scratch.len() {
+    // Session-framed keepalive routed to the lease's current manager.
+    // ATTACH is idempotent, so a keepalive on a fresh stream (or after a
+    // manager move) re-establishes the session; the manager fences it by
+    // the session epoch.
+    if anchor.lease_ctrl_out < 0 {
         return;
     }
-    anchor.scratch[0] = MSG_LEASE_CTRL;
-    anchor.scratch[1] = (CTRL_BODY & 0xFF) as u8;
-    anchor.scratch[2] = ((CTRL_BODY >> 8) & 0xFF) as u8;
-    let mut p = ENVELOPE_HDR;
-    anchor.scratch[p] = LEASE_CTRL_KEEPALIVE;
-    p += 1;
-    anchor.scratch[p..p + 8].copy_from_slice(&lease_id.to_le_bytes());
-    p += 8;
-    anchor.scratch[p..p + 4].copy_from_slice(&0u32.to_le_bytes());
-    p += 4;
-    anchor.scratch[p..p + 4].copy_from_slice(&DEFAULT_TENANT.to_le_bytes());
-
-    let sys = anchor.syscalls;
-    let lease_out = anchor.lease_ctrl_out;
-    if sys.is_null() || lease_out < 0 {
-        return;
-    }
-    let _ = unsafe { ((*sys).channel_write)(lease_out, anchor.scratch.as_mut_ptr(), total) };
+    lease_session_ctrl(anchor, LEASE_CTRL_KEEPALIVE, lease_id, 0);
 
     // Stash for rendezvous. Unlike grant/revoke, the stream stays open
     // across multiple keepalives; pending_lease_id is cleared in
@@ -1635,6 +1760,168 @@ fn write_response_frames(
     );
 }
 
+/// Route a lease control op (grant/keepalive/revoke) to the lease's
+/// current manager through the session layer, so the lease — and its
+/// live keepalive stream — can be handed off between managers without
+/// expiring.
+fn lease_session_ctrl(anchor: &mut AnchorState, ctrl: u8, lease_id: u64, ttl_ms: u32) {
+    if ctrl == LEASE_CTRL_GRANT {
+        let mut sink = lease_sink!(anchor);
+        let _ = anchor.lsa.attach(CLASS_LEASE, lease_id, 0, 0, &mut sink);
+    }
+    let Some(sess) = anchor.lsa.find_app(CLASS_LEASE, lease_id) else {
+        return;
+    };
+    // Body after the 20-byte session header (stamped by forward):
+    //   [ctrl:1][lease_id:8][ttl_ms:4][tenant:4]
+    let mut body = [0u8; sc::SESSION_HEADER + 1 + 8 + 4 + 4];
+    let mut end = sc::SESSION_HEADER;
+    body[end] = ctrl;
+    end += 1;
+    body[end..end + 8].copy_from_slice(&lease_id.to_le_bytes());
+    end += 8;
+    body[end..end + 4].copy_from_slice(&ttl_ms.to_le_bytes());
+    end += 4;
+    body[end..end + 4].copy_from_slice(&DEFAULT_TENANT.to_le_bytes());
+    end += 4;
+    {
+        let mut sink = lease_sink!(anchor);
+        let _ = anchor
+            .lsa
+            .forward(sess, MSG_LEASE_CTRL, &body[..end], &mut sink);
+    }
+    if ctrl == LEASE_CTRL_REVOKE {
+        let mut sink = lease_sink!(anchor);
+        anchor.lsa.detach(sess, sc::DETACH_NORMAL, &mut sink);
+    }
+}
+
+/// Drain one SessionCtrlV1 frame from lease manager `worker_idx` and
+/// drive the lease handoff relay.
+unsafe fn poll_lease_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
+    let chan = if worker_idx == 0 {
+        anchor.lease_sess0_in
+    } else {
+        anchor.lease_sess1_in
+    };
+    if chan < 0 {
+        return false;
+    }
+    let sys = anchor.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let poll = ((*sys).channel_poll)(chan, POLL_IN);
+    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 3];
+    if ((*sys).channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+        return false;
+    }
+    let mt = hdr[0];
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    if len == 0 || len > anchor.scratch.len() {
+        return len == 0;
+    }
+    if (((*sys).channel_read)(chan, anchor.scratch.as_mut_ptr(), len) as usize) < len {
+        return false;
+    }
+    if (0x70..=0x9F).contains(&mt) {
+        let mut tmp = [0u8; SCRATCH_BUF_SIZE];
+        tmp[..len].copy_from_slice(&anchor.scratch[..len]);
+        let mut sink = lease_sink!(anchor);
+        let _ = anchor.lsa.on_frame(worker_idx, mt, &tmp[..len], &mut sink);
+    }
+    true
+}
+
+/// Drain one SessionCtrlV1 frame from watch_registry `worker_idx` and
+/// drive the watch handoff relay. Watch events themselves flow on the
+/// separate `watch_in` path; this is control-plane only.
+unsafe fn poll_watch_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
+    let chan = if worker_idx == 0 {
+        anchor.watch_sess0_in
+    } else {
+        anchor.watch_sess1_in
+    };
+    if chan < 0 {
+        return false;
+    }
+    let sys = anchor.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let poll = ((*sys).channel_poll)(chan, POLL_IN);
+    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 3];
+    if ((*sys).channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+        return false;
+    }
+    let mt = hdr[0];
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    if len == 0 || len > anchor.scratch.len() {
+        return len == 0;
+    }
+    if (((*sys).channel_read)(chan, anchor.scratch.as_mut_ptr(), len) as usize) < len {
+        return false;
+    }
+    if (0x70..=0x9F).contains(&mt) {
+        let mut tmp = [0u8; SCRATCH_BUF_SIZE];
+        tmp[..len].copy_from_slice(&anchor.scratch[..len]);
+        let mut sink = watch_sink!(anchor);
+        let _ = anchor.wsa.on_frame(worker_idx, mt, &tmp[..len], &mut sink);
+    }
+    true
+}
+
+/// Drain one relocation command and drive the lease handoff.
+unsafe fn poll_relocate_lease(anchor: &mut AnchorState) -> bool {
+    if anchor.relocate_in < 0 {
+        return false;
+    }
+    let sys = anchor.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let poll = ((*sys).channel_poll)(anchor.relocate_in, POLL_IN);
+    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 3];
+    if ((*sys).channel_read)(anchor.relocate_in, hdr.as_mut_ptr(), 3) < 3 {
+        return false;
+    }
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    if len == 0 || len > anchor.scratch.len() {
+        return len == 0;
+    }
+    if (((*sys).channel_read)(anchor.relocate_in, anchor.scratch.as_mut_ptr(), len) as usize) < len
+    {
+        return false;
+    }
+    if hdr[0] == wire::MSG_SESSION_RELOCATE && len >= 1 {
+        let target = anchor.scratch[0];
+        let _ = anchor.lsa.relocate(target);
+        let _ = anchor.wsa.relocate(target);
+    }
+    true
+}
+
+/// Drive the lease and watch handoff machines one tick.
+fn lease_step(anchor: &mut AnchorState) {
+    if anchor.lease_ctrl_out >= 0 {
+        let mut sink = lease_sink!(anchor);
+        let _ = anchor.lsa.step(&mut sink);
+    }
+    if anchor.watch_ctrl_out >= 0 {
+        let mut sink = watch_sink!(anchor);
+        let _ = anchor.wsa.step(&mut sink);
+    }
+}
+
 // ── Lease reply path ──────────────────────────────────────────────────
 
 /// Drain one `MSG_LEASE_STATE` envelope from `lease_in`, rendezvous
@@ -1644,12 +1931,12 @@ fn write_response_frames(
 /// draining until the channel is empty.
 ///
 /// Wire shape (`MSG_LEASE_STATE` payload, see `wire.rs`):
-///   `[lease_id:8][session_epoch:4][ttl_ms:4]
-///    [granted_at:8][keepalive_deadline:8]` = 32 bytes
+///   `[session_id:16][epoch:4][lease_id:8][status:1][ttl_ms:4]
+///    [granted_at:8][keepalive_deadline:8]` = 49 bytes
 ///
-/// `session_epoch` = 0 is the manager's "lease no longer exists" reply.
-/// For a grant op that's an allocation failure → gRPC INTERNAL (13);
-/// for a revoke op that's the expected success path.
+/// `status = LEASE_STATE_GONE` is the manager's "lease no longer
+/// exists" reply. For a grant that's an allocation failure → gRPC
+/// INTERNAL (13); for a revoke it is the expected success path.
 unsafe fn poll_lease_in(anchor: &mut AnchorState) -> bool {
     if anchor.lease_in < 0 {
         return false;
@@ -1671,7 +1958,9 @@ unsafe fn poll_lease_in(anchor: &mut AnchorState) -> bool {
         return false;
     }
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    const LEASE_STATE_LEN: usize = 32;
+    // MSG_LEASE_STATE: [session_id:16][epoch:4][lease_id:8][status:1]
+    //                  [ttl_ms:4][granted:8][deadline:8] = 49 bytes.
+    const LEASE_STATE_LEN: usize = sc::SESSION_HEADER + 8 + 1 + 4 + 8 + 8;
     if payload_len < LEASE_STATE_LEN || payload_len > anchor.scratch.len() {
         return false;
     }
@@ -1680,21 +1969,17 @@ unsafe fn poll_lease_in(anchor: &mut AnchorState) -> bool {
         return false;
     }
 
+    let at = sc::SESSION_HEADER;
     let lease_id = {
-        let p = &anchor.scratch[..payload_len];
+        let p = &anchor.scratch[at..at + 8];
         u64::from_le_bytes([p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]])
     };
-    let session_epoch = u32::from_le_bytes([
-        anchor.scratch[8],
-        anchor.scratch[9],
-        anchor.scratch[10],
-        anchor.scratch[11],
-    ]);
+    let lease_status = anchor.scratch[at + 8];
     let ttl_from_mgr = u32::from_le_bytes([
-        anchor.scratch[12],
-        anchor.scratch[13],
-        anchor.scratch[14],
-        anchor.scratch[15],
+        anchor.scratch[at + 9],
+        anchor.scratch[at + 10],
+        anchor.scratch[at + 11],
+        anchor.scratch[at + 12],
     ]);
 
     let Some((slot_idx, strm)) = anchor.find_lease_inflight(lease_id) else {
@@ -1703,12 +1988,11 @@ unsafe fn poll_lease_in(anchor: &mut AnchorState) -> bool {
     let method = anchor.slots[slot_idx].streams[strm].method;
     let stream_id = anchor.slots[slot_idx].streams[strm].stream_id;
 
-    // Failure handling: epoch=0 means the manager rejected (alloc
-    // failed for grant, or lease didn't exist for revoke). Revoke
-    // treats epoch=0 as success (already gone is fine); grant treats
-    // it as INTERNAL.
-    let grpc_status: u8 = match (method, session_epoch) {
-        (GrpcMethod::LeaseGrant, 0) => 13,
+    // status GONE means the manager has no such lease: for grant that's
+    // an allocation failure (gRPC INTERNAL); for revoke / keepalive the
+    // lease is simply gone, which the encoder maps to ttl 0.
+    let grpc_status: u8 = match (method, lease_status) {
+        (GrpcMethod::LeaseGrant, wire::LEASE_STATE_GONE) => 13,
         _ => 0,
     };
 
@@ -1943,41 +2227,54 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
         Some(WatchOp::Create) => {
             let wid = anchor.next_watch_id();
             anchor.slots[slot_idx].streams[strm].watch_id = wid;
-            // The registry's filter shape (see
-            // `watch_registry::handle_create`) is structured:
-            //   [start_rev:8][filter_bits:1][progress_notify:1]
-            //   [conn:1][stream:4][key_len:2][key…]
-            //   [range_end_len:2][range_end…]
-            // We emit the minimal "prefix-empty / no filters /
-            // current revision" variant — the anchor doesn't track
-            // start_revision on the open stream today so 0 means
-            // "current". Build the blob in a local buffer and hand
-            // it to send_watch_ctrl.
-            let mut filter = [0u8; 320];
-            let mut fp = 0usize;
-            // start_revision = 0 (current)
-            filter[fp..fp + 8].copy_from_slice(&0i64.to_le_bytes());
-            fp += 8;
-            filter[fp] = 0; // filter_bits
-            fp += 1;
-            filter[fp] = 0; // progress_notify
-            fp += 1;
-            // The registry's conn byte is this anchor's SLOT INDEX —
-            // the net conn id is u16 now and does not fit the byte.
-            // Watch frames rendezvous by `watch_id`, so the byte is
-            // informational only.
-            filter[fp] = slot_idx as u8;
-            fp += 1;
-            filter[fp..fp + 4].copy_from_slice(&stream_id.to_le_bytes());
-            fp += 4;
-            let k = key_len.min(filter.len().saturating_sub(fp + 4));
-            filter[fp..fp + 2].copy_from_slice(&(k as u16).to_le_bytes());
-            fp += 2;
-            filter[fp..fp + k].copy_from_slice(&key_buf[..k]);
-            fp += k;
-            filter[fp..fp + 2].copy_from_slice(&0u16.to_le_bytes()); // range_end_len = 0
-            fp += 2;
-            send_watch_ctrl(anchor, WATCH_CTRL_CREATE, wid, &filter[..fp]);
+            let app = wid as u64;
+            // The watch is a session. ATTACH it on the active registry;
+            // forward holds the DEFINE until ATTACHED lands, then the
+            // registry admits it. A handoff can later move the watch to
+            // the standby registry without breaking the stream.
+            {
+                let mut sink = watch_sink!(anchor);
+                let _ = anchor
+                    .wsa
+                    .attach(CLASS_WATCH, app, slot_idx as u16, stream_id, &mut sink);
+            }
+            let Some(sess) = anchor.wsa.find_app(CLASS_WATCH, app) else {
+                send_watch_response(anchor, slot_idx, strm, stream_id, wid, true, false, None);
+                return;
+            };
+            // MSG_WATCH_CTRL define body, after the 20-byte session header
+            // (stamped by forward):
+            //   [ctrl=DEFINE:1][watch_id:8][tenant:4][start_rev:8]
+            //   [filters:1][progress:1][key_len:2][key][re_len:2]
+            let mut body = [0u8; 384];
+            let mut end = sc::SESSION_HEADER;
+            let k = key_len.min(body.len().saturating_sub(end + 30));
+            body[end] = WATCH_CTRL_DEFINE;
+            end += 1;
+            body[end..end + 8].copy_from_slice(&(wid as u64).to_le_bytes());
+            end += 8;
+            body[end..end + 4].copy_from_slice(&DEFAULT_TENANT.to_le_bytes());
+            end += 4;
+            body[end..end + 8].copy_from_slice(&0i64.to_le_bytes()); // start_rev = current
+            end += 8;
+            body[end] = 0; // filters
+            end += 1;
+            body[end] = 0; // progress_notify
+            end += 1;
+            body[end..end + 2].copy_from_slice(&(k as u16).to_le_bytes());
+            end += 2;
+            body[end..end + k].copy_from_slice(&key_buf[..k]);
+            end += k;
+            body[end..end + 2].copy_from_slice(&0u16.to_le_bytes()); // range_end_len = 0
+            end += 2;
+            {
+                let mut sink = watch_sink!(anchor);
+                let _ = anchor
+                    .wsa
+                    .forward(sess, MSG_WATCH_CTRL, &body[..end], &mut sink);
+            }
+            send_watch_response(anchor, slot_idx, strm, stream_id, wid, true, false, None);
+            let _ = sc_finish(anchor, anchor.watch_ctrl_out, end);
             send_watch_response(anchor, slot_idx, strm, stream_id, wid, true, false, None);
         }
         Some(WatchOp::Cancel) => {
@@ -1986,7 +2283,10 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
             } else {
                 anchor.slots[slot_idx].streams[strm].watch_id
             };
-            send_watch_ctrl(anchor, WATCH_CTRL_CANCEL, wid, &[]);
+            if let Some(sess) = anchor.wsa.find_app(CLASS_WATCH, wid as u64) {
+                let mut sink = watch_sink!(anchor);
+                anchor.wsa.detach(sess, sc::DETACH_NORMAL, &mut sink);
+            }
             send_watch_response(anchor, slot_idx, strm, stream_id, wid, false, true, None);
             // Trailing HEADERS with END_STREAM closes the bidi stream.
             let mut trail_block = [0u8; 64];
@@ -2006,51 +2306,6 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
         Some(WatchOp::Progress) | None => {
             // Progress / unknown — no-op for now (no events to flush).
         }
-    }
-}
-
-/// Emit `MSG_WATCH_CTRL` on `watch_ctrl_out`.
-///
-/// Payload (per modules/common/wire.rs):
-///   `[ctrl:u8][session_id:u64 LE][session_epoch:u32 LE]
-///    [tenant_id:u32 LE][kpg_id:u16 LE][filter_len:u16 LE][filter…]`
-///
-/// `session_id` carries the anchor-assigned `watch_id` so the
-/// registry's reply (or fanout's `MSG_WATCH_FRAME`) can be matched
-/// back. `filter` is the watched key prefix.
-fn send_watch_ctrl(anchor: &mut AnchorState, ctrl: u8, watch_id: i64, filter: &[u8]) {
-    let sys = anchor.syscalls;
-    if sys.is_null() || anchor.watch_ctrl_out < 0 {
-        return;
-    }
-    let key_len = filter.len().min(u16::MAX as usize);
-    const ENVELOPE_HDR: usize = 3;
-    let body_len = 1 + 8 + 4 + 4 + 2 + 2 + key_len;
-    let total = ENVELOPE_HDR + body_len;
-    if total > anchor.scratch.len() {
-        return;
-    }
-    anchor.scratch[0] = MSG_WATCH_CTRL;
-    anchor.scratch[1] = (body_len & 0xFF) as u8;
-    anchor.scratch[2] = ((body_len >> 8) & 0xFF) as u8;
-    let mut p = ENVELOPE_HDR;
-    anchor.scratch[p] = ctrl;
-    p += 1;
-    anchor.scratch[p..p + 8].copy_from_slice(&(watch_id as u64).to_le_bytes());
-    p += 8;
-    // session_epoch (anchor side: bump on rebind; 1 today).
-    anchor.scratch[p..p + 4].copy_from_slice(&1u32.to_le_bytes());
-    p += 4;
-    anchor.scratch[p..p + 4].copy_from_slice(&DEFAULT_TENANT.to_le_bytes());
-    p += 4;
-    // kpg_id 0 — single placement group today.
-    anchor.scratch[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
-    p += 2;
-    anchor.scratch[p..p + 2].copy_from_slice(&(key_len as u16).to_le_bytes());
-    p += 2;
-    anchor.scratch[p..p + key_len].copy_from_slice(&filter[..key_len]);
-    unsafe {
-        let _ = ((*sys).channel_write)(anchor.watch_ctrl_out, anchor.scratch.as_mut_ptr(), total);
     }
 }
 
@@ -2205,6 +2460,31 @@ unsafe fn poll_watch_in(anchor: &mut AnchorState) -> bool {
         anchor.scratch[17],
     ]);
     let op_byte = anchor.scratch[18];
+    // A compaction refusal: the watch's replay window fell behind the
+    // compaction floor. Cancel the client stream with the compact
+    // revision rather than resuming it short.
+    if op_byte == WATCH_FRAME_OP_COMPACTED {
+        if let Some((slot_idx, strm)) = anchor.find_watch_stream(watch_id) {
+            let stream_id = anchor.slots[slot_idx].streams[strm].stream_id;
+            send_watch_response(
+                anchor, slot_idx, strm, stream_id, watch_id, false, true, None,
+            );
+            let mut trail = [0u8; 64];
+            let mut toff = 0;
+            if build_grpc_trailers_block(&mut trail, &mut toff, 0).is_some() {
+                let slot = &mut anchor.slots[slot_idx];
+                let _ = append_frame(
+                    slot,
+                    FrameType::Headers as u8,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    stream_id,
+                    &trail[..toff],
+                );
+            }
+            anchor.slots[slot_idx].free_stream(strm);
+        }
+        return true;
+    }
     let key_len = u16::from_le_bytes([anchor.scratch[19], anchor.scratch[20]]) as usize;
     let key_off = 21;
     if key_off + key_len + 2 > payload_len {
@@ -2372,13 +2652,12 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
         }
         NET_MSG_ERROR => {
             // MSG_ERROR is BROADCAST to every anchor sharing linux_net's
-            // net_out, so it also carries errors for conns we don't own
-            // (notably peer_router's outbound-dial failures on a
-            // Raft-dialing node). A blanket `phase = Error` let one such
-            // foreign error permanently stop this anchor from serving —
-            // dead on every dialing node, fine on pure acceptors. Only
-            // react to an error for a conn WE own: free that slot, keep
-            // listening. See redis_edge_anchor for the same fix + trace.
+            // net_out, so it also carries errors for conns this anchor
+            // does not own — notably peer_router's outbound-dial failures
+            // on a Raft-dialing node. Reacting to a foreign error would
+            // stop this anchor from serving on that node, so only an
+            // error for a conn this anchor owns is handled: free that
+            // slot and keep listening.
             if let Some(conn_id) = frame_conn {
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
@@ -2630,19 +2909,38 @@ pub extern "C" fn module_new(
 
     anchor.net_in = in_chan;
     anchor.net_out = out_chan;
+    anchor.anchor_id = make_anchor_id(PROTO_ETCD, anchor.listen_port, 0);
 
-    // Manifest port order:
-    // inputs:  net_in[0], routed_in[1], watch_in[2], lease_in[3]
-    // outputs: net_out[0], kv_out[1], watch_ctrl[2], lease_ctrl[3], metrics[4]
     unsafe {
         let sys = &*sys_ptr;
         anchor.routed_in = dev_channel_port(sys, 0, 1);
         anchor.watch_in = dev_channel_port(sys, 0, 2);
         anchor.lease_in = dev_channel_port(sys, 0, 3);
+        anchor.lease_sess0_in = dev_channel_port(sys, 0, 4);
+        anchor.lease_sess1_in = dev_channel_port(sys, 0, 5);
+        anchor.relocate_in = dev_channel_port(sys, 0, 6);
+        anchor.watch_sess0_in = dev_channel_port(sys, 0, 7);
+        anchor.watch_sess1_in = dev_channel_port(sys, 0, 8);
         anchor.kv_out = dev_channel_port(sys, 1, 1);
         anchor.watch_ctrl_out = dev_channel_port(sys, 1, 2);
         anchor.lease_ctrl_out = dev_channel_port(sys, 1, 3);
-        anchor.metrics_out = dev_channel_port(sys, 1, 4);
+        anchor.lease_ctrl2_out = dev_channel_port(sys, 1, 4);
+        anchor.metrics_out = dev_channel_port(sys, 1, 5);
+        anchor.watch_ctrl2_out = dev_channel_port(sys, 1, 6);
+    }
+    // Lease + watch session layers: worker 0 is the active target,
+    // worker 1 the standby a handoff moves sessions onto.
+    {
+        let lwired = [anchor.lease_ctrl_out >= 0, anchor.lease_ctrl2_out >= 0];
+        anchor.lsa.init(anchor.anchor_id, lwired, false);
+        let mut sink = lease_sink!(anchor);
+        anchor.lsa.hello(&mut sink);
+    }
+    {
+        let wwired = [anchor.watch_ctrl_out >= 0, anchor.watch_ctrl2_out >= 0];
+        anchor.wsa.init(anchor.anchor_id, wwired, false);
+        let mut sink = watch_sink!(anchor);
+        anchor.wsa.hello(&mut sink);
     }
     0
 }
@@ -2678,14 +2976,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let routed = poll_routed_in(anchor);
             let lease = poll_lease_in(anchor);
             let watch = poll_watch_in(anchor);
-            if !net && !routed && !lease && !watch {
+            let ls0 = poll_lease_session(anchor, 0);
+            let ls1 = poll_lease_session(anchor, 1);
+            let ws0 = poll_watch_session(anchor, 0);
+            let ws1 = poll_watch_session(anchor, 1);
+            let rel = poll_relocate_lease(anchor);
+            if !net && !routed && !lease && !watch && !ls0 && !ls1 && !ws0 && !ws1 && !rel {
                 break;
             }
             budget -= 1;
         }
+        lease_step(anchor);
         flush_slots(anchor);
 
-        // Phase-14: emit module-scope counters on `metrics_out` at a
+        // Emit module-scope counters on `metrics_out` at a
         // coarse cadence (no-op until the port is wired). ids follow the
         // manifest `[observability] metrics` order.
         anchor.step_ctr = anchor.step_ctr.wrapping_add(1);

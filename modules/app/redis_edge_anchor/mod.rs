@@ -1,44 +1,39 @@
 //! redis_edge_anchor — RESP2 stream anchor for Redis-compatible clients.
 //!
-//! Continuity class: `drain_only` (sticky routing is an optimisation,
-//! not a guarantee). CAS correctness comes from `kv_state_worker`
-//! revision fences downstream, not from connection continuity here.
+//! Continuity classes:
+//! - Command traffic (GET, SET, DEL, INCR, …): `drain_only`. Sticky
+//!   routing is an optimisation, not a guarantee; CAS correctness comes
+//!   from `kv_state_worker` revision fences, not connection continuity.
+//! - Pub/sub: `edge_anchored`. A subscriber connection is a
+//!   SessionCtrlV1 session whose subscription state lives in
+//!   `pubsub_worker` and can be handed off to a standby without the
+//!   subscriber missing messages.
 //!
 //! ## What this module owns
 //!
 //! - TCP bind + accept against foundation/ip (NET_CMD_BIND /
-//!   NET_MSG_BOUND / NET_MSG_ACCEPTED state machine — the same one
-//!   foundation/http uses today; collapses to a thin facade once the
-//!   foundation `stream_anchor_core` is promoted).
+//!   NET_MSG_BOUND / NET_MSG_ACCEPTED).
 //! - Per-connection slot table with RESP2 parser state and pipeline
-//!   ordering. RESP3 negotiation via HELLO is recognised; the parser
-//!   currently treats only RESP2 — RESP3 framing extensions land in
-//!   a follow-up.
-//! - Inline session commands: PING, ECHO, QUIT, COMMAND, CLIENT,
-//!   HELLO, AUTH, SELECT, RESET. AUTH validates against the configured
-//!   `requirepass` param (empty => open server); ACL/username-scoped
-//!   principals are the auth_manager Phase-5 path.
-//! - MULTI / EXEC / DISCARD queue state in the slot (per
-//!   `.context/native_fluxor.md`: anchor owns pipelining order and
-//!   MULTI queueing; kv_state_worker owns the txn fence).
-//! - PUBSUB session state in the slot. PUBLISH still routes through
-//!   kv_out because delivery is durable via kv_state_worker.
+//!   ordering. RESP3 negotiation via HELLO is recognised; framing is
+//!   RESP2.
+//! - Inline session commands: PING, ECHO, QUIT, COMMAND, CLIENT, HELLO,
+//!   AUTH, SELECT, RESET. AUTH validates against the configured
+//!   `requirepass` param (empty => open server).
+//! - MULTI / EXEC / DISCARD queue state in the slot; `kv_state_worker`
+//!   owns the transaction fence.
+//! - The pub/sub session layer (`psa`): it mints a session for a
+//!   subscriber connection, forwards SUBSCRIBE / PUBLISH to the serving
+//!   `pubsub_worker`, relays the worker's message pushes back to the
+//!   client, and relays a handoff between the active worker and a
+//!   standby. The transport, the RESP codec and the ingress hold buffer
+//!   stay here.
 //!
 //! ## What this module forwards
 //!
-//! Every other command (GET, SET, DEL, INCR, MGET, …) is wrapped in
-//! a MSG_KV_REQUEST envelope on `kv_out`. Responses arrive on `kv_in`
-//! as MSG_KV_RESPONSE; the anchor looks up the slot by `corr_id`,
-//! RESP-encodes the result, and ships it via NET_CMD_SEND.
-//!
-//! ## Phase 0 scope
-//!
-//! Worked-example module of the Fluxor-native migration (see
-//! `.context/migration_plan.md`). The KV envelope round-trip is
-//! wired; the kv_request_router stub is still a no-op, so forwarded
-//! commands will time out until Phase 1 fills in the router. The
-//! inline command set is enough to PING / AUTH / HELLO / QUIT a
-//! Redis client end-to-end against this module today.
+//! Every non-inline command (GET, SET, DEL, INCR, MGET, …) is wrapped
+//! in a `MSG_KV_REQUEST` envelope on `kv_out`. Responses arrive on
+//! `kv_in` as `MSG_KV_RESPONSE`; the anchor looks up the slot by
+//! `corr_id`, RESP-encodes the result, and ships it via NET_CMD_SEND.
 
 #![no_std]
 #![allow(
@@ -74,12 +69,68 @@ mod redis_codec;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/session_anchor.rs"]
+mod session_anchor;
+
 use redis_codec::{
     enc_array_header, enc_bulk, enc_error, enc_integer, enc_null_bulk, enc_raw, enc_simple_str,
     eq_ascii_ci, itoa, parse_i64, parse_one, ArgView, Argv, Built, ParseStep,
 };
+use session_anchor::session_core::session_ctrl as sc;
+use session_anchor::session_core::{
+    anchor_id as make_anchor_id, mint_session_id, session_app_id, CLASS_PUBSUB,
+};
+use session_anchor::{AnchorAction, SessionAnchor, Target};
+
+/// Write one `[msg][len:2 LE][payload…]` envelope to `chan`.
+unsafe fn write_env(sys: *const SyscallTable, chan: i32, msg: u8, payload: &[u8]) -> bool {
+    if sys.is_null() || chan < 0 || payload.len() > u16::MAX as usize {
+        return false;
+    }
+    let mut buf = [0u8; SCRATCH_BUF_SIZE + 3];
+    let total = 3 + payload.len();
+    if total > buf.len() {
+        return false;
+    }
+    buf[0] = msg;
+    buf[1] = (payload.len() & 0xFF) as u8;
+    buf[2] = ((payload.len() >> 8) & 0xFF) as u8;
+    buf[3..total].copy_from_slice(payload);
+    ((*sys).channel_write)(chan, buf.as_mut_ptr(), total) == total as i32
+}
+
+/// A `SessionAnchor` sink over the two worker control channels.
+macro_rules! ps_sink {
+    ($a:expr) => {{
+        let sys = $a.syscalls;
+        let c0 = $a.pubsub_out;
+        let c1 = $a.pubsub_out2;
+        move |t: Target, m: u8, p: &[u8]| -> bool {
+            let chan = match t {
+                Target::Worker(w) => {
+                    if w == 0 {
+                        c0
+                    } else if w == 1 {
+                        c1
+                    } else {
+                        -1
+                    }
+                }
+                Target::Directory => -1,
+            };
+            unsafe { write_env(sys, chan, m, p) }
+        }
+    }};
+}
+
 use types::PROTO_REDIS;
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
+use wire::{
+    MSG_PUBSUB_CTRL, MSG_PUBSUB_MSG, MSG_PUBSUB_PUBLISH, MSG_PUBSUB_PUBLISHED,
+    PUBSUB_CTRL_PSUBSCRIBE, PUBSUB_CTRL_PUNSUBSCRIBE, PUBSUB_CTRL_SUBSCRIBE,
+    PUBSUB_CTRL_UNSUBSCRIBE, PUBSUB_KIND_MESSAGE, PUBSUB_KIND_PMESSAGE, PUBSUB_KIND_PSUBSCRIBE,
+    PUBSUB_KIND_PUNSUBSCRIBE, PUBSUB_KIND_SUBSCRIBE, PUBSUB_KIND_UNSUBSCRIBE,
+};
 
 // ── NET protocol constants (foundation/ip Stream Surface v1) ──────────
 //
@@ -232,6 +283,9 @@ struct Slot {
     multi_count: u16,
     in_pubsub: bool,
     sub_count: u16,
+    /// SessionCtrlV1 app id for this connection's pub/sub session
+    /// (0 = not attached). `session_id = [anchor_id][pubsub_session]`.
+    pubsub_session: u64,
 
     recv_buf: [u8; RECV_BUF_SIZE],
     recv_len: usize,
@@ -269,6 +323,7 @@ impl Slot {
             multi_count: 0,
             in_pubsub: false,
             sub_count: 0,
+            pubsub_session: 0,
             recv_buf: [0; RECV_BUF_SIZE],
             recv_len: 0,
             send_buf: [0; SEND_BUF_SIZE],
@@ -293,6 +348,7 @@ impl Slot {
         self.multi_count = 0;
         self.in_pubsub = false;
         self.sub_count = 0;
+        self.pubsub_session = 0;
         self.recv_len = 0;
         self.send_len = 0;
         self.ro_reset();
@@ -498,6 +554,36 @@ enum AnchorPhase {
     Error = 0xFF,
 }
 
+/// Subscriber sessions the anchor can front.
+const PS_MAX: usize = 64;
+/// Concurrent PUBLISH fan-outs awaiting worker receiver counts.
+const PUB_PENDING: usize = 16;
+
+/// One in-flight PUBLISH: broadcast to every wired worker, its receiver
+/// counts summed and the total returned to the publisher's ordered
+/// reply slot once every worker has answered.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PubPending {
+    corr: u64,
+    slot: u16,
+    remaining: u8,
+    active: bool,
+    count: u32,
+}
+
+impl PubPending {
+    const fn free() -> Self {
+        Self {
+            corr: 0,
+            slot: 0,
+            remaining: 0,
+            active: false,
+            count: 0,
+        }
+    }
+}
+
 #[repr(C)]
 struct AnchorState {
     syscalls: *const SyscallTable,
@@ -511,6 +597,15 @@ struct AnchorState {
     auth_decision_in: i32,
     disconnect_in: i32,
     metrics_out: i32,
+    /// Pub/sub worker channels (SessionCtrlV1 + MSG_PUBSUB_*). Worker 0
+    /// is the one new subscriber sessions attach to; worker 1 is the
+    /// standby a handoff moves sessions onto.
+    pubsub_out: i32,
+    pubsub_in: i32,
+    pubsub_out2: i32,
+    pubsub_in2: i32,
+    /// MSG_SESSION_RELOCATE from session_relocator.
+    relocate_in: i32,
 
     listen_port: u16,
     phase: AnchorPhase,
@@ -520,15 +615,24 @@ struct AnchorState {
     _pad1: [u8; 3],
 
     corr_seq: u64,
+    /// Monotonic pub/sub session ids (app-id half of the session id).
+    pubsub_seq: u64,
+    /// This anchor's 8-byte SessionCtrlV1 identity.
+    anchor_id: [u8; 8],
+    /// The session layer for subscriber connections: identity, the
+    /// worker each is bound to, and the handoff relay that moves one
+    /// between workers without dropping the subscriber.
+    psa: SessionAnchor<PS_MAX>,
+    pub_pending: [PubPending; PUB_PENDING],
 
     // Configured AUTH password (redis `requirepass`). `requirepass_len`
-    // == 0 means no auth is required and the server is open (the
-    // anonymous Phase-0 model). See `handle_auth`.
+    // == 0 means no auth is required and the server is open to
+    // anonymous clients. See `handle_auth`.
     requirepass: [u8; REQUIREPASS_MAX],
     requirepass_len: u8,
     _pad2: [u8; 7],
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=commands, 1=forwarded, 2=net_errors,
     // 3=auth_failures).
@@ -553,6 +657,11 @@ impl AnchorState {
         self.auth_decision_in = -1;
         self.disconnect_in = -1;
         self.metrics_out = -1;
+        self.pubsub_out = -1;
+        self.pubsub_in = -1;
+        self.pubsub_out2 = -1;
+        self.pubsub_in2 = -1;
+        self.relocate_in = -1;
 
         self.listen_port = DEFAULT_LISTEN_PORT;
         self.phase = AnchorPhase::Init;
@@ -560,6 +669,11 @@ impl AnchorState {
         self.server_conn_id = 0;
         self._pad1 = [0; 3];
         self.corr_seq = 0;
+        self.pubsub_seq = 0;
+        self.anchor_id = [0; 8];
+        self.pub_pending = [PubPending::free(); PUB_PENDING];
+        // psa is (re)initialised in module_new once anchor_id and the
+        // wired worker set are known.
         self.requirepass = [0; REQUIREPASS_MAX];
         self.requirepass_len = 0;
         self._pad2 = [0; 7];
@@ -599,6 +713,14 @@ impl AnchorState {
 
     fn free_slot(&mut self, idx: usize) {
         if idx < MAX_CONNS {
+            // A subscriber that drops takes its pub/sub session with it.
+            if self.slots[idx].pubsub_session != 0 {
+                let app = self.slots[idx].pubsub_session;
+                if let Some(sess) = self.psa.find_app(CLASS_PUBSUB, app) {
+                    let mut sink = ps_sink!(self);
+                    self.psa.detach(sess, sc::DETACH_CLIENT_GONE, &mut sink);
+                }
+            }
             self.slots[idx].conn_id = SLOT_FREE;
             self.slots[idx].phase = SlotPhase::Open;
             self.slots[idx].reset_session();
@@ -696,12 +818,31 @@ fn dispatch(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispatch 
     if eq_ascii_ci(cmd, b"EXEC") {
         return handle_exec(&mut anchor.slots[slot_idx]);
     }
+    if eq_ascii_ci(cmd, b"LATTICE.RELOCATE") {
+        // Ops / test hook: drain the current active pub/sub worker onto
+        // the standby. `session_relocator` drives this from a placement
+        // event in production; this makes it triggerable from a client.
+        let target: u8 = if argv.count >= 2 {
+            let v = argv.args[1];
+            let (off, len) = (v.offset as usize, v.len as usize);
+            parse_i64(&anchor.slots[slot_idx].recv_buf[off..off + len]).unwrap_or(1) as u8
+        } else {
+            1
+        };
+        let _ = anchor.psa.relocate(target);
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_simple_str(&mut s.send_buf, &mut s.send_len, b"OK");
+        return Dispatch::Handled;
+    }
+    if eq_ascii_ci(cmd, b"PUBLISH") {
+        return handle_publish(anchor, slot_idx, argv);
+    }
     if eq_ascii_ci(cmd, b"SUBSCRIBE")
         || eq_ascii_ci(cmd, b"PSUBSCRIBE")
         || eq_ascii_ci(cmd, b"UNSUBSCRIBE")
         || eq_ascii_ci(cmd, b"PUNSUBSCRIBE")
     {
-        return handle_subscribe_family(&mut anchor.slots[slot_idx], cmd, argv);
+        return handle_subscribe_family(anchor, slot_idx, cmd, argv);
     }
 
     // MULTI queueing.
@@ -898,10 +1039,8 @@ fn handle_hello(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispa
 /// `AUTH password` or `AUTH username password`. Validates against the
 /// configured `requirepass` in constant time. Matches real-redis
 /// semantics: an unconfigured server rejects AUTH outright rather than
-/// silently accepting any password (the old stub returned OK for
-/// everything, which masked misconfiguration). Username, if supplied, is
-/// ignored — single-password auth only; ACL users are the auth_manager
-/// Phase-5 path.
+/// silently accepting any password. Username, if supplied, is ignored —
+/// single-password auth only; ACL users are handled by `auth_manager`.
 fn handle_auth(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispatch {
     if argv.count < 2 {
         let s = &mut anchor.slots[slot_idx];
@@ -1029,10 +1168,116 @@ fn handle_exec(slot: &mut Slot) -> Dispatch {
     Dispatch::Handled
 }
 
-fn handle_subscribe_family(slot: &mut Slot, cmd: &[u8], argv: &Argv) -> Dispatch {
+// ── SessionCtrlV1 pub/sub session layer ───────────────────────────────
+//
+// A subscriber connection is a session (`session_id =
+// [anchor_id:8][conn_generation:8]`), fronted by `SessionAnchor`. The
+// anchor keeps the transport and the RESP codec; `pubsub_worker` owns
+// the subscription list and the PUBLISH match, so a subscriber survives
+// a worker move (the handoff relay lives in `SessionAnchor`). Command
+// traffic (GET/SET/…) on the same connection is not a session and stays
+// drain_only.
+
+/// Number of wired pub/sub workers (1 or 2).
+fn ps_worker_count(anchor: &AnchorState) -> u8 {
+    let mut n = 0u8;
+    if anchor.pubsub_out >= 0 {
+        n += 1;
+    }
+    if anchor.pubsub_out2 >= 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Attach a pub/sub session for this connection if it has none, and
+/// return its `app_id` (0 when no worker is wired).
+fn ensure_pubsub_session(anchor: &mut AnchorState, slot_idx: usize) -> u64 {
+    if anchor.pubsub_out < 0 {
+        return 0;
+    }
+    if anchor.slots[slot_idx].pubsub_session == 0 {
+        anchor.pubsub_seq = anchor.pubsub_seq.wrapping_add(1);
+        if anchor.pubsub_seq == 0 {
+            anchor.pubsub_seq = 1;
+        }
+        let app = anchor.pubsub_seq;
+        anchor.slots[slot_idx].pubsub_session = app;
+        let conn_id = anchor.slots[slot_idx].conn_id;
+        let mut sink = ps_sink!(anchor);
+        let _ = anchor.psa.attach(CLASS_PUBSUB, app, conn_id, 0, &mut sink);
+    }
+    anchor.slots[slot_idx].pubsub_session
+}
+
+/// Forward a SUBSCRIBE-family command to the subscriber's worker via
+/// the session layer. The worker's per-channel acks (delivered as
+/// `MSG_PUBSUB_MSG`) drive the RESP reply, so the anchor emits none.
+fn handle_subscribe_family(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    cmd: &[u8],
+    argv: &Argv,
+) -> Dispatch {
     let is_sub = eq_ascii_ci(cmd, b"SUBSCRIBE") || eq_ascii_ci(cmd, b"PSUBSCRIBE");
     let is_psub = eq_ascii_ci(cmd, b"PSUBSCRIBE") || eq_ascii_ci(cmd, b"PUNSUBSCRIBE");
+    let ctrl = if is_sub {
+        if is_psub {
+            PUBSUB_CTRL_PSUBSCRIBE
+        } else {
+            PUBSUB_CTRL_SUBSCRIBE
+        }
+    } else if is_psub {
+        PUBSUB_CTRL_PUNSUBSCRIBE
+    } else {
+        PUBSUB_CTRL_UNSUBSCRIBE
+    };
 
+    // No worker wired: keep the connection usable with a local ack
+    // (non-durable subscription, but the connection still works).
+    if anchor.pubsub_out < 0 {
+        return local_subscribe_ack(&mut anchor.slots[slot_idx], is_sub, is_psub, argv);
+    }
+
+    if is_sub {
+        anchor.slots[slot_idx].in_pubsub = true;
+    }
+    let app = ensure_pubsub_session(anchor, slot_idx);
+    let Some(sess) = anchor.psa.find_app(CLASS_PUBSUB, app) else {
+        return Dispatch::Handled;
+    };
+    let n_names = (argv.count as usize).saturating_sub(1);
+
+    // MSG_PUBSUB_CTRL: [session_header:20 (stamped by forward)]
+    //                  [ctrl:1][count:1] then names.
+    let mut body = [0u8; SCRATCH_BUF_SIZE];
+    let mut end = sc::SESSION_HEADER; // forward overwrites the header
+    body[end] = ctrl;
+    body[end + 1] = n_names.min(255) as u8;
+    end += 2;
+    let mut i = 0;
+    while i < n_names {
+        let v = argv.args[i + 1];
+        let (off, len) = (v.offset as usize, v.len as usize);
+        if end + 2 + len > body.len() {
+            break;
+        }
+        body[end..end + 2].copy_from_slice(&(len as u16).to_le_bytes());
+        end += 2;
+        body[end..end + len].copy_from_slice(&anchor.slots[slot_idx].recv_buf[off..off + len]);
+        end += len;
+        i += 1;
+    }
+    let mut sink = ps_sink!(anchor);
+    let _ = anchor
+        .psa
+        .forward(sess, MSG_PUBSUB_CTRL, &body[..end], &mut sink);
+    Dispatch::Handled
+}
+
+/// Local (worker-less) subscribe acknowledgement — kept only for graphs
+/// that do not wire a pub/sub worker.
+fn local_subscribe_ack(slot: &mut Slot, is_sub: bool, is_psub: bool, argv: &Argv) -> Dispatch {
     if is_sub {
         slot.in_pubsub = true;
     }
@@ -1045,8 +1290,7 @@ fn handle_subscribe_family(slot: &mut Slot, cmd: &[u8], argv: &Argv) -> Dispatch
             slot.sub_count -= 1;
         }
         let v = argv.args[i + 1];
-        let off = v.offset as usize;
-        let len = v.len as usize;
+        let (off, len) = (v.offset as usize, v.len as usize);
         let kind: &[u8] = if is_sub {
             if is_psub {
                 b"psubscribe"
@@ -1064,14 +1308,356 @@ fn handle_subscribe_family(slot: &mut Slot, cmd: &[u8], argv: &Argv) -> Dispatch
         if !enc_bulk(&mut slot.send_buf, &mut slot.send_len, channel) {
             return Dispatch::Fatal;
         }
-        let sub_count = slot.sub_count as i64;
-        let _ = enc_integer(&mut slot.send_buf, &mut slot.send_len, sub_count);
+        let _ = enc_integer(
+            &mut slot.send_buf,
+            &mut slot.send_len,
+            slot.sub_count as i64,
+        );
         i += 1;
     }
     if slot.sub_count == 0 {
         slot.in_pubsub = false;
     }
     Dispatch::Handled
+}
+
+/// Broadcast a PUBLISH to every wired worker (a subscriber may sit on
+/// either during a handoff) and reserve an ordered reply slot for the
+/// summed receiver count.
+fn handle_publish(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispatch {
+    if argv.count < 3 {
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_error(
+            &mut s.send_buf,
+            &mut s.send_len,
+            b"ERR wrong number of arguments for 'publish'",
+        );
+        return Dispatch::Handled;
+    }
+    let workers = ps_worker_count(anchor);
+    if workers == 0 {
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_integer(&mut s.send_buf, &mut s.send_len, 0);
+        return Dispatch::Handled;
+    }
+    let cv = argv.args[1];
+    let mv = argv.args[2];
+    let (co, cl) = (cv.offset as usize, cv.len as usize);
+    let (mo, ml) = (mv.offset as usize, mv.len as usize);
+    let corr = anchor.next_corr();
+
+    // [corr:8][channel_len:2][channel][message_len:2][message]
+    let mut env = [0u8; SCRATCH_BUF_SIZE];
+    let mut end = 0usize;
+    env[end..end + 8].copy_from_slice(&corr.to_le_bytes());
+    end += 8;
+    env[end..end + 2].copy_from_slice(&(cl as u16).to_le_bytes());
+    end += 2;
+    env[end..end + cl].copy_from_slice(&anchor.slots[slot_idx].recv_buf[co..co + cl]);
+    end += cl;
+    env[end..end + 2].copy_from_slice(&(ml as u16).to_le_bytes());
+    end += 2;
+    env[end..end + ml].copy_from_slice(&anchor.slots[slot_idx].recv_buf[mo..mo + ml]);
+    end += ml;
+
+    let sys = anchor.syscalls;
+    let mut sent = 0u8;
+    for chan in [anchor.pubsub_out, anchor.pubsub_out2] {
+        if chan >= 0 && unsafe { write_env(sys, chan, MSG_PUBSUB_PUBLISH, &env[..end]) } {
+            sent += 1;
+        }
+    }
+    if sent == 0 {
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_error(
+            &mut s.send_buf,
+            &mut s.send_len,
+            b"BUSY pubsub worker backpressured",
+        );
+        return Dispatch::Handled;
+    }
+    // Track the fan-out so the summed count returns once every worker
+    // answered; reserve the ordered reply slot now.
+    if let Some(pp) = anchor.pub_pending.iter_mut().find(|p| !p.active) {
+        pp.active = true;
+        pp.corr = corr;
+        pp.slot = slot_idx as u16;
+        pp.remaining = sent;
+        pp.count = 0;
+    } else {
+        // Table full: answer 0 rather than hang the publisher.
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_integer(&mut s.send_buf, &mut s.send_len, 0);
+        return Dispatch::Handled;
+    }
+    if !anchor.slots[slot_idx].ro_reserve(corr) {
+        anchor.slots[slot_idx].phase = SlotPhase::Closing;
+        return Dispatch::Fatal;
+    }
+    Dispatch::Forwarded
+}
+
+/// Drain one envelope from worker `worker_idx`'s reply channel.
+unsafe fn poll_pubsub_worker(anchor: &mut AnchorState, worker_idx: u8) -> bool {
+    let chan = if worker_idx == 0 {
+        anchor.pubsub_in
+    } else {
+        anchor.pubsub_in2
+    };
+    if chan < 0 {
+        return false;
+    }
+    let sys = anchor.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let poll = ((*sys).channel_poll)(chan, POLL_IN);
+    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 3];
+    if ((*sys).channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+        return false;
+    }
+    let mt = hdr[0];
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    if len == 0 || len > anchor.scratch.len() {
+        return len == 0;
+    }
+    if (((*sys).channel_read)(chan, anchor.scratch.as_mut_ptr(), len) as usize) < len {
+        return false;
+    }
+    if mt == MSG_PUBSUB_PUBLISHED {
+        handle_published(anchor, len);
+    } else if mt == MSG_PUBSUB_MSG {
+        deliver_pubsub_msg(anchor, len);
+    } else if (0x70..=0x9F).contains(&mt) {
+        // SessionCtrlV1 frame from this worker: drive the handoff relay.
+        let mut tmp = [0u8; SCRATCH_BUF_SIZE];
+        tmp[..len].copy_from_slice(&anchor.scratch[..len]);
+        let mut sink = ps_sink!(anchor);
+        let action = anchor.psa.on_frame(worker_idx, mt, &tmp[..len], &mut sink);
+        if let AnchorAction::Detached(idx) | AnchorAction::Lost(idx) = action {
+            // The session ended: clear the client slot's flag if it
+            // still points at this (now gone) session.
+            let app = session_app_id(anchor.psa.sessions[idx].session_id());
+            let _ = app;
+            for sl in anchor.slots.iter_mut() {
+                if sl.conn_id != SLOT_FREE
+                    && sl.pubsub_session != 0
+                    && anchor
+                        .psa
+                        .find_app(CLASS_PUBSUB, sl.pubsub_session)
+                        .is_none()
+                {
+                    sl.pubsub_session = 0;
+                    sl.in_pubsub = false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Accumulate a worker's receiver count for a broadcast PUBLISH; when
+/// every worker has answered, fill the publisher's ordered reply.
+fn handle_published(anchor: &mut AnchorState, len: usize) {
+    if len < 12 {
+        return;
+    }
+    let corr = u64::from_le_bytes([
+        anchor.scratch[0],
+        anchor.scratch[1],
+        anchor.scratch[2],
+        anchor.scratch[3],
+        anchor.scratch[4],
+        anchor.scratch[5],
+        anchor.scratch[6],
+        anchor.scratch[7],
+    ]);
+    let recv = u32::from_le_bytes([
+        anchor.scratch[8],
+        anchor.scratch[9],
+        anchor.scratch[10],
+        anchor.scratch[11],
+    ]);
+    let Some(pi) = anchor
+        .pub_pending
+        .iter()
+        .position(|p| p.active && p.corr == corr)
+    else {
+        return;
+    };
+    anchor.pub_pending[pi].count += recv;
+    anchor.pub_pending[pi].remaining = anchor.pub_pending[pi].remaining.saturating_sub(1);
+    if anchor.pub_pending[pi].remaining > 0 {
+        return;
+    }
+    let slot_idx = anchor.pub_pending[pi].slot as usize;
+    let total = anchor.pub_pending[pi].count as i64;
+    anchor.pub_pending[pi] = PubPending::free();
+    let mut reply = [0u8; 24];
+    let mut rl = 0usize;
+    if enc_integer(&mut reply, &mut rl, total)
+        && slot_idx < MAX_CONNS
+        && !anchor.slots[slot_idx].ro_fill(corr, &reply[..rl])
+    {
+        anchor.slots[slot_idx].phase = SlotPhase::Closing;
+    }
+}
+
+/// RESP-encode a `MSG_PUBSUB_MSG` push and append it to the subscriber
+/// connection named by its session id.
+fn deliver_pubsub_msg(anchor: &mut AnchorState, len: usize) {
+    if len < sc::SESSION_HEADER + 1 + 4 + 2 {
+        return;
+    }
+    let mut sid = [0u8; 16];
+    sid.copy_from_slice(&anchor.scratch[..16]);
+    let app = session_app_id(&sid);
+    let kind = anchor.scratch[sc::SESSION_HEADER];
+    let count = u32::from_le_bytes([
+        anchor.scratch[sc::SESSION_HEADER + 1],
+        anchor.scratch[sc::SESSION_HEADER + 2],
+        anchor.scratch[sc::SESSION_HEADER + 3],
+        anchor.scratch[sc::SESSION_HEADER + 4],
+    ]);
+    let mut at = sc::SESSION_HEADER + 5;
+    let read_field = |buf: &[u8], at: &mut usize| -> Option<(usize, usize)> {
+        if *at + 2 > buf.len() {
+            return None;
+        }
+        let l = u16::from_le_bytes([buf[*at], buf[*at + 1]]) as usize;
+        *at += 2;
+        if *at + l > buf.len() {
+            return None;
+        }
+        let start = *at;
+        *at += l;
+        Some((start, l))
+    };
+    let Some((c_off, c_len)) = read_field(&anchor.scratch[..len], &mut at) else {
+        return;
+    };
+    let Some((p_off, p_len)) = read_field(&anchor.scratch[..len], &mut at) else {
+        return;
+    };
+    let Some((m_off, m_len)) = read_field(&anchor.scratch[..len], &mut at) else {
+        return;
+    };
+
+    let mut channel = [0u8; 256];
+    let mut pattern = [0u8; 256];
+    let mut message = [0u8; 1024];
+    let cc = c_len.min(channel.len());
+    let pp = p_len.min(pattern.len());
+    let mm = m_len.min(message.len());
+    channel[..cc].copy_from_slice(&anchor.scratch[c_off..c_off + cc]);
+    pattern[..pp].copy_from_slice(&anchor.scratch[p_off..p_off + pp]);
+    message[..mm].copy_from_slice(&anchor.scratch[m_off..m_off + mm]);
+
+    let Some(slot_idx) = anchor
+        .slots
+        .iter()
+        .position(|s| s.conn_id != SLOT_FREE && s.pubsub_session == app)
+    else {
+        return;
+    };
+
+    let mut buf = [0u8; 1536];
+    let mut bl = 0usize;
+    let (label, arity): (&[u8], i64) = match kind {
+        PUBSUB_KIND_SUBSCRIBE => (b"subscribe", 3),
+        PUBSUB_KIND_UNSUBSCRIBE => (b"unsubscribe", 3),
+        PUBSUB_KIND_PSUBSCRIBE => (b"psubscribe", 3),
+        PUBSUB_KIND_PUNSUBSCRIBE => (b"punsubscribe", 3),
+        PUBSUB_KIND_MESSAGE => (b"message", 3),
+        PUBSUB_KIND_PMESSAGE => (b"pmessage", 4),
+        _ => return,
+    };
+    let _ = enc_array_header(&mut buf, &mut bl, arity);
+    let _ = enc_bulk(&mut buf, &mut bl, label);
+    match kind {
+        PUBSUB_KIND_MESSAGE => {
+            let _ = enc_bulk(&mut buf, &mut bl, &channel[..cc]);
+            let _ = enc_bulk(&mut buf, &mut bl, &message[..mm]);
+        }
+        PUBSUB_KIND_PMESSAGE => {
+            let _ = enc_bulk(&mut buf, &mut bl, &pattern[..pp]);
+            let _ = enc_bulk(&mut buf, &mut bl, &channel[..cc]);
+            let _ = enc_bulk(&mut buf, &mut bl, &message[..mm]);
+        }
+        _ => {
+            let _ = enc_bulk(&mut buf, &mut bl, &channel[..cc]);
+            let _ = enc_integer(&mut buf, &mut bl, count as i64);
+            anchor.slots[slot_idx].sub_count = count as u16;
+            if count == 0 {
+                anchor.slots[slot_idx].in_pubsub = false;
+            }
+        }
+    }
+    // Count the relay so the delivery cursor matches the worker's
+    // out_produced at the next handoff.
+    if let Some(sess) = anchor.psa.find_app(CLASS_PUBSUB, app) {
+        anchor.psa.relayed(sess);
+    }
+    let routed = if anchor.slots[slot_idx].ro_active() {
+        anchor.slots[slot_idx].ro_push_ready(&buf[..bl])
+    } else {
+        let s = &mut anchor.slots[slot_idx];
+        if s.send_len + bl <= SEND_BUF_SIZE {
+            s.send_buf[s.send_len..s.send_len + bl].copy_from_slice(&buf[..bl]);
+            s.send_len += bl;
+            true
+        } else {
+            false
+        }
+    };
+    if !routed {
+        anchor.slots[slot_idx].phase = SlotPhase::Closing;
+    }
+}
+
+/// Drain one operator relocation command and drive the session handoff.
+unsafe fn poll_relocate_in(anchor: &mut AnchorState) -> bool {
+    if anchor.relocate_in < 0 {
+        return false;
+    }
+    let sys = anchor.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let poll = ((*sys).channel_poll)(anchor.relocate_in, POLL_IN);
+    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 3];
+    if ((*sys).channel_read)(anchor.relocate_in, hdr.as_mut_ptr(), 3) < 3 {
+        return false;
+    }
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    if len == 0 || len > anchor.scratch.len() {
+        return len == 0;
+    }
+    if (((*sys).channel_read)(anchor.relocate_in, anchor.scratch.as_mut_ptr(), len) as usize) < len
+    {
+        return false;
+    }
+    // MSG_SESSION_RELOCATE: [target_worker:1]
+    if hdr[0] == wire::MSG_SESSION_RELOCATE && len >= 1 {
+        let target = anchor.scratch[0];
+        let _ = anchor.psa.relocate(target);
+    }
+    true
+}
+
+/// Drive the session handoff machine one tick.
+fn ps_step(anchor: &mut AnchorState) {
+    if ps_worker_count(anchor) == 0 {
+        return;
+    }
+    let mut sink = ps_sink!(anchor);
+    let _ = anchor.psa.step(&mut sink);
 }
 
 // ── Router envelope builder ───────────────────────────────────────────
@@ -1239,8 +1825,8 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     let corr = u64::from_le_bytes([p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]]);
     let conn_id = p[8];
     let result = p[9];
-    // p[10..18] = revision (unused in Phase 1 RESP mapping; surfaces
-    // later when WATCH revisions and INCR-style numeric responses need it).
+    // p[10..18] = revision (unused by the RESP mapping; carried for
+    // WATCH revisions and numeric responses).
     let body_len = u16::from_le_bytes([p[18], p[19]]) as usize;
     let body_off = 20;
     if body_off + body_len > payload_len {
@@ -1393,14 +1979,13 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
         }
         NET_MSG_ERROR => {
             // MSG_ERROR is BROADCAST to every anchor sharing linux_net's
-            // net_out, so it also carries errors for conns we don't own —
-            // notably peer_router's outbound-dial failures on a
-            // Raft-dialing node. The old blanket `phase = Error` let one
-            // such foreign error permanently stop redis from accepting
-            // clients (observed: redis dead on every dialing node, fine on
-            // pure-acceptor nodes). Only react to an error for a conn WE
-            // own: free that client slot and keep listening. Errors for
-            // other conns (peer dials, http) are ignored.
+            // net_out, so it also carries errors for conns this anchor
+            // does not own — notably peer_router's outbound-dial failures
+            // on a Raft-dialing node. Reacting to a foreign error would
+            // stop redis from accepting clients on that node, so only an
+            // error for a conn this anchor owns is handled: free that
+            // client slot and keep listening. Errors for other conns
+            // (peer dials, http) are ignored.
             if let Some(conn_id) = net_conn_id(payload) {
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
@@ -1647,9 +2232,23 @@ pub extern "C" fn module_new(
         anchor.kv_in = dev_channel_port(sys, 0, 1);
         anchor.auth_decision_in = dev_channel_port(sys, 0, 2);
         anchor.disconnect_in = dev_channel_port(sys, 0, 3);
+        anchor.pubsub_in = dev_channel_port(sys, 0, 4);
+        anchor.pubsub_in2 = dev_channel_port(sys, 0, 5);
+        anchor.relocate_in = dev_channel_port(sys, 0, 6);
         anchor.kv_out = dev_channel_port(sys, 1, 1);
         anchor.auth_request_out = dev_channel_port(sys, 1, 2);
         anchor.metrics_out = dev_channel_port(sys, 1, 3);
+        anchor.pubsub_out = dev_channel_port(sys, 1, 4);
+        anchor.pubsub_out2 = dev_channel_port(sys, 1, 5);
+    }
+    // The session layer: worker 0 always the active target; worker 1 the
+    // standby if wired. Directory not used (the anchor mints identity).
+    {
+        let wired = [anchor.pubsub_out >= 0, anchor.pubsub_out2 >= 0];
+        anchor.psa.init(anchor.anchor_id, wired, false);
+        // Say HELLO to each wired worker so it learns the anchor id.
+        let mut sink = ps_sink!(anchor);
+        anchor.psa.hello(&mut sink);
     }
     0
 }
@@ -1684,10 +2283,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // of one frame/tick. This is what lets the graph batch under load.
         let m_net = poll_net_in(anchor);
         let m_kv = poll_kv_in(anchor);
+        let m_ps0 = poll_pubsub_worker(anchor, 0);
+        let m_ps1 = poll_pubsub_worker(anchor, 1);
+        let m_rel = poll_relocate_in(anchor);
+        ps_step(anchor);
+        let m_ps = m_ps0 || m_ps1 || m_rel;
         ro_stall_sweep(anchor);
         flush_slots(anchor);
 
-        // Phase-14: emit module-scope counters on `metrics_out` at a
+        // Emit module-scope counters on `metrics_out` at a
         // coarse cadence (no-op until the port is wired). ids follow the
         // manifest `[observability] metrics` order.
         anchor.step_ctr = anchor.step_ctr.wrapping_add(1);
@@ -1703,7 +2307,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 ],
             );
         }
-        m_net || m_kv
+        m_net || m_kv || m_ps
     };
     if more {
         STEP_BURST

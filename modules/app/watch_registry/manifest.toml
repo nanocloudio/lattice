@@ -3,17 +3,31 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Durable watch state owner. Maintains
-# `WatchID -> WatchState{key_range, start_revision, filters,
-# progress_notify, last_sent_revision, session_epoch, anchor_binding}`.
-# Plans replay after worker movement, validates stale epochs, and
-# emits watch-attach / resume / cancel transitions as
-# `SessionCtrlV1`-class events.
+# Durable watch state owner and SessionCtrlV1 session worker. Maintains
+# `WatchID -> WatchRecord{key_range, start_revision, filters,
+# progress_notify, last_sent_revision, binding{session_id, anchor_id,
+# session_epoch}, phase, delivery cursors}`. Answers Fluxor's session
+# control plane (attach / detach / drain / export / resume) for every
+# watch it fronts, plans replay when a session (re)enters service, and
+# validates epochs per session rather than in cluster lockstep.
+
+# Continuity role: a movable session worker that survives a handoff.
+capabilities = ["session.worker", "session.handoff", "session.resume"]
+
+[capability_facts."session.resume"]
+scope = "fleet"
+
+# Params (TLV, parsed by the module via define_params!):
+#   worker_id  tag 1, u8, default 0 — which of the anchor's workers this
+#              instance is (0 = the one new sessions attach to, 1 = a
+#              standby). A single-registry graph leaves it at 0.
 
 [[ports]]
 # `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved
 # port name (it collides with the kernel-allocated control channel
-# passed to every module's `module_new`). See standards/fluxor-modules.md.
+# passed to every module's `module_new`). Carries both SessionCtrlV1
+# frames (0x70..0x9F) and the data-plane `MSG_WATCH_CTRL` envelopes
+# from the etcd anchor.
 name = "ctrl_in"
 direction = "input"
 content_type = "OctetStream"
@@ -24,24 +38,31 @@ name = "mutations"
 direction = "input"
 content_type = "OctetStream"
 
-# Ack frames from the fanout module (last_sent_revision advancement).
+# `MSG_WATCH_PROGRESS` acks from watch_fanout: one per framed event
+# (the delivery cursor and acked revision advance together), plus the
+# compaction-refusal ack that ends a watch.
 [[ports]]
 name = "progress"
 direction = "input"
 content_type = "OctetStream"
 
 # Cluster-wide placement epoch events from substrate
-# `control_plane.epoch_events`. Each MSG_PLACEMENT_EPOCH_EVENT
-# bumps every active watch's `session_epoch` atomically so frames in
-# flight under the old epoch can be detected and fenced by the anchor.
-# Optional — single-node graphs that don't wire `control_plane`
-# leave this unwired and the registry stays at the bootstrap epoch.
+# `control_plane.epoch_events`. Held on the hub; never stamped into a
+# session. Optional — single-node
+# graphs that don't wire `control_plane` leave this unwired.
 [[ports]]
 name = "in_epoch_events"
 direction = "input"
 content_type = "OctetStream"
 
-# Replay plan emitted to fanout when a worker rebind occurs.
+# SessionCtrlV1 replies (MSG_SC_*) back to the etcd anchor. This is the
+# module's first output, so `module_new` binds it from `out_chan`.
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Replay plan emitted to fanout when a session (re)enters service.
 [[ports]]
 name = "replay_plan"
 direction = "output"
@@ -64,7 +85,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

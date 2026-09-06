@@ -3,16 +3,29 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Durable lease state owner. Maintains
-# `LeaseID -> LeaseState{ttl_ms, granted_at_ms, keepalive_deadline_ms,
-# attached_keys[], epoch}`. Processes grant/revoke/keepalive, emits
-# committed keepalive responses, and fences stale keepalive streams
-# by `session_epoch`.
+# Durable lease state owner and SessionCtrlV1 session worker. A lease is
+# a session (`session_id = [anchor_id:8][lease_id:8]`); the manager
+# maintains `LeaseRecord{ttl_ms, granted_at_ms, keepalive_deadline_ms}`
+# per session, processes grant / revoke / keepalive / time_to_live, and
+# fences a keepalive stream by the SESSION EPOCH — a keepalive at a
+# stale epoch is refused, so it cannot refresh a lease the session has
+# moved past. The deadline crosses in the handoff blob, so a worker
+# move does not lose or reset the lease.
+
+# Continuity role: a movable session worker that survives a handoff.
+capabilities = ["session.worker", "session.handoff", "session.resume"]
+
+[capability_facts."session.resume"]
+scope = "fleet"
+
+# Params (TLV, parsed by the module via define_params!):
+#   worker_id  tag 1, u8, default 0 — which of the anchor's workers this
+#              instance is. A single-manager graph leaves it at 0.
 
 [[ports]]
-# `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved
-# port name (it collides with the kernel-allocated control channel
-# passed to every module's `module_new`). See standards/fluxor-modules.md.
+# `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved port
+# name. Carries both SessionCtrlV1 frames (0x70..0x9F) and the
+# data-plane `MSG_LEASE_CTRL` envelopes from the etcd anchor.
 name = "ctrl_in"
 direction = "input"
 content_type = "OctetStream"
@@ -21,9 +34,7 @@ content_type = "OctetStream"
 #
 # `required`: the deadline scan runs on this tick and on nothing else,
 # so a graph that grants leases without it hands out TTLs that never
-# arrive — the lease lives until a client revokes it. `fluxor build`
-# refuses such a graph, which makes the omission a build failure rather
-# than leases that quietly never expire.
+# arrive. `fluxor build` refuses such a graph.
 [[ports]]
 name = "tick"
 direction = "input"
@@ -31,15 +42,21 @@ content_type = "OctetStream"
 required = true
 
 # Cluster-wide placement epoch events from substrate
-# `control_plane.epoch_events`. MSG_PLACEMENT_EPOCH_EVENT bumps
-# `session_epoch` on every active lease so keepalive frames in flight
-# under the old epoch can be filtered by the anchor.
+# `control_plane.epoch_events`. Kept as a wired input for symmetry with
+# watch_registry; the anchor drives per-session rebinds.
 [[ports]]
 name = "in_epoch_events"
 direction = "input"
 content_type = "OctetStream"
 
-# State responses out to etcd_edge_anchor.
+# SessionCtrlV1 replies (MSG_SC_*) back to the etcd anchor. First
+# output, so `module_new` binds it from `out_chan`.
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_LEASE_STATE responses out to etcd_edge_anchor.
 [[ports]]
 name = "responses"
 direction = "output"
@@ -56,7 +73,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

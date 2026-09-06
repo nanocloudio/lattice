@@ -1,16 +1,12 @@
 //! watch_fanout — high-rate event fanout for active watches.
 //!
-//! Phase 4 module. Consumes `MSG_WATCH_EVENT` envelopes from
-//! `watch_registry`, frames them as `MSG_WATCH_FRAME` envelopes
-//! the `etcd_edge_anchor` can write to the wire, and reports
-//! delivery back to the registry via `progress`.
+//! Consumes `MSG_WATCH_EVENT` envelopes from `watch_registry`, frames
+//! them as `MSG_WATCH_FRAME` envelopes the `etcd_edge_anchor` writes to
+//! the wire, and reports delivery back to the registry via `progress`.
+//! One event per frame; the etcd anchor stitches frames into a
+//! `WatchResponse`.
 //!
-//! Phase 4 scope: one event-per-frame (no batching) for the
-//! common-case single-watch single-event path. Batching arrives
-//! when the etcd anchor stitches frames into a `WatchResponse`
-//! with multiple events.
-//!
-//! ## Replay (Phase-2 slice C)
+//! ## Replay
 //!
 //! On `MSG_WATCH_REPLAY_PLAN` the fanout backfills the window the
 //! client missed while disconnected. It issues `KV_OP_SCAN_VERSIONS`
@@ -73,7 +69,9 @@ use watch_replay::{
     build_frame, parse_replay_plan, walk_versions_page, ReplayPlan, PLAN_KEY_MAX, SCAN_BODY_MAX,
 };
 use wire::{
-    MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_WATCH_EVENT, MSG_WATCH_FRAME, MSG_WATCH_REPLAY_PLAN,
+    MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_WATCH_EVENT, MSG_WATCH_FRAME, MSG_WATCH_PROGRESS,
+    MSG_WATCH_REPLAY_PLAN, WATCH_FRAME_OP_COMPACTED, WATCH_PROGRESS_COMPACTED,
+    WATCH_PROGRESS_DELIVERED,
 };
 
 const SCRATCH_BUF_SIZE: usize = 4096;
@@ -130,7 +128,7 @@ struct FanoutState {
     /// one watcher's history under another watcher's id.
     corr_seq: u64,
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=events, 1=delivered, 2=dropped, 3=replayed,
     // 4=replays_unserviceable).
@@ -231,10 +229,61 @@ fn handle_event(fanout: &mut FanoutState, event_payload: &[u8]) {
         if write_envelope(&*sys, fanout.frames_out, MSG_WATCH_FRAME, event_payload) {
             fanout.frames_emitted = fanout.frames_emitted.wrapping_add(1);
             fanout.m_delivered += 1;
+            // One ack per framed event: it is the watch's acked
+            // revision and its delivery cursor at once, so the registry
+            // advances both in one step and they cannot disagree at a
+            // handoff. The event body
+            // is `[watch_id:8][kpg:2][rev:8]…`.
+            if event_payload.len() >= 18 {
+                let mut wid = [0u8; 8];
+                wid.copy_from_slice(&event_payload[0..8]);
+                let mut rev = [0u8; 8];
+                rev.copy_from_slice(&event_payload[10..18]);
+                emit_progress(
+                    fanout,
+                    u64::from_le_bytes(wid),
+                    u64::from_le_bytes(rev),
+                    WATCH_PROGRESS_DELIVERED,
+                );
+            }
         } else {
             fanout.m_dropped += 1;
         }
     }
+}
+
+/// Emit one `MSG_WATCH_PROGRESS` back to the registry.
+fn emit_progress(fanout: &mut FanoutState, watch_id: u64, revision: u64, kind: u8) {
+    let mut body = [0u8; 17];
+    body[0..8].copy_from_slice(&watch_id.to_le_bytes());
+    body[8..16].copy_from_slice(&revision.to_le_bytes());
+    body[16] = kind;
+    unsafe {
+        let sys = fanout.syscalls;
+        if !sys.is_null() {
+            let _ = write_envelope(&*sys, fanout.progress_out, MSG_WATCH_PROGRESS, &body);
+        }
+    }
+}
+
+/// Refuse a watch explicitly because its replay window fell behind the
+/// compaction floor: a `WATCH_FRAME_OP_COMPACTED` frame to the anchor
+/// (which cancels the client stream with the compact revision) and a
+/// `WATCH_PROGRESS_COMPACTED` ack to the registry (which ends the
+/// record). Silent short-resume is exactly what must not happen.
+fn refuse_compacted(fanout: &mut FanoutState, watch_id: u64, compact_rev: u64) {
+    // [watch_id:8][kpg:2][rev:8][op:1][klen:2][vlen:2] = a minimal frame.
+    let mut body = [0u8; 23];
+    body[0..8].copy_from_slice(&watch_id.to_le_bytes());
+    body[10..18].copy_from_slice(&compact_rev.to_le_bytes());
+    body[18] = WATCH_FRAME_OP_COMPACTED;
+    unsafe {
+        let sys = fanout.syscalls;
+        if !sys.is_null() {
+            let _ = write_envelope(&*sys, fanout.frames_out, MSG_WATCH_FRAME, &body);
+        }
+    }
+    emit_progress(fanout, watch_id, compact_rev, WATCH_PROGRESS_COMPACTED);
 }
 
 /// Record a plan we could not service. Always paired with a reason in
@@ -358,7 +407,20 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
     if result == KV_RESULT_COMPACTED {
         // The window is genuinely gone. Delivering the surviving tail
         // would hand the client a partial history it could not tell
-        // from a complete one, so the backfill fails visibly instead.
+        // from a complete one. Refuse the watch explicitly — cancel the
+        // client stream with the compact revision and end the record —
+        // rather than resuming short in silence.
+        let compact_rev = u64::from_le_bytes([
+            payload[10],
+            payload[11],
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+            payload[16],
+            payload[17],
+        ]);
+        refuse_compacted(fanout, fanout.current.watch_id, compact_rev);
         finish_backfill(fanout, false);
         return;
     }
@@ -504,7 +566,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Phase-14: emit module-scope counters on `metrics_out` at a
+        // Emit module-scope counters on `metrics_out` at a
         // coarse cadence (no-op until the port is wired). ids follow the
         // manifest `[observability] metrics` order.
         fanout.step_ctr = fanout.step_ctr.wrapping_add(1);

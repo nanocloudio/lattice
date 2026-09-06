@@ -1,0 +1,50 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Redis pub/sub session state as a movable SessionCtrlV1 worker. A
+# subscriber connection is a session (`session_id =
+# [anchor_id:8][conn_generation:8]`); this worker owns its subscription
+# list (exact channels + glob patterns) and the PUBLISH match, so a
+# subscriber survives a worker move without the silent message loss
+# Redis pub/sub otherwise suffers.
+# The redis anchor keeps the transport, the RESP codec and the ingress
+# hold buffer; command traffic on the same connection stays drain_only.
+
+# Continuity role: a movable session worker that survives a handoff.
+capabilities = ["session.worker", "session.handoff", "session.resume"]
+
+[capability_facts."session.resume"]
+scope = "fleet"
+
+# Params (TLV, parsed by the module via define_params!):
+#   worker_id  tag 1, u8, default 0 — which of the anchor's workers this
+#              instance is. A single-worker graph leaves it at 0.
+
+[[ports]]
+# SessionCtrlV1 frames (0x70..0x9F), MSG_PUBSUB_CTRL and
+# MSG_PUBSUB_PUBLISH from the redis anchor.
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Everything back to the redis anchor on ONE ordered channel:
+# SessionCtrlV1 replies (MSG_SC_*), MSG_PUBSUB_MSG pushes toward
+# subscribers, and MSG_PUBSUB_PUBLISHED receiver counts. One channel so
+# message pushes are relayed before the anchor sees a handoff's
+# EXPORT_BEGIN (the delivery-cursor gate depends on that ordering).
+# First output, so `module_new` binds it from `out_chan`.
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability ────────────────────────────────────────────────────
+[observability]
+metrics = ["subscribes", "publishes", "deliveries"]

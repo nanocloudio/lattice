@@ -67,10 +67,9 @@ pub const MSG_KV_REQUEST: u8 = 0xC0;
 /// them, while widening the head would move `body_len` and break every
 /// one at once.
 ///
-/// It exists because RFC §14.8 requires a `lattice.data` response to
-/// carry "applied index and source-aware consistency/durability
-/// fences", and this envelope is what `lattice_data_anchor` has to
-/// build one out of. `revision` alone cannot: it is the MVCC position
+/// It exists because a `lattice.data` response must carry an applied
+/// index and source-aware consistency/durability fences, and this
+/// envelope is what `lattice_data_anchor` builds one out of. `revision` alone cannot: it is the MVCC position
 /// of the answer, not evidence about which authority produced it or
 /// what it managed to make durable.
 ///
@@ -80,14 +79,14 @@ pub const MSG_KV_REQUEST: u8 = 0xC0;
 ///   which the router already tracks for the linearizable-read fence
 ///   (`MSG_APP_APPLIED_POS` carries both).
 /// - `source_id` — the partition group that answered, from the
-///   `MSG_KV_APPLIED` reply. §21 invariant 11 wants identity travelling
-///   with the epoch, and this is the identity half.
+///   `MSG_KV_APPLIED` reply. Identity must travel with the epoch, and
+///   this is the identity half.
 /// - `durability` — [`crate::db_context::Durability`]'s byte. A
 ///   consensus-path write reports `ReplicatedVolatile`: a committed
 ///   Raft entry IS replicated to a quorum, and the router does not
 ///   observe the fsync proof that would justify `ReplicatedDurable`.
 ///   Everything else reports `Volatile`. Reads make nothing durable.
-/// - `catalog_generation` — RFC §14.2's schema generation, counted by
+/// - `catalog_generation` — the schema generation, counted by
 ///   the worker (see `kv_state_worker`) and relayed from
 ///   `MSG_KV_APPLIED`. It rides the fence tail because it answers the
 ///   same shape of question the rest of the tail does: not "what is the
@@ -101,12 +100,11 @@ pub const MSG_KV_RESPONSE: u8 = 0xC1;
 pub const KV_RESPONSE_FENCE_TAIL_LEN: usize = 8 + 8 + 4 + 1 + 8 + 8;
 
 /// Router → worker. Stamps the routing decision as `kpg_id` and carries
-/// the §23 canonical identity `(tenant, database, keyspace)` the worker
-/// scopes the store to. `route_epoch` is omitted in Phase 1 because
-/// there is only one KPG; when multi-KPG lands, append `route_epoch:u32
-/// LE` at the tail. The head layout is owned by [`KvCommandHead`] —
-/// build and parse it there, never by hand, or the router and worker
-/// drift (this head grew from 15 to 27 bytes when identity landed).
+/// the canonical identity `(tenant, database, keyspace)` the worker
+/// scopes the store to. `route_epoch` is omitted while there is a single
+/// KPG; a multi-KPG deployment appends `route_epoch:u32 LE` at the tail.
+/// The head layout is owned by [`KvCommandHead`] — build and parse it
+/// there, never by hand, or the router and worker drift.
 /// Payload: `[corr_id:u64 LE][kpg_id:u16 LE][conn_id:u8][consistency:u8]
 ///           [op:u8][tenant:u32 LE][database:u32 LE][keyspace:u32 LE]
 ///           [body_len:u16 LE][body…]`
@@ -131,13 +129,13 @@ pub const MSG_KV_APPLIED: u8 = 0xC3;
 // The connectors send SQL TEXT and receive TYPED rows. Two boundaries
 // are being drawn deliberately:
 //
-//   - The connector does not parse. §14.2 makes parsing and binding a
-//     SHARED relational module, so `pg_edge_anchor` and
+//   - The connector does not parse. Parsing and binding are a SHARED
+//     relational module, so `pg_edge_anchor` and
 //     `mysql_edge_anchor` both ship the statement text and let one
 //     parser decide what it means. Two parsers would eventually
 //     disagree and nothing would surface the disagreement.
-//   - The executor does not format. §14.3 gives the connector its own
-//     "result encoding", and the two genuinely differ (PostgreSQL
+//   - The executor does not format. Each connector has its own result
+//     encoding, and the two genuinely differ (PostgreSQL
 //     renders a boolean `t`/`f`, MySQL `1`/`0`), so values travel typed
 //     and each connector renders them.
 
@@ -165,7 +163,8 @@ pub const MSG_SQL_RESPONSE: u8 = 0xC5;
 /// executor forwards the SAME `KV_OP_TXN` body it built (a set of
 /// mod-revision comparisons and a set of PUTs); the coordinator splits it
 /// per row — one participant per (comparison, PUT) pair — and drives
-/// §13.2 with non-targeted participant ops the router routes by key, so
+/// two-phase commit with non-targeted participant ops the router routes
+/// by key, so
 /// the coordinator needs no partition map. It answers
 /// `MSG_TXN_SUBMIT_RESULT` with the outcome.
 ///
@@ -192,7 +191,7 @@ pub const TXN_SUBMIT_ERROR: u8 = 2;
 
 /// placement_advisor → range_supervisor: execute a split at
 /// `split_key` NOW. The advisor emits this only under an explicit
-/// `auto_execute` opt-in (§12.4: execution stays operator-gated — the
+/// `auto_execute` opt-in (execution stays operator-gated — the
 /// operator both enables the automation and pre-declares the split key,
 /// so the recommender never invents a split point). It automates the
 /// *timing* (fire when load crosses the policy threshold), not the
@@ -211,16 +210,28 @@ pub const MSG_PLACEMENT_SPLIT_CMD: u8 = 0xCD;
 pub const MSG_PLACEMENT_RELOCATE_CMD: u8 = 0xCE;
 
 // ── Watch service (registry ↔ fanout ↔ anchor) ─────────────────────────
+//
+// Session lifecycle — attach / detach / drain / export / resume — is
+// Fluxor's SessionCtrlV1 (`session_core::session_ctrl`, opcodes
+// `0x70..=0x9F`) on the same anchor ↔ registry channel pair as the
+// data-plane envelopes below. Every session-scoped data envelope opens
+// with the contract's session header, `[session_id:16][epoch:4 LE]`,
+// stamped by the anchor at the moment it forwards; the worker admits it
+// only at the session's current epoch.
 
-/// Anchor → registry: create/cancel/resume control.
-/// Payload: `[ctrl:u8][session_id:u64 LE][session_epoch:u32 LE]
-///           [tenant_id:u32 LE][kpg_id:u16 LE][filter_len:u16 LE][filter…]`
-/// `ctrl`: 0=create, 1=resume, 2=cancel, 3=progress_notify.
+/// Anchor → registry: the watch definition for a session the anchor
+/// has ATTACHed (or is attaching — the anchor orders it after
+/// `CMD_SC_ATTACH` on the same channel), and progress pings.
+/// Payload: `[session_id:16][epoch:4 LE][ctrl:u8]` then, for
+/// `ctrl = WATCH_CTRL_DEFINE`:
+///   `[watch_id:u64 LE][tenant_id:u32 LE][start_revision:i64 LE]
+///    [filters:u8][progress_notify:u8][key_len:u16 LE][key…]
+///    [range_end_len:u16 LE][range_end…]`
+/// Cancel is `CMD_SC_DETACH`; there is no ack envelope — the SessionCtrlV1
+/// replies are the acks.
 pub const MSG_WATCH_CTRL: u8 = 0xC8;
-
-/// Registry → anchor: control ack with assigned `session_id` /
-/// `session_epoch` after worker placement.
-pub const MSG_WATCH_CTRL_ACK: u8 = 0xC9;
+pub const WATCH_CTRL_DEFINE: u8 = 0;
+pub const WATCH_CTRL_PROGRESS: u8 = 3;
 
 /// kv_state_worker → registry / fanout: durable mutation event for fanout.
 /// Payload: `[kpg_id:u16 LE][revision:u64 LE][op:u8]
@@ -228,11 +239,17 @@ pub const MSG_WATCH_CTRL_ACK: u8 = 0xC9;
 pub const MSG_WATCH_EVENT: u8 = 0xCA;
 
 /// Fanout → anchor: framed watch response ready for client delivery.
-/// Body is the protocol-native frame (etcd v3 WatchResponse, etc.).
+/// Body: `[watch_id:u64 LE][kpg:2][rev:8][op:1][klen:2][k][vlen:2][v]`
+/// where `op` is `KV_OP_PUT` / `KV_OP_DELETE`, or
+/// [`WATCH_FRAME_OP_COMPACTED`]: the replay window the watch needed
+/// has fallen behind the compaction floor and the watch is refused
+/// explicitly — `rev` carries the compact revision, the anchor answers
+/// `WatchResponse{canceled, compact_revision}` and closes the stream.
 pub const MSG_WATCH_FRAME: u8 = 0xCB;
+pub const WATCH_FRAME_OP_COMPACTED: u8 = 0xFE;
 
 /// Registry → fanout: replay-plan delta after worker rebind.
-/// Payload: `[session_id:u64 LE][from_revision:u64 LE][to_revision:u64 LE]`
+/// Payload: `[watch_id:u64 LE][from_revision:u64 LE][to_revision:u64 LE]`
 ///          `[key_len:u16 LE][key…][range_end_len:u16 LE][range_end…]`
 ///
 /// The KEY SPAN rides along because the fanout has no watch table — it
@@ -250,18 +267,42 @@ pub const MSG_WATCH_FRAME: u8 = 0xCB;
 /// rather than re-delivering the last event it saw.
 pub const MSG_WATCH_REPLAY_PLAN: u8 = 0xCC;
 
+/// Fanout → registry: one frame was put on the wire toward the anchor
+/// (`kind = WATCH_PROGRESS_DELIVERED`), or a replay the registry asked
+/// for could not be serviced and the watch was refused
+/// (`kind = WATCH_PROGRESS_COMPACTED`; the registry drops the record).
+/// One ack per frame: it is the watch's delivery cursor as well as its
+/// acked revision, and the registry advances both in one step.
+/// Payload: `[watch_id:u64 LE][revision:u64 LE][kind:u8]`
+pub const MSG_WATCH_PROGRESS: u8 = 0xCF;
+pub const WATCH_PROGRESS_DELIVERED: u8 = 0;
+pub const WATCH_PROGRESS_COMPACTED: u8 = 1;
+
 // ── Lease service (manager ↔ scheduler ↔ anchor) ───────────────────────
 
-/// Anchor → manager: grant / revoke / keepalive control.
-/// Payload: `[ctrl:u8][lease_id:u64 LE][ttl_ms:u32 LE][tenant_id:u32 LE]`
-/// `ctrl`: 0=grant, 1=revoke, 2=keepalive, 3=time_to_live.
+/// Anchor → manager: grant / revoke / keepalive / time_to_live.
+/// Session-scoped: a lease is a session (`session_id =
+/// [anchor_id:8][lease_id:8]`), ATTACHed by the anchor before the
+/// grant on the same channel. `ctrl`: 0=grant, 1=revoke, 2=keepalive,
+/// 3=time_to_live. An all-zero session id addresses a lease the anchor
+/// holds no session for (a client-supplied id it never saw granted);
+/// the manager answers by `lease_id` alone.
+/// Payload: `[session_id:16][epoch:4 LE][ctrl:u8][lease_id:u64 LE]
+///           [ttl_ms:u32 LE][tenant_id:u32 LE]`
 pub const MSG_LEASE_CTRL: u8 = 0xD0;
 
-/// Manager → anchor: committed lease state response.
-/// Payload: `[lease_id:u64 LE][session_epoch:u32 LE]
+/// Manager → anchor: committed lease state response, echoing the
+/// request's session header. `status` 0 = the lease exists (grant
+/// succeeded / keepalive refreshed / ttl read); 1 = no such lease
+/// (a revoke of a gone lease is fine; a grant that could not allocate
+/// is not; a keepalive answers with `ttl_ms = 0`, which etcd clients
+/// read as expiry).
+/// Payload: `[session_id:16][epoch:4 LE][lease_id:u64 LE][status:u8]
 ///           [ttl_ms:u32 LE][granted_at_ms:u64 LE]
 ///           [keepalive_deadline_ms:u64 LE]`
 pub const MSG_LEASE_STATE: u8 = 0xD1;
+pub const LEASE_STATE_OK: u8 = 0;
+pub const LEASE_STATE_GONE: u8 = 1;
 
 /// The cluster clock: a committed tick carrying the current time.
 /// Payload: `[tick_ms:u64 LE]`
@@ -280,21 +321,68 @@ pub const MSG_LEASE_TICK: u8 = 0xD2;
 ///           [key_len:u16 LE][key…]`
 pub const MSG_LEASE_REVOKE: u8 = 0xD3;
 
-/// Substrate `control_plane` → session-bearing app modules
-/// (`watch_registry`, `lease_manager`, `kv_state_worker`): the
-/// cluster's placement epoch has advanced. Every session in every
-/// downstream module bumps its own `session_epoch` so stale frames
-/// in flight get fenced.
+/// Substrate `control_plane` → placement-aware app modules
+/// (`watch_registry`, `lease_manager`, `kv_state_worker`,
+/// `session_relocator`): the cluster's placement epoch has advanced.
+/// The placement epoch is held by each module and is never stamped
+/// into a session: a session's epoch advances only through an
+/// authoritative rebind.
 ///
 /// Payload (8 bytes): `[prev_epoch:u32 LE][new_epoch:u32 LE]`.
-///
-/// Byte-compatible with clustor's `control_plane.epoch_events`
-/// output (see `deps/clustor/modules/app/control_plane/mod.rs`,
-/// which writes this with `wire::channel_write_msg(..., 0xD4, ...)`).
-/// The first event fires on placement-router init as a
-/// `0 → 1` transition; subsequent events advance monotonically
-/// whenever the substrate detects a rebalance / admin change.
+/// `session_core::placement_event_epoch` also reads clustor's current
+/// `[kpg_id:u16][epoch:u32][reason:u8]` shape under `0xD5`.
 pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD4;
+
+/// `session_relocator` → an edge anchor: move every continuity
+/// session from the other worker onto `target_worker` (0 or 1), one
+/// SessionCtrlV1 handoff each, then attach new sessions there.
+/// Payload: `[target_worker:u8]`
+pub const MSG_SESSION_RELOCATE: u8 = 0xD7;
+
+// ── Pub/sub service (redis anchor ↔ pubsub_worker) ─────────────────────
+//
+// A subscriber connection is a session (`session_id =
+// [anchor_id:8][conn_generation:8]`), ATTACHed when the connection first
+// subscribes, DETACHed when it leaves pub/sub mode or closes, and handed
+// off between workers like any other. Command traffic on the same
+// connection is not a session and stays `drain_only`.
+
+/// Anchor → worker: subscription changes for a session.
+/// Payload: `[session_id:16][epoch:4 LE][ctrl:u8][count:u8]`
+///          then `count × [name_len:u16 LE][name…]`.
+/// `ctrl`: 0=subscribe, 1=unsubscribe, 2=psubscribe, 3=punsubscribe.
+/// A `count` of 0 on unsubscribe / punsubscribe means "all".
+pub const MSG_PUBSUB_CTRL: u8 = 0xDC;
+pub const PUBSUB_CTRL_SUBSCRIBE: u8 = 0;
+pub const PUBSUB_CTRL_UNSUBSCRIBE: u8 = 1;
+pub const PUBSUB_CTRL_PSUBSCRIBE: u8 = 2;
+pub const PUBSUB_CTRL_PUNSUBSCRIBE: u8 = 3;
+
+/// Anchor → worker: a PUBLISH. Not session-scoped (the publisher is
+/// command traffic); `corr_id` correlates the receiver count back.
+/// Payload: `[corr_id:u64 LE][channel_len:u16 LE][channel…]
+///           [message_len:u16 LE][message…]`
+pub const MSG_PUBSUB_PUBLISH: u8 = 0xDD;
+
+/// Worker → anchor: the receiver count for a PUBLISH.
+/// Payload: `[corr_id:u64 LE][receivers:u32 LE]`
+pub const MSG_PUBSUB_PUBLISHED: u8 = 0xDE;
+
+/// Worker → anchor: a push toward a subscriber session — a
+/// subscription acknowledgement or a delivered message.
+/// Payload: `[session_id:16][epoch:4 LE][kind:u8][count:u32 LE]
+///           [channel_len:u16 LE][channel…][pattern_len:u16 LE][pattern…]
+///           [message_len:u16 LE][message…]`
+/// `kind`: 0=subscribe, 1=unsubscribe, 2=message, 3=pmessage,
+/// 4=psubscribe, 5=punsubscribe. `count` is the session's subscription
+/// count after the change (acks) and unused for messages.
+pub const MSG_PUBSUB_MSG: u8 = 0xDF;
+pub const PUBSUB_KIND_SUBSCRIBE: u8 = 0;
+pub const PUBSUB_KIND_UNSUBSCRIBE: u8 = 1;
+pub const PUBSUB_KIND_MESSAGE: u8 = 2;
+pub const PUBSUB_KIND_PMESSAGE: u8 = 3;
+pub const PUBSUB_KIND_PSUBSCRIBE: u8 = 4;
+pub const PUBSUB_KIND_PUNSUBSCRIBE: u8 = 5;
 
 /// `kv_state_worker` → `ttl_scheduler`: a KV record's expiry deadline.
 /// Payload: `[deadline_ms:u64 LE][key_hash:u64 LE]`, deadline `0` =
@@ -328,12 +416,12 @@ pub const MSG_TTL_REGISTER: u8 = 0xD5;
 /// that are discarded, which is the same outcome as not restarting.
 pub const MSG_TTL_CLOCK_RESUME: u8 = 0xD6;
 
-// ── Clustor consensus bridge (Phase 7) ────────────────────────────────
+// ── Clustor consensus bridge ──────────────────────────────────────────
 //
 // Byte-compatible with clustor's `gateway.client_requests` ingress (see
 // `clustor/modules/common/wire.rs::MSG_CLIENT_PROPOSAL`). When the
-// Phase 7 proposal adapter is wired (`kv_request_router.proposal_out`
-// → `gateway.client_requests`), each write KV_COMMAND gets re-emitted as
+// proposal adapter is wired (`kv_request_router.proposal_out`
+// → `gateway.client_requests`), each write KV_COMMAND is re-emitted as
 // a `MSG_CLIENT_REQUEST` envelope. the gateway codec parses the wrapper,
 // stamps a correlation_id, and forwards `MSG_CLIENT_PROPOSAL` into
 // the Raft ingestion pipeline. consensus → lattice_apply_bridge
@@ -424,7 +512,7 @@ pub const LATTICE_ENTRY_TAG: u8 = 0x4C; // 'L'
 /// of clustor's sniffed markers (`0xAD`, `0xCC`).
 pub const LATTICE_RECORD_TAG: u8 = 0x52; // 'R'
 
-// ── Linearizable-read fence (ReadIndex, RFC §1.3 / spec Phase 5) ──────
+// ── Linearizable-read fence (ReadIndex) ──────────────────────────────
 //
 // Byte-compatible with clustor's consensus read protocol. The
 // router SUBMITS a fence request carrying only the correlation id
@@ -470,7 +558,7 @@ pub const MSG_RETENTION_FLOOR: u8 = 0xE0;
 /// Payload: `[kpg_id:u16 LE][floor_revision:u64 LE]`
 pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 
-// ── MVCC GC floor (RFC §18, §21 invariant 13) — Phase-2 slice B ───────
+// ── MVCC GC floor ────────────────────────────────────────────────────
 //
 // The 0xE0 operational band, continued. Taken before this block:
 // 0xE0 retention floor, 0xE1 compaction floor, 0xE2 ttl map update,
@@ -484,7 +572,7 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 // Why these exist when MSG_RETENTION_FLOOR / MSG_COMPACTION_FLOOR
 // already do: those two are a purely LOCAL aggregation — a source
 // declares a number, the coordinator takes a min, and whoever listens
-// may act. §18 requires the opposite shape for GC. Reclaiming history
+// may act. GC requires the opposite shape. Reclaiming history
 // is irreversible, so the floor it happens behind must be a
 // REPLICATED DECISION: proposed, committed, and only then acted on.
 // A locally-computed floor would let a leader that is about to lose
@@ -493,7 +581,7 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 // worker's compaction is gated on the committed record alone.
 
 /// Claim source → compaction_coordinator: a fenced retention claim
-/// (§18's claim set). Richer than `MSG_RETENTION_FLOOR`, which carries
+/// (the claim set). Richer than `MSG_RETENTION_FLOOR`, which carries
 /// no identity and no freshness and therefore cannot distinguish "this
 /// source has nothing to protect" from "this source is gone".
 ///
@@ -510,8 +598,8 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 ///
 /// `expiry_unix_ms` is a LIVENESS bound, not an ordering input: a claim
 /// past its expiry is STALE, and a stale required source BLOCKS
-/// advancement rather than being read as "claims nothing" (§18: missing
-/// or stale claim sources block unsafe advancement).
+/// advancement rather than being read as "claims nothing": a missing or
+/// stale claim source blocks unsafe advancement.
 pub const MSG_RETENTION_CLAIM: u8 = 0xEC;
 
 /// compaction_coordinator → consensus: PROPOSE a GC floor advance.
@@ -535,7 +623,7 @@ pub const MSG_GC_FLOOR_PROPOSE: u8 = 0xEA;
 /// and for no other floor.
 pub const MSG_GC_FLOOR_COMMITTED: u8 = 0xEB;
 
-// ── App state-machine snapshot (backlog §61/62, clustor RFC §2.1) ──────
+// ── App state-machine snapshot ────────────────────────────────────────
 //
 // The state half of a Raft snapshot. Without it a snapshot is a bare
 // `(term, index)` manifest, so replay from a compaction floor cannot
@@ -543,7 +631,7 @@ pub const MSG_GC_FLOOR_COMMITTED: u8 = 0xEB;
 // bench rig.
 //
 // These opcodes and payload shapes are DEFINED BY CLUSTOR
-// (`clustor/modules/common/wire.rs`, RFC §2.1) — lattice is one
+// (`clustor/modules/common/wire.rs`) — lattice is one
 // consumer of that contract alongside loam. They are mirrored here
 // verbatim because lattice modules can't include clustor's wire.rs;
 // they must not be renumbered independently.
@@ -645,9 +733,8 @@ pub const MSG_ADAPTER_ROLLUP: u8 = 0xE9;
 // The fixed heads that precede an op body on the KV path. Each layout
 // lives in exactly ONE place — a struct with `encode`/`decode` and a
 // `LEN` — so a field added to a head changes every producer and consumer
-// at once. Before this, the offsets were hand-written in ~19 modules,
-// and the drift showed: `MSG_KV_COMMAND`'s head grew 15→27 bytes for the
-// §23 identity while several comments still said 15.
+// at once. Hand-written offsets in each module would drift instead: a
+// head and a stale comment disagreeing on its width.
 
 /// The head of a [`MSG_KV_COMMAND`] payload — everything the router
 /// stamps before the op body. Built by the router, parsed by the worker.
@@ -658,7 +745,7 @@ pub struct KvCommandHead {
     pub conn_id: u8,
     pub consistency: u8,
     pub op: u8,
-    /// §23 canonical identity the worker scopes the store to.
+    /// The canonical identity the worker scopes the store to.
     pub tenant: u32,
     pub database: u32,
     pub keyspace: u32,
@@ -808,12 +895,11 @@ impl KvResponseHead {
 }
 
 /// The fence tail that trails every [`MSG_KV_RESPONSE`] body — the proof
-/// the answering group carried (§14.8), plus the schema generation the
+/// the answering group carried, plus the schema generation the
 /// compute-side catalog cache validates against. It trails the body (not
 /// the head) so a consumer reading only `body_len` never has to know it
-/// is there; [`KV_RESPONSE_FENCE_TAIL_LEN`] is its width. This is the
-/// structure that drifted twice — applied index/durability, then
-/// `catalog_generation` — which is why it is owned here now.
+/// is there; [`KV_RESPONSE_FENCE_TAIL_LEN`] is its width. It is owned in
+/// one place so producers and consumers cannot disagree on its shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FenceTail {
     pub applied_index: u64,

@@ -585,6 +585,18 @@ pub const KV_RESULT_CROSS_DOMAIN: u8 = 0x12;
 /// three are never collapsed — that distinction is the whole point.
 pub const KV_RESULT_IDEMPOTENT_LOOKUP: u8 = 0x13;
 
+/// HOST-INTERNAL, never on the wire: the command consumed its step
+/// budget before its reply was complete and the provider is holding
+/// its position. The hosting module keeps the command frame and
+/// re-applies it — the same bytes — on later steps while the store
+/// serves, until a real result comes back; a store that stops serving
+/// (recovery, quarantine, snapshot install) holds it queued like any
+/// other command, and a re-drive that refuses is dropped without a
+/// reply, leaving the caller's timeout to re-issue — the standard
+/// fail-closed path. Only `KV_OP_SCAN_VERSIONS` on the disk provider
+/// answers this way (a key-ordered walk of the whole span).
+pub const KV_RESULT_PAUSED: u8 = 0xFE;
+
 pub const KV_RESULT_INTERNAL: u8 = 0xFF;
 
 /// Sentinel `element-len` value in `KV_RESULT_ARRAY` payloads that

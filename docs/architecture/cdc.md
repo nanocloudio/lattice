@@ -17,6 +17,17 @@ behind, and stores its own cursor as ordinary KV records through the
 same router, with a compare-and-swap generation pointer so a
 restarted or superseded pump cannot corrupt the checkpoint.
 
+A versioned scan walks the feed's key span in key order and filters by
+revision, so its length is the span's, not the window's. The disk
+store bounds that walk per step (`SCAN_STEP_BLOCKS` run blocks) and
+holds its position, and the state worker re-drives the paused page one
+slice per step. Other commands keep flowing between slices — except a
+second versioned scan, which waits at the channel head (and queues the
+commands behind it) until the held one answers; a window at the
+store's high-water mark is answered empty without opening a run. A
+large table therefore costs the pump page latency, never the worker
+its step deadline.
+
 ## Events
 
 Each change produces one little-endian `CdcEvent`:

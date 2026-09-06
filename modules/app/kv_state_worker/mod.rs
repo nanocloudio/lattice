@@ -27,22 +27,33 @@
 //!
 //! ### Disk-mode step-cost bounds
 //!
-//! No step blocks unboundedly; the two heavyweight actions are
-//! explicitly bounded and scheduled one-per-step where possible:
+//! No step blocks unboundedly. Every action whose natural size is the
+//! store's — not the command's — is a state machine driven one bounded
+//! slice per step, and the command drain itself is time-budgeted:
 //!
-//! - **Flush** (`DiskStore::flush`, driven from `disk_maintenance` or
-//!   in-line when a command hits memtable `Backpressure`): writes the
-//!   whole memtable — at most `MEMTABLE_MAX_ENTRIES` (512) records ≈
-//!   2.4 MB in ~600 bounded `FS_WRITE` appends plus one fsync and one
-//!   manifest publish. Worst-case step time is therefore one memtable
-//!   drain (single-digit ms on the linux provider, tens of ms on
-//!   FAT32-class media). The advisory watermark (75%) keeps the
-//!   common flush at ≤ 384 records.
-//! - **Compaction** runs `COMPACT_STEP_RECORDS` (128) input records
-//!   per step via `disk_maintenance`; only when a command would
-//!   otherwise fail (memtable AND run set full) is it driven to
-//!   completion in-line, bounded by the provider's fixed logical
-//!   capacity (≤ 8704 records ⇒ ≤ 68 steps).
+//! - **Flush** (`disk_maintenance`, or in-line when a command hits
+//!   memtable `Backpressure`): `FLUSH_STEP_RECORDS` (32) records per
+//!   step into the run file; the run and manifest durability barriers
+//!   are submit/poll fences that span steps rather than block one.
+//! - **Compaction**: `COMPACT_STEP_RECORDS` (32) input records per
+//!   step; only when a command would otherwise fail (memtable AND run
+//!   set full) is it driven to completion in-line, bounded by the
+//!   provider's fixed logical capacity.
+//! - **Version scan** (`KV_OP_SCAN_VERSIONS` — the page read behind
+//!   the CDC pump, watch replay, and the model feed): a key-ordered
+//!   walk of the whole span, filtered by revision, so its length is
+//!   the span's and not the window's. The provider stops at
+//!   `SCAN_STEP_BLOCKS` loaded blocks (or `SCAN_STEP_RECORDS` visited
+//!   records) and keeps its position; the engine reports the pause as
+//!   `KV_RESULT_PAUSED`; this module holds the command frame
+//!   and re-applies it one slice per step until the page is complete,
+//!   with other commands flowing between slices (`hold_command` /
+//!   `drive_held_command`). One slot: a re-issue of the held request
+//!   is adopted into it; a different pausable request waits on the
+//!   channel, and the commands behind it wait with it.
+//! - **Command drain**: `PER_TICK_DRAIN_BUDGET` commands or
+//!   `DRAIN_BUDGET_US` per step, whichever first; the channel is the
+//!   spill buffer.
 //!
 //! ## Scope
 //!
@@ -102,8 +113,9 @@ use kv_store::{DiskMaterializer, KvStore, Materializer, MAX_KEYS};
 use types::{
     KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS, KV_OP_FLUSH, KV_OP_GET,
     KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT,
-    KV_OP_RANGE, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE,
-    KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_INTEGER, KV_RESULT_OK,
+    KV_OP_RANGE, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS, KV_OP_STRLEN, KV_OP_TXN,
+    KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_INTEGER, KV_RESULT_OK,
+    KV_RESULT_PAUSED,
 };
 use wire::{
     APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_DURABLE,
@@ -121,6 +133,13 @@ use compaction_floor::{
 };
 
 const SCRATCH_BUF_SIZE: usize = 8192;
+
+/// Largest command frame the hold slot keeps across steps. The only
+/// pausable op, `KV_OP_SCAN_VERSIONS`, carries two user keys
+/// (`MAX_KEY_LEN` each) and four integers behind the command head;
+/// 1024 covers that with room, and is what keeps the slot cheap enough
+/// to live in the arena unconditionally.
+const HELD_FRAME_MAX: usize = 1024;
 
 // ── MVCC commit-timestamp assignment ────────────────────
 
@@ -423,6 +442,16 @@ struct WorkerState {
     /// Wall clock at the first chunk, for the total `ms=` on the end
     /// line.
     disk_flush_t0: u64,
+    /// A command the engine paused (`KV_RESULT_PAUSED`) is held here
+    /// and re-applied one bounded slice per step until it answers.
+    held_active: bool,
+    held_len: u16,
+    /// Version-scan slices that paused (cumulative), and frames the
+    /// hold slot could not take because they were oversized.
+    m_scan_pauses: u64,
+    m_scan_hold_refusals: u64,
+    /// Re-issued requests adopted into the hold slot (`adopt_retry`).
+    m_scan_retries_adopted: u64,
     /// Disk provider: a bounded compaction is in flight (one
     /// `COMPACT_STEP_RECORDS` step per module step).
     disk_compact_active: bool,
@@ -587,6 +616,8 @@ struct WorkerState {
 
     import_buf: [u8; SNAPSHOT_BODY_MAX],
 
+    held_frame: [u8; HELD_FRAME_MAX],
+
     scratch: [u8; SCRATCH_BUF_SIZE],
 }
 
@@ -637,6 +668,11 @@ impl WorkerState {
         self.disk_flush_chunks = 0;
         self.disk_compact_steps = 0;
         self.disk_flush_t0 = 0;
+        self.held_active = false;
+        self.held_len = 0;
+        self.m_scan_pauses = 0;
+        self.m_scan_hold_refusals = 0;
+        self.m_scan_retries_adopted = 0;
         self.disk_compact_active = false;
         self.disk_compact_cursor = 0;
         self.disk_compact_floor = 0;
@@ -674,11 +710,10 @@ impl WorkerState {
     }
 }
 
-unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
-    let sys_ptr = worker.syscalls;
-    if sys_ptr.is_null() || worker.commands_in < 0 {
-        return false;
-    }
+/// May a command be applied to the store right now? Shared by the
+/// channel drain and the held-command re-drive, so a paused command
+/// is never advanced through a state a fresh one would wait out.
+fn store_serving(worker: &WorkerState) -> bool {
     if worker.state_store == STATE_STORE_DISK && worker.disk_phase != DISK_PHASE_SERVING {
         // Fail closed: a disk store that has not recovered (or has
         // quarantined on a storage fault) never serves. Commands stay
@@ -695,10 +730,34 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         // store's high-water.
         return false;
     }
+    true
+}
+
+unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
+    let sys_ptr = worker.syscalls;
+    if sys_ptr.is_null() || worker.commands_in < 0 {
+        return false;
+    }
+    if !store_serving(worker) {
+        return false;
+    }
     let sys = &*sys_ptr;
     let poll = (sys.channel_poll)(worker.commands_in, POLL_IN);
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
+    }
+    if worker.held_active && head_is_pausable(worker) {
+        // Another pausable command at the head while the slot is
+        // taken. The common case is a RETRY of the held request — the
+        // caller's phase timeout passed while the walk was still
+        // paging, so it re-issued the same request under a new
+        // correlation. Adopt it: same bytes, new identity, and the
+        // reply goes where it is still wanted. A genuinely different
+        // request waits its turn on the channel; ordinary commands
+        // behind it wait with it (the channel is FIFO), the price of a
+        // single slot, paid only while two different version scans
+        // overlap.
+        return adopt_retry(worker);
     }
     let mut hdr = [0u8; 3];
     let n = (sys.channel_read)(worker.commands_in, hdr.as_mut_ptr(), 3);
@@ -821,9 +880,38 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         return false;
     }
 
-    let cmd = &in_buf[..payload_len];
+    match apply_command_frame(worker, &in_buf[..payload_len]) {
+        CmdOutcome::Answered(ok) => ok,
+        CmdOutcome::Refused => false,
+        CmdOutcome::Paused => {
+            hold_command(worker, &in_buf[..payload_len]);
+            true
+        }
+    }
+}
+
+/// What applying one `MSG_KV_COMMAND` frame came to.
+enum CmdOutcome {
+    /// Applied and answered (`true` = the reply was written).
+    Answered(bool),
+    /// Malformed or undeliverable; dropped without a reply.
+    Refused,
+    /// The engine returned `KV_RESULT_PAUSED`: the command consumed its
+    /// step budget mid-reply and the provider holds its position. The
+    /// frame must be re-applied, byte for byte, on a later step.
+    Paused,
+}
+
+/// Apply one `MSG_KV_COMMAND` frame (`wire::KvCommandHead` + op body)
+/// to the store and write its `MSG_KV_APPLIED` reply. Called from the
+/// channel drain for a fresh frame and from [`drive_held_command`] for
+/// a paused one — the same bytes either way, which is what lets the
+/// provider resume: it recognises the request it paused on.
+unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcome {
+    let sys = &*worker.syscalls;
+    let payload_len = cmd.len();
     let Some(head) = wire::KvCommandHead::decode(cmd) else {
-        return false;
+        return CmdOutcome::Refused;
     };
     let corr_id = head.corr_id;
     let kpg_id = head.kpg_id;
@@ -836,7 +924,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     let body_len = head.body_len as usize;
     let body_off = wire::KvCommandHead::LEN;
     if body_off + body_len > payload_len {
-        return false;
+        return CmdOutcome::Refused;
     }
     let body = &cmd[body_off..body_off + body_len];
 
@@ -922,6 +1010,10 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         // them up front is what releases the borrow.
         let mat_backpressure = mat.backpressure;
         let mat_fault = mat.fault;
+        let mat_reply_revision = mat.reply_revision;
+        if r == KV_RESULT_PAUSED {
+            return CmdOutcome::Paused;
+        }
         if mat_backpressure {
             // Retryable, NOT a fault: the memtable filled while the
             // chunked flush was still draining it. Counted on the same
@@ -961,7 +1053,14 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
                 }
             }
         }
-        (r, n, worker.disk_revision)
+        // A historical read answers as-of the revision it pinned, not
+        // the one the engine has reached since.
+        let as_of = if mat_reply_revision != 0 {
+            mat_reply_revision
+        } else {
+            worker.disk_revision
+        };
+        (r, n, as_of)
     } else {
         worker
             .store
@@ -1025,11 +1124,11 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     const APP_TAIL: usize = 8;
     let resp_payload_len = wire::KvAppliedHead::LEN + result_body_len + APP_TAIL;
     if resp_payload_len > u16::MAX as usize {
-        return false;
+        return CmdOutcome::Refused;
     }
     let total = 3 + resp_payload_len;
     if total > worker.scratch.len() {
-        return false;
+        return CmdOutcome::Refused;
     }
     let scratch = &mut worker.scratch[..total];
     scratch[0] = MSG_KV_APPLIED;
@@ -1051,7 +1150,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     scratch[p..p + 8].copy_from_slice(&worker.catalog_generation.to_le_bytes());
 
     if worker.responses_out < 0 {
-        return false;
+        return CmdOutcome::Refused;
     }
     let n = (sys.channel_write)(worker.responses_out, worker.scratch.as_mut_ptr(), total);
     let ok = n == total as i32;
@@ -1067,7 +1166,91 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     if ok && worker.mutations_out >= 0 {
         emit_watch_event(worker, op, kpg_id, result, result_revision, body);
     }
-    ok
+    CmdOutcome::Answered(ok)
+}
+
+/// Keep a paused command's frame for re-application. One slot: the
+/// drain refuses to admit a second pausable command while it is
+/// occupied (see [`drain_commands`]), so occupancy is never a race.
+unsafe fn hold_command(worker: &mut WorkerState, cmd: &[u8]) {
+    // A frame that does not fit cannot be held; the caller's page
+    // request times out upstream and is re-issued (the provider may
+    // have parked a page prefix before the refusal — harmless, since a
+    // re-issue with the same window and cursor reclaims it). Bounded
+    // by construction: the only pausable op carries two user keys and
+    // four integers.
+    if cmd.len() > HELD_FRAME_MAX {
+        worker.m_scan_hold_refusals = worker.m_scan_hold_refusals.wrapping_add(1);
+        return;
+    }
+    worker.held_frame[..cmd.len()].copy_from_slice(cmd);
+    worker.held_len = cmd.len() as u16;
+    worker.held_active = true;
+    worker.m_scan_pauses = worker.m_scan_pauses.wrapping_add(1);
+}
+
+/// The frame at the channel head is pausable and the slot is taken:
+/// consume it if it is the held request re-issued (identical but for
+/// `corr_id`), replacing the held identity. Otherwise leave it.
+unsafe fn adopt_retry(worker: &mut WorkerState) -> bool {
+    let sys = &*worker.syscalls;
+    const CORR: core::ops::Range<usize> = 0..8;
+    let held_len = worker.held_len as usize;
+    let mut frame = [0u8; 3 + HELD_FRAME_MAX];
+    let n = (sys.channel_peek)(worker.commands_in, frame.as_mut_ptr(), 3 + held_len);
+    if n != (3 + held_len) as i32 {
+        return false;
+    }
+    let payload_len = u16::from_le_bytes([frame[1], frame[2]]) as usize;
+    let cand = &frame[3..3 + held_len];
+    let held = &worker.held_frame[..held_len];
+    let same = payload_len == held_len && cand[CORR.end..] == held[CORR.end..];
+    if !same {
+        return false;
+    }
+    // Consume it (header + payload) and adopt its correlation.
+    let mut sink = [0u8; 3 + HELD_FRAME_MAX];
+    let got = (sys.channel_read)(worker.commands_in, sink.as_mut_ptr(), 3 + held_len);
+    if got != (3 + held_len) as i32 {
+        return false;
+    }
+    worker.held_frame[CORR].copy_from_slice(&sink[3 + CORR.start..3 + CORR.end]);
+    worker.m_scan_retries_adopted = worker.m_scan_retries_adopted.wrapping_add(1);
+    true
+}
+
+/// Re-apply the held command — one bounded slice of its walk per
+/// step. Runs at the head of every drain, before any fresh command, so
+/// a paused scan is never starved by the queue behind it, and other
+/// commands keep flowing between its slices (replies correlate by
+/// `corr_id`; nothing upstream assumes reply order).
+unsafe fn drive_held_command(worker: &mut WorkerState) -> bool {
+    if !worker.held_active || !store_serving(worker) {
+        return false;
+    }
+    let len = worker.held_len as usize;
+    let mut frame = [0u8; HELD_FRAME_MAX];
+    frame[..len].copy_from_slice(&worker.held_frame[..len]);
+    match apply_command_frame(worker, &frame[..len]) {
+        CmdOutcome::Paused => {}
+        CmdOutcome::Answered(_) | CmdOutcome::Refused => worker.held_active = false,
+    }
+    true
+}
+
+/// Is the frame at the head of `commands` a command that may pause?
+/// Peeked, not read: while a paused command is held, its successor of
+/// the same kind stays on the channel — the channel is the spill
+/// buffer — until the slot frees. Every other frame is admitted.
+unsafe fn head_is_pausable(worker: &mut WorkerState) -> bool {
+    let sys = &*worker.syscalls;
+    const PEEK: usize = 3 + wire::KvCommandHead::LEN;
+    let mut hdr = [0u8; PEEK];
+    let n = (sys.channel_peek)(worker.commands_in, hdr.as_mut_ptr(), PEEK);
+    if n < PEEK as i32 || hdr[0] != MSG_KV_COMMAND {
+        return false;
+    }
+    wire::KvCommandHead::decode(&hdr[3..]).is_some_and(|h| h.op == KV_OP_SCAN_VERSIONS)
 }
 
 /// Emit `MSG_WATCH_EVENT` for the just-applied mutation, if any. Wire
@@ -1675,6 +1858,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     let mut budget = PER_TICK_DRAIN_BUDGET;
     let mut drained = 0u32;
     let mut spilled = false;
+    // A held (paused) command gets its slice FIRST, inside the drain
+    // window so its cost counts against `DRAIN_BUDGET_US` like any
+    // other command's.
+    if unsafe { drive_held_command(worker) } {
+        budget -= 1;
+        drained += 1;
+    }
     while budget > 0 {
         // Time check FIRST for every command after the first: a step
         // must always make some progress, but it must never START work
@@ -1961,14 +2151,11 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
             // fills. Without it runs only ever merge at MAX_RUNS (a refused
             // flush) or on a committed GC floor (which needs GC enablement),
             // so on a steady write trickle the run count grows without bound
-            // — and the READ side pays for it: a SCAN_VERSIONS drain walks
-            // every run's blocks in ONE step, and on the pi5 rig that walk
-            // was MEASURED crossing the step-deadline ceiling (17.6 ms at
-            // runs=1 growing with count) and getting the module TERMINATED
-            // ("storage unavailable" with a healthy front half). Merging at
-            // 3 runs keeps per-scan work bounded by a constant. Same merge
-            // the MAX_RUNS branch runs: floor already in force, reclaims
-            // nothing, pure run-count hygiene.
+            // — and the READ side pays for it: every merged walk opens every
+            // run, and a version scan visits every run's blocks in its span.
+            // Merging at 3 runs keeps the per-walk run count a constant.
+            // Same merge the MAX_RUNS branch runs: floor already in force,
+            // reclaims nothing, pure run-count hygiene.
             if !worker.disk_flush_active
                 && !worker.disk_compact_active
                 && worker.disk_state.run_count as usize >= RUN_MERGE_THRESHOLD
@@ -2426,7 +2613,7 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     // ph=phase fw=flush_wanted ca=compact_active deg=degraded_steps
     // hard=hard_faults errno=last_errno mem=memtable runs=run_files
     // fa/fc/ff/fb=flush attempts/completions/failures/backpressure
-    let mut buf = [0u8; 288];
+    let mut buf = [0u8; 320];
     // `ss`/`rp` are the EFFECTIVE params (rig.md §7a) — repeated on
     // every heartbeat so a capture that misses the init line still
     // proves which provider this worker actually selected.
@@ -2503,6 +2690,18 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     n = write_dec(&mut buf, n, worker.disk_state.scans_skipped.get());
     n = write_prefix(&mut buf, n, b" cs=");
     n = write_dec(&mut buf, n, worker.disk_compact_steps);
+    //   held = a paused command is being re-driven right now
+    //   sp   = version-scan slices that paused (cumulative)
+    //   sa   = re-issued requests adopted into the hold slot
+    //   hr   = pausable frames refused by the slot (oversized)
+    n = write_prefix(&mut buf, n, b" held=");
+    n = write_dec(&mut buf, n, u64::from(worker.held_active));
+    n = write_prefix(&mut buf, n, b" sp=");
+    n = write_dec(&mut buf, n, worker.m_scan_pauses);
+    n = write_prefix(&mut buf, n, b" sa=");
+    n = write_dec(&mut buf, n, worker.m_scan_retries_adopted);
+    n = write_prefix(&mut buf, n, b" hr=");
+    n = write_dec(&mut buf, n, worker.m_scan_hold_refusals);
     dev_log(sys, DISK_LOG_LEVEL, buf.as_ptr(), n);
 }
 

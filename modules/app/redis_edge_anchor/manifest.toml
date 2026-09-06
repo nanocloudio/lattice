@@ -3,6 +3,11 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
+# Client-facing transport anchor. The pub/sub half is edge_anchored
+# (its session state lives in pubsub_worker); command traffic stays
+# drain_only.
+capabilities = ["transport.anchor.stream.secure"]
+
 # RESP2/RESP3 stream anchor for Redis-compatible clients. Built on the
 # stream-anchor pattern (`stream_anchor_core` is not yet promoted as a
 # foundation core; this module owns its own NET_CMD_* state machine
@@ -69,13 +74,46 @@ name = "disconnect"
 direction = "input"
 content_type = "OctetStream"
 
+# Pub/sub worker replies: MSG_PUBSUB_MSG pushes toward subscribers,
+# MSG_PUBSUB_PUBLISHED receiver counts, and SessionCtrlV1 replies
+# (fan-in from pubsub_worker.ctrl_out + pubsub_worker.messages).
+[[ports]]
+name = "pubsub_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Standby pub/sub worker replies (two-worker handoff graphs).
+[[ports]]
+name = "pubsub_in2"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_SESSION_RELOCATE from session_relocator (drives subscriber handoffs).
+[[ports]]
+name = "relocate_in"
+direction = "input"
+content_type = "OctetStream"
+
 # Adapter events out to adapter_metrics.
 [[ports]]
 name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# SessionCtrlV1 frames + MSG_PUBSUB_CTRL/PUBLISH out to the active
+# pub/sub worker.
+[[ports]]
+name = "pubsub_out"
+direction = "output"
+content_type = "OctetStream"
+
+# The standby pub/sub worker (two-worker handoff graphs).
+[[ports]]
+name = "pubsub_out2"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability ────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

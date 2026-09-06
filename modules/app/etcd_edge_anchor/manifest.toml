@@ -3,6 +3,9 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
+# Client-facing transport anchor for the etcd continuity classes.
+capabilities = ["transport.anchor.stream.secure"]
+
 # gRPC/HTTP2 edge anchor for etcd v3 KV / Watch / Lease / Auth / Txn
 # subset. Built on the stream-anchor pattern (foundation
 # `stream_anchor_core` is not yet promoted; this module owns its own
@@ -39,6 +42,36 @@ name = "lease_in"
 direction = "input"
 content_type = "OctetStream"
 
+# SessionCtrlV1 replies from the two lease_managers (per worker), and the
+# relocation command that drives a lease handoff. Wired only in
+# two-worker graphs; single-worker graphs leave them unwired.
+[[ports]]
+name = "lease_sess0_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lease_sess1_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "relocate_in"
+direction = "input"
+content_type = "OctetStream"
+
+# SessionCtrlV1 replies from the two watch_registries (per worker),
+# two-worker watch handoff graphs only.
+[[ports]]
+name = "watch_sess0_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "watch_sess1_in"
+direction = "input"
+content_type = "OctetStream"
+
 # Parsed KV / Watch / Lease control envelopes out to the router /
 # watch_registry / lease_manager.
 [[ports]]
@@ -56,12 +89,24 @@ name = "lease_ctrl"
 direction = "output"
 content_type = "OctetStream"
 
+# The standby lease_manager (two-worker handoff graphs).
+[[ports]]
+name = "lease_ctrl2"
+direction = "output"
+content_type = "OctetStream"
+
 [[ports]]
 name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# The standby watch_registry (two-worker handoff graphs).
+[[ports]]
+name = "watch_ctrl2"
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability ────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

@@ -784,6 +784,164 @@ impl RunMeta {
     }
 }
 
+/// Blocks the version scan may LOAD from run files in one call before
+/// it pauses (`ScanProgress::paused`). This is the step bound for a
+/// walk whose length is otherwise proportional to the stored keyspan:
+/// a `(from, to]` window is answered by walking the whole span in key
+/// order and filtering by timestamp, so the records that qualify can
+/// be arbitrarily far apart.
+///
+/// Sized from the pi5 rig: a block is ONE speculative FS read (header,
+/// payload and CRC together, ~190 us on FAT32/NVMe), so two blocks is
+/// ~0.4 ms of I/O — comfortably inside the worker's 1.5 ms drain
+/// budget with the rest of the step's work. Resume is free in the
+/// steady state (the merge is arena-resident and continues in place),
+/// so the budget is not paying a re-positioning tax; when the run set
+/// has changed underneath a paused scan the rebuild costs one indexed
+/// block per run on top.
+pub const SCAN_STEP_BLOCKS: usize = 2;
+
+/// Records the version scan may VISIT (read from any source, whether
+/// or not they qualify) in one call before it pauses. Bounds the
+/// memtable-resident part of a walk, which loads no blocks and would
+/// otherwise escape `SCAN_STEP_BLOCKS`: a full memtable is
+/// `MEMTABLE_MAX_ENTRIES` compares, tens of microseconds.
+pub const SCAN_STEP_RECORDS: u32 = MEMTABLE_MAX_ENTRIES as u32;
+
+/// Bytes of transcoded reply page the hosting engine may park across a
+/// pause (`kv_store::scan_versions_op`). One command reply buffer.
+pub const SCAN_PAGE_MAX: usize = 8192;
+
+/// Resumable range-scan bookkeeping — the position memo behind
+/// [`KvStateStore::scan_at`], the read every SQL scan, RANGE op and
+/// snapshot page goes through.
+///
+/// A page's cursor is an ordinal (visible entries already emitted
+/// since the span start). Without a memo every page re-walks from the
+/// span start and skip-counts to its cursor, so a full read of a span
+/// costs O(n²/page) — hundreds of milliseconds per page on FAT32 once a
+/// few thousand records live in runs. The memo remembers where the
+/// ordinal physically is: the last key consumed, the per-key decision
+/// state at that point, the live merge standing just past it, and the
+/// record that closed the last page (pulled, not emitted). A page then
+/// costs its own records and nothing else.
+///
+/// Same validity rules as [`ScanState`]: the key survives anything,
+/// the live merge only an unchanged run set. Same single-memo contract:
+/// a caller paging two spans alternately re-walks each time, exactly
+/// and slowly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RangeMemo {
+    valid: bool,
+    live: bool,
+    /// The per-key latch as of just after `last_key`: its prefix has
+    /// been decided (emitted, or a tombstone, at this revision).
+    decided: bool,
+    _pad: u8,
+    span_start_len: u16,
+    span_end_len: u16,
+    last_key_len: u16,
+    pending_klen: u16,
+    pending_vlen: u16,
+    _pad2: u16,
+    generation: u32,
+    _pad3: u32,
+    /// The normalized revision the walk answers at.
+    revision: u64,
+    /// Ordinal of the NEXT visible entry to emit.
+    ordinal: u64,
+    span_start: [u8; MAX_ENCODED_KEY],
+    span_end: [u8; MAX_ENCODED_KEY],
+    last_key: [u8; MAX_ENCODED_KEY],
+    pending_key: [u8; MAX_ENCODED_KEY],
+    pending_val: [u8; MAX_VALUE_LEN],
+    merge: Merge,
+}
+
+/// Resumable version-scan bookkeeping — the position memo behind
+/// [`KvStateStore::scan_versions`].
+///
+/// A window is walked in key order and its page cursor is an ORDINAL
+/// (the count of qualifying records already emitted). Without a memo,
+/// every call — every page, and every record within a page when the
+/// caller drains one record at a time — re-walks from the span start
+/// and skip-counts, which is quadratic in the window and, on FAT32,
+/// re-reads every block each time. The memo remembers where ordinal
+/// `ordinal` physically is: the last key visited, and the live merge
+/// standing just past it.
+///
+/// Validity has two levels. The KEY memo (`valid`) survives anything:
+/// a flush, a compaction, interleaved writes — the window's bounds are
+/// frozen and the walk is key-ordered, so "resume just past this key"
+/// is exact regardless of where the records now physically live. The
+/// LIVE merge (`live`) is exact only while the run set it was opened
+/// against is the run set in force (`generation` unchanged); otherwise
+/// it is reopened at the key — one block per run up front, the rest of
+/// the positioning inside the next call's budget.
+///
+/// ONE memo. It is an accelerator, never the guarantee: a request the
+/// memo does not fit walks fresh and skip-counts, which is exact and
+/// slow. Progress across pauses is the HOST's guarantee — it drives a
+/// paused request to its answer before it admits another pausable one
+/// (`kv_state_worker::drain_commands` / `head_is_pausable`). Two paused
+/// windows alternating request by request would restart each other's
+/// walk on every call.
+///
+/// Arena-resident (~90 KB against a ~2.5 MB state) for the same reason
+/// the read memo is: a per-command stack object cannot outlive the
+/// command, and this one has to.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScanState {
+    valid: bool,
+    live: bool,
+    /// A transcoded partial page is parked in `page` (engine-level).
+    page_valid: bool,
+    _pad: u8,
+    span_start_len: u16,
+    span_end_len: u16,
+    last_key_len: u16,
+    page_emitted: u16,
+    /// Manifest generation the live merge was opened against.
+    generation: u32,
+    page_len: u32,
+    /// The parked page is a COMPLETE reply (its cursor in
+    /// `page_next_cursor`), kept so a retry of the same request is
+    /// answered from it without moving the walk.
+    page_complete: bool,
+    _pad2: [u8; 3],
+    /// A record the merge yielded that did not fit the caller's
+    /// output: kept here, yielded first on the next call, so the merge
+    /// stays live across a page boundary instead of being rebuilt.
+    pending_klen: u16,
+    pending_vlen: u16,
+    /// Ordinal of the NEXT record to emit — what a caller resuming
+    /// here passes as its cursor.
+    ordinal: u64,
+    from: u64,
+    hi: u64,
+    /// Ordinal the parked page STARTED at (the request cursor).
+    page_ordinal: u64,
+    page_next_cursor: u64,
+    span_start: [u8; MAX_ENCODED_KEY],
+    span_end: [u8; MAX_ENCODED_KEY],
+    last_key: [u8; MAX_ENCODED_KEY],
+    pending_key: [u8; MAX_ENCODED_KEY],
+    pending_val: [u8; MAX_VALUE_LEN],
+    merge: Merge,
+    page: [u8; SCAN_PAGE_MAX],
+}
+
+impl ScanState {
+    /// Record `key` as the last key the walk consumed — the exact
+    /// resume point for whichever way the next call rebuilds.
+    fn note_visited(&mut self, key: &[u8]) {
+        self.last_key[..key.len()].copy_from_slice(key);
+        self.last_key_len = key.len() as u16;
+    }
+}
+
 /// Multi-step snapshot capture bookkeeping.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1079,6 +1237,8 @@ pub struct DiskState {
     compact: CompactState,
     install: InstallState,
     flush: FlushState,
+    scan: ScanState,
+    range: RangeMemo,
     pub entries: [MemEntry; MEMTABLE_MAX_ENTRIES],
 }
 
@@ -1108,7 +1268,120 @@ impl DiskState {
         self.compact.active = false;
         self.install.active = false;
         self.flush.active = false;
+        self.scan_reset();
+        self.range_reset();
         self.memo_valid = false;
+    }
+
+    /// Forget the range-scan position. The next page walks from the
+    /// span start (skip-counting to its cursor): slow, and exact.
+    pub fn range_reset(&mut self) {
+        self.range.valid = false;
+        self.range.live = false;
+        self.range.pending_klen = 0;
+    }
+
+    // ── Version-scan page memo (engine-level parking) ─────────────
+    //
+    // The engine transcodes store records into its reply page; when
+    // the store pauses mid-page the transcoded prefix has to survive
+    // to the next step, and the engine is stack-allocated per command.
+    // It parks the prefix here, keyed by the request (window + cursor),
+    // and takes it back on the re-drive. A COMPLETE page is parked too:
+    // a caller that lost the reply (a timeout retry under a new
+    // correlation) asks for the same request again, and answering it
+    // from the parked page keeps the walk where it is.
+
+    /// Does the parked page belong to the request at `ordinal` in the
+    /// window `(from, hi]` over the memo's span?
+    fn scan_page_is(&self, span: KeySpan<'_>, from: u64, hi: u64, ordinal: u64) -> bool {
+        let sc = &self.scan;
+        sc.page_valid
+            && sc.page_ordinal == ordinal
+            && sc.from == from
+            && sc.hi == hi
+            && sc.span_start[..sc.span_start_len as usize] == *span.start
+            && sc.span_end[..sc.span_end_len as usize] == *span.end
+    }
+
+    /// Park `page` for the request that started at `ordinal` in the
+    /// memo's window: the transcoded prefix of an unfinished reply
+    /// (`complete = false`), or a finished reply whose cursor is
+    /// `next_cursor`. A page over `SCAN_PAGE_MAX` is not parked.
+    pub fn scan_page_park(
+        &mut self,
+        ordinal: u64,
+        emitted: u16,
+        page: &[u8],
+        complete: bool,
+        next_cursor: u64,
+    ) {
+        if page.len() > SCAN_PAGE_MAX {
+            self.scan.page_valid = false;
+            return;
+        }
+        self.scan.page[..page.len()].copy_from_slice(page);
+        self.scan.page_len = page.len() as u32;
+        self.scan.page_emitted = emitted;
+        self.scan.page_ordinal = ordinal;
+        self.scan.page_complete = complete;
+        self.scan.page_next_cursor = next_cursor;
+        self.scan.page_valid = true;
+    }
+
+    /// Take back the parked page for the request `(span, from, hi,
+    /// ordinal)`: `(emitted, bytes, complete, next_cursor)` copied into
+    /// `out`, or `None` when nothing matching is parked. An unfinished
+    /// page is taken exactly once; a complete one stays parked, so
+    /// retries answer alike for as long as the park survives — until
+    /// the memo is displaced or the store's high water moves past the
+    /// pinned ceiling, after which a retry re-walks a fresh window.
+    pub fn scan_page_take(
+        &mut self,
+        span: KeySpan<'_>,
+        from: u64,
+        hi: u64,
+        ordinal: u64,
+        out: &mut [u8],
+    ) -> Option<(u16, usize, bool, u64)> {
+        if !self.scan_page_is(span, from, hi, ordinal) || self.scan.page_len as usize > out.len() {
+            return None;
+        }
+        let sc = &mut self.scan;
+        let n = sc.page_len as usize;
+        out[..n].copy_from_slice(&sc.page[..n]);
+        if !sc.page_complete {
+            sc.page_valid = false;
+        }
+        Some((sc.page_emitted, n, sc.page_complete, sc.page_next_cursor))
+    }
+
+    /// Forget the version-scan position. The next request walks from
+    /// the span start (skip-counting to its cursor): slow, and exact.
+    pub fn scan_reset(&mut self) {
+        self.scan.valid = false;
+        self.scan.live = false;
+        self.scan.page_valid = false;
+        self.scan.pending_klen = 0;
+    }
+
+    /// The ceiling pinned for the window `(from, ..]` over `span` that
+    /// is currently open, if one is. While the scan memo holds the
+    /// window — a paused walk being re-driven, or its next page — a
+    /// caller that asked for "up to now" without naming the ceiling it
+    /// was told gets the SAME window each time: "now" moves with every
+    /// write that lands while the window is open, and a window
+    /// re-pinned to it would count its ordinals against a different
+    /// set of records on every call. The pin lives exactly as long as
+    /// the memo: once the walk completes (or another span displaces
+    /// it), a fresh unversioned request re-resolves "now".
+    pub fn scan_window_ceiling(&self, span: KeySpan<'_>, from: u64) -> Option<u64> {
+        let sc = &self.scan;
+        (sc.valid
+            && sc.from == from
+            && sc.span_start[..sc.span_start_len as usize] == *span.start
+            && sc.span_end[..sc.span_end_len as usize] == *span.end)
+            .then_some(sc.hi)
     }
 
     /// Serve a latest-view read of `key` from the single-command memo,
@@ -1180,6 +1453,16 @@ impl DiskState {
 
     fn add_blocks(&self, n: u64) {
         self.blocks_read.set(self.blocks_read.get().wrapping_add(n));
+    }
+
+    /// The memtable as a merge source (see [`MemView`]).
+    fn mem_view(&self) -> MemView<'_> {
+        MemView {
+            count: self.mem_count as usize,
+            order: &self.order,
+            entries: &self.entries,
+            blocks_read: &self.blocks_read,
+        }
     }
 
     /// The slot the next publish writes into: never the active one.
@@ -1316,7 +1599,9 @@ impl DiskState {
 // ── Run-file sequential reader ────────────────────────────────────────
 
 /// Cursor over one run file's records, loading and CRC-checking one
-/// block at a time. Lives on the caller's stack (~4.7 KB each).
+/// block at a time. Lives on the caller's stack (~4.7 KB each), or in
+/// the arena as part of the resumable version scan's merge.
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct RunScan {
     blocks_loaded: u32,
@@ -1336,7 +1621,8 @@ struct RunScan {
     key_len: usize,
     val_off: usize,
     val_len: usize,
-    buf: [u8; BLOCK_MAX_PAYLOAD],
+    /// One whole block as read from the file: header, payload, CRC.
+    buf: [u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
 }
 
 impl RunScan {
@@ -1356,7 +1642,7 @@ impl RunScan {
             key_len: 0,
             val_off: 0,
             val_len: 0,
-            buf: [0u8; BLOCK_MAX_PAYLOAD],
+            buf: [0u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
         }
     }
 
@@ -1461,44 +1747,45 @@ impl RunScan {
                 self.has_cur = false;
                 return Ok(false);
             }
-            let mut hdr = [0u8; 8];
+            // ONE read per block: header, payload and CRC together.
+            // The payload length is not known until the header is
+            // parsed, so the read is speculative — the largest block
+            // there can be, clamped to the file — and the surplus is
+            // ignored. Every storage read is a full FS call (~190 us on
+            // FAT32/NVMe, rig-measured); separate header/payload/CRC
+            // reads would triple the dominant cost of every run-backed
+            // lookup, so the block travels in one.
+            let remaining =
+                (self.data_end + RUN_FOOTER_LEN as u64).saturating_sub(self.next_block_off);
+            let want = (BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD).min(remaining as usize);
+            if want < BLOCK_OVERHEAD {
+                return Err(StoreError::StorageFault);
+            }
             read_exact(
                 storage,
                 FileKind::Run,
                 self.run_id,
                 self.next_block_off,
-                &mut hdr,
+                &mut self.buf[..want],
             )?;
             self.blocks_loaded = self.blocks_loaded.saturating_add(1);
-            let payload_len = rd_u32(&hdr, 0) as usize;
-            let rec_count = rd_u32(&hdr, 4);
+            let payload_len = rd_u32(&self.buf, 0) as usize;
+            let rec_count = rd_u32(&self.buf, 4);
             if payload_len == 0 || payload_len > BLOCK_MAX_PAYLOAD || rec_count == 0 {
                 return Err(StoreError::StorageFault);
             }
             let block_end = self.next_block_off + (BLOCK_OVERHEAD + payload_len) as u64;
-            if block_end > self.data_end {
+            if block_end > self.data_end || BLOCK_OVERHEAD + payload_len > want {
                 return Err(StoreError::StorageFault);
             }
-            read_exact(
-                storage,
-                FileKind::Run,
-                self.run_id,
-                self.next_block_off + 8,
-                &mut self.buf[..payload_len],
-            )?;
-            let mut crc_b = [0u8; 4];
-            read_exact(
-                storage,
-                FileKind::Run,
-                self.run_id,
-                self.next_block_off + 8 + payload_len as u64,
-                &mut crc_b,
-            )?;
-            if crc32(&self.buf[..payload_len]) != rd_u32(&crc_b, 0) {
+            let payload = 8..8 + payload_len;
+            if crc32(&self.buf[payload.clone()]) != rd_u32(&self.buf, payload.end) {
                 return Err(StoreError::StorageFault);
             }
-            self.payload_len = payload_len;
-            self.pos = 0;
+            // `pos`/`payload_len` index into `buf`, whose first 8 bytes
+            // are the block header.
+            self.payload_len = payload.end;
+            self.pos = payload.start;
             self.cur_block_off = self.next_block_off;
             self.cur_rec_idx = u32::MAX;
             self.next_block_off = block_end;
@@ -1554,6 +1841,54 @@ fn read_exact<S: RunStorage>(
 /// records in ascending encoded-key order with duplicates deduped
 /// (memtable shadows runs; a newer run shadows an older run). Lives on
 /// the caller's stack (~75 KB: MAX_RUNS block buffers).
+/// The memtable as a merge source: the three fields a walk reads, and
+/// the block counter it reports into. Borrowed field-by-field so a
+/// `Merge` that lives INSIDE `DiskState` (the resumable version scan)
+/// can advance while the memtable is read — disjoint borrows of one
+/// struct, no copy of the 76 KB merge in and out per step.
+struct MemView<'a> {
+    count: usize,
+    order: &'a [u16; MEMTABLE_MAX_ENTRIES],
+    entries: &'a [MemEntry; MEMTABLE_MAX_ENTRIES],
+    blocks_read: &'a Cell<u64>,
+}
+
+impl MemView<'_> {
+    fn key(&self, pos: usize) -> &[u8] {
+        let e = &self.entries[self.order[pos] as usize];
+        &e.key[..e.key_len as usize]
+    }
+
+    fn value(&self, pos: usize) -> &[u8] {
+        let e = &self.entries[self.order[pos] as usize];
+        &e.value[..e.value_len as usize]
+    }
+
+    /// First position whose key is `>= key` (`count` when none).
+    fn lower_bound(&self, key: &[u8]) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.key(mid) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    fn add_blocks(&self, n: u64) {
+        self.blocks_read.set(self.blocks_read.get().wrapping_add(n));
+    }
+}
+
+/// `#[repr(C)]` + `Copy` because one instance is arena-resident: the
+/// version scan keeps its merge in `DiskState::scan` across steps, and
+/// the zeroed arena must be a valid (idle) value.
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct Merge {
     include_mem: bool,
     mem_pos: usize,
@@ -1563,9 +1898,10 @@ struct Merge {
 
 impl Merge {
     /// Position every source at its first record with key
-    /// `>= start_bound` (runs have no index blocks in v1 — deliberate
-    /// simplification over §9.2's "should" — so this is a sequential
-    /// skip).
+    /// `>= start_bound`. Each run is opened at the block its sparse
+    /// index names for the bound and advanced from there, so the
+    /// positioning cost is O(blocks that hold the bound), not O(blocks
+    /// before it).
     fn init<S: RunStorage>(
         state: &DiskState,
         storage: &S,
@@ -1621,17 +1957,51 @@ impl Merge {
                 }
             }
             state.bump_opened();
-            *rs = match point_key {
-                // Binary-search the sparse index and start at the right
-                // block instead of walking from the head of the run.
-                Some(key) => RunScan::open_at(&state.runs[i], idx_seek(&state.run_index[i], key)),
-                None => RunScan::open(&state.runs[i]),
-            };
+            // Binary-search the sparse index and start at the right
+            // block instead of walking from the head of the run. Legal
+            // for a lower bound as much as for a point key: `idx_seek`
+            // answers "the block a scan for this key may safely START
+            // at", which is exactly the range-scan question. (The Bloom
+            // pre-check above is the one point-only optimisation.)
+            *rs = RunScan::open_at(&state.runs[i], idx_seek(&state.run_index[i], start_bound));
             while rs.next(storage)? {
                 if rs.cur_key() >= start_bound {
                     break;
                 }
             }
+            state.add_blocks(rs.take_blocks());
+        }
+        Ok(m)
+    }
+
+    /// Open every source for a walk that will START at `bound` — but
+    /// do not position: each run is opened at the block its sparse
+    /// index names for `bound` (one block loaded, the first record of
+    /// that block as its head), the memtable at its lower bound. The
+    /// caller skips keys below `bound` as it walks, so the positioning
+    /// cost — up to one index stride of blocks per run — is paid inside
+    /// the caller's step budget rather than up front. `include_runs =
+    /// false` walks the memtable alone.
+    fn open_lazy<S: RunStorage>(
+        state: &DiskState,
+        storage: &S,
+        include_runs: bool,
+        bound: &[u8],
+    ) -> Result<Self, StoreError> {
+        let mut m = Self {
+            include_mem: true,
+            mem_pos: state.mem_lower_bound(bound),
+            run_count: if include_runs {
+                state.run_count as usize
+            } else {
+                0
+            },
+            runs: [RunScan::idle(); MAX_RUNS],
+        };
+        for (i, rs) in m.runs.iter_mut().take(m.run_count).enumerate() {
+            state.bump_opened();
+            *rs = RunScan::open_at(&state.runs[i], idx_seek(&state.run_index[i], bound));
+            rs.next(storage)?;
             state.add_blocks(rs.take_blocks());
         }
         Ok(m)
@@ -1672,7 +2042,7 @@ impl Merge {
     /// exhausted.
     fn next<S: RunStorage>(
         &mut self,
-        state: &DiskState,
+        mem: &MemView<'_>,
         storage: &S,
         key_out: &mut [u8],
         val_out: &mut [u8],
@@ -1683,8 +2053,8 @@ impl Merge {
         let klen;
         {
             let mut best: Option<&[u8]> = None;
-            if self.include_mem && self.mem_pos < state.mem_count as usize {
-                best = Some(state.mem_key(self.mem_pos));
+            if self.include_mem && self.mem_pos < mem.count {
+                best = Some(mem.key(self.mem_pos));
                 winner = Some(0);
             }
             for (i, rs) in self.runs.iter().take(self.run_count).enumerate() {
@@ -1709,7 +2079,7 @@ impl Merge {
         // Phase 2: copy the winner's value.
         let win = winner.unwrap_or(0);
         let vlen = if win == 0 {
-            let v = state.mem_value(self.mem_pos);
+            let v = mem.value(self.mem_pos);
             val_out[..v.len()].copy_from_slice(v);
             v.len()
         } else {
@@ -1719,16 +2089,14 @@ impl Merge {
         };
         // Phase 3: advance every source whose head equals the winner
         // key (dedupe — the highest-priority copy was emitted).
-        if self.include_mem
-            && self.mem_pos < state.mem_count as usize
-            && state.mem_key(self.mem_pos) == &key_out[..klen]
+        if self.include_mem && self.mem_pos < mem.count && mem.key(self.mem_pos) == &key_out[..klen]
         {
             self.mem_pos += 1;
         }
         for rs in self.runs.iter_mut().take(self.run_count) {
             if rs.has_cur && rs.cur_key() == &key_out[..klen] {
                 rs.next(storage)?;
-                state.add_blocks(rs.take_blocks());
+                mem.add_blocks(rs.take_blocks());
             }
         }
         Ok(Some((klen, vlen)))
@@ -2570,7 +2938,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut m = Merge::init(self.state, &*self.storage, false, b"")?;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
-        while let Some((klen, _)) = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)? {
+        while let Some((klen, _)) =
+            m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
+        {
             highest = highest.max(key_timestamp(&kbuf[..klen]));
         }
         self.state.highest_revision = highest;
@@ -2811,6 +3181,439 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     }
 }
 
+impl<S: RunStorage> DiskStore<'_, S> {
+    /// The budgeted body of [`KvStateStore::scan_versions`], once the
+    /// window has been checked. Every return leaves `state.scan` exact
+    /// for its ordinal; an `Err` may not (the caller resets it).
+    fn scan_versions_walk(
+        &mut self,
+        span: KeySpan<'_>,
+        from_revision: Revision,
+        hi: u64,
+        resume_cursor: u64,
+        limit: usize,
+        out: &mut [u8],
+    ) -> Result<ScanProgress, StoreError> {
+        // Every block this call loads counts, positioning included.
+        let blocks0 = self.state.blocks_read.get();
+        // No run holds a version above the durable high-water mark, so
+        // a window that starts at or above it is answered from the
+        // memtable alone — zero run I/O for a feed that is caught up
+        // with everything flushed.
+        let include_runs = from_revision < self.state.durable_highest_revision;
+
+        // ── Position: resume from the memo, or start a fresh walk ──
+        let sc = &self.state.scan;
+        let memo_hit = sc.valid
+            && sc.from == from_revision
+            && sc.hi == hi
+            && sc.ordinal <= resume_cursor
+            && sc.span_start[..sc.span_start_len as usize] == *span.start
+            && sc.span_end[..sc.span_end_len as usize] == *span.end;
+        // Qualifying records still to skip before emitting: the whole
+        // cursor on a fresh walk, the gap between the memo's position
+        // and the cursor on a hit (zero in the steady state).
+        let mut to_skip;
+        // Keys at or below the resume key are behind the walk. On a
+        // fresh walk the bound is the span start (exclusive: it is the
+        // first key wanted); on a hit it is the last key consumed
+        // (inclusive: it has been consumed).
+        let bound_inclusive;
+        let mut boundbuf = [0u8; MAX_ENCODED_KEY];
+        let bound_len;
+        if memo_hit {
+            to_skip = resume_cursor - sc.ordinal;
+            if sc.pending_klen > 0 {
+                // The walk stands past the stashed record, which is
+                // yielded from the stash below; the sources resume
+                // after it, not after the last key emitted.
+                bound_len = sc.pending_klen as usize;
+                boundbuf[..bound_len].copy_from_slice(&sc.pending_key[..bound_len]);
+                bound_inclusive = true;
+            } else if sc.last_key_len > 0 {
+                bound_len = sc.last_key_len as usize;
+                boundbuf[..bound_len].copy_from_slice(&sc.last_key[..bound_len]);
+                bound_inclusive = true;
+            } else {
+                bound_len = span.start.len();
+                boundbuf[..bound_len].copy_from_slice(span.start);
+                bound_inclusive = false;
+            }
+            if !(sc.live && sc.generation == self.state.generation) {
+                // The run set changed under the memo (a flush published,
+                // a compaction adopted). The key is still exact; reopen
+                // at it — one block per run now, the rest of the
+                // positioning inside this call's budget.
+                let m = Merge::open_lazy(
+                    self.state,
+                    &*self.storage,
+                    include_runs,
+                    &boundbuf[..bound_len],
+                )?;
+                let sc = &mut self.state.scan;
+                sc.merge = m;
+                sc.live = true;
+                sc.generation = self.state.generation;
+            }
+        } else {
+            bound_len = span.start.len();
+            boundbuf[..bound_len].copy_from_slice(span.start);
+            bound_inclusive = false;
+            let m = Merge::open_lazy(self.state, &*self.storage, include_runs, span.start)?;
+            let sc = &mut self.state.scan;
+            sc.merge = m;
+            sc.valid = true;
+            sc.live = true;
+            sc.page_valid = false;
+            sc.pending_klen = 0;
+            sc.generation = self.state.generation;
+            sc.from = from_revision;
+            sc.hi = hi;
+            sc.ordinal = 0;
+            sc.last_key_len = 0;
+            sc.span_start_len = span.start.len() as u16;
+            sc.span_start[..span.start.len()].copy_from_slice(span.start);
+            sc.span_end_len = span.end.len() as u16;
+            sc.span_end[..span.end.len()].copy_from_slice(span.end);
+            to_skip = resume_cursor;
+        }
+        let bound = &boundbuf[..bound_len];
+
+        // ── Walk, bounded ─────────────────────────────────────────
+        // Disjoint borrows of the arena: the merge advances in place
+        // while the memtable is read through `MemView`.
+        let DiskState {
+            scan,
+            order,
+            entries,
+            mem_count,
+            blocks_read,
+            ..
+        } = &mut *self.state;
+        let mem = MemView {
+            count: *mem_count as usize,
+            order,
+            entries,
+            blocks_read,
+        };
+        // The memtable position is re-derived on every call: entries
+        // admitted or released since the merge was built have shifted
+        // it, and the key memo — not the index — is what is exact.
+        scan.merge.mem_pos = mem.lower_bound(bound);
+        let mut kbuf = [0u8; MAX_ENCODED_KEY];
+        let mut vbuf = [0u8; MAX_VALUE_LEN];
+        let mut visited = 0u32;
+        let mut emitted = 0usize;
+        let mut pos = 0usize;
+        // `ordinal` tracks the merge position in qualifying records; it
+        // equals `resume_cursor + emitted` once the skip is spent.
+        let mut ordinal = resume_cursor - to_skip;
+        let in_progress = |scan: &mut ScanState, ordinal, emitted: usize, pos, paused| {
+            scan.ordinal = ordinal;
+            Ok(ScanProgress {
+                entries: emitted,
+                bytes: pos,
+                progress: Progress::InProgress {
+                    cursor: resume_cursor + emitted as u64,
+                },
+                paused,
+            })
+        };
+        loop {
+            // A record stashed by the previous call (it did not fit
+            // that page) comes first; otherwise the merge's next.
+            let (klen, vlen) = if scan.pending_klen > 0 {
+                let (kl, vl) = (scan.pending_klen as usize, scan.pending_vlen as usize);
+                kbuf[..kl].copy_from_slice(&scan.pending_key[..kl]);
+                vbuf[..vl].copy_from_slice(&scan.pending_val[..vl]);
+                scan.pending_klen = 0;
+                (kl, vl)
+            } else {
+                // Budget check FIRST for every record after the first:
+                // a call always makes progress, but never starts a
+                // block it has no budget for. Pausing leaves the merge
+                // standing just past the last key consumed, so the next
+                // call continues in place.
+                if visited > 0
+                    && (mem.blocks_read.get().wrapping_sub(blocks0) >= SCAN_STEP_BLOCKS as u64
+                        || visited >= SCAN_STEP_RECORDS)
+                {
+                    return in_progress(scan, ordinal, emitted, pos, true);
+                }
+                let Some(next) = scan
+                    .merge
+                    .next(&mem, &*self.storage, &mut kbuf, &mut vbuf)?
+                else {
+                    scan.valid = false;
+                    return Ok(ScanProgress::done(emitted, pos));
+                };
+                if next.0 < MIN_ENCODED_KEY {
+                    return Err(StoreError::StorageFault);
+                }
+                // Behind the walk: the lazily opened sources' lead-in,
+                // or the resume key itself. Costs its block, so it is
+                // a visit for the budget; it moves no memo.
+                let k = &kbuf[..next.0];
+                if *k < *bound || (bound_inclusive && *k == *bound) {
+                    visited += 1;
+                    continue;
+                }
+                next
+            };
+            if !span.end.is_empty() && kbuf[..klen] >= *span.end {
+                scan.valid = false;
+                return Ok(ScanProgress::done(emitted, pos));
+            }
+            visited += 1;
+            // No per-key `decided` latch and no tombstone filter — that
+            // is the entire difference from `scan_at`. Every version in
+            // the window is an event that happened, including deletes,
+            // and including several versions of the same key.
+            let ts = key_timestamp(&kbuf[..klen]);
+            if ts <= from_revision || ts > hi {
+                scan.note_visited(&kbuf[..klen]);
+                continue;
+            }
+            if to_skip > 0 {
+                to_skip -= 1;
+                ordinal += 1;
+                scan.note_visited(&kbuf[..klen]);
+                continue; // already emitted in an earlier step
+            }
+            let need = RECORD_FIXED + klen + vlen;
+            if pos + need > out.len() {
+                // Pulled, not emitted: stash it for the next call. The
+                // merge stays live, the memo stays at the previous key
+                // and ordinal, and nothing is rebuilt at the page edge.
+                scan.pending_klen = klen as u16;
+                scan.pending_vlen = vlen as u16;
+                scan.pending_key[..klen].copy_from_slice(&kbuf[..klen]);
+                scan.pending_val[..vlen].copy_from_slice(&vbuf[..vlen]);
+                if pos == 0 {
+                    scan.ordinal = ordinal;
+                    return Err(StoreError::OutputTooSmall);
+                }
+                return in_progress(scan, ordinal, emitted, pos, false);
+            }
+            out[pos..pos + 2].copy_from_slice(&(klen as u16).to_le_bytes());
+            out[pos + 2..pos + 6].copy_from_slice(&(vlen as u32).to_le_bytes());
+            out[pos + 6..pos + 6 + klen].copy_from_slice(&kbuf[..klen]);
+            out[pos + 6 + klen..pos + need].copy_from_slice(&vbuf[..vlen]);
+            pos += need;
+            emitted += 1;
+            ordinal += 1;
+            scan.note_visited(&kbuf[..klen]);
+            if emitted >= limit {
+                // Exactly the caller's page, and not a record more: the
+                // merge stands just past the last emitted record, so the
+                // memo names the ordinal the caller will ask for next
+                // and the next page continues in place.
+                return in_progress(scan, ordinal, emitted, pos, false);
+            }
+        }
+    }
+}
+
+impl<S: RunStorage> DiskStore<'_, S> {
+    /// The body of [`KvStateStore::scan_at`] once the floor has been
+    /// checked. Every `Ok` return leaves `state.range` exact for its
+    /// ordinal; an `Err` may not (the caller resets it).
+    fn scan_at_walk(
+        &mut self,
+        span: KeySpan<'_>,
+        revn: u64,
+        resume_cursor: u64,
+        limit: usize,
+        out: &mut [u8],
+    ) -> Result<ScanProgress, StoreError> {
+        // ── Position: resume from the memo, or start a fresh walk ──
+        let rm = &self.state.range;
+        let memo_hit = rm.valid
+            && rm.revision == revn
+            && rm.ordinal <= resume_cursor
+            && rm.span_start[..rm.span_start_len as usize] == *span.start
+            && rm.span_end[..rm.span_end_len as usize] == *span.end;
+        let mut to_skip;
+        let bound_inclusive;
+        let mut boundbuf = [0u8; MAX_ENCODED_KEY];
+        let bound_len;
+        // Per-key decision state, restored from the memo on a hit.
+        let mut prefix = [0u8; MAX_ENCODED_KEY];
+        let mut prefix_len = 0usize;
+        let mut decided = false;
+        if memo_hit {
+            to_skip = resume_cursor - rm.ordinal;
+            if rm.pending_klen > 0 {
+                bound_len = rm.pending_klen as usize;
+                boundbuf[..bound_len].copy_from_slice(&rm.pending_key[..bound_len]);
+                bound_inclusive = true;
+            } else if rm.last_key_len > 0 {
+                bound_len = rm.last_key_len as usize;
+                boundbuf[..bound_len].copy_from_slice(&rm.last_key[..bound_len]);
+                bound_inclusive = true;
+            } else {
+                bound_len = span.start.len();
+                boundbuf[..bound_len].copy_from_slice(span.start);
+                bound_inclusive = false;
+            }
+            if rm.last_key_len as usize >= MIN_ENCODED_KEY {
+                prefix_len = rm.last_key_len as usize - VERSION_SUFFIX_LEN;
+                prefix[..prefix_len].copy_from_slice(&rm.last_key[..prefix_len]);
+                decided = rm.decided;
+            }
+            if !(rm.live && rm.generation == self.state.generation) {
+                let m = Merge::open_lazy(self.state, &*self.storage, true, &boundbuf[..bound_len])?;
+                let rm = &mut self.state.range;
+                rm.merge = m;
+                rm.live = true;
+                rm.generation = self.state.generation;
+            }
+        } else {
+            bound_len = span.start.len();
+            boundbuf[..bound_len].copy_from_slice(span.start);
+            bound_inclusive = false;
+            let m = Merge::open_lazy(self.state, &*self.storage, true, span.start)?;
+            let rm = &mut self.state.range;
+            rm.merge = m;
+            rm.valid = true;
+            rm.live = true;
+            rm.pending_klen = 0;
+            rm.decided = false;
+            rm.generation = self.state.generation;
+            rm.revision = revn;
+            rm.ordinal = 0;
+            rm.last_key_len = 0;
+            rm.span_start_len = span.start.len() as u16;
+            rm.span_start[..span.start.len()].copy_from_slice(span.start);
+            rm.span_end_len = span.end.len() as u16;
+            rm.span_end[..span.end.len()].copy_from_slice(span.end);
+            to_skip = resume_cursor;
+        }
+        let bound = &boundbuf[..bound_len];
+
+        // ── Walk ─────────────────────────────────────────────────
+        let DiskState {
+            range: rm,
+            order,
+            entries,
+            mem_count,
+            blocks_read,
+            ..
+        } = &mut *self.state;
+        let mem = MemView {
+            count: *mem_count as usize,
+            order,
+            entries,
+            blocks_read,
+        };
+        rm.merge.mem_pos = mem.lower_bound(bound);
+        let mut kbuf = [0u8; MAX_ENCODED_KEY];
+        let mut vbuf = [0u8; MAX_VALUE_LEN];
+        let mut emitted = 0usize;
+        let mut pos = 0usize;
+        let mut ordinal = resume_cursor - to_skip;
+        loop {
+            let (klen, vlen) = if rm.pending_klen > 0 {
+                let (kl, vl) = (rm.pending_klen as usize, rm.pending_vlen as usize);
+                kbuf[..kl].copy_from_slice(&rm.pending_key[..kl]);
+                vbuf[..vl].copy_from_slice(&rm.pending_val[..vl]);
+                rm.pending_klen = 0;
+                (kl, vl)
+            } else {
+                let Some(next) = rm.merge.next(&mem, &*self.storage, &mut kbuf, &mut vbuf)? else {
+                    rm.valid = false;
+                    return Ok(ScanProgress::done(emitted, pos));
+                };
+                if next.0 < MIN_ENCODED_KEY {
+                    return Err(StoreError::StorageFault);
+                }
+                let k = &kbuf[..next.0];
+                if *k < *bound || (bound_inclusive && *k == *bound) {
+                    continue; // the lazily opened sources' lead-in
+                }
+                next
+            };
+            if !span.end.is_empty() && kbuf[..klen] >= *span.end {
+                rm.valid = false;
+                return Ok(ScanProgress::done(emitted, pos));
+            }
+            // The decision state as of BEFORE this record — what the
+            // memo must hold if this record ends up stashed unprocessed.
+            let decided_before = decided;
+            let plen = klen - VERSION_SUFFIX_LEN;
+            if plen != prefix_len || kbuf[..plen] != prefix[..prefix_len] {
+                prefix[..plen].copy_from_slice(&kbuf[..plen]);
+                prefix_len = plen;
+                decided = false;
+            }
+            let mut emit = true;
+            if decided {
+                emit = false; // an older version of an already-decided key
+            } else if key_timestamp(&kbuf[..klen]) > revn {
+                emit = false; // not yet visible at this revision
+            } else {
+                decided = true;
+                if key_kind_byte(&kbuf[..klen]) == ValueKind::PointTombstone as u8 {
+                    emit = false; // deleted at this revision
+                } else if to_skip > 0 {
+                    to_skip -= 1;
+                    ordinal += 1;
+                    emit = false; // already emitted in an earlier step
+                }
+            }
+            if emit {
+                let need = RECORD_FIXED + klen + vlen;
+                if pos + need > out.len() {
+                    // Pulled, not emitted: stash it, unprocessed, for
+                    // the next page. The merge stays live and the memo
+                    // stays at the previous record's state.
+                    rm.pending_klen = klen as u16;
+                    rm.pending_vlen = vlen as u16;
+                    rm.pending_key[..klen].copy_from_slice(&kbuf[..klen]);
+                    rm.pending_val[..vlen].copy_from_slice(&vbuf[..vlen]);
+                    rm.decided = decided_before;
+                    rm.ordinal = ordinal;
+                    if pos == 0 {
+                        return Err(StoreError::OutputTooSmall);
+                    }
+                    return Ok(ScanProgress {
+                        entries: emitted,
+                        bytes: pos,
+                        progress: Progress::InProgress {
+                            cursor: resume_cursor + emitted as u64,
+                        },
+                        paused: false,
+                    });
+                }
+                out[pos..pos + 2].copy_from_slice(&(klen as u16).to_le_bytes());
+                out[pos + 2..pos + 6].copy_from_slice(&(vlen as u32).to_le_bytes());
+                out[pos + 6..pos + 6 + klen].copy_from_slice(&kbuf[..klen]);
+                out[pos + 6 + klen..pos + need].copy_from_slice(&vbuf[..vlen]);
+                pos += need;
+                emitted += 1;
+                ordinal += 1;
+            }
+            rm.last_key[..klen].copy_from_slice(&kbuf[..klen]);
+            rm.last_key_len = klen as u16;
+            rm.decided = decided;
+            rm.ordinal = ordinal;
+            if emitted >= limit {
+                // Exactly the caller's page: the memo names the ordinal
+                // the caller asks for next, so the next page continues
+                // in place instead of re-walking to a cursor it ran past.
+                return Ok(ScanProgress {
+                    entries: emitted,
+                    bytes: pos,
+                    progress: Progress::InProgress {
+                        cursor: resume_cursor + emitted as u64,
+                    },
+                    paused: false,
+                });
+            }
+        }
+    }
+}
+
 // ── KvStateStore implementation ───────────────────────────────────────
 
 impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
@@ -2838,7 +3641,8 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         loop {
-            let Some((klen, vlen)) = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?
+            let Some((klen, vlen)) =
+                m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
             else {
                 return Err(StoreError::NotFound);
             };
@@ -2871,96 +3675,44 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
     /// the timestamp). The resume cursor is the count of entries
     /// already emitted since `span.start` — an opaque ordinal that
     /// stays logically stable across flush and floor-respecting
-    /// compaction because neither changes visible content. Resume
-    /// re-walks the merge and skips that many visible entries (bounded
-    /// by the provider's fixed capacities).
+    /// compaction because neither changes visible content. The page
+    /// after the last one answered continues from the position memo
+    /// ([`RangeMemo`]); any other cursor re-walks the merge and skips
+    /// that many visible entries (bounded by the provider's fixed
+    /// capacities).
     fn scan_at(
-        &self,
+        &mut self,
         span: KeySpan<'_>,
         revision: Revision,
         resume_cursor: u64,
+        limit: usize,
         out: &mut [u8],
     ) -> Result<ScanProgress, StoreError> {
         if revision != 0 && revision < self.state.compaction_floor {
             return Err(StoreError::Compacted);
         }
-        let revn = normalize_revision(revision);
-        let mut m = Merge::init(self.state, &*self.storage, true, span.start)?;
-        let mut kbuf = [0u8; MAX_ENCODED_KEY];
-        let mut vbuf = [0u8; MAX_VALUE_LEN];
-        let mut prefix = [0u8; MAX_ENCODED_KEY];
-        let mut prefix_len = 0usize;
-        let mut decided = false;
-        let mut skipped = 0u64;
-        let mut emitted = 0usize;
-        let mut pos = 0usize;
-        loop {
-            let Some((klen, vlen)) = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?
-            else {
-                return Ok(ScanProgress {
-                    entries: emitted,
-                    bytes: pos,
-                    progress: Progress::Done,
-                });
-            };
-            if !span.end.is_empty() && kbuf[..klen] >= *span.end {
-                return Ok(ScanProgress {
-                    entries: emitted,
-                    bytes: pos,
-                    progress: Progress::Done,
-                });
-            }
-            if klen < MIN_ENCODED_KEY {
-                return Err(StoreError::StorageFault);
-            }
-            let plen = klen - VERSION_SUFFIX_LEN;
-            if plen != prefix_len || kbuf[..plen] != prefix[..prefix_len] {
-                prefix[..plen].copy_from_slice(&kbuf[..plen]);
-                prefix_len = plen;
-                decided = false;
-            }
-            if decided {
-                continue; // an older version of an already-decided key
-            }
-            if key_timestamp(&kbuf[..klen]) > revn {
-                continue; // not yet visible at this revision
-            }
-            decided = true;
-            if key_kind_byte(&kbuf[..klen]) == ValueKind::PointTombstone as u8 {
-                continue; // deleted at this revision
-            }
-            if skipped < resume_cursor {
-                skipped += 1;
-                continue; // already emitted in an earlier step
-            }
-            let need = RECORD_FIXED + klen + vlen;
-            if pos + need > out.len() {
-                if pos == 0 {
-                    return Err(StoreError::OutputTooSmall);
-                }
-                return Ok(ScanProgress {
-                    entries: emitted,
-                    bytes: pos,
-                    progress: Progress::InProgress {
-                        cursor: resume_cursor + emitted as u64,
-                    },
-                });
-            }
-            out[pos..pos + 2].copy_from_slice(&(klen as u16).to_le_bytes());
-            out[pos + 2..pos + 6].copy_from_slice(&(vlen as u32).to_le_bytes());
-            out[pos + 6..pos + 6 + klen].copy_from_slice(&kbuf[..klen]);
-            out[pos + 6 + klen..pos + need].copy_from_slice(&vbuf[..vlen]);
-            pos += need;
-            emitted += 1;
+        let r = self.scan_at_walk(
+            span,
+            normalize_revision(revision),
+            resume_cursor,
+            limit,
+            out,
+        );
+        if matches!(r, Err(e) if e != StoreError::OutputTooSmall) {
+            // Records were consumed and the ordinal not published:
+            // forget the position rather than resume it wrongly.
+            self.state.range_reset();
         }
+        r
     }
 
     fn scan_versions(
-        &self,
+        &mut self,
         span: KeySpan<'_>,
         from_revision: Revision,
         to_revision: Revision,
         resume_cursor: u64,
+        limit: usize,
         out: &mut [u8],
     ) -> Result<ScanProgress, StoreError> {
         // The window's LOWER bound is what the floor has to clear.
@@ -2975,69 +3727,27 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             // Empty or inverted window: nothing happened in it. This is
             // a legitimate answer (a watcher that reconnects instantly
             // has missed nothing), not an error.
-            return Ok(ScanProgress {
-                entries: 0,
-                bytes: 0,
-                progress: Progress::Done,
-            });
+            return Ok(ScanProgress::done(0, 0));
         }
-        let mut m = Merge::init(self.state, &*self.storage, true, span.start)?;
-        let mut kbuf = [0u8; MAX_ENCODED_KEY];
-        let mut vbuf = [0u8; MAX_VALUE_LEN];
-        let mut skipped = 0u64;
-        let mut emitted = 0usize;
-        let mut pos = 0usize;
-        loop {
-            let Some((klen, vlen)) = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?
-            else {
-                return Ok(ScanProgress {
-                    entries: emitted,
-                    bytes: pos,
-                    progress: Progress::Done,
-                });
-            };
-            if !span.end.is_empty() && kbuf[..klen] >= *span.end {
-                return Ok(ScanProgress {
-                    entries: emitted,
-                    bytes: pos,
-                    progress: Progress::Done,
-                });
-            }
-            if klen < MIN_ENCODED_KEY {
-                return Err(StoreError::StorageFault);
-            }
-            // No per-key `decided` latch and no tombstone filter — that
-            // is the entire difference from `scan_at`. Every version in
-            // the window is an event that happened, including deletes,
-            // and including several versions of the same key.
-            let ts = key_timestamp(&kbuf[..klen]);
-            if ts <= from_revision || ts > hi {
-                continue;
-            }
-            if skipped < resume_cursor {
-                skipped += 1;
-                continue; // already emitted in an earlier step
-            }
-            let need = RECORD_FIXED + klen + vlen;
-            if pos + need > out.len() {
-                if pos == 0 {
-                    return Err(StoreError::OutputTooSmall);
-                }
-                return Ok(ScanProgress {
-                    entries: emitted,
-                    bytes: pos,
-                    progress: Progress::InProgress {
-                        cursor: resume_cursor + emitted as u64,
-                    },
-                });
-            }
-            out[pos..pos + 2].copy_from_slice(&(klen as u16).to_le_bytes());
-            out[pos + 2..pos + 6].copy_from_slice(&(vlen as u32).to_le_bytes());
-            out[pos + 6..pos + 6 + klen].copy_from_slice(&kbuf[..klen]);
-            out[pos + 6 + klen..pos + need].copy_from_slice(&vbuf[..vlen]);
-            pos += need;
-            emitted += 1;
+        if from_revision >= self.state.highest_revision {
+            // Nothing has been materialized above `from`, so no record
+            // can qualify: the answer is known without opening a single
+            // run. This is the state a caught-up feed spends nearly all
+            // its time in, and it must cost nothing — a walk here is
+            // O(stored) work to prove an empty window empty.
+            self.state.scan_reset();
+            return Ok(ScanProgress::done(0, 0));
         }
+        let r = self.scan_versions_walk(span, from_revision, hi, resume_cursor, limit, out);
+        if matches!(r, Err(e) if e != StoreError::OutputTooSmall) {
+            // A fault mid-walk leaves the memo's position and its
+            // ordinal out of step (records were consumed, the ordinal
+            // was not published). Forget it: the next request walks
+            // fresh and exact. `OutputTooSmall` is not a fault — the
+            // record that did not fit is stashed and the memo is exact.
+            self.state.scan_reset();
+        }
+        r
     }
 
     /// Materialize one committed batch (format v1, module docs).
@@ -3141,7 +3851,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             let mut kbuf = [0u8; MAX_ENCODED_KEY];
             let mut vbuf = [0u8; MAX_VALUE_LEN];
             while m
-                .next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?
+                .next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
                 .is_some()
             {
                 total += 1;
@@ -3190,7 +3900,8 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         let mut ordinal = 0u64;
         loop {
-            let Some((klen, vlen)) = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?
+            let Some((klen, vlen)) =
+                m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
             else {
                 self.state.capture.active = false;
                 return Ok((pos, Progress::Done));
@@ -3547,7 +4258,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
         let mut fill = 0usize;
         let mut block_recs = 0u32;
         loop {
-            let next = m.next(self.state, &*self.storage, &mut kbuf, &mut vbuf)?;
+            let next = m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?;
             let Some((klen, vlen)) = next else {
                 // Input exhausted: close the last block, then hand the
                 // footer + fsync + publish tail to its own phases —

@@ -29,6 +29,11 @@ requires review but is not checked by the simple integer-value guard.
 | Disk value record | Shape | `MAX_VALUE_LEN` | modules/common/disk_store.rs | — | Derived as 4150 bytes to include metadata around the 4096-byte public value. |
 | Memtable entries | Capacity | `MEMTABLE_MAX_ENTRIES` | modules/common/disk_store.rs | 512 | Backpressures mutation while flush catches up. |
 | Memtable flush watermark | Pacing | `MEMTABLE_FLUSH_WATERMARK` | modules/common/disk_store.rs | 384 | Starts flush early; not a refusal ceiling. |
+| Version-scan blocks per step | Pacing | `SCAN_STEP_BLOCKS` | modules/common/disk_store.rs | 2 | The walk pauses holding its position; the worker re-drives it next step. Bounds run-file I/O per step, not the window. |
+| Version-scan records per step | Pacing | `SCAN_STEP_RECORDS` | modules/common/disk_store.rs | — | Derived as `MEMTABLE_MAX_ENTRIES` (512); bounds the memtable-resident part of a walk, which loads no blocks. |
+| Parked version-scan page | Capacity | `SCAN_PAGE_MAX` | modules/common/disk_store.rs | 8192 | The reply prefix kept across a pause. The engine caps every page at this budget, so a park can never be refused; the cap therefore bounds one command's reply, not a refusal path. |
+| Version-scan entry shrink | Shape | `VERSIONS_TRANSCODE_SLACK` | modules/common/kv_store.rs | 6 | The least a reply entry is smaller than its raw record; the engine sizes each store request by it, so a record the store hands over always fits the page (an overflow record is stashed against the held ordinal, so the cursor never runs ahead of the caller). |
+| Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held; the request times out upstream and is re-issued. Only `KV_OP_SCAN_VERSIONS` pauses, and its frame is bounded well under this. |
 | Immutable runs | Capacity | `MAX_RUNS` | modules/common/disk_store.rs | 16 | Backpressures until compaction frees a run slot. |
 | Manifest files | Capacity | `MAX_MANIFEST_FILES` | modules/common/disk_store.rs | 8 | Bounds retained manifest generations; rotation/reclamation must keep pace. |
 | Runs returned by listing | Capacity | `MAX_LISTED_RUNS` | modules/common/disk_store.rs | 64 | Rejects/flags an inventory that cannot be represented; never silently truncates authoritative run state. |
@@ -211,8 +216,8 @@ raising them blindly increases fixed memory in every instance.
 
 These do not refuse a finite workload, but determine latency and throughput and
 must be performance-tested: disk flush 32 records/step, disk compaction 32,
-watch replay 32, backup 24, CDC 16, index backfill 16, range copy 16, SQL scan
-64, SQL delete 32, and lease revoke 32. A pacing loop that cannot be rescheduled
+version scan 2 run blocks/step, watch replay 32, backup 24, CDC 16, index
+backfill 16, range copy 16, SQL scan 64, SQL delete 32, and lease revoke 32. A pacing loop that cannot be rescheduled
 is a correctness bug, not merely a performance issue.
 
 ## Composition and scaling consequences
