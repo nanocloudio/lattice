@@ -49,10 +49,12 @@
 //! `resolved(T)` promises nothing at or below T remains unpublished,
 //! so T can never be the LIVE fence frontier: any response's fence
 //! tail (a checkpoint ack, a mid-window page) can carry a frontier
-//! covering feed-range writes the pump has not read yet. The only
-//! honest T is `safe_frontier` — the frontier of the response that
-//! CLOSED a window at the head. At that instant every feed-range write
-//! at or below it is published or in the ring, and the emit gate
+//! covering feed-range writes the pump has not read yet, and a
+//! snapshot-bounded scan reports its pinned head while that frontier
+//! runs ahead of it. The only honest T is `safe_frontier` — the
+//! timestamp of the highest event published when a window CLOSES at
+//! the head. At that instant every feed-range write at or below it is
+//! published or in the ring, and the emit gate
 //! additionally requires the ring empty (all acked).
 //!
 //! # Compaction lapse (`on_lapse`)
@@ -292,9 +294,10 @@ pub struct FeedCore {
     /// Raw fence frontier — the newest commit frontier any response
     /// tail carried. Diagnostic only; never emitted as resolved.
     pub frontier: u64,
-    /// The emit-safe frontier: latched from `frontier` only when a
-    /// window CLOSES caught-up at the head, because only then is every
-    /// feed-range write at or below it published or ringed.
+    /// The emit-safe frontier: the timestamp of the highest event
+    /// published when a window CLOSES caught-up at the head. Every
+    /// feed-range write at or below it is published or ringed, and
+    /// every unpublished one sits at a strictly greater timestamp.
     pub safe_frontier: u64,
     pub last_resolved_sent: u64,
     pub last_resolved_ms: u64,
@@ -1240,12 +1243,19 @@ impl FeedCore {
                         self.window_cursor = 0;
                         self.caught_up = revision <= self.cur_revision;
                         if self.caught_up {
-                            // The one instant a resolved frontier is
-                            // honest: everything at or below this
-                            // response's frontier is published or in
-                            // the ring (the emit gate requires the
-                            // ring drained on top).
-                            self.safe_frontier = self.frontier;
+                            // The honest resolved frontier is the
+                            // timestamp of the highest event this
+                            // window PUBLISHED — never the live fence
+                            // frontier, which a snapshot-bounded scan
+                            // leaves covering writes at revisions above
+                            // the pinned head that are not read yet.
+                            // Revisions are assigned in commit-timestamp
+                            // order, so every unpublished feed-range
+                            // write sits above the published head and
+                            // carries a strictly greater timestamp:
+                            // resolving to the published timestamp can
+                            // never precede one of them.
+                            self.safe_frontier = self.cur_timestamp;
                         }
                     } else {
                         self.window_cursor = next_cursor;
@@ -1464,11 +1474,12 @@ impl FeedCore {
         }
 
         // Resolved watermark cadence. The frontier emitted is
-        // `safe_frontier` — latched only at a caught-up window close —
-        // never the live fence frontier, which can cover feed-range
-        // writes still unread (any response tail moves it). With the
-        // ring empty on top, "resolved(T)" is truthful: nothing at or
-        // below T remains unpublished.
+        // `safe_frontier` — the published head's timestamp latched at a
+        // caught-up window close — never the live fence frontier, which
+        // can cover feed-range writes still unread (any response tail
+        // moves it, and a snapshot scan pins its head below it). With
+        // the ring empty on top, "resolved(T)" is truthful: nothing at
+        // or below T remains unpublished.
         if self.state == ST_STREAMING
             && self.caught_up
             && self.ring_len() == 0

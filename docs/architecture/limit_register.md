@@ -277,3 +277,158 @@ buffer, `MAX_*`, slot/depth/capacity constant, truncation, eviction, fallback,
 and target-specific resource table as a register change or an explicitly
 documented pacing exemption. CI should gain a reverse source scan; until it
 does, omission detection remains a review obligation.
+
+## Machine-checked block
+
+The tables above carry the reasoning; prose is not parseable, so the same
+ceilings are restated here in the form the `limit-register` gate reads:
+`NAME | source path | right-hand side`. The right-hand side is compared
+textually after whitespace normalisation, so a row records what the source
+says rather than an evaluated number — `SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`
+stays as written. A `-` marks a derived or typed constant whose declaration
+is required but whose value is reviewed rather than integer-checked.
+
+Editing a constant means editing its row, and every name here also appears in
+the prose above, so the readable tables and the checked list cannot diverge
+into two registers.
+
+```limit-register
+MAX_KEYS | modules/common/kv_store.rs | 1024
+MAX_KEY_LEN | modules/common/kv_store.rs | 256
+MAX_VALUE_LEN | modules/common/kv_store.rs | 4096
+SCRATCH_BUF_SIZE | modules/app/kv_state_worker/mod.rs | 8192
+SNAPSHOT_BODY_MAX | modules/app/kv_state_worker/mod.rs | -
+SNAPSHOT_CHUNK_MAX | modules/app/kv_state_worker/mod.rs | 4096
+MAX_ENCODED_KEY | modules/common/disk_store.rs | 544
+MAX_VALUE_LEN | modules/common/disk_store.rs | -
+MEMTABLE_MAX_ENTRIES | modules/common/disk_store.rs | 512
+MEMTABLE_FLUSH_WATERMARK | modules/common/disk_store.rs | 384
+SCAN_STEP_BLOCKS | modules/common/disk_store.rs | 2
+SCAN_STEP_RECORDS | modules/common/disk_store.rs | -
+SCAN_PAGE_MAX | modules/common/disk_store.rs | 8192
+VERSIONS_TRANSCODE_SLACK | modules/common/kv_store.rs | 6
+HELD_FRAME_MAX | modules/app/kv_state_worker/mod.rs | 1024
+MAX_RUNS | modules/common/disk_store.rs | 16
+MAX_MANIFEST_FILES | modules/common/disk_store.rs | 8
+MAX_LISTED_RUNS | modules/common/disk_store.rs | 64
+SLOTS | modules/common/fd_cache.rs | 5
+PATH_MAX | modules/common/fs_run_storage.rs | 17
+MAX_COMMAND_BYTES | modules/common/replica_facade.rs | 4096
+MAX_RESPONSE_BYTES | modules/common/replica_facade.rs | 4096
+MAX_WATCH_EVENT_BYTES | modules/common/replica_facade.rs | 4096
+SLOT_COUNT | modules/common/partition_map.rs | 1024
+MAX_KEY_BOUND_LEN | modules/common/partition_map.rs | 256
+MAX_REPLICAS | modules/common/partition_map.rs | 5
+MAX_RANGES | modules/common/partition_map.rs | 64
+MAX_PARTITION_PORTS | modules/app/kv_request_router/mod.rs | 2
+MAX_LOCAL_PARTITIONS | modules/app/partition_demux/mod.rs | 8
+MAX_INFLIGHT | modules/app/kv_request_router/mod.rs | 256
+LIN_READ_SLOTS | modules/app/kv_request_router/mod.rs | 32
+LIN_READ_BUF | modules/app/kv_request_router/mod.rs | 300
+HOLD_SLOTS | modules/app/kv_request_router/mod.rs | 48
+HELP_SLOTS | modules/app/kv_request_router/mod.rs | 8
+HELP_KEY_MAX | modules/app/kv_request_router/mod.rs | 64
+RANGE_MAP_PARAM_MAX | modules/app/kv_request_router/mod.rs | 2048
+MAX_TRACKED_RANGES | modules/app/kv_request_router/mod.rs | 8
+HOT_KEY_SLOTS | modules/app/kv_request_router/mod.rs | 4
+MAX_LIFECYCLE_RANGES | modules/common/range_lifecycle.rs | 2
+MAX_NODES | modules/common/placement.rs | 32
+RANGE_MAP_PARAM_MAX | modules/app/rebalancer/mod.rs | 2048
+KEY_MAX | modules/app/elastic_split_driver/mod.rs | 256
+MAP_MAX | modules/app/elastic_split_driver/mod.rs | 2048
+FRAME_MAX | modules/app/span_courier/mod.rs | 8192
+PEND_BUF | modules/app/span_courier/mod.rs | 16384
+RASM_BUF | modules/app/span_courier/mod.rs | -
+MAX_PARTICIPANTS | modules/common/txn.rs | 8
+OPERAND_MAX | modules/app/txn_coordinator/mod.rs | 64
+HOLD_CAPACITY | modules/app/timestamp_allocator/mod.rs | 32
+MAX_WATCHES | modules/common/watch_hub.rs | 256
+WATCH_KEY_MAX | modules/common/watch_hub.rs | 96
+MAX_LEASES | modules/app/lease_manager/mod.rs | 256
+QUEUE_CAP | modules/app/ttl_scheduler/mod.rs | 1024
+MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 16
+MAX_SOURCES | modules/common/compaction_floor.rs | 4
+MAX_KPG | modules/common/compaction_floor.rs | 32
+MAX_RETENTION_CLAIMS | modules/common/db_ops.rs | 64
+MAX_BACKUP_RANGES | modules/common/db_ops.rs | -
+MAX_SUCCESSOR_CURSORS | modules/common/db_ops.rs | 2
+KEY_MAX | modules/app/backup_coordinator/mod.rs | 128
+PAGE_BUF | modules/app/backup_coordinator/mod.rs | 3584
+UNACKED_CAP | modules/common/cdc_feed.rs | 16
+KEY_MAX | modules/common/cdc_feed.rs | 256
+CDC_MAX_KEY_LEN | modules/common/cdc_wire.rs | 256
+CDC_MAX_VALUE_LEN | modules/common/cdc_wire.rs | 4096
+DATA_FRAME_MAX_PAYLOAD | modules/common/data_surface.rs | 8192
+MAX_PUSHDOWN_KEY_LEN | modules/common/data_surface.rs | 64
+MAX_PUSHDOWN_PREFIX_LEN | modules/common/data_surface.rs | 32
+MAX_PUSHDOWN_PREFIXES | modules/common/data_surface.rs | 4
+MAX_PUSHDOWN_AGGREGATES | modules/common/data_surface.rs | 4
+MAX_VOTERS | modules/common/data_surface.rs | -
+MAX_CONNS | modules/app/lattice_data_anchor/mod.rs | 16
+MAX_INFLIGHT | modules/app/lattice_data_anchor/mod.rs | 128
+MAX_INFLIGHT | modules/app/lattice_data_client/mod.rs | 128
+MAX_CONNS | modules/app/redis_edge_anchor/mod.rs | 64
+MAX_QUEUED | modules/app/redis_edge_anchor/mod.rs | 32
+MAX_SUBS | modules/app/redis_edge_anchor/mod.rs | 16
+MAX_CONNS | modules/app/memcached_stream_anchor/mod.rs | 64
+MAX_INFLIGHT | modules/app/memcached_stream_anchor/mod.rs | 256
+MAX_INFLIGHT | modules/app/memcached_datagram_anchor/mod.rs | 512
+MAX_TOKENS | modules/common/memcached_codec.rs | 32
+MAX_CONNS | modules/app/etcd_edge_anchor/mod.rs | 64
+MAX_STREAMS_PER_CONN | modules/app/etcd_edge_anchor/mod.rs | 8
+STREAM_BODY_MAX | modules/app/etcd_edge_anchor/mod.rs | 2048
+MAX_CONNS | modules/app/pg_edge_anchor/mod.rs | 16
+MAX_CONNS | modules/app/mysql_edge_anchor/mod.rs | 16
+MAX_COLS | modules/app/mysql_edge_anchor/mod.rs | 32
+MAX_CONNS | modules/app/doc_edge_anchor/mod.rs | 8
+NAME_MAX | modules/app/doc_edge_anchor/mod.rs | 64
+ID_MAX | modules/app/doc_edge_anchor/mod.rs | -
+KEY_MAX | modules/app/doc_edge_anchor/mod.rs | 512
+MAX_BSON | modules/common/doc_server_codec.rs | 4096
+MAX_CONNS | modules/app/wide_edge_anchor/mod.rs | 8
+MAX_RESULT_ROWS | modules/app/wide_edge_anchor/mod.rs | 16
+CQL_MAX_COLS | modules/common/cql_server_codec.rs | 16
+CQL_NAME_MAX | modules/common/cql_server_codec.rs | 48
+CQL_MAX_CLUSTERING | modules/common/cql_server_codec.rs | 4
+MAX_CONNS | modules/app/model_edge_anchor/mod.rs | 8
+MAX_TERMS | modules/app/model_edge_anchor/mod.rs | 32
+MAX_DIMS | modules/app/model_edge_anchor/mod.rs | 64
+MAX_K | modules/app/model_edge_anchor/mod.rs | 16
+MAX_DS_BUCKETS | modules/app/model_edge_anchor/mod.rs | 64
+MAX_VERTEX_ID | modules/app/model_edge_anchor/mod.rs | 32
+MAX_PATH_HOPS | modules/app/model_edge_anchor/mod.rs | -
+MAX_CONNS | modules/app/prometheus_edge_anchor/mod.rs | 8
+MAX_SERIES_Q | modules/app/prometheus_edge_anchor/mod.rs | 32
+MAX_STEPS_Q | modules/app/prometheus_edge_anchor/mod.rs | 128
+MAX_SAMPLES_Q | modules/app/prometheus_edge_anchor/mod.rs | 2048
+MAX_POINTS | modules/common/tsquery_core.rs | 1024
+MAX_MATCHERS | modules/common/tsquery_core.rs | 16
+MAX_LABELS | modules/common/tsquery_core.rs | 32
+MAX_ARGS | modules/common/redis_codec.rs | 32
+MAX_SQL_LEN | modules/common/sql_core.rs | 4096
+MAX_LIST_COLS | modules/common/sql_core.rs | 32
+MAX_INSERT_ROWS | modules/common/sql_core.rs | 8
+MAX_PREDICATES | modules/common/sql_core.rs | 4
+MAX_IN_VALUES | modules/common/sql_core.rs | 16
+MAX_COLUMNS | modules/common/relational.rs | 64
+MAX_KEY_COLUMNS | modules/common/relational.rs | 8
+MAX_TEXT_LEN | modules/common/relational.rs | 120
+MAX_ROW_BYTES | modules/common/relational.rs | 4096
+MAX_FK_PROBES | modules/common/relational.rs | 2
+MAX_SORT_ROWS | modules/app/relational_executor/mod.rs | 512
+MAX_TABLE_INDEXES | modules/app/relational_executor/mod.rs | 4
+QUEUE_DEPTH | modules/app/relational_executor/mod.rs | 4
+MAX_AGG_ITEMS | modules/app/relational_executor/mod.rs | 8
+MAX_GROUPS | modules/app/relational_executor/mod.rs | 32
+MAX_MODEL_ID_LEN | modules/common/models.rs | 48
+MAX_DOC_INDEX_VALUE_LEN | modules/common/models.rs | 256
+MAX_CLUSTERING_COLUMNS | modules/common/models.rs | -
+MAX_VERTEX_ID_LEN | modules/common/models.rs | 32
+MAX_GRAPH_SYNC_INDEXES | modules/common/models.rs | 4
+MAX_TERM_LEN | modules/common/models.rs | 48
+MAX_PRINCIPALS | modules/common/auth_table.rs | 64
+PRINCIPAL_NAME_MAX | modules/common/auth_table.rs | 32
+CRED_MAX | modules/common/auth_table.rs | 96
+MAX_TENANTS | modules/common/quota_bucket.rs | 64
+MAX_COUNTERS | modules/common/metrics_rollup.rs | 32
+```
