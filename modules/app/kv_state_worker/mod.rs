@@ -2937,7 +2937,7 @@ unsafe fn publish_retention_claim(worker: &mut WorkerState) {
 /// Pull at most one `MSG_PLACEMENT_EPOCH_EVENT` per tick and advance
 /// the worker's `cluster_epoch`. Monotonic — a stale or duplicate
 /// event is a no-op. Wire shape:
-///   `[prev_epoch:u32 LE][new_epoch:u32 LE]`.
+///   `[kpg_id:u16 LE][epoch:u32 LE][reason:u8]`.
 unsafe fn drain_epoch_events(worker: &mut WorkerState) {
     let sys_ptr = worker.syscalls;
     if sys_ptr.is_null() || worker.epoch_events_in < 0 {
@@ -2956,7 +2956,7 @@ unsafe fn drain_epoch_events(worker: &mut WorkerState) {
         return;
     }
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if !(8..=64).contains(&payload_len) {
+    if !(7..=64).contains(&payload_len) {
         return;
     }
     let mut buf = [0u8; 64];
@@ -2965,7 +2965,7 @@ unsafe fn drain_epoch_events(worker: &mut WorkerState) {
     {
         return;
     }
-    let new_epoch = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let new_epoch = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
     if new_epoch > worker.cluster_epoch {
         worker.cluster_epoch = new_epoch;
     }

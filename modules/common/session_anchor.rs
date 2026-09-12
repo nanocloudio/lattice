@@ -41,11 +41,12 @@
 //!
 //! ## Directory
 //!
-//! When a `session.directory` is wired (clustor's `session_directory`,
-//! which speaks its own replicated request set rather than
-//! SessionCtrlV1 frames), the anchor BINDs each session at attach,
-//! asks it to advance the epoch before committing a handoff, and
-//! UNBINDs at detach. A directory refusal refuses the handoff.
+//! When a `session.directory` is wired, the anchor speaks the contract's
+//! directory verbs to it: ATTACH for each session when it is minted,
+//! ATTACH again at the next epoch naming the standby before a handoff
+//! commits — the authoritative rebind — and DETACH at teardown. The
+//! directory answers after its own commit on the contract's frames, each
+//! naming its session. A directory refusal refuses the handoff.
 
 #![allow(
     dead_code,
@@ -101,21 +102,15 @@ pub const APHASE_RESUME_WAIT: u8 = 5;
 pub const APHASE_REFUSE_WAIT: u8 = 6;
 pub const APHASE_DETACH_WAIT: u8 = 7;
 
-// ── Directory bridge (clustor `session_directory`) ────────────────────
+// ── Directory bridge ──────────────────────────────────────────────────
 //
-// Mirror of `deps/clustor/modules/common/session_registry.rs` and the
-// `MSG_SR_*` ids in clustor's `wire.rs`. The directory takes its
-// commands as replicated proposals and answers only after commit, on
-// its own reply port, correlated by `request_id`.
-
-pub const MSG_SR_REQUEST: u8 = 0x90;
-pub const MSG_SR_REPLY: u8 = 0x91;
-pub const SR_OP_BIND: u8 = 1;
-pub const SR_OP_EPOCH_BUMP: u8 = 2;
-pub const SR_OP_UNBIND: u8 = 9;
-pub const SR_ST_OK: u8 = 0;
-/// `[request_id:8][op:1][status:1][sid:16][epoch:4][a:8][b:8]`
-pub const SR_REPLY_LEN: usize = 8 + 1 + 1 + 16 + 4 + 8 + 8;
+// The anchor speaks the contract's directory verbs (`session_ctrl`):
+// ATTACH when a session is minted, ATTACH at the next epoch naming the
+// standby before a handoff commits, DETACH at teardown. The directory
+// answers after its own commit, on the contract's frames — ATTACHED,
+// EPOCH_CONFIRMED, DETACHED, ERROR — each naming the session, which is
+// how a reply finds its session here. The grant that follows a binding
+// is the transport's and is not read.
 
 /// Where a frame goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,21 +398,26 @@ impl<const N: usize> SessionAnchor<N> {
         let req = self.next_dir_req();
         let s = self.sessions[idx];
         let worker = self.workers[s.worker as usize];
-        // [request_id:8][op:1][sid:16][epoch:4][anchor:8][worker:8][flags:1]
+        // ATTACH [sid:16][anchor_id:8][epoch:4][cc:1][worker_id:8]
         let b = &mut self.scratch;
-        b[0..8].copy_from_slice(&req.to_le_bytes());
-        b[8] = SR_OP_BIND;
-        b[9..25].copy_from_slice(s.session_id());
-        b[25..29].copy_from_slice(&s.epoch().to_le_bytes());
-        b[29..37].copy_from_slice(&self.anchor_id);
-        b[37..45].copy_from_slice(&worker);
-        b[45] = 0;
-        if sink(Target::Directory, MSG_SR_REQUEST, &self.scratch[..46]) {
+        b[0..16].copy_from_slice(s.session_id());
+        b[16..24].copy_from_slice(&self.anchor_id);
+        b[24..28].copy_from_slice(&s.epoch().to_le_bytes());
+        b[28] = sc::CC_EDGE_ANCHORED;
+        b[29..37].copy_from_slice(&worker);
+        if sink(
+            Target::Directory,
+            sc::CMD_SC_ATTACH,
+            &self.scratch[..sc::ATTACH_PAYLOAD_LEN],
+        ) {
             self.sessions[idx].dir_req = req;
         }
     }
 
-    fn dir_epoch_bump(
+    /// The swap's authoritative rebind: ATTACH at `new_epoch` naming the
+    /// standby, which the directory answers with a verdict and, on
+    /// acceptance, a grant under the new generation.
+    fn dir_rebind(
         &mut self,
         idx: usize,
         new_epoch: u32,
@@ -425,13 +425,18 @@ impl<const N: usize> SessionAnchor<N> {
     ) -> bool {
         let req = self.next_dir_req();
         let s = self.sessions[idx];
+        let worker = self.workers[s.standby as usize];
         let b = &mut self.scratch;
-        b[0..8].copy_from_slice(&req.to_le_bytes());
-        b[8] = SR_OP_EPOCH_BUMP;
-        b[9..25].copy_from_slice(s.session_id());
-        b[25..29].copy_from_slice(&s.epoch().to_le_bytes());
-        b[29..33].copy_from_slice(&new_epoch.to_le_bytes());
-        if sink(Target::Directory, MSG_SR_REQUEST, &self.scratch[..33]) {
+        b[0..16].copy_from_slice(s.session_id());
+        b[16..24].copy_from_slice(&self.anchor_id);
+        b[24..28].copy_from_slice(&new_epoch.to_le_bytes());
+        b[28] = sc::CC_EDGE_ANCHORED;
+        b[29..37].copy_from_slice(&worker);
+        if sink(
+            Target::Directory,
+            sc::CMD_SC_ATTACH,
+            &self.scratch[..sc::ATTACH_PAYLOAD_LEN],
+        ) {
             self.sessions[idx].dir_req = req;
             true
         } else {
@@ -443,14 +448,16 @@ impl<const N: usize> SessionAnchor<N> {
         if !self.dir_wired {
             return;
         }
-        let req = self.next_dir_req();
         let s = self.sessions[idx];
+        // DETACH [sid:16][epoch:4][reason:1]
         let b = &mut self.scratch;
-        b[0..8].copy_from_slice(&req.to_le_bytes());
-        b[8] = SR_OP_UNBIND;
-        b[9..25].copy_from_slice(s.session_id());
-        b[25..29].copy_from_slice(&s.epoch().to_le_bytes());
-        let _ = sink(Target::Directory, MSG_SR_REQUEST, &self.scratch[..29]);
+        sc::put_session_header(b, s.session_id(), s.epoch());
+        b[20] = sc::DETACH_NORMAL;
+        let _ = sink(
+            Target::Directory,
+            sc::CMD_SC_DETACH,
+            &self.scratch[..sc::DETACH_PAYLOAD_LEN],
+        );
     }
 
     // ── lifecycle ─────────────────────────────────────────────────
@@ -890,7 +897,7 @@ impl<const N: usize> SessionAnchor<N> {
                 }
                 let new_epoch = next_epoch(s.epoch());
                 if self.dir_wired {
-                    if self.dir_epoch_bump(idx, new_epoch, sink) {
+                    if self.dir_rebind(idx, new_epoch, sink) {
                         self.sessions[idx].phase = APHASE_DIR_WAIT;
                         self.sessions[idx].deadline = HANDOFF_DEADLINE_TICKS;
                         AnchorAction::None
@@ -972,33 +979,45 @@ impl<const N: usize> SessionAnchor<N> {
         AnchorAction::None
     }
 
-    /// Handle one `MSG_SR_REPLY` from the directory.
+    /// Handle one frame from the directory: a verdict names its session.
+    /// Grants and HELLO_ACK are not verdicts and are not read here.
     pub fn on_dir_reply(
         &mut self,
+        msg: u8,
         payload: &[u8],
         sink: &mut impl FnMut(Target, u8, &[u8]) -> bool,
     ) -> AnchorAction {
-        if payload.len() < SR_REPLY_LEN {
+        if payload.len() < sc::SESSION_HEADER {
             return AnchorAction::None;
         }
-        let req = u64::from_le_bytes([
-            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-            payload[7],
-        ]);
-        let op = payload[8];
-        let status = payload[9];
+        let ok = match msg {
+            sc::MSG_SC_ATTACHED | sc::MSG_SC_ERROR => {
+                payload.len() > sc::SESSION_HEADER && payload[sc::SESSION_HEADER] == sc::STATUS_OK
+            }
+            sc::MSG_SC_EPOCH_CONFIRMED | sc::MSG_SC_DETACHED => true,
+            _ => return AnchorAction::None,
+        };
+        let sid = sc::session_id(payload);
         let Some(idx) = self
             .sessions
             .iter()
-            .position(|s| s.in_use && s.dir_req == req && req != 0)
+            .position(|s| s.in_use && s.dir_req != 0 && s.session_id() == sid)
         else {
             return AnchorAction::None;
         };
         self.sessions[idx].dir_req = 0;
         let s = self.sessions[idx];
-        match op {
-            SR_OP_BIND => {
-                if status != SR_ST_OK {
+        match s.phase {
+            APHASE_DIR_WAIT => {
+                // The rebind's verdict decides the handoff.
+                if !ok {
+                    return self.refuse(idx, sc::STATUS_STALE_EPOCH, sink);
+                }
+                let new_epoch = next_epoch(s.epoch());
+                self.commit_resume(idx, new_epoch, sink)
+            }
+            _ => {
+                if !ok && msg == sc::MSG_SC_ATTACHED {
                     // The directory refused the binding: the session
                     // cannot be fronted. Tear it down wherever it got to.
                     let sid = *s.session_id();
@@ -1008,14 +1027,6 @@ impl<const N: usize> SessionAnchor<N> {
                 }
                 AnchorAction::None
             }
-            SR_OP_EPOCH_BUMP if s.phase == APHASE_DIR_WAIT => {
-                if status != SR_ST_OK {
-                    return self.refuse(idx, sc::STATUS_STALE_EPOCH, sink);
-                }
-                let new_epoch = next_epoch(s.epoch());
-                self.commit_resume(idx, new_epoch, sink)
-            }
-            _ => AnchorAction::None,
         }
     }
 }

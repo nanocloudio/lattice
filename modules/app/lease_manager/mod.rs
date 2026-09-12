@@ -67,7 +67,6 @@ mod telemetry;
 use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{
     placement_event_epoch, session_app_id, worker_id, SessionId, CLASS_LEASE,
-    MSG_PLACEMENT_EPOCH_EVENT_CP,
 };
 use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
 use ttl_scheduler::{ExpiryEntry, TtlQueue, EXPIRY_KIND_LEASE};
@@ -479,7 +478,10 @@ fn time_to_live(mgr: &mut LeaseManagerState, sid: &SessionId, epoch: u32, lease_
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call per MSG_LEASE_STATE frame; the parameters are the frame's fields in wire order"
+)]
 fn emit_state(
     mgr: &mut LeaseManagerState,
     sid: &SessionId,
@@ -659,7 +661,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         if let Some((mt, len)) = read_envelope(sys, mgr.epoch_events_in, &mut mgr.scratch) {
-            if mt == MSG_PLACEMENT_EPOCH_EVENT || mt == MSG_PLACEMENT_EPOCH_EVENT_CP {
+            if mt == MSG_PLACEMENT_EPOCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&mgr.scratch[..len]);
                 handle_epoch_event(mgr, mt, &tmp[..len]);

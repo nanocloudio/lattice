@@ -51,7 +51,7 @@ mod session_core;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
-use session_core::{placement_event_epoch, MSG_PLACEMENT_EPOCH_EVENT_CP};
+use session_core::placement_event_epoch;
 use wire::{MSG_PLACEMENT_EPOCH_EVENT, MSG_SESSION_RELOCATE};
 
 const SCRATCH_BUF_SIZE: usize = 256;
@@ -218,7 +218,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*sys_ptr;
 
         if let Some((mt, len)) = read_envelope(sys, st.epoch_events_in, &mut st.scratch) {
-            if mt == MSG_PLACEMENT_EPOCH_EVENT || mt == MSG_PLACEMENT_EPOCH_EVENT_CP {
+            if mt == MSG_PLACEMENT_EPOCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&st.scratch[..len]);
                 if let Some(e) = placement_event_epoch(mt, &tmp[..len]) {

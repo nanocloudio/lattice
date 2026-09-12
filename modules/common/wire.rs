@@ -328,10 +328,10 @@ pub const MSG_LEASE_REVOKE: u8 = 0xD3;
 /// into a session: a session's epoch advances only through an
 /// authoritative rebind.
 ///
-/// Payload (8 bytes): `[prev_epoch:u32 LE][new_epoch:u32 LE]`.
-/// `session_core::placement_event_epoch` also reads clustor's current
-/// `[kpg_id:u16][epoch:u32][reason:u8]` shape under `0xD5`.
-pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD4;
+/// Payload (7 bytes): `[kpg_id:u16 LE][epoch:u32 LE][reason:u8]` — the
+/// substrate's declaration (clustor `wire.rs`), decoded by
+/// `session_core::placement_event_epoch`.
+pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD5;
 
 /// `session_relocator` → an edge anchor: move every continuity
 /// session from the other worker onto `target_worker` (0 or 1), one
@@ -396,7 +396,7 @@ pub const PUBSUB_KIND_PUNSUBSCRIBE: u8 = 5;
 /// released and nothing a client can observe. For the same reason a
 /// write that carries no TTL sends nothing: a stale entry left behind
 /// fires a sweep that frees nothing.
-pub const MSG_TTL_REGISTER: u8 = 0xD5;
+pub const MSG_TTL_REGISTER: u8 = 0xD4;
 
 /// `kv_state_worker` → `ttl_scheduler`: resume the clock at this
 /// frontier. Payload: `[frontier_ms:u64 LE]`.

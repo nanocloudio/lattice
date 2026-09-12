@@ -75,9 +75,7 @@ mod session_worker;
 mod telemetry;
 
 use session_worker::session_core::session_ctrl as sc;
-use session_worker::session_core::{
-    placement_event_epoch, worker_id, SessionId, CLASS_WATCH, MSG_PLACEMENT_EPOCH_EVENT_CP,
-};
+use session_worker::session_core::{placement_event_epoch, worker_id, SessionId, CLASS_WATCH};
 use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
 use watch_hub::{
     match_event, MatchedWatch, WatchHub, WatchRecord, MAX_WATCHES, WATCH_EVENT_DELETE,
@@ -678,7 +676,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         if let Some((mt, len)) = read_envelope(sys, reg.epoch_events_in, &mut reg.scratch) {
-            if mt == MSG_PLACEMENT_EPOCH_EVENT || mt == MSG_PLACEMENT_EPOCH_EVENT_CP {
+            if mt == MSG_PLACEMENT_EPOCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&reg.scratch[..len]);
                 handle_epoch_event(reg, mt, &tmp[..len]);

@@ -8,11 +8,10 @@
 //! - the identity triple `session_id` / `anchor_id` / `session_epoch`
 //!   and the binding that carries it, with presence tracked apart from
 //!   value so no anchor id is a sentinel;
-//! - the two epoch rules that must never be confused again: a
-//!   **session epoch** is per session and advances by one on every
-//!   authoritative rebind of *that* session; a **placement epoch** is
-//!   cluster-wide, substrate-driven, and is never stamped into a
-//!   session record;
+//! - two distinct epochs, kept separate: a **session epoch** is per
+//!   session and advances by one on every authoritative rebind of
+//!   *that* session; a **placement epoch** is cluster-wide,
+//!   substrate-driven, and is never stamped into a session record;
 //! - session-id minting, so a data-plane address is recoverable from
 //!   the identity itself (`[anchor_id:8][app_id:8 BE]`).
 //!
@@ -34,6 +33,7 @@
     clippy::duplicate_mod,
     reason = "platform contract mounted wholesale; each consumer uses a subset"
 )]
+#[rustfmt::skip]
 pub mod session_ctrl;
 
 pub use session_ctrl::{ANCHOR_ID_BYTES, SESSION_ID_BYTES, WORKER_ID_BYTES};
@@ -212,24 +212,22 @@ impl Default for PlacementEpoch {
     }
 }
 
-/// Lattice's placement-epoch envelope: `[prev_epoch:u32 LE][new_epoch:u32 LE]`.
-pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD4;
-/// Clustor `control_plane.epoch_events` as it stands today:
-/// `[kpg_id:u16 LE][epoch:u32 LE][reason:u8]`.
-pub const MSG_PLACEMENT_EPOCH_EVENT_CP: u8 = 0xD5;
+/// The substrate's placement-epoch envelope, `control_plane.epoch_events`:
+/// `[kpg_id:u16 LE][epoch:u32 LE][reason:u8]`. The declaration is
+/// clustor's (`wire.rs`); this is the one shape a placement event has.
+pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD5;
+/// Payload bytes of a placement-epoch event.
+pub const PLACEMENT_EPOCH_EVENT_LEN: usize = 2 + 4 + 1;
 
-/// The new placement epoch carried by either envelope shape, or
-/// `None` for anything else.
+/// The new placement epoch a placement event carries, or `None` for
+/// anything that is not one.
 pub fn placement_event_epoch(msg_type: u8, payload: &[u8]) -> Option<u32> {
-    match msg_type {
-        MSG_PLACEMENT_EPOCH_EVENT if payload.len() >= 8 => Some(u32::from_le_bytes([
-            payload[4], payload[5], payload[6], payload[7],
-        ])),
-        MSG_PLACEMENT_EPOCH_EVENT_CP if payload.len() >= 7 => Some(u32::from_le_bytes([
-            payload[2], payload[3], payload[4], payload[5],
-        ])),
-        _ => None,
+    if msg_type != MSG_PLACEMENT_EPOCH_EVENT || payload.len() < PLACEMENT_EPOCH_EVENT_LEN {
+        return None;
     }
+    Some(u32::from_le_bytes([
+        payload[2], payload[3], payload[4], payload[5],
+    ]))
 }
 
 // ── Identity minting ──────────────────────────────────────────────────
