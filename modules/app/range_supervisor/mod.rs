@@ -216,7 +216,7 @@ define_params! {
     // `range_map` param carries). Post-split maps are computed from
     // it + the operation record, so both modules agree on generation
     // and epoch without a side channel.
-    5, range_map, str, 0
+    5, range_map, str_chunked, 0
         => |s, d, len| {
             let at = s.range_map_hex_len as usize;
             if at + len <= RANGE_MAP_PARAM_MAX * 2 {

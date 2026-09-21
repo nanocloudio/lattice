@@ -79,20 +79,18 @@ mod types;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-#[path = "../../common/net_proto.rs"]
-mod net_proto;
-
 #[path = "../../common/doc_server_codec.rs"]
 mod codec;
 
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
-use codec::models;
-use net_proto::{
-    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
+use abi::contracts::net::net_proto::{
+    conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
+    CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
+use codec::models;
 use types::{
     KV_OP_DELETE, KV_OP_GET, KV_OP_INCR, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_TXN,
     KV_RESULT_CAS_FAILED, KV_RESULT_EXISTS, KV_RESULT_INTEGER, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
@@ -305,7 +303,7 @@ unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8])
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload_len = NET_CONN_LEN + data.len();
+    let payload_len = CONN_ID_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
         return false;
     }
@@ -319,7 +317,7 @@ unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8])
     if !data.is_empty() {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
-            scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+            scratch.add(NET_FRAME_HDR + CONN_ID_LEN),
             data.len(),
         );
     }
@@ -1367,13 +1365,13 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
             if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= 4 {
                 let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
+                    anchor.server_conn_id = conn_id(payload);
                     anchor.phase = PHASE_LISTENING;
                 }
-            } else if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= NET_CONN_LEN {
+            } else if anchor.phase == PHASE_WAIT_BOUND && payload.len() >= CONN_ID_LEN {
                 // Single-anchor provider (no port in payload): claim
                 // the first BOUND we see.
-                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
+                anchor.server_conn_id = conn_id(payload);
                 anchor.phase = PHASE_LISTENING;
             }
         }
@@ -1385,33 +1383,34 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
                     return;
                 }
             }
-            if let Some(new_id) = net_conn_id(payload) {
+            if payload.len() >= CONN_ID_LEN {
+                let new_id = conn_id(payload);
                 if anchor.alloc_slot(new_id).is_none() {
                     let _ = net_send(anchor, NET_CMD_CLOSE, new_id, &[]);
                 }
             }
         }
         NET_MSG_DATA => {
-            if payload.len() > NET_CONN_LEN {
-                if let Some(conn_id) = net_conn_id(payload) {
-                    let data = &payload[NET_CONN_LEN..];
-                    if let Some(idx) = anchor.find_slot(conn_id) {
-                        let slot = &mut anchor.slots[idx];
-                        let room = RECV_BUF - slot.recv_len;
-                        if data.len() > room {
-                            slot.state = S_CLOSING;
-                        } else {
-                            let at = slot.recv_len;
-                            slot.recv[at..at + data.len()].copy_from_slice(data);
-                            slot.recv_len += data.len();
-                            drain_slot(anchor, idx);
-                        }
+            if payload.len() > CONN_ID_LEN {
+                let conn_id = conn_id(payload);
+                let data = &payload[CONN_ID_LEN..];
+                if let Some(idx) = anchor.find_slot(conn_id) {
+                    let slot = &mut anchor.slots[idx];
+                    let room = RECV_BUF - slot.recv_len;
+                    if data.len() > room {
+                        slot.state = S_CLOSING;
+                    } else {
+                        let at = slot.recv_len;
+                        slot.recv[at..at + data.len()].copy_from_slice(data);
+                        slot.recv_len += data.len();
+                        drain_slot(anchor, idx);
                     }
                 }
             }
         }
         NET_MSG_CLOSED | NET_MSG_ERROR => {
-            if let Some(conn_id) = net_conn_id(payload) {
+            if payload.len() >= CONN_ID_LEN {
+                let conn_id = conn_id(payload);
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                 }

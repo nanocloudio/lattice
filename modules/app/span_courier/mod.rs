@@ -11,7 +11,7 @@
 //!
 //! One instance runs per side, `mode` selecting the role:
 //!
-//! - **ship** (`mode: 0`, the source node): dials `endpoint` at boot and
+//! - **ship** (`mode: 0`, the source node): dials `authority` at boot and
 //!   redials on loss. Envelopes arriving on `local_in` (the source
 //!   worker's `snapshot_export`) are streamed to the peer; envelopes
 //!   arriving FROM the peer (the target's install ack) are re-emitted on
@@ -51,17 +51,20 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../common/hex_core.rs");
 
-#[path = "../../common/net_proto.rs"]
-mod net_proto;
+#[path = "../../common/authority.rs"]
+mod authority;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
-use net_proto::{
-    net_conn_id, NET_CMD_BIND, NET_CMD_CONNECT, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNOK, NET_MSG_DATA, NET_MSG_ERROR, NET_SOCK_STREAM,
+use abi::contracts::net::net_proto::{
+    conn_id, connected_parts, error_parts, CMD_BIND as NET_CMD_BIND,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
+    MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND, MSG_CLOSED as NET_MSG_CLOSED,
+    MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
+    REQUESTER_TAG_NONE,
 };
+use authority::{Authority, PORT_SPAN_COURIER};
 
 /// Envelope TLV header width on the local channels and inside the TCP
 /// stream.
@@ -87,18 +90,17 @@ define_params! {
     // 0 = ship (dial out, source node), 1 = receive (listen, target node).
     1, mode, u8, 0
         => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
-    // Ship mode: hex of [ip:4][port:2 LE], the receive side's listener.
-    2, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i);
-            s.ep_hex_len += 1;
-            i += 1;
-        }
-    };
+    // Tag 2 is retired.
     // Receive mode: TCP port to listen on.
     3, listen_port, u16, 7400
         => |s, d, len| { s.listen_port = p_u16(d, len, 0, 7400); };
+    // Ship mode: the receive side's listener, `host[:port]`; the port
+    // defaults to 7400.
+    4, authority, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.authority.set(core::slice::from_raw_parts(d, len));
+        }
+    };
 }
 
 #[repr(C)]
@@ -111,11 +113,10 @@ struct CourierState {
     metrics_out: i32,
 
     mode: u8,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
-    ip: [u8; 4],
-    port: u16,
+    authority: Authority,
     listen_port: u16,
+    /// Requester tag on every dial; `MSG_CONNECTED` / `MSG_ERROR` echo it.
+    tag: u8,
 
     bound: u8,
     connected: u8,
@@ -144,11 +145,9 @@ impl CourierState {
         self.local_out = -1;
         self.metrics_out = -1;
         self.mode = MODE_SHIP;
-        self.ep_hex = [0; 16];
-        self.ep_hex_len = 0;
-        self.ip = [0; 4];
-        self.port = 0;
+        self.authority = Authority::empty();
         self.listen_port = 7400;
+        self.tag = 0;
         self.bound = 0;
         self.connected = 0;
         self.conn_id = 0;
@@ -176,12 +175,12 @@ unsafe fn tcp_send_raw(
     nbuf: &mut [u8; NET_BUF],
     bytes: &[u8],
 ) -> bool {
-    let total = ENV_HDR + NET_CONN_LEN + bytes.len();
+    let total = ENV_HDR + CONN_ID_LEN + bytes.len();
     if net_out < 0 || total > NET_BUF {
         return false;
     }
     nbuf[0] = NET_CMD_SEND;
-    let plen = (NET_CONN_LEN + bytes.len()) as u16;
+    let plen = (CONN_ID_LEN + bytes.len()) as u16;
     nbuf[1..3].copy_from_slice(&plen.to_le_bytes());
     nbuf[3..5].copy_from_slice(&conn_id.to_le_bytes());
     nbuf[5..5 + bytes.len()].copy_from_slice(bytes);
@@ -314,37 +313,14 @@ pub extern "C" fn module_new(
         s.local_in = dev_channel_port(sys, 0, 1);
         s.local_out = dev_channel_port(sys, 1, 1);
         s.metrics_out = dev_channel_port(sys, 1, 2);
-    }
-    if s.mode == MODE_SHIP {
-        // Decode [ip:4][port:2 LE] from the endpoint hex.
-        let mut ep = [0u8; 8];
-        if s.ep_hex_len != 12 {
-            return -1;
-        }
-        for (i, byte) in ep.iter_mut().enumerate().take(6) {
-            let hi = hex_nibble(s.ep_hex[i * 2]);
-            let lo = hex_nibble(s.ep_hex[i * 2 + 1]);
-            let (Some(hi), Some(lo)) = (hi, lo) else {
-                return -1;
-            };
-            *byte = (hi << 4) | lo;
-        }
-        s.ip.copy_from_slice(&ep[0..4]);
-        s.port = u16::from_le_bytes([ep[4], ep[5]]);
-        if s.port == 0 {
+        s.tag = dev_requester_tag(sys);
+        if s.mode == MODE_SHIP && !s.authority.adopt(PORT_SPAN_COURIER) {
+            let m = b"[courier] refusing to construct: authority (host[:port]) is required in ship mode";
+            dev_log(sys, 2, m.as_ptr(), m.len());
             return -1;
         }
     }
     0
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[no_mangle]
@@ -383,26 +359,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         && now.wrapping_sub(s.dial_ms) >= REDIAL_MS
         && s.net_out >= 0
     {
-        let mut payload = [0u8; 8];
-        payload[0] = NET_SOCK_STREAM;
-        payload[1] = s.ip[3];
-        payload[2] = s.ip[2];
-        payload[3] = s.ip[1];
-        payload[4] = s.ip[0];
-        let port = s.port.to_le_bytes();
-        payload[5] = port[0];
-        payload[6] = port[1];
-        payload[7] = 0;
-        unsafe {
-            net_write_frame(
-                sys,
-                s.net_out,
-                NET_CMD_CONNECT,
-                payload.as_ptr(),
-                8,
-                s.nbuf.as_mut_ptr(),
-                NET_BUF,
-            );
+        let mut payload = [0u8; CONNECT_TO_MAX];
+        let n = s.authority.connect_record(&mut payload, Some(s.tag));
+        if n > 0 {
+            unsafe {
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CONNECT_TO,
+                    payload.as_ptr(),
+                    n,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
+            }
         }
         s.dial_ms = now.max(1);
     }
@@ -421,11 +391,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let payload_start = ENV_HDR;
         match msg {
-            NET_MSG_CONNOK => {
-                if let Some(cid) = net_conn_id(&s.nbuf[payload_start..payload_start + plen]) {
+            NET_MSG_CONNECTED => {
+                // Claim only our own dial: the NET provider fans
+                // `net_out` to every consumer, and the tag says whose
+                // connection this is.
+                let claimed = if plen >= CONN_ID_LEN {
+                    let (cid, tag) = connected_parts(&s.nbuf[payload_start..payload_start + plen]);
+                    (tag == s.tag || tag == REQUESTER_TAG_NONE).then_some(cid)
+                } else {
+                    None
+                };
+                if let Some(cid) = claimed {
                     s.conn_id = cid;
                     s.connected = 1;
-                    unsafe { dev_log(sys, 3, b"[courier] connok".as_ptr(), 16) };
+                    unsafe { dev_log(sys, 3, b"[courier] connected".as_ptr(), 19) };
                     // Flush everything queued while the dial was still
                     // in flight.
                     let pl = s.pend_len as usize;
@@ -459,37 +438,53 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let local_port =
                         u16::from_le_bytes([s.nbuf[payload_start + 2], s.nbuf[payload_start + 3]]);
                     if local_port == s.listen_port {
-                        if let Some(cid) = net_conn_id(&s.nbuf[payload_start..payload_start + plen])
-                        {
-                            s.conn_id = cid;
-                            s.connected = 1;
-                            s.rasm_len = 0;
-                            unsafe { dev_log(sys, 3, b"[courier] accept".as_ptr(), 16) };
-                        }
+                        s.conn_id = conn_id(&s.nbuf[payload_start..payload_start + plen]);
+                        s.connected = 1;
+                        s.rasm_len = 0;
+                        unsafe { dev_log(sys, 3, b"[courier] accept".as_ptr(), 16) };
                     }
                 }
             }
             NET_MSG_DATA => {
-                if plen > NET_CONN_LEN {
-                    let same = net_conn_id(&s.nbuf[payload_start..payload_start + plen])
-                        == Some(s.conn_id);
+                if plen > CONN_ID_LEN {
+                    let same = conn_id(&s.nbuf[payload_start..payload_start + plen]) == s.conn_id;
                     if same && s.connected == 1 {
                         let mut data = [0u8; NET_BUF];
-                        let dl = plen - NET_CONN_LEN;
+                        let dl = plen - CONN_ID_LEN;
                         data[..dl].copy_from_slice(
-                            &s.nbuf[payload_start + NET_CONN_LEN..payload_start + plen],
+                            &s.nbuf[payload_start + CONN_ID_LEN..payload_start + plen],
                         );
                         unsafe { deliver_stream(s, sys, &data[..dl]) };
                     }
                 }
             }
-            NET_MSG_CLOSED | NET_MSG_ERROR => {
-                if net_conn_id(&s.nbuf[payload_start..payload_start + plen]) == Some(s.conn_id)
-                    || s.connected == 0
+            NET_MSG_CLOSED => {
+                if s.connected == 1
+                    && plen >= CONN_ID_LEN
+                    && conn_id(&s.nbuf[payload_start..payload_start + plen]) == s.conn_id
                 {
                     s.connected = 0;
                     s.conn_id = 0;
                     s.rasm_len = 0;
+                }
+            }
+            NET_MSG_ERROR => {
+                // A tagged error is a failed dial and is ours by tag
+                // alone; an untagged one names an established
+                // connection by conn id.
+                if plen > CONN_ID_LEN {
+                    let (cid, _errno, tag) =
+                        error_parts(&s.nbuf[payload_start..payload_start + plen]);
+                    let ours = if s.connected == 1 {
+                        tag == REQUESTER_TAG_NONE && cid == s.conn_id
+                    } else {
+                        tag == s.tag || tag == REQUESTER_TAG_NONE
+                    };
+                    if ours {
+                        s.connected = 0;
+                        s.conn_id = 0;
+                        s.rasm_len = 0;
+                    }
                 }
             }
             NET_MSG_BOUND => {}

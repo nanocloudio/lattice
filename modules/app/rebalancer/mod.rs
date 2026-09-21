@@ -86,7 +86,7 @@ define_params! {
 
     // The ordered range map, hex (TLV str chunks append). Same encoding the
     // router and range_supervisor consume.
-    1, range_map, str, 0
+    1, range_map, str_chunked, 0
         => |s, d, len| {
             let at = s.range_map_hex_len as usize;
             if s.range_map_hex_len == u16::MAX || at + len > RANGE_MAP_PARAM_MAX * 2 {

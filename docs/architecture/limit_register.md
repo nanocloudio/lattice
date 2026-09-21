@@ -76,6 +76,7 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 | Courier frame | Shape | `FRAME_MAX` | modules/app/span_courier/mod.rs | 8192 | A larger envelope cannot cross; the stream drops whole and the downstream install aborts on the gap (fail closed, counted). |
 | Courier pre-dial pending bytes | Capacity | `PEND_BUF` | modules/app/span_courier/mod.rs | 16384 | Overflow before the dial completes drops the pending stream whole; the install aborts on the gap. |
 | Courier reassembly buffer | Capacity | `RASM_BUF` | modules/app/span_courier/mod.rs | — | Derived as `2 * FRAME_MAX` (16384). Overflow drops the inbound stream whole; the install aborts on the gap. |
+| Dial authority | Shape | `AUTHORITY_MAX` | modules/common/authority.rs | 64 | A longer `host[:port]` refuses construction of the connector; a name is never truncated into a different name. |
 | Transaction participants | Topology | `MAX_PARTICIPANTS` | modules/common/txn.rs | 8 | Rejects a wider transaction. |
 | Transaction operand | Shape | `OPERAND_MAX` | modules/app/txn_coordinator/mod.rs | 64 | Rejects an oversized coordinator operand. |
 | Timestamp-allocation holds | Capacity | `HOLD_CAPACITY` | modules/app/timestamp_allocator/mod.rs | 32 | Backpressures/defer allocation while held work drains. |
@@ -278,6 +279,115 @@ and target-specific resource table as a register change or an explicitly
 documented pacing exemption. CI should gain a reverse source scan; until it
 does, omission detection remains a review obligation.
 
+## Module-internal bounds
+
+These are the per-module buffers, capacities, and pacing budgets the
+modules declare. They bound one module's own frames, tables, and
+work-per-step rather than a deployment-visible guarantee, but the gate
+checks them for the same reason: a ceiling in source and absent here is
+a defect. A constant that is not a bare `usize` integer (a typed or
+derived one) carries `—` and is reviewed for presence, not integer-
+checked.
+
+### Module frame, scratch, and shape bounds
+
+| Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
+|---|---|---|---|---:|---|
+| Agg Key Max | Shape | `AGG_KEY_MAX` | modules/app/relational_executor/mod.rs | 48 | Rejects an input longer than this bound. |
+| Catalog Name Key Max | Shape | `CATALOG_NAME_KEY_MAX` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
+| Cdc Envelope Max | Shape | `CDC_ENVELOPE_MAX` | modules/common/cdc_wire.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Disk Batch Max | Shape | `DISK_BATCH_MAX` | modules/common/kv_store.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Key Max | Shape | `KEY_MAX` | modules/app/model_edge_anchor/mod.rs | 512 | Rejects an input longer than this bound. |
+| Key Max | Shape | `KEY_MAX` | modules/app/prometheus_edge_anchor/mod.rs | 512 | Rejects an input longer than this bound. |
+| Key Max | Shape | `KEY_MAX` | modules/app/wide_edge_anchor/mod.rs | 512 | Rejects an input longer than this bound. |
+| Max Cached Name | Shape | `MAX_CACHED_NAME` | modules/app/relational_executor/mod.rs | 64 | Rejects an input longer than this bound. |
+| Max Decimal Precision | Shape | `MAX_DECIMAL_PRECISION` | modules/common/relational.rs | — | Maximum NUMERIC/DECIMAL precision; a wider declaration is rejected. |
+| Max Index Value Len | Shape | `MAX_INDEX_VALUE_LEN` | modules/common/db_ops.rs | 256 | Rejects an input longer than this bound. |
+| Max Kv Key | Shape | `MAX_KV_KEY` | modules/app/relational_executor/mod.rs | — | Rejects an input longer than this bound. |
+| Max Name Len | Shape | `MAX_NAME_LEN` | modules/common/relational.rs | 64 | Rejects an input longer than this bound. |
+| Max Ordered Value Len | Shape | `MAX_ORDERED_VALUE_LEN` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
+| Max Plain Value Len | Shape | `MAX_PLAIN_VALUE_LEN` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
+| Max Primary Key Len | Shape | `MAX_PRIMARY_KEY_LEN` | modules/common/db_ops.rs | — | Rejects an input longer than this bound. |
+| Max Probe Key Len | Shape | `MAX_PROBE_KEY_LEN` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
+| Max Record Len | Shape | `MAX_RECORD_LEN` | modules/common/disk_store.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Max Split Key Len | Shape | `MAX_SPLIT_KEY_LEN` | modules/common/range_lifecycle.rs | — | Rejects an input longer than this bound. |
+| Max Wire Version | Shape | `MAX_WIRE_VERSION` | modules/common/doc_server_codec.rs | — | The highest Mongo wire protocol version the codec advertises and accepts. |
+| Password Max | Shape | `PASSWORD_MAX` | modules/app/mysql_edge_anchor/mod.rs | 64 | Rejects an input longer than this bound. |
+| Password Max | Shape | `PASSWORD_MAX` | modules/app/pg_edge_anchor/mod.rs | 64 | Rejects an input longer than this bound. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_client/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Requirepass Max | Shape | `REQUIREPASS_MAX` | modules/app/redis_edge_anchor/mod.rs | 128 | Rejects an input longer than this bound. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/kv_request_router/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/lattice_data_client/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/lease_manager/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/ttl_scheduler/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_fanout/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Store Id Max | Shape | `STORE_ID_MAX` | modules/common/fs_run_storage.rs | — | Rejects an input longer than this bound. |
+| Ts Request Size | Shape | `TS_REQUEST_SIZE` | modules/app/kv_state_worker/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Watch Export Max | Shape | `WATCH_EXPORT_MAX` | modules/common/watch_hub.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Wide Schema Max | Shape | `WIDE_SCHEMA_MAX` | modules/common/cql_server_codec.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+
+### Module capacities
+
+| Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
+|---|---|---|---|---:|---|
+| Agg Max | Capacity | `AGG_MAX` | modules/app/relational_executor/mod.rs | — | Rejects work beyond this count. |
+| Max Cols | Capacity | `MAX_COLS` | modules/app/pg_edge_anchor/mod.rs | 32 | Columns per row the Postgres codec encodes; a wider row is refused. |
+| Max Edge Plan Entries | Capacity | `MAX_EDGE_PLAN_ENTRIES` | modules/common/models.rs | — | Rejects work beyond this count. |
+| Max Groups | Capacity | `MAX_GROUPS` | modules/common/tsquery_core.rs | 128 | Distinct groups a metrics query aggregates; beyond it the query is refused. |
+| Max Join Rows | Capacity | `MAX_JOIN_ROWS` | modules/app/relational_executor/mod.rs | 128 | Rows materialised for a join side; a larger join is refused. |
+| Max Per Reject | Capacity | `MAX_PER_REJECT` | modules/app/kv_request_router/mod.rs | 32 | Rejects work beyond this count. |
+| Max Series | Capacity | `MAX_SERIES` | modules/common/tsquery_core.rs | 256 | Series a metrics query tracks; beyond it the query is refused. |
+| Max Txn Slots | Capacity | `MAX_TXN_SLOTS` | modules/app/relational_executor/mod.rs | 2 | Concurrent coordinator transactions; a further BEGIN is refused. |
+| Ps Max | Capacity | `PS_MAX` | modules/app/redis_edge_anchor/mod.rs | 64 | Pattern subscriptions per Redis connection; a further PSUBSCRIBE is refused. |
+| Reject Body Max | Capacity | `REJECT_BODY_MAX` | modules/app/kv_request_router/mod.rs | 4 | Rejects work beyond this count. |
+| Scan Cursor Provider Max | Capacity | `SCAN_CURSOR_PROVIDER_MAX` | modules/common/partition_map.rs | — | Rejects work beyond this count. |
+| Txn Acc Max | Capacity | `TXN_ACC_MAX` | modules/app/relational_executor/mod.rs | 3600 | Rejects work beyond this count. |
+| Txn Body Max | Capacity | `TXN_BODY_MAX` | modules/app/relational_executor/mod.rs | 3800 | Rejects work beyond this count. |
+
+### Module pacing budgets
+
+| Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
+|---|---|---|---|---:|---|
+| Disk Compact Step Cap | Pacing | `DISK_COMPACT_STEP_CAP` | modules/common/kv_store.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Disk Fence Stall Budget | Pacing | `DISK_FENCE_STALL_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Disk Hard Fault Budget | Pacing | `DISK_HARD_FAULT_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Max Per Sweep | Pacing | `MAX_PER_SWEEP` | modules/app/kv_request_router/mod.rs | 32 | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Page Limit | Pacing | `PAGE_LIMIT` | modules/app/backup_coordinator/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Page Limit | Pacing | `PAGE_LIMIT` | modules/app/rebalancer/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Anchor Budget | Pacing | `PER_TICK_ANCHOR_BUDGET` | modules/app/etcd_edge_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Budget | Pacing | `PER_TICK_BUDGET` | modules/app/lattice_data_client/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Drain Budget | Pacing | `PER_TICK_DRAIN_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Kv Budget | Pacing | `PER_TICK_KV_BUDGET` | modules/app/lattice_data_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Kv Budget | Pacing | `PER_TICK_KV_BUDGET` | modules/app/memcached_stream_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Kv Budget | Pacing | `PER_TICK_KV_BUDGET` | modules/app/redis_edge_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Net Budget | Pacing | `PER_TICK_NET_BUDGET` | modules/app/lattice_data_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Net Budget | Pacing | `PER_TICK_NET_BUDGET` | modules/app/memcached_stream_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Net Budget | Pacing | `PER_TICK_NET_BUDGET` | modules/app/redis_edge_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Per Tick Router Budget | Pacing | `PER_TICK_ROUTER_BUDGET` | modules/app/kv_request_router/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Reap Budget | Pacing | `REAP_BUDGET` | modules/app/kv_state_worker/mod.rs | 64 | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Replay Page Limit | Pacing | `REPLAY_PAGE_LIMIT` | modules/app/watch_fanout/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Ro Stall Limit | Pacing | `RO_STALL_LIMIT` | modules/app/redis_edge_anchor/mod.rs | — | Read-only stall ticks before the anchor reconnects its link. |
+| Ttl Resume Budget | Pacing | `TTL_RESUME_BUDGET` | modules/app/kv_state_worker/mod.rs | 32 | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Wedge Budget | Pacing | `WEDGE_BUDGET` | modules/common/cdc_feed.rs | — | Consecutive wedge retries before a feed reports STALLED. |
+
+### Module topology bounds
+
+| Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
+|---|---|---|---|---:|---|
+| Max Placement Replicas | Topology | `MAX_PLACEMENT_REPLICAS` | modules/common/data_surface.rs | — | Replicas a placement may name; bounded by MAX_REPLICAS. |
+
 ## Machine-checked block
 
 The tables above carry the reasoning; prose is not parseable, so the same
@@ -339,6 +449,7 @@ MAP_MAX | modules/app/elastic_split_driver/mod.rs | 2048
 FRAME_MAX | modules/app/span_courier/mod.rs | 8192
 PEND_BUF | modules/app/span_courier/mod.rs | 16384
 RASM_BUF | modules/app/span_courier/mod.rs | -
+AUTHORITY_MAX | modules/common/authority.rs | 64
 MAX_PARTICIPANTS | modules/common/txn.rs | 8
 OPERAND_MAX | modules/app/txn_coordinator/mod.rs | 64
 HOLD_CAPACITY | modules/app/timestamp_allocator/mod.rs | 32
@@ -431,4 +542,83 @@ PRINCIPAL_NAME_MAX | modules/common/auth_table.rs | 32
 CRED_MAX | modules/common/auth_table.rs | 96
 MAX_TENANTS | modules/common/quota_bucket.rs | 64
 MAX_COUNTERS | modules/common/metrics_rollup.rs | 32
+AGG_KEY_MAX | modules/app/relational_executor/mod.rs | 48
+CATALOG_NAME_KEY_MAX | modules/common/relational.rs | -
+CDC_ENVELOPE_MAX | modules/common/cdc_wire.rs | -
+DISK_BATCH_MAX | modules/common/kv_store.rs | -
+KEY_MAX | modules/app/model_edge_anchor/mod.rs | 512
+KEY_MAX | modules/app/prometheus_edge_anchor/mod.rs | 512
+KEY_MAX | modules/app/wide_edge_anchor/mod.rs | 512
+MAX_CACHED_NAME | modules/app/relational_executor/mod.rs | 64
+MAX_DECIMAL_PRECISION | modules/common/relational.rs | -
+MAX_INDEX_VALUE_LEN | modules/common/db_ops.rs | 256
+MAX_KV_KEY | modules/app/relational_executor/mod.rs | -
+MAX_NAME_LEN | modules/common/relational.rs | 64
+MAX_ORDERED_VALUE_LEN | modules/common/relational.rs | -
+MAX_PLAIN_VALUE_LEN | modules/common/relational.rs | -
+MAX_PRIMARY_KEY_LEN | modules/common/db_ops.rs | -
+MAX_PROBE_KEY_LEN | modules/common/relational.rs | -
+MAX_RECORD_LEN | modules/common/disk_store.rs | -
+MAX_SPLIT_KEY_LEN | modules/common/range_lifecycle.rs | -
+MAX_WIRE_VERSION | modules/common/doc_server_codec.rs | -
+PASSWORD_MAX | modules/app/mysql_edge_anchor/mod.rs | 64
+PASSWORD_MAX | modules/app/pg_edge_anchor/mod.rs | 64
+RECV_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 4096
+RECV_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
+RECV_BUF_SIZE | modules/app/lattice_data_client/mod.rs | -
+RECV_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
+RECV_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | 4096
+REQUIREPASS_MAX | modules/app/redis_edge_anchor/mod.rs | 128
+SCRATCH_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | -
+SCRATCH_BUF_SIZE | modules/app/kv_request_router/mod.rs | -
+SCRATCH_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
+SCRATCH_BUF_SIZE | modules/app/lattice_data_client/mod.rs | -
+SCRATCH_BUF_SIZE | modules/app/lease_manager/mod.rs | 4096
+SCRATCH_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | -
+SCRATCH_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | -
+SCRATCH_BUF_SIZE | modules/app/ttl_scheduler/mod.rs | 4096
+SCRATCH_BUF_SIZE | modules/app/watch_fanout/mod.rs | 4096
+SEND_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 4096
+SEND_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
+SEND_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
+SEND_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | 4096
+STORE_ID_MAX | modules/common/fs_run_storage.rs | -
+TS_REQUEST_SIZE | modules/app/kv_state_worker/mod.rs | -
+WATCH_EXPORT_MAX | modules/common/watch_hub.rs | -
+WIDE_SCHEMA_MAX | modules/common/cql_server_codec.rs | -
+AGG_MAX | modules/app/relational_executor/mod.rs | -
+MAX_COLS | modules/app/pg_edge_anchor/mod.rs | 32
+MAX_EDGE_PLAN_ENTRIES | modules/common/models.rs | -
+MAX_GROUPS | modules/common/tsquery_core.rs | 128
+MAX_JOIN_ROWS | modules/app/relational_executor/mod.rs | 128
+MAX_PER_REJECT | modules/app/kv_request_router/mod.rs | 32
+MAX_SERIES | modules/common/tsquery_core.rs | 256
+MAX_TXN_SLOTS | modules/app/relational_executor/mod.rs | 2
+PS_MAX | modules/app/redis_edge_anchor/mod.rs | 64
+REJECT_BODY_MAX | modules/app/kv_request_router/mod.rs | 4
+SCAN_CURSOR_PROVIDER_MAX | modules/common/partition_map.rs | -
+TXN_ACC_MAX | modules/app/relational_executor/mod.rs | 3600
+TXN_BODY_MAX | modules/app/relational_executor/mod.rs | 3800
+DISK_COMPACT_STEP_CAP | modules/common/kv_store.rs | -
+DISK_FENCE_STALL_BUDGET | modules/app/kv_state_worker/mod.rs | -
+DISK_HARD_FAULT_BUDGET | modules/app/kv_state_worker/mod.rs | -
+MAX_PER_SWEEP | modules/app/kv_request_router/mod.rs | 32
+PAGE_LIMIT | modules/app/backup_coordinator/mod.rs | -
+PAGE_LIMIT | modules/app/rebalancer/mod.rs | -
+PER_TICK_ANCHOR_BUDGET | modules/app/etcd_edge_anchor/mod.rs | -
+PER_TICK_BUDGET | modules/app/lattice_data_client/mod.rs | -
+PER_TICK_DRAIN_BUDGET | modules/app/kv_state_worker/mod.rs | -
+PER_TICK_KV_BUDGET | modules/app/lattice_data_anchor/mod.rs | -
+PER_TICK_KV_BUDGET | modules/app/memcached_stream_anchor/mod.rs | -
+PER_TICK_KV_BUDGET | modules/app/redis_edge_anchor/mod.rs | -
+PER_TICK_NET_BUDGET | modules/app/lattice_data_anchor/mod.rs | -
+PER_TICK_NET_BUDGET | modules/app/memcached_stream_anchor/mod.rs | -
+PER_TICK_NET_BUDGET | modules/app/redis_edge_anchor/mod.rs | -
+PER_TICK_ROUTER_BUDGET | modules/app/kv_request_router/mod.rs | -
+REAP_BUDGET | modules/app/kv_state_worker/mod.rs | 64
+REPLAY_PAGE_LIMIT | modules/app/watch_fanout/mod.rs | -
+RO_STALL_LIMIT | modules/app/redis_edge_anchor/mod.rs | -
+TTL_RESUME_BUDGET | modules/app/kv_state_worker/mod.rs | 32
+WEDGE_BUDGET | modules/common/cdc_feed.rs | -
+MAX_PLACEMENT_REPLICAS | modules/common/data_surface.rs | -
 ```

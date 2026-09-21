@@ -134,13 +134,12 @@ use wire::{
 
 // ── NET protocol constants (foundation/ip Stream Surface v1) ──────────
 //
-// Shared with every TCP edge anchor via `modules/common/net_proto.rs`.
+// The SDK's Stream Surface contract, reached through the `abi` mount.
 
-#[path = "../../common/net_proto.rs"]
-mod net_proto;
-use net_proto::{
-    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
+use abi::contracts::net::net_proto::{
+    conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
+    CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
 
 // ── Per-slot capacities ───────────────────────────────────────────────
@@ -1921,14 +1920,14 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
             if anchor.phase == AnchorPhase::WaitBound && payload.len() >= 4 {
                 let port = u16::from_le_bytes([payload[2], payload[3]]);
                 if port == anchor.listen_port {
-                    anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
+                    anchor.server_conn_id = conn_id(payload);
                     anchor.phase = AnchorPhase::Listening;
                     dev_log(&*sys, 3, b"[redis_anc] bound".as_ptr(), 17);
                 }
-            } else if anchor.phase == AnchorPhase::WaitBound && payload.len() >= NET_CONN_LEN {
+            } else if anchor.phase == AnchorPhase::WaitBound && payload.len() >= CONN_ID_LEN {
                 // Single-anchor provider (no port in payload): claim
                 // the first BOUND we see.
-                anchor.server_conn_id = net_conn_id(payload).unwrap_or(SLOT_FREE);
+                anchor.server_conn_id = conn_id(payload);
                 anchor.phase = AnchorPhase::Listening;
                 dev_log(&*sys, 3, b"[redis_anc] bound".as_ptr(), 17);
             }
@@ -1945,7 +1944,8 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
                     return;
                 }
             }
-            if let Some(new_id) = net_conn_id(payload) {
+            if payload.len() >= CONN_ID_LEN {
+                let new_id = conn_id(payload);
                 if anchor.alloc_slot(new_id).is_some() {
                     dev_log(&*sys, 3, b"[redis_anc] accepted".as_ptr(), 20);
                 } else {
@@ -1960,17 +1960,17 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
             }
         }
         NET_MSG_DATA => {
-            if payload.len() > NET_CONN_LEN {
-                if let Some(conn_id) = net_conn_id(payload) {
-                    let data_slice = &payload[NET_CONN_LEN..];
-                    if let Some(idx) = anchor.find_slot(conn_id) {
-                        handle_client_data(anchor, idx, data_slice);
-                    }
+            if payload.len() > CONN_ID_LEN {
+                let conn_id = conn_id(payload);
+                let data_slice = &payload[CONN_ID_LEN..];
+                if let Some(idx) = anchor.find_slot(conn_id) {
+                    handle_client_data(anchor, idx, data_slice);
                 }
             }
         }
         NET_MSG_CLOSED => {
-            if let Some(conn_id) = net_conn_id(payload) {
+            if payload.len() >= CONN_ID_LEN {
+                let conn_id = conn_id(payload);
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                     dev_log(&*sys, 3, b"[redis_anc] client closed".as_ptr(), 25);
@@ -1986,7 +1986,8 @@ unsafe fn dispatch_net_frame(anchor: &mut AnchorState, msg_type: u8, payload: &[
             // error for a conn this anchor owns is handled: free that
             // client slot and keep listening. Errors for other conns
             // (peer dials, http) are ignored.
-            if let Some(conn_id) = net_conn_id(payload) {
+            if payload.len() >= CONN_ID_LEN {
+                let conn_id = conn_id(payload);
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     anchor.free_slot(idx);
                     anchor.m_net_errors += 1;
@@ -2032,7 +2033,7 @@ unsafe fn net_send_close_pic(anchor: &mut AnchorState, conn_id: u16) -> bool {
         out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        NET_CONN_LEN,
+        CONN_ID_LEN,
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -2045,7 +2046,7 @@ unsafe fn net_send_data_pic(anchor: &mut AnchorState, conn_id: u16, data: &[u8])
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload_len = NET_CONN_LEN + data.len();
+    let payload_len = CONN_ID_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
@@ -2058,7 +2059,7 @@ unsafe fn net_send_data_pic(anchor: &mut AnchorState, conn_id: u16, data: &[u8])
     *scratch.add(NET_FRAME_HDR + 1) = id[1];
     core::ptr::copy_nonoverlapping(
         data.as_ptr(),
-        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        scratch.add(NET_FRAME_HDR + CONN_ID_LEN),
         data.len(),
     );
     let total = NET_FRAME_HDR + payload_len;

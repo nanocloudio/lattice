@@ -34,6 +34,11 @@ quantum = "0.0.1"
 # omitted until the protocol surface can be slimmed down for embedded.
 targets = ["bcm2712"]
 
+# The limit register (docs/architecture/limit_register.md) covers every
+# ceiling-shaped constant in the files it names: an unregistered one is a
+# defect, not a warning. Fails CI until the coverage list is empty.
+limit_register_coverage = "fail"
+
 # No root cargo manifest — it was retired along with `crates/lattice-common`
 # (the cores live in `modules/common` and are `#[path]`-mounted, not linked),
 # matching wave/spectra. Phases 1.1/1.2 then fmt-check + clippy the PIC module
@@ -86,7 +91,7 @@ dir  = "configs"
 # the render gate only checks that no placeholder is left unresolved (it
 # does not parse the map), so a non-empty stand-in is all it needs. PEER3_*
 # extend the peer list for the four-node relocation template.
-vars = { SELF_ID = "0", LISTEN_PORT = "6379", REDIS_PORT = "6379", DATA_PORT = "6380", LIN_READS = "0", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", PEER3_PORT = "9093", PEER0_ADDR = "127.0.0.1:7000", PEER1_ADDR = "127.0.0.1:7001", PEER2_ADDR = "127.0.0.1:7002", PEER0_HOST = "127.0.0.1", PEER1_HOST = "127.0.0.1", PEER2_HOST = "127.0.0.1", PEER3_HOST = "127.0.0.1", HTTP_PORT = "19090", WAL_DIR = "/tmp/lattice/0/wal", SNAP_DIR = "/tmp/lattice/0/snap", RANGE_MAP = "00", INIT_MAP = "00", CUTOVER_MAP = "00", SPAN_START = "00", SURVEY_MAP = "00", A_BOOT_MAP = "00", A_CUTOVER_MAP = "00", B_MAP = "00", COURIER_EP = "7f0000011c1c" }
+vars = { SELF_ID = "0", LISTEN_PORT = "6379", REDIS_PORT = "6379", DATA_PORT = "6380", LIN_READS = "0", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", PEER3_PORT = "9093", PEER0_ADDR = "127.0.0.1:7000", PEER1_ADDR = "127.0.0.1:7001", PEER2_ADDR = "127.0.0.1:7002", PEER0_HOST = "127.0.0.1", PEER1_HOST = "127.0.0.1", PEER2_HOST = "127.0.0.1", PEER3_HOST = "127.0.0.1", HTTP_PORT = "19090", WAL_DIR = "/tmp/lattice/0/wal", SNAP_DIR = "/tmp/lattice/0/snap", RANGE_MAP = "00", INIT_MAP = "00", CUTOVER_MAP = "00", SPAN_START = "00", SURVEY_MAP = "00", A_BOOT_MAP = "00", A_CUTOVER_MAP = "00", B_MAP = "00", COURIER_EP = "127.0.0.1:7452" }
 
 [required]
 # Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps only

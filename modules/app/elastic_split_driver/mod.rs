@@ -91,7 +91,7 @@ define_params! {
     4, span_end, str, 0
         => |s, d, len| { append_hex(&mut s.span_end_hex, &mut s.span_end_hex_len, KEY_MAX * 2, d, len); };
     // Post-cutover RANGE_MAP_UPDATE_V1 frame, hex.
-    5, cutover_map, str, 0
+    5, cutover_map, str_chunked, 0
         => |s, d, len| { append_hex(&mut s.map_hex, &mut s.map_hex_len, MAP_MAX * 2, d, len); };
     // Drain window between raising the barrier and the catch-up copy:
     // long enough for writes already routed past the router to apply.

@@ -7,13 +7,13 @@ hardware_targets = ["bcm2712"]
 # stream. Carries app-snapshot envelopes (RESET/CHUNK one way, the
 # install-complete ack the other) over ONE TCP connection, byte-for-byte
 # and unparsed, so the worker-side contract is identical to the
-# in-process wiring. `mode: 0` (ship) dials `endpoint` from the source
+# in-process wiring. `mode: 0` (ship) dials `authority` from the source
 # node; `mode: 1` (receive) listens on `listen_port` on the target node.
 # Transport loss fails closed: an incomplete stream is dropped whole,
 # the target's strict chunk accumulation aborts the install, no ack is
 # returned, and the split driver's cutover never fires.
 
-# NET provider events (BOUND/ACCEPTED/CONNOK/DATA/CLOSED/ERROR).
+# NET provider events (BOUND/ACCEPTED/CONNECTED/DATA/CLOSED/ERROR).
 [[ports]]
 name = "net_in"
 direction = "input"
@@ -27,7 +27,7 @@ name = "local_in"
 direction = "input"
 content_type = "OctetStream"
 
-# NET provider commands (BIND/CONNECT/SEND).
+# NET provider commands (BIND/CONNECT_TO/SEND).
 [[ports]]
 name = "net_out"
 direction = "output"

@@ -12,7 +12,7 @@
 //!
 //! Ports:  net_in/net_out (transport), request_in (structured commands),
 //!         reply_out (reply values).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `password` (optional; enables AUTH).
+//! Params: `authority` (`host[:port]`, port 6379 when omitted), `password` (optional; enables AUTH).
 //! request_in frame: `[nargs:u8]` then per arg `[len:u16 LE][bytes]` — the module
 //!         builds the RESP wire bytes, so upstream sends args, not protocol bytes.
 
@@ -45,13 +45,16 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 // Shared, host-tested cores — identical source to the `chronicle-bytecode` crate.
 include!("../../common/resp_core.rs");
 include!("../../common/redis_core.rs");
-include!("../../common/hex_core.rs");
 
-#[path = "../../common/net_proto.rs"]
-mod net_proto;
-use net_proto::{
-    net_conn_id, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_CLOSED,
-    NET_MSG_CONNOK as NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_REDIS};
+
+use abi::contracts::net::net_proto::{
+    conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
 };
 
 const NET_BUF: usize = 2048;
@@ -70,10 +73,7 @@ struct RedisState {
     request_in: i32,
     reply_out: i32,
 
-    ip: [u8; 4],
-    port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
+    authority: Authority,
     password: [u8; PASS_BUF],
     password_len: u16,
 
@@ -111,13 +111,11 @@ struct RedisState {
 define_params! {
     RedisState;
 
-    // Endpoint: hex of [ip:4][port:2 LE]. The connector owns the endpoint.
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i);
-            s.ep_hex_len += 1;
-            i += 1;
+    // Tag 1 is retired.
+    // The peer, `host[:port]`; the port defaults to 6379.
+    3, authority, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.authority.set(core::slice::from_raw_parts(d, len));
         }
     };
 
@@ -169,9 +167,7 @@ pub extern "C" fn module_new(
         s.net_out = out_chan;
         s.request_in = dev_channel_port(sys, 0, 1);
         s.reply_out = dev_channel_port(sys, 1, 1);
-        s.ip = [0u8; 4];
-        s.port = 0;
-        s.ep_hex_len = 0;
+        s.authority.clear();
         s.password_len = 0;
         s.phase = Phase::Disconnected;
         s.conn_id = 0;
@@ -189,12 +185,10 @@ pub extern "C" fn module_new(
         s.errors = 0;
         s.reconnects = 0;
         parse_tlv(s, params, params_len);
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
-            }
+        if !s.authority.adopt(PORT_REDIS) {
+            let m = b"[redis] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
         }
         dev_log(sys, 3, b"[redis] init".as_ptr(), 12);
         0
@@ -217,26 +211,19 @@ unsafe fn feed(s: &mut RedisState, sys: &SyscallTable, ev: Ev, now: u64) {
     let (action, next) = redis_transition(s.phase, ev, needs_auth);
     match action {
         Act::Connect => {
-            // CONNECT payload: [sock_type][ip host-order (reversed octets)][port LE][tag].
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1] = s.ip[3];
-            payload[2] = s.ip[2];
-            payload[3] = s.ip[1];
-            payload[4] = s.ip[0];
-            let port = s.port.to_le_bytes();
-            payload[5] = port[0];
-            payload[6] = port[1];
-            payload[7] = s.tag;
-            net_write_frame(
-                sys,
-                s.net_out,
-                NET_CMD_CONNECT,
-                payload.as_ptr(),
-                8,
-                s.nbuf.as_mut_ptr(),
-                NET_BUF,
-            );
+            let mut payload = [0u8; CONNECT_TO_MAX];
+            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            if n > 0 {
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CONNECT_TO,
+                    payload.as_ptr(),
+                    n,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
+            }
             s.started_ms = now;
         }
         Act::SendAuth => {
@@ -295,7 +282,7 @@ unsafe fn feed(s: &mut RedisState, sys: &SyscallTable, ev: Ev, now: u64) {
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    NET_CONN_LEN,
+                    CONN_ID_LEN,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -372,23 +359,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let pl = core::slice::from_raw_parts(payload, plen.min(NET_BUF - NET_FRAME_HDR));
                 match msg {
                     NET_MSG_CONNECTED if s.phase == Phase::Connecting => {
-                        // CONNOK payload: [conn_id:u16 LE][requester_tag:u8?].
-                        // `>` not `>= + 1`: at least one byte beyond the
-                        // conn id, which is the tag read on the next line.
-                        if plen > NET_CONN_LEN && pl[NET_CONN_LEN] == s.tag {
-                            if let Some(id) = net_conn_id(pl) {
+                        if plen >= CONN_ID_LEN {
+                            let (id, tag) = connected_parts(pl);
+                            if tag == s.tag || tag == REQUESTER_TAG_NONE {
                                 s.conn_id = id;
                                 feed(s, sys, Ev::Connected, now);
                             }
                         }
                     }
                     NET_MSG_DATA if s.phase == Phase::Authing || s.phase == Phase::Awaiting => {
-                        if plen > NET_CONN_LEN && net_conn_id(pl) == Some(s.conn_id) {
-                            let data_len = plen - NET_CONN_LEN;
+                        if plen > CONN_ID_LEN && conn_id(pl) == s.conn_id {
+                            let data_len = plen - CONN_ID_LEN;
                             let space = REPLY_BUF - s.reply_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(NET_CONN_LEN),
+                                payload.add(CONN_ID_LEN),
                                 s.reply.as_mut_ptr().add(s.reply_len as usize),
                                 take,
                             );
@@ -405,17 +390,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_CLOSED if s.phase != Phase::Disconnected => {
-                        if net_conn_id(pl) == Some(s.conn_id) {
+                        if plen >= CONN_ID_LEN && conn_id(pl) == s.conn_id {
                             feed(s, sys, Ev::PeerClosed, now);
                         }
                     }
-                    NET_MSG_ERROR => {
-                        // ERROR payload: [conn_id:u16 LE][errno:i8][requester_tag:u8?].
-                        let ours = (s.phase == Phase::Connecting
-                            && plen >= NET_CONN_LEN + 2
-                            && pl[NET_CONN_LEN + 1] == s.tag)
-                            || (s.phase != Phase::Disconnected
-                                && net_conn_id(pl) == Some(s.conn_id));
+                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                        // A tagged error is a connect-phase failure and is
+                        // ours by tag alone; an untagged one belongs to an
+                        // established connection and routes by conn id.
+                        let (id, _errno, tag) = error_parts(pl);
+                        let ours = if tag == REQUESTER_TAG_NONE {
+                            (s.phase == Phase::Connecting)
+                                || (s.phase != Phase::Disconnected && id == s.conn_id)
+                        } else {
+                            s.phase == Phase::Connecting && tag == s.tag
+                        };
                         if ours {
                             feed(s, sys, Ev::NetError, now);
                         }
@@ -427,7 +416,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 4. Pump the flush buffer (AUTH or command) over the open connection.
         if (s.phase == Phase::Authing || s.phase == Phase::Awaiting) && s.conn_id != 0 {
-            let max_chunk = NET_BUF - NET_FRAME_HDR - NET_CONN_LEN;
+            let max_chunk = NET_BUF - NET_FRAME_HDR - CONN_ID_LEN;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {
@@ -439,7 +428,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else {
                     max_chunk
                 };
-                let total_payload = chunk + NET_CONN_LEN;
+                let total_payload = chunk + CONN_ID_LEN;
                 let id = s.conn_id.to_le_bytes();
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
@@ -448,7 +437,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.nbuf[4] = id[1];
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
-                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + NET_CONN_LEN),
+                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + CONN_ID_LEN),
                     chunk,
                 );
                 (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), NET_FRAME_HDR + total_payload);
@@ -484,7 +473,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    NET_CONN_LEN,
+                    CONN_ID_LEN,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );

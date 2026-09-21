@@ -15,7 +15,7 @@
 //!         one reply record per query; a set that overflows the reply buffer
 //!         is DROPPED with `errors` counted, never truncated: a consumer
 //!         must not mistake a prefix for the whole set).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `user`, `database`, `password`,
+//! Params: `authority` (`host[:port]`, port 5432 when omitted), `user`, `database`, `password`,
 //!         `cid_len` (0 = off; N = the first N bytes of each request record are
 //!         an opaque correlation prefix, echoed at the front of the reply —
 //!         and every query then yields a reply, a row-less one being the bare
@@ -53,15 +53,17 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
 include!("../../common/scram_core.rs");
 include!("../../common/pg_core.rs");
 include!("../../common/pg_reply.rs");
-include!("../../common/hex_core.rs");
 
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_PG};
+
+use abi::contracts::net::net_proto::{
+    conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
+};
 
 const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 2048;
@@ -89,10 +91,7 @@ struct PgState {
     request_in: i32,
     reply_out: i32,
 
-    ip: [u8; 4],
-    port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
+    authority: Authority,
     user: [u8; NAME_BUF],
     user_len: u16,
     database: [u8; NAME_BUF],
@@ -153,10 +152,11 @@ struct PgState {
 define_params! {
     PgState;
 
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i); s.ep_hex_len += 1; i += 1;
+    // Tag 1 is retired.
+    // The peer, `host[:port]`; the port defaults to 5432.
+    6, authority, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.authority.set(core::slice::from_raw_parts(d, len));
         }
     };
     2, user, str, 0 => |s, d, len| {
@@ -227,9 +227,7 @@ pub extern "C" fn module_new(
         s.net_out = out_chan;
         s.request_in = dev_channel_port(sys, 0, 1);
         s.reply_out = dev_channel_port(sys, 1, 1);
-        s.ip = [0u8; 4];
-        s.port = 0;
-        s.ep_hex_len = 0;
+        s.authority.clear();
         s.user_len = 0;
         s.database_len = 0;
         s.password_len = 0;
@@ -256,12 +254,10 @@ pub extern "C" fn module_new(
         s.completed = 0;
         s.errors = 0;
         parse_tlv(s, params, params_len);
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
-            }
+        if !s.authority.adopt(PORT_PG) {
+            let m = b"[pg] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
         }
         dev_log(sys, 3, b"[pg] init".as_ptr(), 9);
         0
@@ -536,25 +532,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 2. A queued query drives connect (if down) or send (if ready).
         if s.has_query == 1 {
             if s.phase == DISCONNECTED {
-                let mut payload = [0u8; 8];
-                payload[0] = SOCK_TYPE_STREAM;
-                payload[1] = s.ip[3];
-                payload[2] = s.ip[2];
-                payload[3] = s.ip[1];
-                payload[4] = s.ip[0];
-                let port = s.port.to_le_bytes();
-                payload[5] = port[0];
-                payload[6] = port[1];
-                payload[7] = s.tag;
-                net_write_frame(
-                    sys,
-                    s.net_out,
-                    NET_CMD_CONNECT,
-                    payload.as_ptr(),
-                    8,
-                    s.nbuf.as_mut_ptr(),
-                    NET_BUF,
-                );
+                let mut payload = [0u8; CONNECT_TO_MAX];
+                let n = s.authority.connect_record(&mut payload, Some(s.tag));
+                if n > 0 {
+                    net_write_frame(
+                        sys,
+                        s.net_out,
+                        NET_CMD_CONNECT_TO,
+                        payload.as_ptr(),
+                        n,
+                        s.nbuf.as_mut_ptr(),
+                        NET_BUF,
+                    );
+                }
                 s.phase = CONNECTING;
                 s.started_ms = now;
             } else if s.phase == READY {
@@ -580,29 +570,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     break;
                 }
                 let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
-                // Every inbound frame leads with `[conn_id:2 LE]`; the
-                // provider-side layouts are MSG_CONNECTED `[conn][tag]`,
-                // MSG_DATA `[conn][data…]`, MSG_CLOSED `[conn]`, and
-                // MSG_ERROR `[conn][errno][tag]`.
-                let frame_conn = if plen >= 2 {
-                    u16::from_le_bytes([*payload, *payload.add(1)])
-                } else {
-                    u16::MAX // too short to carry an id — matches nothing
-                };
+                let pl = core::slice::from_raw_parts(payload, plen.min(NET_BUF - NET_FRAME_HDR));
                 match msg {
                     NET_MSG_CONNECTED if s.phase == CONNECTING => {
-                        if plen >= 3 && *payload.add(2) == s.tag {
-                            s.conn_id = frame_conn;
-                            send_startup(s, now);
+                        if plen >= CONN_ID_LEN {
+                            let (id, tag) = connected_parts(pl);
+                            if tag == s.tag || tag == REQUESTER_TAG_NONE {
+                                s.conn_id = id;
+                                send_startup(s, now);
+                            }
                         }
                     }
                     NET_MSG_DATA if s.phase != DISCONNECTED => {
-                        if plen > 2 && frame_conn == s.conn_id {
-                            let data_len = plen - 2;
+                        if plen > CONN_ID_LEN && conn_id(pl) == s.conn_id {
+                            let data_len = plen - CONN_ID_LEN;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(2),
+                                payload.add(CONN_ID_LEN),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -611,13 +596,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_CLOSED if s.phase != DISCONNECTED => {
-                        if plen >= 2 && frame_conn == s.conn_id {
+                        if plen >= CONN_ID_LEN && conn_id(pl) == s.conn_id {
                             fail(s, now);
                         }
                     }
-                    NET_MSG_ERROR => {
-                        let ours = (s.phase == CONNECTING && plen >= 4 && *payload.add(3) == s.tag)
-                            || (s.phase != DISCONNECTED && plen >= 2 && frame_conn == s.conn_id);
+                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                        // A tagged error is a connect-phase failure and is
+                        // ours by tag alone; an untagged one belongs to an
+                        // established connection and routes by conn id.
+                        let (id, _errno, tag) = error_parts(pl);
+                        let ours = if tag == REQUESTER_TAG_NONE {
+                            (s.phase == CONNECTING) || (s.phase != DISCONNECTED && id == s.conn_id)
+                        } else {
+                            s.phase == CONNECTING && tag == s.tag
+                        };
                         if ours {
                             fail(s, now);
                         }
@@ -630,7 +622,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 4. Send pump.
         if s.conn_id != 0 && s.req_sent < s.req_len {
             // CMD_SEND payload is `[conn_id:2 LE][data…]`.
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 2;
+            let max_chunk = NET_BUF - NET_FRAME_HDR - CONN_ID_LEN;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {

@@ -99,12 +99,16 @@ mod telemetry;
 #[path = "../../common/data_surface.rs"]
 mod data_surface;
 
-#[path = "../../common/net_proto.rs"]
-mod net_proto;
-use net_proto::{
-    net_conn_id, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_CLOSED,
-    NET_MSG_CONNOK, NET_MSG_DATA, NET_MSG_ERROR, NET_SOCK_STREAM,
+#[path = "../../common/authority.rs"]
+mod authority;
+
+use abi::contracts::net::net_proto::{
+    conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
 };
+use authority::{Authority, PORT_LATTICE_DATA};
 
 use data_surface::{
     decode_response_frame, encode_request_frame, isolation_for, read_policy, Consistency, DataOp,
@@ -143,20 +147,7 @@ const NO_CONN: u16 = 0xFFFF;
 define_params! {
     ClientState;
 
-    // IPv4 of the storage graph's data anchor, as the packed 32-bit
-    // address — 127.0.0.1 is 0x7F000001 (2130706433), the same spelling
-    // `inet_addr` and every config file uses.
-    //
-    // `NET_CMD_CONNECT` carries it through `to_le_bytes`, which is what
-    // peer_router does and what foundation/ip expects. Getting this
-    // backwards dials 1.0.0.127 and the only symptom is a socket stuck
-    // in SYN-SENT, so it is worth stating which end is which.
-    1, server_ip, u32, 0x7F00_0001
-        => |s, d, len| { s.server_ip = p_u32(d, len, 0, 0x7F00_0001); };
-
-    // Port the remote `lattice_data_anchor` binds.
-    2, server_port, u16, 7432
-        => |s, d, len| { s.server_port = p_u16(d, len, 0, 7432); };
+    // Tags 1, 2, 8, 9, 10 and 11 are retired.
 
     // The route this client addresses. Stands in for the routing cache
     // §14.9 will own — see the module header. Written into the low 8
@@ -183,23 +174,34 @@ define_params! {
     7, database_id, u32, 1
         => |s, d, len| { s.database_id = p_u32(d, len, 0, 1); };
 
-    // Additional storage replicas (RFC §30's three-replica range). A
-    // peer exists iff its PORT is non-zero; the ip defaults to
-    // loopback so a localhost cluster only has to name ports.
+    // The storage graph's data anchor, `host[:port]`; the port defaults
+    // to 7432. Required: a client with nowhere to dial is a wiring
+    // error, and saying so at init is cheaper than a graph that looks
+    // healthy and serves nobody.
+    12, authority, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.peers[0].set(core::slice::from_raw_parts(d, len));
+        }
+    };
+
+    // Additional storage replicas (RFC §30's three-replica range), each
+    // an optional `host[:port]` with the same default port.
     //
     // The client talks to ONE peer at a time and rotates on evidence —
     // see `note_authority_refusal`. It does not fan out: the leader is
     // the only replica that can serve writes, and probing all three
     // per request would triple load to learn what one typed refusal
     // already says.
-    8, server2_ip, u32, 0x7F00_0001
-        => |s, d, len| { s.server2_ip = p_u32(d, len, 0, 0x7F00_0001); };
-    9, server2_port, u16, 0
-        => |s, d, len| { s.server2_port = p_u16(d, len, 0, 0); };
-    10, server3_ip, u32, 0x7F00_0001
-        => |s, d, len| { s.server3_ip = p_u32(d, len, 0, 0x7F00_0001); };
-    11, server3_port, u16, 0
-        => |s, d, len| { s.server3_port = p_u16(d, len, 0, 0); };
+    13, authority2, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.peers[1].set(core::slice::from_raw_parts(d, len));
+        }
+    };
+    14, authority3, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.peers[2].set(core::slice::from_raw_parts(d, len));
+        }
+    };
 }
 
 // ── State ─────────────────────────────────────────────────────────────
@@ -229,18 +231,17 @@ struct ClientState {
     kv_out: i32,
     metrics_out: i32,
 
-    server_ip: u32,
-    server_port: u16,
-    server2_ip: u32,
-    server2_port: u16,
-    server3_ip: u32,
-    server3_port: u16,
+    /// The configured storage peers; peer 0 is required, the others
+    /// exist iff configured.
+    peers: [Authority; 3],
     /// Index of the peer currently dialled (0..3).
     peer_idx: u8,
+    /// Requester tag on every dial; `MSG_CONNECTED` / `MSG_ERROR` echo it.
+    tag: u8,
     /// Consecutive MUTATION refusals with `UnavailableAuthority`.
     /// Rotation evidence — see the handler in `handle_response_frame`.
     authority_refusals: u8,
-    /// A dial went out and no CONNOK has come back. If it is still set
+    /// A dial went out and no MSG_CONNECTED has come back. If it is still set
     /// when the next redial period arrives, the peer is unreachable and
     /// rotation advances past it. Without this a DEAD peer is a trap:
     /// a failed outbound dial produces no event, so nothing else ever
@@ -293,13 +294,9 @@ impl ClientState {
         self.kv_in = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
-        self.server_ip = 0x7F00_0001;
-        self.server_port = 7432;
-        self.server2_ip = 0x7F00_0001;
-        self.server2_port = 0;
-        self.server3_ip = 0x7F00_0001;
-        self.server3_port = 0;
+        self.peers = [Authority::empty(), Authority::empty(), Authority::empty()];
         self.peer_idx = 0;
+        self.tag = 0;
         self.authority_refusals = 0;
         self.dial_unanswered = false;
         self.range_id = 1;
@@ -337,17 +334,16 @@ impl ClientState {
     }
 
     /// The `i`th configured peer, or None. Peer 0 always exists.
-    fn peer(&self, i: u8) -> Option<(u32, u16)> {
+    fn peer(&self, i: u8) -> Option<&Authority> {
         match i {
-            0 => Some((self.server_ip, self.server_port)),
-            1 if self.server2_port != 0 => Some((self.server2_ip, self.server2_port)),
-            2 if self.server3_port != 0 => Some((self.server3_ip, self.server3_port)),
+            0 => Some(&self.peers[0]),
+            1 | 2 if self.peers[i as usize].is_set() => Some(&self.peers[i as usize]),
             _ => None,
         }
     }
 
     fn peer_count(&self) -> u8 {
-        1 + (self.server2_port != 0) as u8 + (self.server3_port != 0) as u8
+        1 + self.peers[1].is_set() as u8 + self.peers[2].is_set() as u8
     }
 
     /// Advance to the next configured peer and dial it on the next
@@ -888,7 +884,7 @@ unsafe fn drop_connection(client: &mut ClientState) {
                 client.net_out,
                 NET_CMD_CLOSE,
                 payload.as_ptr(),
-                NET_CONN_LEN,
+                CONN_ID_LEN,
                 scratch,
                 SCRATCH_BUF_SIZE,
             );
@@ -934,21 +930,24 @@ unsafe fn dial(client: &mut ClientState) {
     if poll <= 0 || (poll as u32) & POLL_OUT == 0 {
         return;
     }
-    let Some((ip, port)) = client.peer(client.peer_idx) else {
-        client.peer_idx = 0;
-        return;
+    let mut payload = [0u8; CONNECT_TO_MAX];
+    let n = match client.peer(client.peer_idx) {
+        Some(peer) => peer.connect_record(&mut payload, Some(client.tag)),
+        None => {
+            client.peer_idx = 0;
+            return;
+        }
     };
-    let mut payload = [0u8; 7];
-    payload[0] = NET_SOCK_STREAM;
-    payload[1..5].copy_from_slice(&ip.to_le_bytes());
-    payload[5..7].copy_from_slice(&port.to_le_bytes());
+    if n == 0 {
+        return;
+    }
     let scratch = client.scratch.as_mut_ptr();
     let _ = net_write_frame(
         &*sys,
         client.net_out,
-        NET_CMD_CONNECT,
+        NET_CMD_CONNECT_TO,
         payload.as_ptr(),
-        7,
+        n,
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -960,7 +959,7 @@ unsafe fn net_send_data(client: &mut ClientState, data: &[u8]) -> bool {
     if sys.is_null() || client.net_out < 0 || client.conn_id == NO_CONN {
         return false;
     }
-    let payload_len = NET_CONN_LEN + data.len();
+    let payload_len = CONN_ID_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
@@ -973,7 +972,7 @@ unsafe fn net_send_data(client: &mut ClientState, data: &[u8]) -> bool {
     *scratch.add(NET_FRAME_HDR + 1) = id[1];
     core::ptr::copy_nonoverlapping(
         data.as_ptr(),
-        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        scratch.add(NET_FRAME_HDR + CONN_ID_LEN),
         data.len(),
     );
     let total = NET_FRAME_HDR + payload_len;
@@ -1011,10 +1010,12 @@ unsafe fn poll_net_in(client: &mut ClientState) -> bool {
 
 unsafe fn dispatch_net_frame(client: &mut ClientState, msg_type: u8, payload: &[u8]) {
     match msg_type {
-        NET_MSG_CONNOK => {
-            // CONNOK payload: [conn_id:u16 LE][requester_tag:u8?].
-            if client.conn_id == NO_CONN {
-                if let Some(new_id) = net_conn_id(payload) {
+        NET_MSG_CONNECTED => {
+            // `net_out` is broadcast: claim only the dial that carries
+            // our tag.
+            if client.conn_id == NO_CONN && payload.len() >= CONN_ID_LEN {
+                let (new_id, tag) = connected_parts(payload);
+                if tag == client.tag || tag == REQUESTER_TAG_NONE {
                     client.conn_id = new_id;
                     client.recv_len = 0;
                     client.dial_unanswered = false;
@@ -1026,28 +1027,51 @@ unsafe fn dispatch_net_frame(client: &mut ClientState, msg_type: u8, payload: &[
             }
         }
         NET_MSG_DATA => {
-            if payload.len() > NET_CONN_LEN && net_conn_id(payload) == Some(client.conn_id) {
+            if payload.len() > CONN_ID_LEN && conn_id(payload) == client.conn_id {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-                let n = (payload.len() - NET_CONN_LEN).min(SCRATCH_BUF_SIZE);
-                tmp[..n].copy_from_slice(&payload[NET_CONN_LEN..NET_CONN_LEN + n]);
+                let n = (payload.len() - CONN_ID_LEN).min(SCRATCH_BUF_SIZE);
+                tmp[..n].copy_from_slice(&payload[CONN_ID_LEN..CONN_ID_LEN + n]);
                 handle_wire_data(client, &tmp[..n]);
             }
         }
         // `net_out` is broadcast, so both of these also carry events for
         // connections other modules own. Only react to our own.
-        NET_MSG_CLOSED | NET_MSG_ERROR => {
-            if net_conn_id(payload) == Some(client.conn_id) {
-                drop_connection(client);
-                // A dead leader presents as a disconnect, not as a
-                // refusal. Move on rather than re-dialling a corpse;
-                // if the peer was healthy the rotation comes back
-                // round to it.
-                if client.peer_count() > 1 {
-                    client.next_peer();
+        NET_MSG_CLOSED => {
+            if payload.len() >= CONN_ID_LEN && conn_id(payload) == client.conn_id {
+                lost_connection(client);
+            }
+        }
+        NET_MSG_ERROR => {
+            // A tagged error is a failed dial and is ours by tag alone;
+            // an untagged one names an established connection by conn
+            // id.
+            if payload.len() > CONN_ID_LEN {
+                let (id, _errno, tag) = error_parts(payload);
+                if client.conn_id == NO_CONN {
+                    if tag == client.tag || tag == REQUESTER_TAG_NONE {
+                        // The redial period's rotation moves past the
+                        // peer; nothing to tear down.
+                        let sys = client.syscalls;
+                        if !sys.is_null() {
+                            dev_log(&*sys, 2, b"[data_cli] dial refused".as_ptr(), 23);
+                        }
+                    }
+                } else if tag == REQUESTER_TAG_NONE && id == client.conn_id {
+                    lost_connection(client);
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// The connection is gone. A dead leader presents as a disconnect, not
+/// as a refusal: move on rather than re-dial a corpse; if the peer was
+/// healthy the rotation comes back round to it.
+unsafe fn lost_connection(client: &mut ClientState) {
+    drop_connection(client);
+    if client.peer_count() > 1 {
+        client.next_peer();
     }
 }
 
@@ -1098,6 +1122,22 @@ pub extern "C" fn module_new(
         client.kv_in = dev_channel_port(sys, 0, 1);
         client.kv_out = dev_channel_port(sys, 1, 1);
         client.metrics_out = dev_channel_port(sys, 1, 2);
+        client.tag = dev_requester_tag(sys);
+        if !client.peers[0].adopt(PORT_LATTICE_DATA) {
+            let m = b"[data_cli] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
+        if client.peers[1].offered() && !client.peers[1].adopt(PORT_LATTICE_DATA) {
+            let m = b"[data_cli] refusing to construct: authority2 is not host[:port]";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
+        if client.peers[2].offered() && !client.peers[2].adopt(PORT_LATTICE_DATA) {
+            let m = b"[data_cli] refusing to construct: authority3 is not host[:port]";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
     }
 
     // A client with no compute attached would dial a storage graph and
@@ -1128,7 +1168,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             client.since_dial = client.since_dial.saturating_add(1);
             if client.since_dial >= REDIAL_STEPS {
                 client.since_dial = 0;
-                // A whole redial period with no CONNOK: the peer is
+                // A whole redial period with no MSG_CONNECTED: the peer is
                 // unreachable (dead node, refused connect). Move on —
                 // a healthy peer that was skipped comes back round.
                 if client.dial_unanswered && client.peer_count() > 1 {

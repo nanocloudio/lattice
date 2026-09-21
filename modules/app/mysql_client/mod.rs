@@ -11,7 +11,7 @@
 //! connect -> parse server handshake -> send native-auth response -> OK/ERR.
 //!
 //! Ports:  net_in/net_out (transport), status_out (auth result).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `user`, `database`, `password`.
+//! Params: `authority` (`host[:port]`, port 3306 when omitted), `user`, `database`, `password`.
 //! Scope: `mysql_native_password` and `caching_sha2_password` FAST path (the
 //! server-advertised plugin is spoken from the first response; AuthSwitch to
 //! either plugin is honoured). The sha2 FULL path (cold credential cache)
@@ -45,15 +45,17 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 include!("../../common/mysql_core.rs");
-include!("../../common/hex_core.rs");
 
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_MYSQL};
+
+use abi::contracts::net::net_proto::{
+    conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
+};
 
 const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 512;
@@ -69,10 +71,7 @@ struct MysqlState {
     net_out: i32,
     status_out: i32,
 
-    ip: [u8; 4],
-    port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
+    authority: Authority,
     user: [u8; NAME_BUF],
     user_len: u16,
     database: [u8; NAME_BUF],
@@ -81,7 +80,7 @@ struct MysqlState {
     password_len: u16,
 
     phase: MyPhase,
-    conn_id: u8,
+    conn_id: u16,
     tag: u8,
     started_ms: u64,
     draining: u8,
@@ -103,10 +102,11 @@ struct MysqlState {
 define_params! {
     MysqlState;
 
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i); s.ep_hex_len += 1; i += 1;
+    // Tag 1 is retired.
+    // The peer, `host[:port]`; the port defaults to 3306.
+    5, authority, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.authority.set(core::slice::from_raw_parts(d, len));
         }
     };
     2, user, str, 0 => |s, d, len| {
@@ -173,9 +173,7 @@ pub extern "C" fn module_new(
         s.net_in = in_chan;
         s.net_out = out_chan;
         s.status_out = dev_channel_port(sys, 1, 1);
-        s.ip = [0u8; 4];
-        s.port = 0;
-        s.ep_hex_len = 0;
+        s.authority.clear();
         s.user_len = 0;
         s.database_len = 0;
         s.password_len = 0;
@@ -191,12 +189,10 @@ pub extern "C" fn module_new(
         s.plugin = MyAuthPlugin::Native;
         s.errors = 0;
         parse_tlv(s, params, params_len);
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
-            }
+        if !s.authority.adopt(PORT_MYSQL) {
+            let m = b"[mysql] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
         }
         dev_log(sys, 3, b"[mysql] init".as_ptr(), 12);
         0
@@ -223,25 +219,19 @@ unsafe fn feed(
     let (action, next) = mysql_transition(s.phase, ev);
     match action {
         MyAct::Connect => {
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1] = s.ip[3];
-            payload[2] = s.ip[2];
-            payload[3] = s.ip[1];
-            payload[4] = s.ip[0];
-            let port = s.port.to_le_bytes();
-            payload[5] = port[0];
-            payload[6] = port[1];
-            payload[7] = s.tag;
-            net_write_frame(
-                sys,
-                s.net_out,
-                NET_CMD_CONNECT,
-                payload.as_ptr(),
-                8,
-                s.nbuf.as_mut_ptr(),
-                NET_BUF,
-            );
+            let mut payload = [0u8; CONNECT_TO_MAX];
+            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            if n > 0 {
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CONNECT_TO,
+                    payload.as_ptr(),
+                    n,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
+            }
             s.started_ms = now;
         }
         MyAct::SendHandshakeResponse => {
@@ -274,13 +264,13 @@ unsafe fn feed(
         }
         MyAct::Fail => {
             if s.conn_id != 0 {
-                let close = [s.conn_id];
+                let close = s.conn_id.to_le_bytes();
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    1,
+                    CONN_ID_LEN,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -394,20 +384,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     break;
                 }
                 let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
+                let pl = core::slice::from_raw_parts(payload, plen.min(NET_BUF - NET_FRAME_HDR));
                 match msg {
                     NET_MSG_CONNECTED if s.phase == MyPhase::Connecting => {
-                        if plen >= 2 && *payload.add(1) == s.tag {
-                            s.conn_id = *payload;
-                            feed(s, sys, MyEv::Connected, now, None);
+                        if plen >= CONN_ID_LEN {
+                            let (id, tag) = connected_parts(pl);
+                            if tag == s.tag || tag == REQUESTER_TAG_NONE {
+                                s.conn_id = id;
+                                feed(s, sys, MyEv::Connected, now, None);
+                            }
                         }
                     }
                     NET_MSG_DATA if s.phase != MyPhase::Disconnected => {
-                        if plen > 1 && *payload == s.conn_id {
-                            let data_len = plen - 1;
+                        if plen > CONN_ID_LEN && conn_id(pl) == s.conn_id {
+                            let data_len = plen - CONN_ID_LEN;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(1),
+                                payload.add(CONN_ID_LEN),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -433,17 +427,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_CLOSED if s.phase != MyPhase::Disconnected => {
-                        if plen >= 1 && *payload == s.conn_id {
+                        if plen >= CONN_ID_LEN && conn_id(pl) == s.conn_id {
                             feed(s, sys, MyEv::PeerClosed, now, None);
                         }
                     }
-                    NET_MSG_ERROR => {
-                        let ours = (s.phase == MyPhase::Connecting
-                            && plen >= 3
-                            && *payload.add(2) == s.tag)
-                            || (s.phase != MyPhase::Disconnected
-                                && plen >= 1
-                                && *payload == s.conn_id);
+                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                        // A tagged error is a connect-phase failure and is
+                        // ours by tag alone; an untagged one belongs to an
+                        // established connection and routes by conn id.
+                        let (id, _errno, tag) = error_parts(pl);
+                        let ours = if tag == REQUESTER_TAG_NONE {
+                            (s.phase == MyPhase::Connecting)
+                                || (s.phase != MyPhase::Disconnected && id == s.conn_id)
+                        } else {
+                            s.phase == MyPhase::Connecting && tag == s.tag
+                        };
                         if ours {
                             feed(s, sys, MyEv::NetError, now, None);
                         }
@@ -454,7 +452,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if s.conn_id != 0 && s.req_sent < s.req_len {
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 1;
+            let max_chunk = NET_BUF - NET_FRAME_HDR - CONN_ID_LEN;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {
@@ -466,14 +464,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else {
                     max_chunk
                 };
-                let total_payload = chunk + 1;
+                let total_payload = chunk + CONN_ID_LEN;
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
                 s.nbuf[2] = (total_payload >> 8) as u8;
-                s.nbuf[3] = s.conn_id;
+                s.nbuf[NET_FRAME_HDR..NET_FRAME_HDR + CONN_ID_LEN]
+                    .copy_from_slice(&s.conn_id.to_le_bytes());
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
-                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 1),
+                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + CONN_ID_LEN),
                     chunk,
                 );
                 (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), NET_FRAME_HDR + total_payload);
@@ -494,13 +493,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if s.draining == 1 && matches!(s.phase, MyPhase::Disconnected | MyPhase::Ready) {
             if s.conn_id != 0 {
-                let close = [s.conn_id];
+                let close = s.conn_id.to_le_bytes();
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    1,
+                    CONN_ID_LEN,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );

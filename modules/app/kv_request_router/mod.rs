@@ -1158,8 +1158,10 @@ define_params! {
     // RANGE_MAP_UPDATE_V1 frame as a HEX string, decoded and applied
     // at init. Present-but-invalid fails `module_new` — a graph with a
     // bad map must refuse to start, not serve NoRoute on every key.
-    // `str` params arrive TLV-chunked at 255 bytes with the same tag,
-    // so the apply APPENDS; overflow latches the poisoned length.
+    // A `str_chunked` param arrives as TLV entries of at most 255 bytes
+    // under the same tag, so the apply APPENDS each chunk; overflow
+    // latches the poisoned length. A large encoded map needs this: a
+    // plain `str` is refused past one entry at build time.
     // 1 = the static `range_map` is a BOOT map that may be stale (a
     // lifecycle supervisor owns the live map and republishes it at
     // boot): refuse ordered-mode client requests retryably until the
@@ -1194,7 +1196,7 @@ define_params! {
     6, local_cluster_domain, u32, 0
         => |s, d, len| { s.local_cluster_domain = p_u32(d, len, 0, 0); };
 
-    4, range_map, str, 0
+    4, range_map, str_chunked, 0
         => |s, d, len| {
             let at = s.range_map_param_len as usize;
             if s.range_map_param_len == u16::MAX || at + len > RANGE_MAP_PARAM_MAX * 2 {

@@ -105,14 +105,11 @@ const LEASE_CTRL_KEEPALIVE: u8 = 2;
 
 // ── NET protocol constants (foundation/ip Stream Surface v1) ──────────
 
-#[path = "../../common/net_proto.rs"]
-mod net_proto;
-use net_proto::{
-    net_conn_id, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_CONN_LEN, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
+use abi::contracts::net::net_proto::{
+    conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
+    CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
-
-// NET_CMD_* live in modules/common/net_proto.rs (imported above).
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -2563,7 +2560,11 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
     let payload_start = NET_FRAME_HDR;
     let payload_end = (payload_start + payload_len).min(anchor.scratch.len());
     // Leading conn id (u16 LE) of the frame, when present.
-    let frame_conn = net_conn_id(&anchor.scratch[payload_start..payload_end]);
+    let frame_conn = if payload_end - payload_start >= CONN_ID_LEN {
+        Some(conn_id(&anchor.scratch[payload_start..payload_end]))
+    } else {
+        None
+    };
 
     match msg_type {
         NET_MSG_BOUND => {
@@ -2579,7 +2580,7 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
                     anchor.phase = AnchorPhase::Listening;
                     dev_log(&*sys, 3, b"[etcd_anc] bound".as_ptr(), 16);
                 }
-            } else if anchor.phase == AnchorPhase::WaitBound && payload_len >= NET_CONN_LEN {
+            } else if anchor.phase == AnchorPhase::WaitBound && payload_len >= CONN_ID_LEN {
                 anchor.server_conn_id = frame_conn.unwrap_or(SLOT_FREE);
                 anchor.phase = AnchorPhase::Listening;
                 dev_log(&*sys, 3, b"[etcd_anc] bound".as_ptr(), 16);
@@ -2613,11 +2614,11 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
             }
         }
         NET_MSG_DATA => {
-            if payload_len > NET_CONN_LEN {
+            if payload_len > CONN_ID_LEN {
                 let Some(conn_id) = frame_conn else {
                     return true;
                 };
-                let data_start = payload_start + NET_CONN_LEN;
+                let data_start = payload_start + CONN_ID_LEN;
                 let data_end = payload_end;
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     // Move data from scratch into the slot's recv_buf
@@ -2719,7 +2720,7 @@ unsafe fn net_send_close_pic(anchor: &mut AnchorState, conn_id: u16) -> bool {
         out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        NET_CONN_LEN,
+        CONN_ID_LEN,
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -2732,7 +2733,7 @@ unsafe fn net_send_data_pic(anchor: &mut AnchorState, conn_id: u16, data: &[u8])
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload_len = NET_CONN_LEN + data.len();
+    let payload_len = CONN_ID_LEN + data.len();
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
@@ -2745,7 +2746,7 @@ unsafe fn net_send_data_pic(anchor: &mut AnchorState, conn_id: u16, data: &[u8])
     *scratch.add(NET_FRAME_HDR + 1) = id[1];
     core::ptr::copy_nonoverlapping(
         data.as_ptr(),
-        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        scratch.add(NET_FRAME_HDR + CONN_ID_LEN),
         data.len(),
     );
     let total = NET_FRAME_HDR + payload_len;
@@ -2852,7 +2853,7 @@ unsafe fn net_send_data_pic_from_frame(
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload_len = NET_CONN_LEN + data_len;
+    let payload_len = CONN_ID_LEN + data_len;
     if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
         return false;
     }
@@ -2865,7 +2866,7 @@ unsafe fn net_send_data_pic_from_frame(
     *scratch.add(NET_FRAME_HDR + 1) = id[1];
     core::ptr::copy_nonoverlapping(
         anchor.frame_payload.as_ptr(),
-        scratch.add(NET_FRAME_HDR + NET_CONN_LEN),
+        scratch.add(NET_FRAME_HDR + CONN_ID_LEN),
         data_len,
     );
     let total = NET_FRAME_HDR + payload_len;
