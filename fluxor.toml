@@ -67,6 +67,26 @@ forbid_inline_tests = ["modules", "tools"]
 mode                = "strict"
 max_inline_lines    = 80
 
+# Crate-root allows are permitted only where the cause is structural
+# (standards/lints.md §4). Two trees have one.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """The PIC modules textually mount the fluxor SDK and share the \
+modules/common cores via #[path]/include!, so every compile sees a whole \
+surface and uses a subset (dead_code, unused_imports, unreachable_patterns, \
+duplicate_mod); the unused items live in the mounted source, not the file. \
+And the module ABI is unsafe by construction: each module exports fixed-arity \
+extern "C" entry points over raw pointers (not_unsafe_ptr_arg_deref, \
+too_many_arguments, missing_safety_doc)."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/harness/"
+reason = """A test driver: the integration suites assert through \
+unwrap/expect and report progress and skips on stdout by design, drive the \
+raw module ABI and child process groups (unsafe_code), and #[path]-mount the \
+no_std cores and codecs, each suite using a subset (dead_code, duplicate_mod, \
+unused_imports)."""
+
 [ci.test]
 # CI phase 3.5 project gates, in order:
 #   1. shadow_guard.sh — shadow-checkout hard-fail:

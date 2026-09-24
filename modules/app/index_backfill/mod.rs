@@ -35,11 +35,6 @@
     unreachable_patterns,
     reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
 )]
-#![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; the explicit form is the module idiom"
-)]
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -508,9 +503,8 @@ fn send_next_entry(bf: &mut BfState) {
         fault(bf, b"[ixbf] pk oversize");
         return;
     }
-    for i in 0..pk_len {
-        pk[i] = bf.page[koff + sql_exec::KEYSPACE_PREFIX_LEN + i];
-    }
+    let pk_at = koff + sql_exec::KEYSPACE_PREFIX_LEN;
+    pk[..pk_len].copy_from_slice(&bf.page[pk_at..pk_at + pk_len]);
     // The indexed column's value from the row payload.
     let col_id = bf.d.key_columns()[0];
     let Some(col) = bf.td.column(col_id) else {
@@ -519,9 +513,7 @@ fn send_next_entry(bf: &mut BfState) {
     };
     let ty = col.ty;
     let mut rowbuf = [0u8; PAGE_BUF];
-    for i in 0..vlen {
-        rowbuf[i] = bf.page[voff + 4 + i];
-    }
+    rowbuf[..vlen].copy_from_slice(&bf.page[voff + 4..voff + 4 + vlen]);
     let value = match relational::row_lookup(&rowbuf[..vlen], col_id, ty) {
         Some(relational::ColumnLookup::Present(v)) => v,
         Some(relational::ColumnLookup::Absent) => Value::Null,

@@ -50,11 +50,6 @@
     clippy::duplicate_mod,
     reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
 )]
-#![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; the explicit form is the module idiom"
-)]
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -662,12 +657,8 @@ fn send_next_restore_put(c: &mut CoordState) {
         fault(c, b"[bkp] record too large");
         return;
     }
-    for i in 0..klen {
-        key[i] = c.page[koff + i];
-    }
-    for i in 0..vlen {
-        val[i] = c.page[voff + 4 + i];
-    }
+    key[..klen].copy_from_slice(&c.page[koff..koff + klen]);
+    val[..vlen].copy_from_slice(&c.page[voff + 4..voff + 4 + vlen]);
     c.page_at = vend as u16;
     c.page_records -= 1;
     let Some(bn) = stage_put(c, &key[..klen], &val[..vlen]) else {

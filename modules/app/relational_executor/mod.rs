@@ -64,11 +64,6 @@
     unreachable_patterns,
     reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface. unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
 )]
-#![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; the explicit form is the module idiom"
-)]
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -2334,9 +2329,7 @@ fn send_insert_txn(exec: &mut ExecState, ins: &sql_core::Insert<'_>) {
             p += 2;
             exec.env[p..p + 2].copy_from_slice(&(kk as u16).to_le_bytes());
             p += 2;
-            for b in 0..kk {
-                exec.env[p + b] = ixkey[b];
-            }
+            exec.env[p..p + kk].copy_from_slice(&ixkey[..kk]);
             p += kk;
             exec.env[p..p + 4].copy_from_slice(&0u32.to_le_bytes());
             p += 4;
@@ -3216,8 +3209,8 @@ fn start_select(exec: &mut ExecState, s: &sql_core::Select<'_>) {
             return;
         }
     };
-    for i in 0..ncols {
-        exec.proj[i] = cols[i].column_id;
+    for (i, c) in cols[..ncols].iter().enumerate() {
+        exec.proj[i] = c.column_id;
     }
     exec.proj_len = ncols;
     exec.limit = s.limit.unwrap_or(u32::MAX);
@@ -4387,8 +4380,7 @@ fn start_aggregate(exec: &mut ExecState, s: &sql_core::Select<'_>) {
     }
     // Bind each projection item.
     exec.agg_n = *count as u8;
-    for i in 0..*count {
-        let it = items[i];
+    for (i, &it) in items[..*count].iter().enumerate() {
         match it.func {
             None => {
                 // A bare group column.
@@ -4719,11 +4711,11 @@ fn reply_agg(exec: &mut ExecState) {
 
     // Synthetic result columns: computed values, not stored ones.
     let mut descs = [ColumnDescriptor::EMPTY; MAX_AGG_ITEMS];
-    for i in 0..n {
+    for (i, desc) in descs[..n].iter_mut().enumerate() {
         let nl = exec.agg_item_name_len[i] as usize;
         let mut nm = [0u8; 32];
         nm[..nl].copy_from_slice(&exec.agg_item_name[i][..nl]);
-        descs[i] = match ColumnDescriptor::new(0, agg_result_ty(exec, i), true, false, &nm[..nl]) {
+        *desc = match ColumnDescriptor::new(0, agg_result_ty(exec, i), true, false, &nm[..nl]) {
             Some(d) => d,
             None => {
                 reply_simple(exec, ERR_CORRUPT, TAG_EMPTY, 0);
