@@ -1,10 +1,5 @@
 //! Wire protocol definition linting tool.
 
-#![allow(
-    clippy::disallowed_macros,
-    reason = "host-side lint CLI: reporting findings on stdout is the tool's output contract"
-)]
-
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -23,6 +18,10 @@ struct Args {
     wire_dir: Option<PathBuf>,
 }
 
+#[expect(
+    clippy::disallowed_macros,
+    reason = "each validated definition is reported on stdout, the CLI's output contract"
+)]
 fn validate(path: &Path) -> Result<()> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -32,6 +31,10 @@ fn validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_macros,
+    reason = "the lint summary on stdout is this CLI's output contract"
+)]
 fn main() -> Result<()> {
     let args = Args::parse();
 

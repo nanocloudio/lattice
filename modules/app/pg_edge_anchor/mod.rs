@@ -53,11 +53,6 @@
     clippy::duplicate_mod,
     reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
 )]
-#![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; the explicit form is the module idiom"
-)]
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -555,8 +550,8 @@ fn feed_password(anchor: &mut AnchorState, idx: usize) -> usize {
     // an early-return that leaks the matching prefix length.
     let expected = &anchor.password[..anchor.password_len];
     let mut diff = supplied.len() ^ expected.len();
-    for i in 0..expected.len() {
-        diff |= usize::from(expected[i] ^ supplied.get(i).copied().unwrap_or(0));
+    for (i, &e) in expected.iter().enumerate() {
+        diff |= usize::from(e ^ supplied.get(i).copied().unwrap_or(0));
     }
     if diff == 0 {
         send_startup_complete(anchor, idx);

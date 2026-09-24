@@ -35,11 +35,6 @@
 //! graph that validates and then disagrees with itself about what time
 //! it is.
 
-#![allow(
-    clippy::disallowed_macros,
-    reason = "host-side lint CLI: reporting findings on stdout is the tool's output contract"
-)]
-
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::Deserialize;
@@ -275,6 +270,10 @@ fn check_file(path: &Path) -> Result<Findings> {
     })
 }
 
+#[expect(
+    clippy::disallowed_macros,
+    reason = "findings are reported on stdout, the CLI's output contract"
+)]
 fn report(findings: &[Findings]) -> Result<()> {
     let mut failed = 0usize;
     for f in findings {

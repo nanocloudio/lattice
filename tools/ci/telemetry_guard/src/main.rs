@@ -1,10 +1,5 @@
 //! Telemetry catalog validation tool.
 
-#![allow(
-    clippy::disallowed_macros,
-    reason = "host-side validation CLI: reporting catalog findings on stdout is the tool's output contract"
-)]
-
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
@@ -18,6 +13,10 @@ struct Args {
     catalog: PathBuf,
 }
 
+#[expect(
+    clippy::disallowed_macros,
+    reason = "the catalog verdict on stdout is this CLI's output contract"
+)]
 fn main() -> Result<()> {
     let args = Args::parse();
 

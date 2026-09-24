@@ -40,11 +40,6 @@
     clippy::duplicate_mod,
     reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
 )]
-#![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; the explicit form is the module idiom"
-)]
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -1495,15 +1490,11 @@ fn send_delete_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     let mut p = BODY_AT;
     anchor.env[p..p + 2].copy_from_slice(&(sn as u16).to_le_bytes());
     p += 2;
-    for i in 0..sn {
-        anchor.env[p + i] = start[i];
-    }
+    anchor.env[p..p + sn].copy_from_slice(&start[..sn]);
     p += sn;
     anchor.env[p..p + 2].copy_from_slice(&(en as u16).to_le_bytes());
     p += 2;
-    for i in 0..en {
-        anchor.env[p + i] = end[i];
-    }
+    anchor.env[p..p + en].copy_from_slice(&end[..en]);
     p += en;
     anchor.env[p..p + 8].copy_from_slice(&cursor.to_le_bytes());
     p += 8;
@@ -1643,15 +1634,11 @@ fn send_prior_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     let mut p = BODY_AT;
     anchor.env[p..p + 2].copy_from_slice(&(sn as u16).to_le_bytes());
     p += 2;
-    for i in 0..sn {
-        anchor.env[p + i] = start[i];
-    }
+    anchor.env[p..p + sn].copy_from_slice(&start[..sn]);
     p += sn;
     anchor.env[p..p + 2].copy_from_slice(&(en as u16).to_le_bytes());
     p += 2;
-    for i in 0..en {
-        anchor.env[p + i] = end[i];
-    }
+    anchor.env[p..p + en].copy_from_slice(&end[..en]);
     p += en;
     anchor.env[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
     p += 8;
@@ -1781,15 +1768,11 @@ fn send_select_scan(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     let mut p = BODY_AT;
     anchor.env[p..p + 2].copy_from_slice(&(sn as u16).to_le_bytes());
     p += 2;
-    for i in 0..sn {
-        anchor.env[p + i] = start[i];
-    }
+    anchor.env[p..p + sn].copy_from_slice(&start[..sn]);
     p += sn;
     anchor.env[p..p + 2].copy_from_slice(&(en as u16).to_le_bytes());
     p += 2;
-    for i in 0..en {
-        anchor.env[p + i] = end[i];
-    }
+    anchor.env[p..p + en].copy_from_slice(&end[..en]);
     p += en;
     anchor.env[p..p + 8].copy_from_slice(&cursor.to_le_bytes());
     p += 8;
@@ -1829,8 +1812,11 @@ fn finish_select(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
     let cc = anchor.schema.clustering_count;
     let mut cl_types = [LogicalType::Int; codec::CQL_MAX_CLUSTERING];
     let cl_dirs = [SortDirection::Ascending; codec::CQL_MAX_CLUSTERING];
-    for j in 0..cc {
-        cl_types[j] = anchor.schema.col_type(anchor.schema.clustering[j]);
+    for (t, &c) in cl_types[..cc]
+        .iter_mut()
+        .zip(&anchor.schema.clustering[..cc])
+    {
+        *t = anchor.schema.col_type(c);
     }
 
     // Group cells by row identity — the key up to (not including) the
@@ -1916,15 +1902,15 @@ fn finish_select(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
             rows[r].pk[..pk_len].copy_from_slice(&pk_out[..pk_len]);
             rows[r].pk_len = pk_len;
             // Render the clustering values once.
-            for j in 0..cc {
+            for (&v, cl) in values_out[..cc].iter().zip(rows[r].cl[..cc].iter_mut()) {
                 let mut cb = [0u8; 64];
-                match render_value(values_out[j], &mut cb) {
+                match render_value(v, &mut cb) {
                     Some(cn) => {
-                        rows[r].cl[j].0[..cn].copy_from_slice(&cb[..cn]);
-                        rows[r].cl[j].1 = cn;
-                        rows[r].cl[j].2 = false;
+                        cl.0[..cn].copy_from_slice(&cb[..cn]);
+                        cl.1 = cn;
+                        cl.2 = false;
                     }
-                    None => rows[r].cl[j].2 = true, // NULL
+                    None => cl.2 = true, // NULL
                 }
             }
             row_count += 1;
@@ -1968,8 +1954,7 @@ fn finish_select(anchor: &mut AnchorState, parsed: &CqlStatement<'_>) {
         if !row.marker {
             continue; // cells without a marker: partial artifacts
         }
-        for i in 0..proj_len {
-            let ci = proj[i];
+        for &ci in &proj[..proj_len] {
             let cl_pos = anchor.schema.clustering[..cc].iter().position(|&x| x == ci);
             if ci == table_id_pk {
                 // The partition key renders from the KEY bytes.

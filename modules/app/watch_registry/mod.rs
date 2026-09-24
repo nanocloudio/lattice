@@ -43,12 +43,10 @@
     reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
 )]
 #![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
     clippy::duplicate_mod,
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; raw-pointer ABI entry points are the contract; the PIC build #[path]-remounts shared code"
+    reason = "raw-pointer ABI entry points are the contract; the PIC build #[path]-remounts shared code"
 )]
 use core::ffi::c_void;
 
@@ -528,8 +526,7 @@ fn handle_mutation(reg: &mut RegistryState, payload: &[u8]) {
     if emitted == 0 || sys.is_null() {
         return;
     }
-    for i in 0..emitted {
-        let wid = matched_ids[i];
+    for &wid in &matched_ids[..emitted] {
         out_buf[0..8].copy_from_slice(&wid.to_le_bytes());
         let ok =
             unsafe { write_envelope(&*sys, events_out, MSG_WATCH_EVENT, &out_buf[..8 + body_len]) };

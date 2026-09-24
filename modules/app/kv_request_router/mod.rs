@@ -34,11 +34,6 @@
     clippy::duplicate_mod,
     reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
 )]
-#![allow(
-    clippy::manual_memcpy,
-    clippy::needless_range_loop,
-    reason = "hand-written index loops build wire envelopes byte-by-byte throughout these modules; the explicit form is the module idiom"
-)]
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -3719,13 +3714,12 @@ pub extern "C" fn module_new(
         let hex_len = hex_len as usize;
         let mut frame = [0u8; RANGE_MAP_PARAM_MAX];
         let byte_len = hex_len / 2;
-        for i in 0..byte_len {
-            let hi = hex_nibble(router.range_map_param[i * 2]);
-            let lo = hex_nibble(router.range_map_param[i * 2 + 1]);
-            let (Some(hi), Some(lo)) = (hi, lo) else {
+        let hex = &router.range_map_param[..byte_len * 2];
+        for (byte, pair) in frame[..byte_len].iter_mut().zip(hex.chunks_exact(2)) {
+            let (Some(hi), Some(lo)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) else {
                 return -1;
             };
-            frame[i] = (hi << 4) | lo;
+            *byte = (hi << 4) | lo;
         }
         let Some(max_generation) = router.range_map.apply_full_update(&frame[..byte_len]) else {
             return -1;

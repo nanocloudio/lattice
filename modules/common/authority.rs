@@ -13,6 +13,10 @@
 // needs the contract's opcodes reaches them through its own `abi`
 // mount; nothing of this module's `net_proto` crosses the boundary.
 #[path = "../../target/fluxor/fluxor-abi/sdk/contracts/net/net_proto.rs"]
+#[allow(
+    dead_code,
+    reason = "platform contract mounted wholesale; each connector and the contract suite uses a subset"
+)]
 pub mod net_proto;
 
 use net_proto::{write_connect_to, Target, SOCK_TYPE_STREAM};
@@ -92,10 +96,6 @@ impl Authority {
     /// Text was set and `adopt` accepted it.
     pub fn is_set(&self) -> bool {
         self.len > 0 && self.port != 0
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     pub fn text(&self) -> &[u8] {
