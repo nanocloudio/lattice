@@ -3,7 +3,7 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Phase 7 — adapter between Clustor's commit pipeline and Lattice's
+# Adapter between Clustor's commit pipeline and Lattice's
 # KV state machine. Subscribes to
 # `consensus.committed_entries` (MSG_COMMITTED_ENTRY: term, index,
 # body) and re-emits each entry's body as `MSG_KV_COMMAND` on
@@ -54,7 +54,7 @@ index = 2
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ──────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

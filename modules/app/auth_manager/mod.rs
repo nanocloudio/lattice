@@ -1,6 +1,6 @@
 //! auth_manager — adapter-facing auth and identity translation.
 //!
-//! Phase 6b minimal implementation. Maintains a static principal
+//! Minimal implementation. Maintains a static principal
 //! table keyed by `(protocol, credential bytes)` and answers
 //! `MSG_AUTH_REQUEST` envelopes with `MSG_AUTH_DECISION`. Real
 //! deployments would source the table from a CP-Raft principal
@@ -55,7 +55,7 @@ struct AuthState {
     // module_new; -1 when unwired.
     metrics_out: i32,
     _pad: i32,
-    // Phase-14 counters (ids follow manifest `[observability] metrics`).
+    // Module-scope counters (ids follow manifest `[observability] metrics`).
     m_requests: u64,
     m_allows: u64,
     m_denies: u64,
@@ -194,7 +194,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Phase-14: emit module-scope counters on the metrics port at a
+        // Observability: emit module-scope counters on the metrics port at a
         // coarse cadence (no-op until wired). ids follow manifest order.
         s.step_ctr = s.step_ctr.wrapping_add(1);
         if s.step_ctr.is_multiple_of(5000) {

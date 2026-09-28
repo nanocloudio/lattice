@@ -39,7 +39,7 @@ index = 1
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ──────────────────────────────────────────────────────
 # Declaration order IS the metric-id contract, append-only.
 # `delivered_key_hash` is a rolling FNV over (msg_key, payload) of every
 # delivered publish — a content DIGEST the end-to-end tests compare

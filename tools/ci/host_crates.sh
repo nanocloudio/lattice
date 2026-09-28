@@ -16,7 +16,7 @@
 #
 # tests/harness is intentionally NOT clippy'd here: clippy on a crate that
 # #[path]-mounts 70+ modules/common sources would lint every mounted file, which
-# is a separate triage. Phase 4 compiles and runs the harness suites; a
+# is a separate triage. ci phase 4 compiles and runs the harness suites; a
 # follow-up can add a scoped clippy once mounted-source warnings are addressed
 # at their own sites (the way wave/spectra silence theirs at the mount).
 set -euo pipefail
@@ -27,6 +27,7 @@ declare -A PKG=(
   ["tools/ci/telemetry_guard"]="telemetry_guard"
   ["tools/ci/clock_lint"]="clock_lint"
   ["tools/load/lattice-bench"]="lattice-bench"
+  ["tools/store_dump"]="lattice-store-dump"
 )
 
 fail=0
@@ -41,9 +42,9 @@ for c in "${!PKG[@]}"; do
     || { echo "host_crates: clippy FAILED in $c"; fail=1; }
   ( cd "$dir" && cargo build --all-targets ) >/dev/null 2>&1 \
     || { echo "host_crates: build FAILED in $c"; fail=1; }
-  # Unit tests here (not a cargo `[ci.cargo]` Phase 2): these crates are
+  # Unit tests here (not a cargo `[ci.cargo]` phase 2): these crates are
   # artefact-free, so their tests run before the module build without issue —
-  # unlike tests/harness, which is why Phase 2 is omitted (see fluxor.toml).
+  # unlike tests/harness, which is why phase 2 is omitted (see fluxor.toml).
   ( cd "$dir" && cargo test --all-targets --all-features ) >/dev/null 2>&1 \
     || { echo "host_crates: tests FAILED in $c"; fail=1; }
 done

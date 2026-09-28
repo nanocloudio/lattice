@@ -72,7 +72,7 @@ index = 3
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ──────────────────────────────────────────────────────
 # Declaration order IS the metric-id contract, append-only. `state`,
 # `unacked_depth`, `cursor_revision`, `frontier` are level gauges on
 # the counter channel (monotone or slow-moving; a regression in

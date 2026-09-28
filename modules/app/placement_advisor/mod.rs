@@ -1,9 +1,9 @@
-//! placement_advisor — the §12.4 load-policy recommender as a running
+//! placement_advisor — the load-policy recommender as a running
 //! module.
 //!
 //! Observes each range's key count by scanning it, asks
-//! `placement::recommend` what §12.4 permits saying about that load, and
-//! REPORTS the answer. By default it only reports: §12.4 keeps execution
+//! `placement::recommend` what policy permits saying about that load,
+//! and REPORTS the answer. By default it only reports: execution stays
 //! bounded by operator policy, and an advisor free to act on its own would
 //! turn every policy bug into a topology change. An operator reads the
 //! recommendation and declares the operation in a config, the same manual
@@ -14,7 +14,7 @@
 //! carrying an operator-declared split key, to a `range_supervisor`
 //! running `op_kind 4`. This automates the TIMING of a split while the
 //! operator still enables the automation and chooses WHERE to split — so
-//! §12.4's operator gate is the opt-in itself, not a wire left absent.
+//! the operator gate is the opt-in itself, not a wire left absent.
 //!
 //! ## What it can and cannot measure, stated rather than implied
 //!
@@ -25,8 +25,8 @@
 //! range, it is an unmeasured one, and the contract honours that: an
 //! unmeasured concentration cannot satisfy the hot-key clause.
 //!
-//! What it CAN still recommend is the point. §12.4 lists "size, key
-//! count" among the valid inputs on their own, so an oversized range
+//! What it CAN still recommend is the point. Size and key count are
+//! valid inputs on their own, so an oversized range
 //! is worth splitting whether or not a load signal exists — a quiet
 //! oversized range is still oversized. Gating splits on load as well
 //! as size would not have been conservative, it would have been
@@ -50,7 +50,7 @@
 //! overwrites.
 //!
 //! Per-KEY concentration is unavailable from either: the router counts
-//! writes per RANGE, so §12.4's hot-key clause needs a signal neither of
+//! writes per RANGE, so the hot-key clause needs a signal neither of
 //! these provides.
 
 #![no_std]
@@ -89,7 +89,7 @@ mod telemetry;
 
 use placement::{forecast_to_ceiling, recommend, Forecast, LoadPolicy, RangeLoad, Recommendation};
 
-// ── The router's per-range write counters (§12.4's measured signal) ──
+// ── The router's per-range write counters (the measured signal) ─────
 //
 // Frame layout, fixed by fluxor's telemetry contract:
 //   [0] signal (2 = metric)  [1] kind  [2..4] module  [4..12] t_micros
@@ -137,7 +137,7 @@ const S_COUNT: u8 = 1;
 define_params! {
     AdvisorState;
 
-    // Operator policy (§12.4). Each is a REFUSAL threshold: raising
+    // Operator policy. Each is a REFUSAL threshold: raising
     // min_split_keys or cooldown_ms can only make the advisor quieter.
     1, min_split_keys, u32, 1024
         => |s, d, len| { s.min_split_keys = p_u32(d, len, 0, 1024); };
@@ -146,7 +146,7 @@ define_params! {
     3, cooldown_ms, u32, 60000
         => |s, d, len| { s.cooldown_ms = p_u32(d, len, 0, 60000); };
 
-    // §12.4 opt-in automation. `auto_execute = 1` lets the advisor EMIT a
+    // Opt-in automation. `auto_execute = 1` lets the advisor EMIT a
     // split command (to a wired `range_supervisor` in op_kind 4) the first
     // time policy recommends a split — automating the TIMING. The split
     // KEY is the operator's, declared here as hex; the recommender never
@@ -206,7 +206,7 @@ struct AdvisorState {
     hotkey_frames: u64,
     signal_in: i32,
 
-    // §12.4 opt-in auto-execution (default off).
+    // Opt-in auto-execution (default off).
     auto_execute: u8,
     /// True once the split command has been emitted, so a recommendation
     /// that persists across surveys fires the split exactly once.
@@ -474,7 +474,7 @@ fn on_kv_response(a: &mut AdvisorState, result: u8, body: &[u8]) {
         range_index: 0,
         key_count: a.counted,
         write_rate: effective_rate,
-        // §12.4's hot-key clause, now measured: the router's
+        // The hot-key clause, measured here: the router's
         // Space-Saving table over its own dispatch stream. Still 0
         // when nothing has been observed, which the contract reads as
         // unmeasured rather than as proven-low.
@@ -493,7 +493,7 @@ fn on_kv_response(a: &mut AdvisorState, result: u8, body: &[u8]) {
     }
     report(a, r, a.counted, write_rate, measured);
 
-    // §12.4 opt-in automation: the FIRST time policy recommends a split,
+    // Opt-in automation: the FIRST time policy recommends a split,
     // fire the operator's pre-declared split command exactly once. The
     // recommendation itself is unchanged — this only acts on it when the
     // operator has both enabled `auto_execute` and wired `exec_out`.
@@ -511,7 +511,7 @@ fn on_kv_response(a: &mut AdvisorState, result: u8, body: &[u8]) {
         }
     }
 
-    // Capacity forecast (Phase 10): when does this range reach the
+    // Capacity forecast: when does this range reach the
     // size at which a split is warranted? Reported separately from the
     // recommendation because a forecast is not an instruction — it is
     // the lead time an operator schedules against.
@@ -579,7 +579,7 @@ pub extern "C" fn module_new(
         // compositions that do not wire it, which is why every use of
         // the counted signal is conditional.
         a.signal_in = dev_channel_port(sys, 0, 1);
-        // Output index 2: the §12.4 opt-in split-command port to a
+        // Output index 2: the opt-in split-command port to a
         // range_supervisor. Absent unless the composition wires it, so
         // auto-execution stays off unless BOTH `auto_execute = 1` AND this
         // edge exist.

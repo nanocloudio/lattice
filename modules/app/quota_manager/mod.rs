@@ -1,6 +1,6 @@
 //! quota_manager — per-tenant token buckets + throttle emission.
 //!
-//! Phase 6b minimal implementation. Each tenant has a token bucket
+//! Minimal implementation. Each tenant has a token bucket
 //! that refills at `rate_per_tick` and caps at `burst`. Inbound
 //! `MSG_QUOTA_TICK` (synthetic stand-in for "request executed")
 //! decrements the bucket; underflow emits a `MSG_QUOTA_THROTTLE`
@@ -55,7 +55,7 @@ struct QuotaState {
     // module_new; -1 when unwired.
     metrics_out: i32,
     _pad: i32,
-    // Phase-14 counters (ids follow manifest `[observability] metrics`).
+    // Module-scope counters (ids follow manifest `[observability] metrics`).
     m_checks: u64,
     m_throttles: u64,
     m_disconnects: u64,
@@ -191,7 +191,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Phase-14: emit module-scope counters on the metrics port at a
+        // Observability: emit module-scope counters on the metrics port at a
         // coarse cadence (no-op until wired). ids follow manifest order.
         s.step_ctr = s.step_ctr.wrapping_add(1);
         if s.step_ctr.is_multiple_of(5000) {

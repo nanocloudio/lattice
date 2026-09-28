@@ -1,0 +1,26 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# provider_probe — a module that writes and reads through the
+# `storage.object` / `storage.namespace` contracts it is given, as any
+# fluxor consumer of a store does, for the live suites of lattice's store
+# provider (`kv_state_worker_store`). On a replicated store each node runs
+# one: it writes `writes` keys of its own (and, with `big`, one large
+# value, under `/probe-big/`), asking again while a write answers
+# EINPROGRESS, then checks the store holds as many changes under `/probe/`
+# as keys — every write applied once, wherever it was proposed — and that
+# every node's large value reads back whole. `[probe]` lines in the boot
+# log are what the suites read.
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[observability]
+exempt = "test fixture: its '[probe]' log lines are the observable the live suites read"

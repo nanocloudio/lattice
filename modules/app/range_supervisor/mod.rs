@@ -1,4 +1,4 @@
-//! range_supervisor — the §12 lifecycle pump.
+//! range_supervisor — the range-lifecycle pump.
 //!
 //! Drives ONE lifecycle operation at a time through the state machines in
 //! `modules/common/range_lifecycle.rs`. That file owns every transition
@@ -18,15 +18,15 @@
 //! a span onto a PRE-PROVISIONED, EMPTY partition. There is no clustor
 //! snapshot transfer between groups; the copy runs through the
 //! canonical KV path in bounded pages, which keeps exactly one
-//! durability story for every byte moved (§14.1's rule, applied to
-//! lifecycle). Concretely:
+//! durability story for every byte moved — the canonical-write-path
+//! rule, applied to lifecycle. Concretely:
 //!
 //! 1. The operation record is persisted (`KS_LIFECYCLE_OP`) — always
 //!    to partition 0, the metadata home, via `KV_OP_TARGETED` so no
 //!    map state or barrier can strand the supervisor's own record.
 //!    Every phase advance re-persists the record BEFORE the phase is
 //!    acted on: events name committed facts, and a crash resumes from
-//!    the record (§12.1 "resumable by operation ID").
+//!    the record — resumable by operation ID.
 //! 2. Bulk copy: `TARGETED RANGE_SCAN` pages the parent's span while
 //!    writes continue; each page's pairs are `TARGETED PUT` into the
 //!    child. Overwrites are idempotent, so a crash mid-copy re-runs.
@@ -36,8 +36,8 @@
 //! 4. Catch-up pass: the same copy loop, now against a write-quiesced
 //!    span — after it, child and parent agree byte for byte.
 //! 5. Publication: `apply_to_map` composes the post-split map (the
-//!    contract validates it; a map that would violate §21 invariants
-//!    4/5 refuses rather than publishes), `MSG_RANGE_MAP_UPDATE`
+//!    contract validates it; a map that would violate the coverage
+//!    invariants refuses rather than publishes), `MSG_RANGE_MAP_UPDATE`
 //!    replaces the router's map atomically, and the barrier clears.
 //! 6. Tombstone: the copied span is deleted out of the parent in
 //!    bounded pages. Until it finishes the parent over-retains, which
@@ -58,7 +58,7 @@
 //!   inverse — the source range's span is copied into the SURVIVING
 //!   target's partition, quiesced behind the same cutover barrier,
 //!   caught up, and the two descriptors are replaced by one. The
-//!   §12.2 ordering that matters is preserved by the contract, not by
+//!   merge ordering that matters is preserved by the contract, not by
 //!   this pump: ownership of the combined interval flips at
 //!   `TargetOwns`, one phase BEFORE the descriptors are published, so
 //!   routing lags the truth rather than leading it.
@@ -67,7 +67,7 @@
 //!   then waits idle for a `MSG_PLACEMENT_SPLIT_CMD`. The command supplies
 //!   the operator's split key; execution then runs the split machine
 //!   exactly as a declared split does. Automating WHEN a split fires
-//!   without giving up the operator's choice of WHERE (§12.4).
+//!   without giving up the operator's choice of WHERE.
 //! - Relocation (`op_kind: 3`): changes replicas, not key bounds — the
 //!   supervisor drives clustor's Raft membership through the committed
 //!   `RelocatePhase` machine. Declared form: `reloc_partition`/
@@ -137,7 +137,7 @@ use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_PLACEMENT_RELOCATE_CMD, MSG_PLAC
 
 // ── Capacities ────────────────────────────────────────────────────────
 
-/// Keyspace of lifecycle operation records (§11.4 metadata maps).
+/// Keyspace of lifecycle operation records (metadata maps).
 const KS_LIFECYCLE_OP: u32 = 0x8000_0008;
 
 /// Copy-page size: pairs per RANGE_SCAN request. Small enough that a
@@ -206,7 +206,7 @@ define_params! {
     3, target_partition, u16, 1
         => |s, d, len| { s.target_partition = p_u16(d, len, 0, 1); };
 
-    // Manual execution gate (§12.4): the operator declared the op in
+    // Manual execution gate: the operator declared the op in
     // the config; it starts this long after boot. Gives a live test —
     // and a cautious operator — a window to verify the graph first.
     4, start_delay_ms, u32, 2000
@@ -966,8 +966,8 @@ fn drive_relocation(sup: &mut SupState) {
 
 /// Deterministic operation id from the declared split: FNV-1a over the
 /// split key, twice with different seeds, so a restart derives the
-/// SAME id and resumes the SAME record (§12.1 "resumable by operation
-/// ID" without a coordination service to mint ids).
+/// SAME id and resumes the SAME record — resumable by operation ID
+/// without a coordination service to mint ids.
 fn derived_op_id(sup: &SupState) -> [u8; 16] {
     let key = &sup.split_key[..sup.split_key_len as usize];
     let mut out = [0u8; 16];
@@ -1041,7 +1041,7 @@ fn build_operation(sup: &SupState) -> Option<LifecycleOperation> {
     )
 }
 
-/// §12.2: source ‖ target, adjacent, target survives.
+/// Merge shape: source ‖ target, adjacent, target survives.
 fn build_merge_operation(sup: &SupState) -> Option<LifecycleOperation> {
     let idx = merge_source_index(sup)?;
     let ranges = sup.initial_map.ranges();
@@ -1093,7 +1093,7 @@ fn persist_phase(sup: &mut SupState, phase: SplitPhase) {
         return;
     }
     sup.m_phase = phase as u8 as u64;
-    // §24: every lifecycle transition is operator-visible. One line
+    // Every lifecycle transition is operator-visible. One line
     // per advance; the phase byte is the SplitPhase discriminant.
     unsafe {
         if !sup.syscalls.is_null() {
@@ -1146,7 +1146,7 @@ fn act_on_merge_phase(sup: &mut SupState, phase: MergePhase) {
             persist_merge_phase(sup, next);
         }
         MergePhase::Committed => {
-            // §12.2 step 2: quiesce the source's writes behind the
+            // Merge step 2: quiesce the source's writes behind the
             // barrier BEFORE any transfer, so the copy reads a span
             // nothing is still writing to.
             if send_barrier(sup, true) {
@@ -1208,7 +1208,7 @@ fn act_on_phase(sup: &mut SupState) {
     };
     match phase {
         SplitPhase::Validated => {
-            // The record is durable: that IS §12.1 step 2's committed
+            // The record is durable: that IS split step 2's committed
             // prepare in this composition.
             let Ok(next) = advance_split(&sup.op, SplitEvent::PrepareCommitted) else {
                 fault(sup, b"[rsup] illegal advance from Validated");
@@ -1636,7 +1636,7 @@ pub extern "C" fn module_new(
         return 0;
     }
     if sup.op_kind == 4 {
-        // Runtime-triggered split (§12.4 opt-in automation): decode the
+        // Runtime-triggered split (opt-in automation): decode the
         // map now, then wait idle for a `MSG_PLACEMENT_SPLIT_CMD` on
         // `cmd_in` carrying the operator's split key. The split itself
         // runs the SAME state machine a declared split does.

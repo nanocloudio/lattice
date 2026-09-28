@@ -4,19 +4,18 @@
 //!
 //! - Drain MSG_KV_REQUEST envelopes from every adapter ingress port
 //!   (etcd_in, redis_in, memcached_in, memcached_udp_in).
-//! - Validate routing inputs (Phase 1: single KPG, no quota/auth/CP
-//!   freshness gating; those land in Phase 5 when their producer
-//!   modules become real).
+//! - Validate routing inputs (single KPG; no quota/auth/CP
+//!   freshness gating until their producer modules become real).
 //! - Translate to MSG_KV_COMMAND and emit on `kv_out`. Remember
 //!   `corr_id → protocol` in a small inflight table so the response
 //!   path knows which adapter output to send the eventual reply on.
 //! - Drain MSG_KV_APPLIED from `kv_in`, translate to MSG_KV_RESPONSE,
 //!   send to the right protocol output port.
 //!
-//! ## Phase 1 scope
+//! ## Baseline scope
 //!
 //! Single KPG (kpg_id = 0). No route-plan resolution, no quota
-//! gating, no CP freshness check. The router is the only Phase 1
+//! gating, no CP freshness check. The router is the only baseline
 //! module that needs to track per-corr_id state (the protocol →
 //! output mapping); other modules either preserve corr_id verbatim
 //! (worker) or extract conn_id directly from the envelope (anchor).
@@ -74,10 +73,11 @@ use partition_map::{
     MSG_RANGE_MAP_UPDATE,
 };
 use types::{
-    KvEpoch, RoutingEpoch, KV_OP_RANGE_SCAN, KV_OP_SCAN_VERSIONS, KV_RESULT_CROSS_RANGE,
-    KV_RESULT_DIRTY_EPOCH, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND, KV_RESULT_RANGE, PROTO_ETCD,
-    PROTO_INTERNAL_SQL, PROTO_INTERNAL_WATCH, PROTO_MEMCACHED, PROTO_MEMCACHED_UDP, PROTO_REDIS,
-    PROTO_UNKNOWN, REQ_LINEARIZABLE,
+    KvEpoch, RoutingEpoch, KV_OP_COMPACT, KV_OP_DELETE_META, KV_OP_ETCD_TXN, KV_OP_HASH_KV,
+    KV_OP_LEASE_KEYS, KV_OP_LEASE_REVOKE, KV_OP_RANGE_META, KV_OP_RANGE_SCAN, KV_OP_SCAN_VERSIONS,
+    KV_RESULT_CROSS_RANGE, KV_RESULT_DIRTY_EPOCH, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND,
+    KV_RESULT_RANGE, PROTO_ETCD, PROTO_INTERNAL_SQL, PROTO_INTERNAL_WATCH, PROTO_MEMCACHED,
+    PROTO_MEMCACHED_UDP, PROTO_REDIS, PROTO_UNKNOWN, REQ_LINEARIZABLE,
 };
 use wire::{
     CLIENT_REJECT_NOT_LEADER, LATTICE_ENTRY_TAG, MSG_APP_APPLIED_POS, MSG_CLIENT_PROPOSAL,
@@ -85,18 +85,34 @@ use wire::{
     MSG_CLIENT_REJECT_INTERNAL, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_KV_REQUEST, MSG_KV_RESPONSE,
 };
 
-const SCRATCH_BUF_SIZE: usize = 4096 + 64;
+const SCRATCH_BUF_SIZE: usize = wire::KV_REQUEST_PAYLOAD_MAX;
+
+/// The answer path's buffer: a worker answer as large as the worker
+/// builds one (its 8192-byte scratch), re-headed as `MSG_KV_RESPONSE`.
+/// Commands stay bounded by [`SCRATCH_BUF_SIZE`].
+const REPLY_BUF_SIZE: usize = 8320;
 
 /// Inflight table capacity. Tunable later via params.
 const MAX_INFLIGHT: usize = 256;
+/// Commands a worker's channel had no room for, waiting in order. While
+/// any waits the router takes no new request, so backpressure reaches the
+/// anchors (which answer or retry) instead of a command vanishing.
+const KV_STASH_SLOTS: usize = 4;
+/// One waiting command: the largest the router builds, and a partition
+/// tag.
+const KV_STASH_FRAME: usize = SCRATCH_BUF_SIZE + 2;
+/// A reply whose protocol port has had no room for this long is dropped:
+/// its consumer is stuck, and every other protocol's replies wait behind
+/// it. Shorter waits are a burst, and the reply is delivered.
+const RESP_STASH_WAIT_MS: u64 = 1_000;
 
-/// Phase 1 hardcodes one KPG. Multi-KPG routing lands when
+/// A single KPG is hardcoded. Multi-KPG routing lands when
 /// control_plane exposes route plans.
 const KPG_ID_DEFAULT: u16 = 0;
 
-// ── Phase-3 ROUTING slice: partition-map fencing (RFC §11.2/§11.4, §20)
+// ── ROUTING slice: partition-map fencing ─────────────────────────────
 //
-// `routing_mode = 1` layers the §11 METADATA + FENCING contract over
+// `routing_mode = 1` layers the map METADATA + FENCING contract over
 // the existing single-range runtime: every request resolves through the
 // router's `HashSlotMap` (the declared `RoutingKind::HashSlot` form —
 // never inferred from key bytes) and is fenced on binding generation +
@@ -109,15 +125,15 @@ const KPG_ID_DEFAULT: u16 = 0;
 const ROUTING_MODE_LEGACY: u8 = 0;
 /// Router mode 1: every request fenced through the partition map.
 const ROUTING_MODE_FENCED: u8 = 1;
-/// Router mode 2: ORDERED multi-range routing (Phase 3, RFC §11.2/§20).
+/// Router mode 2: ORDERED multi-range routing.
 /// Every request resolves through the `OrderedRangeMap` by its KEY
-/// BYTES (never a hash — the map form is declared, §11.2), the owning
+/// BYTES (never a hash — the map form is declared), the owning
 /// range's partition selects the worker/proposal PORT PAIR, and a
 /// `RANGE_SCAN` spanning several ranges is stitched gap-free across
 /// them by tagging the owning range index and a routing-epoch stamp
 /// into the continuation cursor (see `partition_map.rs`, scan-cursor
 /// tagging). Requires the `range_map` param (the static map — this is
-/// supervisor-free provisioning; the Phase 4 supervisor later
+/// supervisor-free provisioning; the range supervisor later
 /// publishes `MSG_RANGE_MAP_UPDATE` frames onto `map_update`).
 const ROUTING_MODE_ORDERED: u8 = 2;
 
@@ -128,7 +144,7 @@ const ROUTING_MODE_ORDERED: u8 = 2;
 ///
 /// Two, not more: fluxor caps a module at 16 output ports and the
 /// router spends 15 (per-protocol replies, consensus, fences, the
-/// lifecycle pair). Wider fan-out is §11.6 dense-hosting territory —
+/// lifecycle pair). Wider fan-out is dense-hosting territory —
 /// partition-multiplexed ports, not one static pair per range.
 const MAX_PARTITION_PORTS: usize = 2;
 /// Ranges whose write counts are tracked individually. Beyond this the
@@ -136,7 +152,7 @@ const MAX_PARTITION_PORTS: usize = 2;
 /// honest, whereas folding the tail into range 0 would report a hot
 /// range that does not exist.
 const MAX_TRACKED_RANGES: usize = 8;
-/// Heavy-hitter slots per tracked range (§12.4's hot-KEY clause).
+/// Heavy-hitter slots per tracked range (the hot-KEY load signal).
 ///
 /// ## KNOWN BLIND SPOT — read before trusting this signal
 ///
@@ -150,8 +166,9 @@ const MAX_TRACKED_RANGES: usize = 8;
 /// rather than reasoned about: 400 writes driven at one key produced
 /// no hot-key report at all, and the advisor recommended a SPLIT for a
 /// range whose load a split cannot relieve — the precise mistake
-/// §12.4 names. Space-Saving's own error is an over-estimate and safe;
-/// this sampling gap sits in front of it and reverses the sign.
+/// the placement policy guards against. Space-Saving's own error is
+/// an over-estimate and safe; this sampling gap sits in front of it
+/// and reverses the sign.
 ///
 /// Attributing a multi-key txn to one of its keys is NOT the fix: that
 /// invents concentration that does not exist and makes the recommender
@@ -164,7 +181,7 @@ const MAX_TRACKED_RANGES: usize = 8;
 /// count, never an under-estimate. Over-estimating concentration can
 /// only make the advisor report `HotKeyNotSplittable` — a REFUSAL to
 /// recommend a split — so the error direction makes the recommender
-/// quieter, which is the discipline every §12.4 knob follows. An
+/// quieter, which is the discipline every load-signal knob follows. An
 /// under-estimate would have been the dangerous direction: it would
 /// let a genuinely unsplittable hot key be recommended for a split.
 const HOT_KEY_SLOTS: usize = 4;
@@ -187,7 +204,7 @@ const ROUTING_EPOCH_DEFAULT: RoutingEpoch = 1;
 /// Slot presented for wildcard ops (multi-key / range / whole-store):
 /// in the single-partition reality every slot carries an identical
 /// binding, so slot 0 stands for "the map as a whole". Multi-range
-/// wildcard split is future §20 work (scan descriptor resolution).
+/// wildcard split is future work (scan descriptor resolution).
 const WILDCARD_SLOT: u16 = 0;
 
 /// Static single-partition default binding: every slot → partition 0.
@@ -218,7 +235,7 @@ const LIN_RELEASED: u8 = 2;
 const LIN_REJECTED: u8 = 3;
 /// Consensus granted the read, but the worker has not yet applied
 /// through the fence index. This state is the applied-index half of
-/// RFC §4.3's fence: a grant proves CONSENSUS applied through
+/// the read fence: a grant proves CONSENSUS applied through
 /// `required_commit`, and the store the read queries is a separate
 /// module fed over a channel. Releasing on the grant alone lets a
 /// linearizable read observe a false absence — the write is committed
@@ -334,8 +351,8 @@ const FENCE_KEYS: usize = 6 * 256;
 /// order is broken ONLY at path transitions — which is exactly what the
 /// barrier serializes. Same-path ops pipeline freely.
 /// The durability class a reply may claim, given the path its request
-/// took. §21 invariant 2: only an authority that observed the proof may
-/// claim the class, so this returns the strongest SOUND answer and not
+/// took. Only an authority that observed the proof may claim the
+/// class, so this returns the strongest SOUND answer and not
 /// the most flattering one.
 ///
 /// A consensus-path write reached the worker through the apply bridge,
@@ -425,7 +442,7 @@ struct InflightMeta {
     /// not helped.
     help_key: [u8; HELP_KEY_MAX],
     help_key_len: u8,
-    /// Canonical identity (§23) the op was issued under, kept so a
+    /// Canonical identity the op was issued under, kept so a
     /// cross-partition help resolves the intent under the SAME
     /// `(tenant, database, keyspace)` — otherwise the courier's writes
     /// would land under a different tenant and the read that triggered
@@ -438,8 +455,8 @@ struct InflightMeta {
     /// Without it a request whose completion signal never arrives —
     /// most importantly a write proposed on a node that is NOT the
     /// leader — sits here forever and the caller waits forever. A
-    /// follower accepting a connection and then saying nothing is
-    /// §28's rejected transparent FIFO: the caller cannot tell "not
+    /// follower accepting a connection and then saying nothing is the
+    /// transparent FIFO this design rejects: the caller cannot tell "not
     /// the leader" from "still working". See `sweep_inflight_deadlines`.
     deadline_ms: u64,
 }
@@ -479,14 +496,14 @@ fn op_is_write(op: u8) -> bool {
         0x02 /*PUT*/    | 0x03 /*DELETE*/ | 0x05 /*TXN*/   | 0x06 /*CAS*/
         | 0x07 /*INCR*/ | 0x08 /*DECR*/   | 0x09 /*APPEND*/ | 0x0C /*FLUSH*/
         | 0x0E /*MSET*/ | 0x10 /*PREPEND*/
-        // Cross-range transaction ops (§13). All three MUTATE: prepare
+        // Cross-range transaction ops. All three MUTATE: prepare
         // stages intents, resolve publishes or drops them, and the
         // record write is the decision itself. Omitting them here sent
         // them down the read path, where on a replicated graph they
         // were never proposed and so did nothing at all — while the
         // coordinator dutifully retried a write that could not land.
         | 0x16 /*TXN_PREPARE*/ | 0x17 /*TXN_RESOLVE*/ | 0x18 /*TXN_RECORD*/
-        // Exactly-once execution (§14). Classified as a write even
+        // Exactly-once execution. Classified as a write even
         // though a REDELIVERY performs no mutation: the classification
         // has to be a property of the op, not of what this particular
         // delivery turns out to do, and the first delivery mutates.
@@ -494,6 +511,14 @@ fn op_is_write(op: u8) -> bool {
         // consensus for the one caller most likely to be retrying
         // after a failure.
         | 0x19 /*IDEMPOTENT*/
+        // etcd's DeleteRange (a span deleted at one revision) and Txn.
+        | 0x1D /*DELETE_META*/ | 0x1E /*ETCD_TXN*/
+        // A lease's keys deleted with it, and etcd's Compact.
+        | 0x1F /*LEASE_REVOKE*/ | 0x21 /*COMPACT*/
+        // Large values: a chunk and a manifest record. (The sweep that
+        // reclaims chunks never passes here: the state worker proposes
+        // it, and dispatch refuses it from any ingress.)
+        | 0x23 /*PUT_CHUNK*/ | 0x26 /*PUT_MANIFEST*/
     )
 }
 
@@ -520,7 +545,9 @@ fn op_key(op: u8, body: &[u8]) -> (u64, bool) {
         // Key-first single-key ops: [key_len][key] …
         0x01 /*GET*/ | 0x02 /*PUT*/ | 0x06 /*CAS*/ | 0x07 /*INCR*/
         | 0x08 /*DECR*/ | 0x09 /*APPEND*/ | 0x0A /*EXISTS*/
-        | 0x0F /*STRLEN*/ | 0x10 /*PREPEND*/ => match read_key_at(body, 0) {
+        | 0x0F /*STRLEN*/ | 0x10 /*PREPEND*/
+        // A large value's write: a PUT whose value is its manifest.
+        | 0x26 /*PUT_MANIFEST*/ => match read_key_at(body, 0) {
             Some(h) => (h, false),
             None => (0, true),
         },
@@ -662,7 +689,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 /// Every LOCAL-domain range's partition binding has a live worker port
 /// (and, on a replicated graph, a live proposal port). A range in
-/// another cluster domain (§11.3/§26.5) is reached by redirect, not by a
+/// another cluster domain is reached by redirect, not by a
 /// port on this router, so its `partition_id` — cluster-local to its own
 /// domain — is not required to be wired here.
 fn ordered_partitions_reachable(router: &RouterState) -> bool {
@@ -702,18 +729,18 @@ enum RouteOrdered {
         rewritten_len: usize,
     },
     /// The resolved range's home partition is in another Clustor cluster
-    /// domain (§11.3/§26.5): the caller is redirected to `domain` rather
+    /// domain: the caller is redirected to `domain` rather
     /// than served a wrong local answer.
     CrossDomain { domain: u32 },
     /// Fail-closed refusal, before any side effect. `stale` selects
     /// the metric: a stale route (refresh and retry) vs a cross-range
-    /// key set (no coordinator until Phase 5).
+    /// key set (no cross-range coordinator exists).
     Reject { result: u8, stale: bool },
 }
 
 /// Route to a resolved descriptor's partition — unless its binding names
 /// a different cluster domain than this router serves, in which case the
-/// caller is redirected (§11.3/§26.5). The single place the domain check
+/// caller is redirected. The single place the domain check
 /// lives, so every ordered single-key resolution honours it identically.
 fn route_single(router: &RouterState, d: &partition_map::RangeDescriptor) -> RouteOrdered {
     if d.binding.cluster_id != router.local_cluster_domain {
@@ -729,7 +756,7 @@ fn route_single(router: &RouterState, d: &partition_map::RangeDescriptor) -> Rou
 
 /// The transaction-path counterpart: the keys already agreed on one
 /// `partition`; redirect if that partition's `domain` is not this
-/// router's, otherwise route locally (§11.3/§26.5).
+/// router's, otherwise route locally.
 fn route_txn_single(router: &RouterState, partition: u16, domain: u32) -> RouteOrdered {
     if domain != router.local_cluster_domain {
         RouteOrdered::CrossDomain { domain }
@@ -748,7 +775,7 @@ fn op_key_bytes(op: u8, body: &[u8]) -> Option<&[u8]> {
         body.get(off + 2..off + 2 + klen)
     };
     match op {
-        0x01 | 0x02 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0F | 0x10 => read_at(0),
+        0x01 | 0x02 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0F | 0x10 | 0x26 => read_at(0),
         0x03 | 0x0D => {
             if body.len() >= 2 && u16::from_le_bytes([body[0], body[1]]) == 1 {
                 read_at(2)
@@ -777,14 +804,14 @@ fn parse_span(body: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
 /// Single-key ops route by their key bytes. A `RANGE_SCAN` becomes a
 /// sub-scan of the range the continuation names (or the first covering
 /// range on a fresh cursor), with bounds clamped to that range and the
-/// cross-range continuation minted for the response path — §20's
-/// "resolve all descriptors covering the span, merge ordered subscans"
+/// cross-range continuation minted for the response path — resolve
+/// all descriptors covering the span, merge ordered subscans —
 /// with the merge state carried in the CURSOR rather than in router
 /// memory. A `SCAN_VERSIONS` must fit one range: two partitions have
 /// independent revision spaces, so a cross-range version window is
 /// unanswerable, not just unimplemented. Multi-key writes and
 /// whole-store ops on a multi-range map refuse with
-/// `KV_RESULT_CROSS_RANGE` until the Phase 5 coordinator exists.
+/// `KV_RESULT_CROSS_RANGE` until a cross-range coordinator exists.
 fn route_ordered(
     router: &RouterState,
     op: u8,
@@ -893,6 +920,55 @@ fn route_ordered(
         };
     }
 
+    // etcd's Range: one range answers it whole, or it is refused — a
+    // span crossing ranges would otherwise be answered by the range that
+    // owns its start, missing the rest. etcd's ends: none = the one key,
+    // `\0` = unbounded.
+    // etcd's Txn touches keys anywhere in its compares and ops, and a
+    // lease's keys can be anywhere: on a map of one range it is that
+    // range's; across ranges it is refused rather than applied by one range
+    // to keys another owns.
+    if op == KV_OP_ETCD_TXN
+        || op == KV_OP_LEASE_REVOKE
+        || op == KV_OP_LEASE_KEYS
+        || op == KV_OP_COMPACT
+        || op == KV_OP_HASH_KV
+    {
+        return if map.ranges().len() == 1 {
+            route_single(router, &map.ranges()[0])
+        } else {
+            RouteOrdered::Reject {
+                result: KV_RESULT_CROSS_RANGE,
+                stale: false,
+            }
+        };
+    }
+    if op == KV_OP_RANGE_META || op == KV_OP_DELETE_META {
+        let Some((start, end, _rest)) = parse_span(body) else {
+            return reject_internal;
+        };
+        let mut succ = [0u8; SCAN_REWRITE_BUF];
+        let end: &[u8] = if end.is_empty() {
+            if start.len() >= succ.len() {
+                return reject_internal;
+            }
+            succ[..start.len()].copy_from_slice(start);
+            succ[start.len()] = 0;
+            &succ[..start.len() + 1]
+        } else if end == [0] {
+            &[]
+        } else {
+            end
+        };
+        return match map.covering(start, end) {
+            Some((first, last)) if first == last => route_single(router, &map.ranges()[first]),
+            Some(_) => RouteOrdered::Reject {
+                result: KV_RESULT_CROSS_RANGE,
+                stale: false,
+            },
+            None => route_single(router, &map.ranges()[0]),
+        };
+    }
     if op == KV_OP_SCAN_VERSIONS {
         let Some((start, end, _rest)) = parse_span(body) else {
             return reject_internal;
@@ -920,7 +996,7 @@ fn route_ordered(
     }
 
     // A TXN whose every key — comparisons and both branches — lives in
-    // ONE range executes there atomically (§13.1 single-range
+    // ONE range executes there atomically (single-range
     // transactions need no coordinator). Any key that cannot be
     // resolved, or a second partition, refuses CROSS_RANGE: half a
     // transaction is worse than none.
@@ -931,7 +1007,7 @@ fn route_ordered(
     // The two-phase family. These arrive from the transaction
     // coordinator via KV_OP_TARGETED — but ALSO from remote compute
     // over `lattice.data`, whose surface defines Prepare/Commit
-    // (§14.8) and whose anchor refuses TARGETED by design (explicit
+    // and whose anchor refuses TARGETED by design (explicit
     // partition addressing is a lifecycle tool, not a client
     // capability). Without these arms a remote participant prepare
     // fell through to CROSS_RANGE below, which made 2PC over the data
@@ -974,7 +1050,7 @@ fn route_ordered(
     // DELETE/MGET, keys-only SCAN forms, historical span reads). On a
     // single-range map they are exactly the ops the single-partition
     // graph always served; on a multi-range map they have no
-    // cross-range execution until Phase 5 and refuse BY NAME.
+    // cross-range execution and refuse BY NAME.
     if map.len() == 1 {
         return route_single(router, &map.ranges()[0]);
     }
@@ -1141,11 +1217,11 @@ define_params! {
     2, replicated, u8, 0
         => |s, d, len| { s.replicated = p_u8(d, len, 0, 0); };
 
-    // 0 = legacy hash routing (default, byte-identical Phase-1 path).
+    // 0 = legacy hash routing (default, the original direct path).
     // 1 = partition-map-fenced: every request resolves through the
     // hash-slot map with a generation/epoch check; a mismatch rejects
     // with KV_RESULT_DIRTY_EPOCH (StaleRoute semantics) instead of
-    // dispatching. See the Phase-3 ROUTING block above.
+    // dispatching. See the ROUTING block above.
     3, routing_mode, u8, 0
         => |s, d, len| { s.routing_mode = p_u8(d, len, 0, 0); };
 
@@ -1163,13 +1239,13 @@ define_params! {
     // first runtime map publication arrives. Without this, the window
     // between restart and republication serves routes from a map the
     // last split already superseded — reads land on a tombstoned span
-    // and report absence that is not true (§21 invariant 6, applied
-    // to restart). Lifecycle traffic is exempt: the supervisor must
-    // read its own record to publish at all.
+    // and report absence that is not true (the no-false-absence rule,
+    // applied to restart). Lifecycle traffic is exempt: the supervisor
+    // must read its own record to publish at all.
     5, await_map, u8, 0
         => |s, d, len| { s.await_map = p_u8(d, len, 0, 0); };
 
-    // §11.3/§26.5: which Clustor cluster domain THIS router serves. A
+    // Which Clustor cluster domain THIS router serves. A
     // `partition_id` is cluster-local, so a range descriptor whose
     // binding names a DIFFERENT `cluster_id` lives in another domain
     // this router cannot reach — its keys refuse with a
@@ -1239,7 +1315,7 @@ struct RouterState {
     metrics_out: i32,
     internal_watch_out: i32,
     compute_out: i32,
-    /// Phase 7 consensus bridge. -1 when unwired (Phase 1 fallback —
+    /// Consensus bridge. -1 when unwired (direct fallback —
     /// write commands go straight to the worker via `kv_out`).
     proposal_out: i32,
     /// Linearizable-read fence submission → consensus.read.
@@ -1260,14 +1336,14 @@ struct RouterState {
     replicated: u8,
     /// Param `routing_mode`: 0 = legacy, 1 = partition-map-fenced.
     routing_mode: u8,
-    /// Param `local_cluster_domain` (§11.3/§26.5): the Clustor cluster
+    /// Param `local_cluster_domain`: the Clustor cluster
     /// domain this router serves. A descriptor whose `binding.cluster_id`
     /// differs lives in another domain and refuses CROSS_DOMAIN. Default
     /// 0 = the single-domain deployment (every existing map binds 0).
     local_cluster_domain: u32,
 
     /// Declared routing form + the map generation the router currently
-    /// expects (§11.2: the routing form comes from keyspace metadata,
+    /// expects (the routing form comes from keyspace metadata,
     /// never key sniffing). Advanced by MAP_UPDATE_V1 batches: after an
     /// applied batch the expected generation is the max generation seen,
     /// so slots the batch did NOT cover fence as stale until a follow-up
@@ -1276,13 +1352,13 @@ struct RouterState {
     /// The router's current routing-epoch view (`types::RoutingEpoch`),
     /// presented on every fenced lookup against the map's own epoch.
     routing_epoch: RoutingEpoch,
-    /// The §11.4 hash-slot map. Static single-partition default: every
+    /// The hash-slot map. Static single-partition default: every
     /// slot → partition 0, generation MAP_GENERATION_DEFAULT.
     slot_map: HashSlotMap,
     /// One-shot-log latch for dropped map_update frames.
     logged_map_update_drop: u8,
 
-    /// The §11.2 ORDERED range map (routing_mode 2). Loaded from the
+    /// The ORDERED range map (routing_mode 2). Loaded from the
     /// `range_map` param at init; replaced whole by
     /// `MSG_RANGE_MAP_UPDATE` frames on `map_update` at runtime (each
     /// replacement bumps `routing_epoch`, which retires every
@@ -1302,10 +1378,10 @@ struct RouterState {
     /// Param `await_map` + the latch it waits on.
     await_map: u8,
     map_published: u8,
-    /// Phase 6 job-worker caller pair (PROTO_INTERNAL_JOB). -1 when no
+    /// Job-worker caller pair (PROTO_INTERNAL_JOB). -1 when no
     /// worker is wired.
     internal_job_in: i32,
-    /// Phase 9 `lattice_data_anchor` ingress (PROTO_INTERNAL_DATA).
+    /// `lattice_data_anchor` ingress (PROTO_INTERNAL_DATA).
     /// Replies leave on `compute_out`, shared with the in-graph SQL
     /// executor — see the init refusal for why that is sound.
     internal_data_in: i32,
@@ -1314,7 +1390,7 @@ struct RouterState {
     /// where the local gateway is always the leader and never rejects.
     gateway_reject_in: i32,
 
-    /// Cross-partition transaction helping (Phase 5). See
+    /// Cross-partition transaction helping. See
     /// `maybe_start_help`. Each slot is one in-flight help: read the
     /// home record from its partition, and if it holds a DECISION,
     /// carry that decision to the stuck partition. The router never
@@ -1326,7 +1402,7 @@ struct RouterState {
     m_helps_started: u64,
     m_helps_resolved: u64,
     internal_job_out: i32,
-    /// §12 cutover barrier (SPAN_BARRIER_V1 on `map_update`). While
+    /// Cutover barrier (SPAN_BARRIER_V1 on `map_update`). While
     /// set, ordered-mode writes into `[barrier_start, barrier_end)`
     /// refuse retryably. One barrier at a time: one lifecycle
     /// operation runs at a time, and the supervisor owns both facts.
@@ -1348,7 +1424,7 @@ struct RouterState {
     /// Ordered-mode refusals of cross-range key sets (metric 6).
     m_cross_range_rejects: u64,
     /// Requests refused because their key's home range lives in another
-    /// Clustor cluster domain (§11.3/§26.5) — answered with a
+    /// Clustor cluster domain — answered with a
     /// KV_RESULT_CROSS_DOMAIN redirect, counted so a misconfigured
     /// map-vs-`local_cluster_domain` shows up as a signal, not silence.
     m_cross_domain_rejects: u64,
@@ -1359,8 +1435,8 @@ struct RouterState {
 
     /// Reads awaiting their ReadIndex fence.
     pending_lin: [PendingLinRead; LIN_READ_SLOTS],
-    /// LIN-BOUND rejects surfaced to clients (fail-closed error, spec
-    /// Phase 5 — the anchor maps KV_RESULT_LIN_BOUND to its protocol's
+    /// LIN-BOUND rejects surfaced to clients (fail-closed error — the
+    /// anchor maps KV_RESULT_LIN_BOUND to its protocol's
     /// unavailability error).
     lin_rejects: u32,
     /// Per-conn ordering: count of ops outstanding (dispatched, no
@@ -1393,12 +1469,12 @@ struct RouterState {
     /// `SWEEP_INTERVAL` steps instead.
     sweep_ctr: u16,
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=routed, 1=rejects, 2=lin_reads,
     // 3=stale_route_rejects, 4=map_generation, 5=map_update_drops).
     m_routed: u64,
-    /// Per-range write counts (§12.4 load signal). Monotonic; a
+    /// Per-range write counts (the load signal). Monotonic; a
     /// consumer differences them over time to get a rate, exactly as
     /// every other counter on this port is used.
     m_range_writes: [u64; MAX_TRACKED_RANGES],
@@ -1421,7 +1497,7 @@ struct RouterState {
     /// against a store that has not applied the write it must see.
     worker_applied_index: [u64; MAX_TRACKED_RANGES],
     /// The term each position was reached in. Paired with the index
-    /// because §21 invariant 11 wants a fence's epoch travelling with
+    /// because a fence's epoch must travel with
     /// it: an applied index from a stale term is a stale fence.
     worker_applied_term: [u64; MAX_TRACKED_RANGES],
     /// Linearizable reads that reached their deadline still waiting for
@@ -1450,12 +1526,33 @@ struct RouterState {
     /// picks the output port from proto and settles the per-conn
     /// ordering accounting from (conn, path).
     inflight: InflightTable<InflightMeta, MAX_INFLIGHT>,
+    /// Commands waiting for room on their worker port (`KV_STASH_SLOTS`),
+    /// a ring from `kv_stash_head`.
+    kv_stash: [[u8; KV_STASH_FRAME]; KV_STASH_SLOTS],
+    kv_stash_len: [usize; KV_STASH_SLOTS],
+    kv_stash_port: [i32; KV_STASH_SLOTS],
+    kv_stash_head: usize,
+    kv_stash_count: usize,
+    /// A reply its protocol port had no room for (`resp_stash_len`
+    /// bytes, since `resp_stash_ms`): written before the next worker
+    /// reply is read, so replies keep their order and none is lost to a
+    /// burst.
+    resp_stash: [u8; REPLY_BUF_SIZE],
+    resp_stash_len: usize,
+    resp_stash_dest: i32,
+    resp_stash_ms: u64,
+    /// Replies dropped because their consumer stayed stuck.
+    m_resp_drops: u64,
 
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    scratch: [u8; REPLY_BUF_SIZE],
 }
 
 impl RouterState {
     fn init(&mut self, syscalls: *const SyscallTable) {
+        self.kv_stash_head = 0;
+        self.kv_stash_count = 0;
+        self.resp_stash_len = 0;
+        self.m_resp_drops = 0;
         self.syscalls = syscalls;
         self.etcd_in = -1;
         self.redis_in = -1;
@@ -1708,7 +1805,7 @@ unsafe fn drain_ingress(router: &mut RouterState, ingress_chan: i32, protocol: u
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // MSG_KV_REQUEST head = [corr:8][proto:1][tenant:4][conn:1][cons:1][op:1][body_len:2] = 18
     const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
-    if payload_len < REQ_HEAD || payload_len > router.scratch.len() {
+    if !(REQ_HEAD..=SCRATCH_BUF_SIZE).contains(&payload_len) {
         return false;
     }
     let mut in_buf = [0u8; SCRATCH_BUF_SIZE];
@@ -1758,7 +1855,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         req[0], req[1], req[2], req[3], req[4], req[5], req[6], req[7],
     ]);
     let _embedded_proto = req[8]; // already known from ingress port
-                                  // Canonical identity (§23). The tenant rides in the fixed head; the
+                                  // Canonical identity. The tenant rides in the fixed head; the
                                   // database and keyspace ride in an OPTIONAL 8-byte tail after the
                                   // body, appended only by anchors that carry a native RequestContext
                                   // (today, `lattice_data_anchor`). A point-protocol envelope with no
@@ -1782,7 +1879,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         (0, 0)
     };
 
-    // KV_OP_TARGETED unwrap (Phase 4 lifecycle bootstrap): the range
+    // KV_OP_TARGETED unwrap (lifecycle bootstrap): the range
     // supervisor — and ONLY the range supervisor, on its own ingress —
     // may address a partition explicitly, because a split's child
     // bootstrap must write into the target while the map still names
@@ -1813,6 +1910,28 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         body_len -= 3;
     }
 
+    // A chunk sweep reclaims at the floor it names, which must be one
+    // that committed: only the state worker proposes it. From a client
+    // it would name any floor it liked. An origin entry is a store
+    // provider's write, applied by its origin's record: from a client it
+    // would speak for a replica it is not.
+    if matches!(
+        op,
+        types::KV_OP_CHUNK_SWEEP
+            | types::KV_OP_ORIGIN_REGISTER
+            | types::KV_OP_ORIGIN_WRITE
+            | types::KV_OP_ORIGIN_CHUNK
+    ) {
+        emit_reject(
+            router,
+            protocol,
+            corr_id,
+            conn_id,
+            types::KV_RESULT_RESERVED,
+        );
+        return DISPATCH_DROPPED;
+    }
+
     // Route classification up front — the ordering barrier needs the
     // prospective path BEFORE any side effects.
     // A write is ANY mutating op — not just PUT/DELETE. Getting this
@@ -1823,7 +1942,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     // they took the ReadIndex fence and returned CLUSTERDOWN. Classify
     // by op so every mutation goes through consensus when it is wired.
     let is_write = op_is_write(op);
-    // Hash of the op's key, for §12.4's hot-KEY tracking. Ops with no
+    // Hash of the op's key, for hot-KEY tracking. Ops with no
     // single key (scans, txns spanning many) contribute nothing rather
     // than contributing a wrong key — a txn attributed to one of its
     // keys would invent concentration that is not there.
@@ -1841,7 +1960,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     // Dependency key for the per-conn barrier (task #17).
     let (key_hash, wildcard) = op_key(op, &req[body_off..body_off + body_len]);
 
-    // Phase-3 routing fence (§11.2, §21 invariant 6): in fenced mode
+    // The routing fence (fail closed, no false absence): in fenced mode
     // every request resolves through the hash-slot map before ANY side
     // effect (no barrier interaction, no inflight slot, no channel
     // write). The slot is `key_hash % SLOT_COUNT` — identical to
@@ -1874,7 +1993,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         }
     }
 
-    // Phase-3 ORDERED routing (§11.2/§20): resolve the owning range by
+    // ORDERED routing: resolve the owning range by
     // KEY BYTES, pick the partition's port pair, and — for a
     // `RANGE_SCAN` — clamp the sub-span to the owning range and mint
     // the cross-range continuation. Fail-closed refusals (a stale
@@ -1905,7 +2024,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
             emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
             return DISPATCH_DROPPED;
         }
-        // §12.1 step 6, enforcement half: while a cutover barrier is
+        // Cutover enforcement half: while a cutover barrier is
         // up, WRITES into the moving span refuse retryably (QUOTA →
         // redis BUSY, SQL retryable error). Reads pass — the parent
         // still owns the span until publication. A wildcard write
@@ -1942,7 +2061,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
                 body_in_scan_buf = true;
             }
             RouteOrdered::CrossDomain { domain } => {
-                // §11.3/§26.5: the key's home partition is in another
+                // The key's home partition is in another
                 // Clustor cluster domain. Redirect the caller to it,
                 // carrying the domain so the redirect is actionable.
                 router.m_cross_domain_rejects = router.m_cross_domain_rejects.wrapping_add(1);
@@ -2028,8 +2147,8 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     // Remember corr → (proto, conn, path) so the response path can pick
     // the right output port and settle the ordering accounting. If the
     // table is full we drop the request — anchors will time out and
-    // clients will retry. Reasonable for Phase 1; Phase 5 wires this
-    // into quota_manager.
+    // clients will retry. Reasonable until this is wired into
+    // quota_manager.
     let mut help_key = [0u8; HELP_KEY_MAX];
     // For a rewritten scan the body lives in `scan_buf` and `body_len`
     // is the REWRITTEN length — slicing `req` with it runs past the
@@ -2070,7 +2189,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     }
 
     // Step 2: build MSG_KV_COMMAND in router.scratch. The head layout
-    // (kpg + §23 identity) is owned by wire::KvCommandHead.
+    // (kpg + canonical identity) is owned by wire::KvCommandHead.
     let cmd_payload_len = wire::KvCommandHead::LEN + body_len;
     if cmd_payload_len > u16::MAX as usize {
         // Roll back the inflight slot we reserved above.
@@ -2078,7 +2197,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         return DISPATCH_DROPPED;
     }
     let cmd_total = 3 + cmd_payload_len;
-    if cmd_total > router.scratch.len() {
+    if cmd_total > SCRATCH_BUF_SIZE {
         let _ = router.inflight.remove(corr_id);
         return DISPATCH_DROPPED;
     }
@@ -2099,8 +2218,8 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         database: id_database,
         keyspace: id_keyspace,
         // Not stamped by the router: per-write commit timestamps are
-        // assigned by the worker from in-band replicated leases (CDC
-        // RFC A-1), in committed-log order. A non-zero value here is a
+        // assigned by the worker from in-band replicated CDC leases,
+        // in committed-log order. A non-zero value here is a
         // proposer-side override the worker honours verbatim.
         commit_ts: 0,
         body_len: body_len as u16,
@@ -2132,12 +2251,26 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         // from its own voter set on the 460th write.
         let cp_payload_len = 3 + cmd_payload_len;
         let cp_total = 3 + cp_payload_len;
-        if cp_payload_len > u16::MAX as usize || cp_total > router.scratch.len() {
-            // ANSWER it. This used to drop silently, which is
-            // indistinguishable from a lost message and strands any
-            // caller without its own timeout — every other refusal in
-            // this router emits a typed result, and there is no reason
-            // for these two to be the exception.
+        // One consensus entry carries `[LATTICE_ENTRY_TAG][command]`; a
+        // larger command cannot be committed, however often it is retried.
+        if 1 + cmd_payload_len > wire::CONSENSUS_PROPOSAL_BODY_MAX {
+            let _ = router.inflight.remove(corr_id);
+            router.m_proposal_drops = router.m_proposal_drops.wrapping_add(1);
+            emit_reject(
+                router,
+                protocol,
+                corr_id,
+                conn_id,
+                types::KV_RESULT_TOO_LARGE,
+            );
+            return DISPATCH_DROPPED;
+        }
+        if cp_payload_len > u16::MAX as usize || cp_total > SCRATCH_BUF_SIZE {
+            // ANSWER it. Dropping silently here would be
+            // indistinguishable from a lost message and would strand
+            // any caller without its own timeout — every other refusal
+            // in this router emits a typed result, and there is no
+            // reason for these two to be the exception.
             let _ = router.inflight.remove(corr_id);
             router.m_proposal_drops = router.m_proposal_drops.wrapping_add(1);
             emit_reject(router, protocol, corr_id, conn_id, KV_RESULT_INTERNAL);
@@ -2184,7 +2317,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         return DISPATCH_OK;
     }
 
-    // Phase 5 read split: a linearizable read takes the ReadIndex fence
+    // Read split: a linearizable read takes the ReadIndex fence
     // (stash the built command; submit MSG_CLIENT_READ_REQUEST; forward
     // to the worker only on MSG_CLIENT_READ_RESPONSE). Degrades — stash
     // full, command oversize, fence backpressured — fall through to the
@@ -2256,19 +2389,22 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         }
     }
 
+    // Behind any command already waiting (order is kept), else straight
+    // to the worker; with no room, it waits its turn.
     let mut kv_tag_buf = [0u8; SCRATCH_BUF_SIZE];
-    if !write_envelope_maybe_tagged(
-        sys,
-        kv_port,
-        &mut router.scratch[..],
-        cmd_total,
-        kv_tag,
-        &mut kv_tag_buf[..],
-    ) {
-        // Backpressure: undo inflight and let the anchor's retry path
-        // surface to the client. Phase 1 drops; Phase 5 would emit a
-        // throttle event.
+    let written = router.kv_stash_count == 0
+        && write_envelope_maybe_tagged(
+            sys,
+            kv_port,
+            &mut router.scratch[..],
+            cmd_total,
+            kv_tag,
+            &mut kv_tag_buf[..],
+        );
+    if !written && !stash_command(router, kv_port, cmd_total, kv_tag) {
+        // Even the waiting room is full: refused, retryably.
         let _ = router.inflight.remove(corr_id);
+        emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
         return DISPATCH_DROPPED;
     }
     note_dispatched(
@@ -2282,7 +2418,68 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     DISPATCH_OK
 }
 
-/// One observation for a range's Space-Saving table (§12.4 hot key).
+/// Keep the command built in `scratch[..total]` (tagged for its partition
+/// when `tag` names one) until its worker port has room. `false` when
+/// every slot is taken.
+fn stash_command(router: &mut RouterState, port: i32, total: usize, tag: Option<u16>) -> bool {
+    if router.kv_stash_count == KV_STASH_SLOTS {
+        return false;
+    }
+    let i = (router.kv_stash_head + router.kv_stash_count) % KV_STASH_SLOTS;
+    let RouterState {
+        kv_stash, scratch, ..
+    } = &mut *router;
+    let (Some(slot), Some(src)) = (kv_stash.get_mut(i), scratch.get(..total)) else {
+        return false;
+    };
+    let len = match tag {
+        None => {
+            let Some(d) = slot.get_mut(..total) else {
+                return false;
+            };
+            d.copy_from_slice(src);
+            total
+        }
+        Some(partition) => {
+            // As `write_envelope_maybe_tagged` frames it.
+            let (Some(payload), Some(d)) =
+                (src.get(wire::ENVELOPE_HDR..), slot.get_mut(..total + 2))
+            else {
+                return false;
+            };
+            let new_payload = (payload.len() + 2) as u16;
+            d[0] = src[0];
+            d[1..3].copy_from_slice(&new_payload.to_le_bytes());
+            d[3..5].copy_from_slice(&partition.to_le_bytes());
+            d[5..].copy_from_slice(payload);
+            total + 2
+        }
+    };
+    router.kv_stash_len[i] = len;
+    router.kv_stash_port[i] = port;
+    router.kv_stash_count += 1;
+    true
+}
+
+/// Write waiting commands, in order, while their ports take them.
+unsafe fn flush_stash(router: &mut RouterState) {
+    let sys = router.syscalls;
+    if sys.is_null() {
+        return;
+    }
+    while router.kv_stash_count > 0 {
+        let i = router.kv_stash_head;
+        let (port, len) = (router.kv_stash_port[i], router.kv_stash_len[i]);
+        let n = ((*sys).channel_write)(port, router.kv_stash[i].as_mut_ptr(), len);
+        if n != len as i32 {
+            return;
+        }
+        router.kv_stash_head = (i + 1) % KV_STASH_SLOTS;
+        router.kv_stash_count -= 1;
+    }
+}
+
+/// One observation for a range's Space-Saving table (hot-key signal).
 ///
 /// Space-Saving proper: a hit increments; a miss replaces the SMALLEST
 /// slot and inherits its count. Inheriting is what bounds the error
@@ -2396,7 +2593,7 @@ unsafe fn note_dispatched(
     // Single chokepoint for every successfully dispatched op (consensus /
     // fenced-read / direct paths all funnel through here).
     router.m_routed = router.m_routed.wrapping_add(1);
-    // §12.4's load signal at its only honest source. The router is the
+    // The load signal at its only honest source. The router is the
     // one place that sees every write AND the range it was routed to;
     // anything downstream has already lost the range, and anything
     // upstream has not yet chosen it. Counted here, a hot range is a
@@ -2411,8 +2608,8 @@ unsafe fn note_dispatched(
             // a single key would UNDER-report concentration, and
             // under-reporting is what lets a genuinely unsplittable
             // hot key be recommended for a split it cannot benefit
-            // from — §12.4's named mistake, demonstrated live before
-            // this existed.
+            // from — the precise mistake this sampling discipline
+            // exists to avoid.
             HotKeys::Txn(body) => sample_txn_keys(router, range_index, body),
             HotKeys::None => {}
         }
@@ -2450,7 +2647,7 @@ struct Help {
     key: [u8; HELP_KEY_MAX],
     key_len: u8,
     corr: u64,
-    /// Canonical identity (§23) inherited from the read that triggered
+    /// Canonical identity inherited from the read that triggered
     /// the help; every courier command carries it so the record GET and
     /// the resolve write stay in the requester's tenant.
     id_tenant: u32,
@@ -2506,7 +2703,7 @@ unsafe fn maybe_start_help(
     let Some(desc) = router.range_map.lookup(&rk) else {
         return;
     };
-    // §11.3/§26.5: a record whose home range is in another cluster
+    // A record whose home range is in another cluster
     // domain cannot be helped from here — its own domain's router
     // couriers it. Helping locally would route the courier to a local
     // partition that does not hold the record.
@@ -2666,7 +2863,7 @@ unsafe fn send_help_command(
     // kpg 0 (the help routes to an explicit port, not by kpg).
     let payload_len = wire::KvCommandHead::LEN + body.len();
     let total = 3 + payload_len;
-    if total > router.scratch.len() || payload_len > u16::MAX as usize {
+    if total > SCRATCH_BUF_SIZE || payload_len > u16::MAX as usize {
         return false;
     }
     let out = &mut router.scratch[..total];
@@ -2726,9 +2923,9 @@ const INFLIGHT_TIMEOUT_MS: u64 = 5_000;
 /// The failure it prevents is real and measured. With this sweep, a
 /// write sent to a FOLLOWER is refused at ~5.0s with
 /// `-CLUSTERDOWN`. Without it, the connection is CLOSED at ~8.6s with
-/// no reply at all — the caller gets a hangup, and §14.8 is explicit
-/// that "network loss cannot be reduced to FIFO hangup" because a
-/// hangup is not an outcome.
+/// no reply at all — the caller gets a hangup. Network loss must
+/// never be reduced to a FIFO hangup, because a hangup is not an
+/// outcome.
 ///
 /// It took two bad readings to establish that. First the probe used a
 /// 5s read timeout and saw the 5.0s refusal land just past its own
@@ -2869,8 +3066,14 @@ unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
                     }
                 }
             }
+            // TOO_LARGE is final; anything else is retryable.
+            let result = if status == wire::CLIENT_REJECT_TOO_LARGE {
+                types::KV_RESULT_TOO_LARGE
+            } else {
+                types::KV_RESULT_QUOTA
+            };
             if let Some((corr, proto, _)) = oldest {
-                if emit_reject(router, proto, corr, conn_id, types::KV_RESULT_QUOTA) {
+                if emit_reject(router, proto, corr, conn_id, result) {
                     op_settled(router, proto, conn_id);
                 }
             }
@@ -3300,7 +3503,7 @@ unsafe fn drain_map_update(router: &mut RouterState) {
         // wrong envelope type, a frame kind that doesn't match the
         // declared routing mode, or an invalid frame all land here.
         // The frame KIND is the envelope type byte, never sniffed from
-        // the payload (§11.2's declared-not-inferred rule).
+        // the payload (the declared-not-inferred rule).
         let applied = if take != plen {
             None
         } else if hdr[0] == MSG_MAP_UPDATE && router.routing_mode == ROUTING_MODE_FENCED {
@@ -3421,7 +3624,7 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
             // The term moves with the index and only with it. Taking a
             // newer term while rejecting its index would pair a fresh
             // epoch with a stale position, which is exactly the
-            // misattributed fence §21 invariant 11 forbids.
+            // misattributed fence the design forbids.
             router.worker_applied_term[partition] = term;
         }
         return true;
@@ -3431,10 +3634,10 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
     }
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // MSG_KV_APPLIED head layout owned by wire::KvAppliedHead.
-    if payload_len < wire::KvAppliedHead::LEN || payload_len > router.scratch.len() {
+    if !(wire::KvAppliedHead::LEN..=REPLY_BUF_SIZE).contains(&payload_len) {
         return false;
     }
-    let mut in_buf = [0u8; SCRATCH_BUF_SIZE];
+    let mut in_buf = [0u8; REPLY_BUF_SIZE];
     let n2 = (sys.channel_read)(router.kv_in, in_buf.as_mut_ptr(), payload_len);
     if (n2 as usize) < payload_len {
         return false;
@@ -3603,12 +3806,57 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
     }
     .encode(&mut out[p..]);
 
-    let forwarded = write_envelope_raw(sys, dest, &mut router.scratch[..], resp_total);
-    // The op completed (response forwarded, or dropped on egress
-    // backpressure — either way it is no longer outstanding): settle
-    // the per-conn ordering slot, which may replay held requests.
+    let forwarded = write_envelope_raw(sys, dest, &mut router.scratch[..], resp_total)
+        || stash_reply(router, dest, resp_total);
+    // The op completed (response forwarded, or waiting for its port):
+    // settle the per-conn ordering slot, which may replay held requests.
     op_settled(router, meta.proto, meta.conn);
     forwarded
+}
+
+/// Keep the reply in `scratch[..total]` until `dest` has room.
+fn stash_reply(router: &mut RouterState, dest: i32, total: usize) -> bool {
+    let RouterState {
+        resp_stash,
+        scratch,
+        ..
+    } = &mut *router;
+    let (Some(d), Some(src)) = (resp_stash.get_mut(..total), scratch.get(..total)) else {
+        return false;
+    };
+    d.copy_from_slice(src);
+    router.resp_stash_len = total;
+    router.resp_stash_dest = dest;
+    router.resp_stash_ms = if router.syscalls.is_null() {
+        0
+    } else {
+        unsafe { dev_millis(&*router.syscalls) }
+    };
+    true
+}
+
+/// Write a waiting reply: whether none waits now. One whose consumer has
+/// stayed stuck past `RESP_STASH_WAIT_MS` is dropped.
+unsafe fn flush_reply(router: &mut RouterState) -> bool {
+    let len = router.resp_stash_len;
+    if len == 0 {
+        return true;
+    }
+    let sys = router.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let dest = router.resp_stash_dest;
+    if ((*sys).channel_write)(dest, router.resp_stash.as_mut_ptr(), len) == len as i32 {
+        router.resp_stash_len = 0;
+        return true;
+    }
+    if dev_millis(&*sys).wrapping_sub(router.resp_stash_ms) > RESP_STASH_WAIT_MS {
+        router.resp_stash_len = 0;
+        router.m_resp_drops = router.m_resp_drops.wrapping_add(1);
+        return true;
+    }
+    false
 }
 
 // ── Module ABI ────────────────────────────────────────────────────────
@@ -3767,7 +4015,7 @@ pub extern "C" fn module_new(
     //
     // `internal_sql_in` is compute placed IN this graph; `internal_data_in`
     // is the same compute placed remotely and reaching us through the
-    // Phase 9 data anchor. Both reply on `compute_out`, because the
+    // data anchor. Both reply on `compute_out`, because the
     // router's outputs sit at fluxor's 16-port cap and there is no
     // seventeenth to give the second one.
     //
@@ -3778,8 +4026,9 @@ pub extern "C" fn module_new(
     // same client, or neither. Refuse the combination rather than serve
     // a reply path that is only sometimes addressed.
     //
-    // This costs nothing §30 needs: it compares a combined placement
-    // against a separated one by running each and comparing histories,
+    // This costs the placement comparison nothing: it compares a
+    // combined placement against a separated one by running each and
+    // comparing histories,
     // which is two graphs either way.
     if router.internal_sql_in >= 0 && router.internal_data_in >= 0 {
         return -1;
@@ -3807,6 +4056,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     let mut budget = PER_TICK_ROUTER_BUDGET;
     while budget > 0 {
         let progressed = unsafe {
+            // Waiting commands first; while any still wait, no new
+            // request is taken (the anchors see the backpressure).
+            flush_stash(router);
+            let replies_clear = flush_reply(router);
+            if router.kv_stash_count > 0 {
+                let k = drain_gateway_rejects(router);
+                let e = replies_clear && drain_kv_in(router);
+                if !(k || e) {
+                    break;
+                }
+                budget -= 1;
+                continue;
+            }
             let a = drain_ingress(router, router.etcd_in, PROTO_ETCD);
             let b = drain_ingress(router, router.redis_in, PROTO_REDIS);
             let c = drain_ingress(router, router.memcached_in, PROTO_MEMCACHED);
@@ -3821,7 +4083,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let i = drain_ingress(router, router.internal_job_in, types::PROTO_INTERNAL_JOB);
             let j = drain_ingress(router, router.internal_data_in, types::PROTO_INTERNAL_DATA);
             let k = drain_gateway_rejects(router);
-            let e = drain_kv_in(router);
+            let e = replies_clear && drain_kv_in(router);
             a || b || c || d || e || f || g || h || i || j || k
         };
         if !progressed {
@@ -3852,7 +4114,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     router.m_routed,
                     router.m_rejects,
                     router.m_lin_reads,
-                    // §12.4 load signal: writes attributed to range 0
+                    // Load signal: writes attributed to range 0
                     // and range 1. Monotonic; a consumer differences
                     // them for a rate.
                     router.m_range_writes[0],
@@ -3872,6 +4134,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     router.m_not_leader_rejects,
                     router.m_helps_started,
                     router.m_helps_resolved,
+                    router.m_resp_drops,
                 ],
             );
         }

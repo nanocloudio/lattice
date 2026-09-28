@@ -1,0 +1,102 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+# mod.rs is a SYMLINK to ../document_executor/mod.rs: the same source,
+# built with `big`. (A symlink, not an `entry` outside this directory: the
+# build's staleness check walks the module's own directory.)
+#
+# document_executor_big — the executor for documents past one channel
+# frame, up to its policy (MAX_DOCUMENT: the decided Kubernetes object
+# bound, 1.5 MiB). Requests and answers past a frame cross as
+# wire::MSG_PART parts; its whole-document buffers are one heap arena
+# (~33 MiB) taken at construction. A separate module TYPE, not a variant
+# of document_executor: a graph that keeps documents to a frame keeps the
+# bounded executor and pays nothing. Ports, params and behaviour are
+# document_executor's; see its manifest (below, the same).
+
+[[variant]]
+name     = "big"
+features = ["big"]
+default  = true
+
+# The shared document execution engine. Runs canonical document
+# operations (MSG_DOC_REQUEST,
+# modules/common/doc_exec.rs) against collections as their descriptors
+# declare them, over the canonical KV path.
+#
+# One executor serves every document dialect (doc_edge_anchor for MongoDB,
+# the Kubernetes front): dialects translate and render, this module
+# executes. Two executors would eventually disagree about what an
+# operation on a collection means.
+#
+# Owns:
+#   - the document catalog: collection descriptors and id allocation
+#   - document keys (collection, shard key, id) and records (doc_tree)
+#   - insert, replace, update, delete, get and list, each mutation one
+#     KV transaction compared on the revision it read
+#   - what a descriptor declares: ids, generated ids, create stamps,
+#     values kept across a replace, identity paths, the revision path,
+#     document limits
+#
+# Does NOT own:
+#   - any wire format (BSON, JSON), authentication, or rendering — the
+#     dialects'
+#   - durability: every write is a KV request and takes the same Raft + WAL
+#     path a Redis SET does
+
+# Requests from the first dialect (e.g. doc_edge_anchor).
+[[ports]]
+name = "dialect_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Requests from a second dialect, where one is wired.
+[[ports]]
+name = "dialect2_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_KV_RESPONSE from kv_request_router.compute_out (or
+# lattice_data_client when compute is placed apart).
+[[ports]]
+name = "kv_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_WATCH_EVENT change notifications (kv_state_worker.mutations): mark
+# the followed watches (FLAG_FOLLOW) whose span holds the changed key, so
+# they are read again at once. Optional: unwired, a followed watch is read
+# again every second.
+[[ports]]
+name = "changes_in"
+direction = "input"
+content_type = "OctetStream"
+required = false
+
+# Responses to the first dialect.
+[[ports]]
+name = "dialect_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Responses to the second dialect.
+[[ports]]
+name = "dialect2_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_KV_REQUEST to kv_request_router.internal_sql_in (the compute
+# ingress), stamped PROTO_INTERNAL_SQL so replies come back on compute_out.
+[[ports]]
+name = "kv_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["operations", "docs_read", "docs_written", "errors", "queue_rejects", "timeouts"]

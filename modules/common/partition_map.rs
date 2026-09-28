@@ -1,29 +1,29 @@
-//! Partition-map contracts — RFC database foundation §11.
+//! Partition-map contracts.
 //!
 //! Versioned, bounded, `no_std` schemas for range descriptors and the
-//! two explicit routing forms (§11.2): the ordered range map and the
+//! two explicit routing forms: the ordered range map and the
 //! hash-slot map. This file is contracts only — no routing wiring, no
 //! module behavior. Everything is fixed-layout, fixed-capacity, and
-//! fail-closed, in the Phase 0 style of `internal_key.rs` /
-//! `db_context.rs`.
+//! fail-closed, in the same contracts-only style as `internal_key.rs`
+//! and `db_context.rs`.
 //!
 //! Design rules encoded here:
 //!
-//! - **Logical identity outlives physical placement** (§11.3):
+//! - **Logical identity outlives physical placement**:
 //!   `range_id` is wide and globally unique; the Clustor
 //!   `partition_id` is a cluster-local physical binding fenced by
 //!   `partition_incarnation` and `placement_epoch`.
-//! - **The routing form is declared, never inferred** (§11.2, §11.4):
+//! - **The routing form is declared, never inferred**:
 //!   a keyspace's routing kind comes from its `KeyspaceRouting`
 //!   record, not from sniffing key bytes.
 //! - **Ranges are half-open `[start_key, end_key)`** over USER key
-//!   bounds (§5). An empty `start_key` means MIN; an empty `end_key`
+//!   bounds. An empty `start_key` means MIN; an empty `end_key`
 //!   means MAX.
-//! - **Invariants 4 and 5 (§21) are executable**: an ordered range map
+//! - **The coverage invariants are executable**: an ordered range map
 //!   validates gap-free, non-overlapping, ordered, MIN..MAX coverage
 //!   by all-Active descriptors, returning a typed violation naming the
 //!   offending index.
-//! - **Stale routing cannot mutate current state** (§21 invariant 6):
+//! - **Stale routing cannot mutate current state**:
 //!   checked lookups fence on descriptor generation and routing epoch
 //!   and return a typed error that maps onto
 //!   `db_context::RetryClass::StaleRoute`.
@@ -50,8 +50,8 @@ pub const KEYSPACE_ROUTING_VERSION: u16 = 1;
 
 /// Maximum length of one user-key range bound, bytes.
 pub const MAX_KEY_BOUND_LEN: usize = 256;
-/// Maximum replicas per range (§11.5: three voters default, five max;
-/// learners/observers fit within the same bound in transition states).
+/// Maximum replicas per range: three voters default, five max;
+/// learners/observers fit within the same bound in transition states.
 pub const MAX_REPLICAS: usize = 5;
 /// Fixed capacity of one `OrderedRangeMap`.
 pub const MAX_RANGES: usize = 64;
@@ -64,7 +64,7 @@ pub const SLOT_COUNT: usize = 1024;
 
 // ── Enums (fail closed on unknown discriminants) ──────────────────────
 
-/// Declared routing form of a partition map (§11.2). Never inferred
+/// Declared routing form of a partition map. Never inferred
 /// from key bytes.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,7 +85,7 @@ impl RoutingKind {
     }
 }
 
-/// Range lifecycle state (§12). Every transition is an explicit state
+/// Range lifecycle state. Every transition is an explicit state
 /// machine with generation fencing; routing serves only `Active`.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +112,7 @@ impl Lifecycle {
     }
 }
 
-/// Replica role (§11.5).
+/// Replica role.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReplicaRole {
@@ -137,7 +137,7 @@ impl ReplicaRole {
 
 // ── Replica and physical binding ──────────────────────────────────────
 
-/// One replica of a range (§11.5).
+/// One replica of a range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Replica {
     pub node_id: u32,
@@ -153,7 +153,7 @@ impl Replica {
     };
 }
 
-/// Physical partition binding (§11.3): the current Clustor placement of
+/// Physical partition binding: the current Clustor placement of
 /// a logical range. `partition_id` matches `types::KpgId` (`u16`);
 /// `partition_incarnation` prevents delayed messages or files from a
 /// previously reused physical ID from becoming valid.
@@ -177,7 +177,7 @@ impl Binding {
 // ── Range descriptor ──────────────────────────────────────────────────
 
 /// Versioned statement of range bounds, logical identity, physical
-/// binding, replicas, and lifecycle (§11.3).
+/// binding, replicas, and lifecycle.
 ///
 /// Wire layout (`RANGE_DESCRIPTOR_VERSION` 1, all integers LE):
 ///
@@ -201,7 +201,7 @@ pub struct RangeDescriptor {
     pub database_id: u32,
     pub partition_map_id: u32,
     pub routing_kind: RoutingKind,
-    /// Wide, globally unique logical range identity (§11.3). Outlives
+    /// Wide, globally unique logical range identity. Outlives
     /// every physical placement.
     pub range_id: [u8; 16],
     start_key: [u8; MAX_KEY_BOUND_LEN],
@@ -209,7 +209,7 @@ pub struct RangeDescriptor {
     end_key: [u8; MAX_KEY_BOUND_LEN],
     end_key_len: u16,
     /// Descriptor generation; bumped by every lifecycle operation and
-    /// fenced on every routed request (§11.2, §12).
+    /// fenced on every routed request.
     pub generation: u32,
     pub lifecycle: Lifecycle,
     pub binding: Binding,
@@ -250,7 +250,7 @@ impl RangeDescriptor {
     /// replica set outside `1..=MAX_REPLICAS`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "contract constructor mirrors the §11.3 record shape one-to-one"
+        reason = "contract constructor mirrors the descriptor record shape one-to-one"
     )]
     pub fn new(
         database_id: u32,
@@ -459,7 +459,7 @@ impl RangeDescriptor {
 
 // ── Typed errors ──────────────────────────────────────────────────────
 
-/// A §21 invariant-4/5 violation found by `OrderedRangeMap::validate`.
+/// A coverage-invariant violation found by `OrderedRangeMap::validate`.
 /// Each variant names the violation class and the offending descriptor
 /// index (boundary violations report the index of the *second*
 /// descriptor of the offending pair).
@@ -471,8 +471,8 @@ pub enum MapViolation {
     FirstNotMin { index: usize },
     /// Last descriptor's end bound is not MAX (empty).
     LastNotMax { index: usize },
-    /// Descriptor is not `Lifecycle::Active` (invariant 4: routing
-    /// serves only active descriptors).
+    /// Descriptor is not `Lifecycle::Active` (routing serves only
+    /// active descriptors).
     NotActive { index: usize },
     /// Descriptor declares a routing kind other than `OrderedRange`.
     WrongKind { index: usize },
@@ -491,8 +491,7 @@ pub enum MapViolation {
 /// Typed routing-check failure. Every variant maps onto
 /// `db_context::RetryClass::StaleRoute`: the caller's descriptor cache
 /// is stale (or the map itself is mid-update) and must be refreshed
-/// before retrying — stale metadata must never mutate current state
-/// (§21 invariant 6).
+/// before retrying — stale metadata must never mutate current state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteError {
     /// No active descriptor covers the key.
@@ -516,16 +515,16 @@ impl RouteError {
 
 // ── Ordered range map ─────────────────────────────────────────────────
 
-/// Fixed-capacity ordered range map (§11.2): a sorted array of gap-
+/// Fixed-capacity ordered range map: a sorted array of gap-
 /// free, non-overlapping, all-Active descriptors covering MIN..MAX.
 ///
-/// `validate()` makes §21 invariants 4 and 5 executable; `lookup`
+/// `validate()` makes the coverage invariants executable; `lookup`
 /// assumes a validated map (it is still safe on an unvalidated one —
 /// it just may return `None`).
 pub struct OrderedRangeMap {
-    /// Routing epoch fenced by `lookup_generation_checked` (§11.2:
-    /// "the owning range validates every request's descriptor
-    /// generation and routing epoch").
+    /// Routing epoch fenced by `lookup_generation_checked`: the
+    /// owning range validates every request's descriptor generation
+    /// and routing epoch.
     pub routing_epoch: u32,
     len: usize,
     ranges: [RangeDescriptor; MAX_RANGES],
@@ -563,7 +562,7 @@ impl OrderedRangeMap {
         Some(())
     }
 
-    /// Enforce §21 invariants 4 and 5: every live key belongs to
+    /// Enforce the coverage invariants: every live key belongs to
     /// exactly one active descriptor; active descriptors are ordered,
     /// gap-free, and non-overlapping, and together cover MIN..MAX.
     pub fn validate(&self) -> Result<(), MapViolation> {
@@ -629,7 +628,8 @@ impl OrderedRangeMap {
         }
     }
 
-    /// `lookup` plus the §11.2 fences: the presented routing epoch must
+    /// `lookup` plus the routing fences: the presented routing epoch
+    /// must
     /// match the map's and the presented generation must match the
     /// owning descriptor's. Any mismatch — behind OR ahead — is a
     /// stale route: the caller refreshes metadata and retries.
@@ -659,8 +659,8 @@ impl OrderedRangeMap {
     /// the half-open span `[start, end)` (empty `end` = MAX), as an
     /// inclusive index pair `(first, last)`.
     ///
-    /// This is §20's "resolve all descriptors covering the span" step
-    /// for a multi-range scan: on a validated map the returned run is
+    /// This is the resolve-all-descriptors-covering-the-span step of
+    /// a multi-range scan: on a validated map the returned run is
     /// gap-free by construction, so a scan that visits exactly these
     /// ranges in order visits every key of the span exactly once.
     /// `None` when the map is empty or no range intersects the span
@@ -756,7 +756,7 @@ pub const RANGE_MAP_UPDATE_VERSION: u16 = 1;
 /// KV router's `map_update` input port (sibling of [`MSG_MAP_UPDATE`],
 /// same 0xE0 operational band). The two frame kinds share the port; the
 /// envelope type byte says which map form a frame feeds — never the
-/// bytes themselves (§11.2's declared-not-inferred rule, applied to the
+/// bytes themselves (the declared-not-inferred rule, applied to the
 /// control plane too).
 pub const MSG_RANGE_MAP_UPDATE: u8 = 0xE3;
 /// `[version:u16][count:u16]`, followed by `count` self-delimiting
@@ -784,13 +784,13 @@ pub fn encode_range_map_update(descriptors: &[RangeDescriptor], out: &mut [u8]) 
     Some(n)
 }
 
-// ── SPAN_BARRIER frame (§12 cutover barrier) ──────────────────────────
+// ── SPAN_BARRIER frame (cutover barrier) ──────────────────────────────
 
 /// Envelope message type carrying a `SPAN_BARRIER_V1` frame on the KV
 /// router's `map_update` port (0xE0 operational band, sibling of
 /// [`MSG_MAP_UPDATE`] / [`MSG_RANGE_MAP_UPDATE`]).
 ///
-/// §12.1 step 6's cutover barrier, in router form: while a barrier is
+/// The split cutover barrier, in router form: while a barrier is
 /// set, ordered-mode WRITES whose key falls in the half-open span
 /// refuse with a retryable result — reads are untouched. The range
 /// supervisor sets it before the final catch-up copy pass (so no
@@ -896,7 +896,7 @@ impl<'a> SpanBarrier<'a> {
 // bounded by span entry count), so 48 bits is not a practical limit —
 // but the tagging still fails closed rather than truncating.
 //
-// The epoch byte is §20's "retries on generation change" made
+// The epoch byte is the retry-on-generation-change rule made
 // concrete: a continuation minted under one map must not resume under
 // another, because the range INDEX it names may cover different keys
 // there — resuming it would silently skip or repeat a stretch of the
@@ -965,14 +965,14 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Physical binding of one logical hash slot (§11.4). Mirrors the
+/// Physical binding of one logical hash slot. Mirrors the
 /// partition-binding fields of `Binding` that fence hash-routed
 /// requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotBinding {
     /// Clustor physical partition (matches `types::KpgId`).
     pub partition_id: u16,
-    /// Fences stale physical-ID reuse (§11.3).
+    /// Fences stale physical-ID reuse.
     pub partition_incarnation: u32,
     /// Binding generation, fenced on every checked lookup.
     pub generation: u32,
@@ -986,7 +986,7 @@ impl SlotBinding {
     };
 }
 
-/// Fixed-slot hash map (§11.2, §11.4): the canonical key maps to one
+/// Fixed-slot hash map: the canonical key maps to one
 /// of `SLOT_COUNT` logical slots, and each slot maps to a partition
 /// group. Preserves the existing hash-to-KPG behavior for point
 /// workloads that deliberately forgo ordered cross-partition scans.
@@ -1215,7 +1215,7 @@ impl<'a> MapUpdateReader<'a> {
 
 // ── Keyspace routing declaration ──────────────────────────────────────
 
-/// The §11.2 routing-form rule as a record: a keyspace's map form is
+/// The routing-form rule as a record: a keyspace's map form is
 /// DECLARED in keyspace metadata — one of these per keyspace — and
 /// never inferred from key bytes.
 ///

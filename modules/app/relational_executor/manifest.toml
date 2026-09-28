@@ -3,14 +3,13 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# The shared relational execution engine (RFC database foundation §14.2,
-# §14.5). Compiles typed relational operations into bounded Lattice KV
-# reads, ordered scans, and writes.
+# The shared relational execution engine. Compiles typed relational
+# operations into bounded Lattice KV reads, ordered scans, and writes.
 #
-# One executor serves BOTH connectors. §14.2 makes the intermediate
+# One executor serves BOTH connectors. The intermediate
 # representation, the catalogs, name resolution, binding, planning and
-# execution shared modules rather than per-connector ones, and §14.3
-# forbids a connector from introducing its own table format or catalog of
+# execution are shared modules rather than per-connector ones, and a
+# connector may not introduce its own table format or catalog of
 # record. Two executors would satisfy the letter of that and break its
 # intent: they would eventually disagree about what a statement means for
 # a given schema, and nothing would surface the disagreement.
@@ -25,7 +24,7 @@ hardware_targets = ["bcm2712"]
 #
 # Does NOT own:
 #   - wire protocol, authentication, session variables, error-code
-#     mapping, or result FORMATTING — all connector concerns per §14.3
+#     mapping, or result FORMATTING — all connector concerns
 #   - durability. Every write leaves here as a KV request and acquires
 #     its durability from the same Raft + WAL path a Redis SET takes.
 
@@ -87,7 +86,7 @@ name = "txn_submit_out"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name). Ids 0-4 are
 # counters emitted on the `metrics` port in this exact order; ids 5+ ride

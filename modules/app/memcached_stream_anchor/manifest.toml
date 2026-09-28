@@ -12,12 +12,12 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "routed_in"
@@ -34,7 +34,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ──────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

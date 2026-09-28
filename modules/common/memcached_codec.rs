@@ -259,6 +259,11 @@ pub fn encode_reply(
     let sb = send_buf;
     let sl = send_len;
 
+    // A write past what its path carries: memcached's own answer.
+    if result == types::KV_RESULT_TOO_LARGE {
+        let _ = append(sb, sl, b"SERVER_ERROR object too large for cache\r\n");
+        return;
+    }
     match mem_op {
         MemOp::Get | MemOp::Gets => match result {
             KV_RESULT_OK if !body.is_empty() => {

@@ -1,6 +1,6 @@
 //! lattice_apply_bridge — Clustor commit-pipeline ⇄ Lattice KV adapter.
 //!
-//! Phase 7. Consumes `MSG_COMMITTED_ENTRY` envelopes from
+//! Consumes `MSG_COMMITTED_ENTRY` envelopes from
 //! `consensus.committed_entries` and re-emits each entry's body
 //! as `MSG_KV_COMMAND` on `kv_out`, preserving raft commit-index
 //! order. The downstream `kv_state_worker.commands` port is the
@@ -11,7 +11,7 @@
 //!   `[term:u64 LE][index:u64 LE][body…]`
 //! The body is the verbatim MSG_KV_COMMAND payload the lattice
 //! proposer originally submitted (see `kv_request_router`'s
-//! Phase 7 path, which would route writes through a the gateway codec
+//! consensus path, which routes writes through the gateway codec
 //! proposal envelope instead of straight to the worker).
 //!
 //! The bridge does NOT re-order, batch, or reshape — it's the
@@ -97,12 +97,12 @@ struct BridgeState {
     pos_index: u64,
     published_index: u64,
     /// Per-source forwarded count and gap count. `forwarded` is the
-    /// Phase-14 `applied` telemetry counter (one per entry written to
+    /// `applied` telemetry counter (one per entry written to
     /// `kv_out`); `gaps` is retained for gap detection.
     forwarded: u64,
     gaps: u64,
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=applied [=forwarded], 1=dropped).
     /// Steps that ended holding a retained entry a destination refused.

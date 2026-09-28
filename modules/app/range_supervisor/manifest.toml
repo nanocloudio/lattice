@@ -3,18 +3,21 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Range lifecycle supervisor (RFC database foundation §12, Phase 4).
+# Range lifecycle supervisor.
 #
 # Pumps ONE declared lifecycle operation through the state machines in
-# modules/common/range_lifecycle.rs. Split is driven today; merge and
-# relocation are contract-complete and refuse at init until the pump
-# grows them. The operation record persists in KS_LIFECYCLE_OP through
-# the canonical KV path (partition 0, TARGETED), so a crash resumes by
-# operation id from the durable phase — never from intentions.
+# modules/common/range_lifecycle.rs: split and merge move a key span
+# between partitions page by page behind the cutover barrier, and
+# relocation moves a range's replica set through the substrate's Raft
+# membership changes (declared by params, or armed to take the move
+# from a runtime relocation command). The split/merge operation record
+# persists in KS_LIFECYCLE_OP through the canonical KV path
+# (partition 0, TARGETED), so a crash resumes by operation id from the
+# durable phase — never from intentions.
 #
-# The manual execution gate (§12.4): the operation is DECLARED in the
+# The manual execution gate: the operation is DECLARED in the
 # graph config and starts `start_delay_ms` after boot. Automation
-# proposes (Phase 10); an operator config change executes.
+# proposes; an operator config change executes.
 
 # Replies from kv_request_router.internal_lifecycle_out.
 [[ports]]

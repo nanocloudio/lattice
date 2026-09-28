@@ -1,6 +1,6 @@
-//! SQL front end for the relational capability (RFC database
-//! foundation §14.2: "name resolution, binding, and semantic
-//! validation" as a SHARED module, not a per-connector one).
+//! SQL front end for the relational capability: name resolution,
+//! binding, and semantic validation as a SHARED module, not a
+//! per-connector one.
 //!
 //! Dual-target facade: the same source compiles into the no_std PIC
 //! `relational_executor` and is host-tested here. Heap-free — every
@@ -9,7 +9,7 @@
 //!
 //! ## Why the connectors do not each parse
 //!
-//! §14.3 lets a connector own its dialect syntax but forbids it from
+//! A connector owns its dialect syntax but is forbidden from
 //! introducing "connector-specific table formats, transaction managers,
 //! indexes, catalogs of record, or persistence paths". If PostgreSQL and
 //! MySQL each had their own parser AND binder, they would inevitably
@@ -36,10 +36,10 @@
 //! predicate, plus the session statements a real `psql` or `mariadb`
 //! client sends before it will let a user type anything. Everything else
 //! is [`Statement::Unsupported`] — a NAMED refusal that the connector
-//! turns into a proper error. That matters more than it sounds: §14.3
-//! requires compatibility behaviour that cannot be represented honestly
-//! to be "rejected or reported as unsupported rather than silently
-//! approximated", and the most tempting approximation in a SQL front end
+//! turns into a proper error. That matters more than it sounds:
+//! compatibility behaviour that cannot be represented honestly must be
+//! rejected or reported as unsupported rather than silently
+//! approximated, and the most tempting approximation in a SQL front end
 //! is to ignore the clause you do not understand. Ignoring a `WHERE`
 //! returns the wrong rows; ignoring a `JOIN` returns rows from one table
 //! and calls it an answer. Both are worse than an error.
@@ -498,7 +498,7 @@ impl<'a> Parser<'a> {
     /// rather than an oversight: this build has one schema, so accepting
     /// `public.t` and treating it as `t` matches what the client means,
     /// while pretending to support multiple schemas would be the silent
-    /// approximation §14.3 forbids. A qualifier that is not the
+    /// approximation this layer forbids. A qualifier that is not the
     /// well-known default is refused below.
     /// A qualified column reference `table.column` — both idents required.
     fn qualified(&mut self) -> Result<(&'a [u8], &'a [u8]), SqlError> {
@@ -842,7 +842,7 @@ pub enum Statement<'a> {
         if_exists: bool,
     },
     /// `CREATE INDEX name ON table (column)` — one column, non-unique.
-    /// Multi-column and expression indexes refuse BY NAME (§14.4's
+    /// Multi-column and expression indexes refuse BY NAME (the key
     /// encoding supports composites, the surface grows deliberately).
     CreateIndex {
         name: &'a [u8],
@@ -1152,7 +1152,7 @@ fn finish<'a>(p: &mut Parser<'a>, stmt: Statement<'a>) -> Result<Statement<'a>, 
 
 fn parse_create<'a>(p: &mut Parser<'a>) -> Result<Statement<'a>, SqlError> {
     if p.eat_kw(b"unique")? {
-        // UNIQUE INDEX needs the §14.4 ownership record wired through
+        // UNIQUE INDEX needs the unique-ownership record wired through
         // the write path; refuse by name until it is.
         return Err(SqlError::Unsupported);
     }

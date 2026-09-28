@@ -1,7 +1,5 @@
 //! lattice_data_client — compute-side originator of `lattice.data`.
 //!
-//! RFC database foundation §14.8, §14.9, §26 phase 9.
-//!
 //! ## A drop-in for the router
 //!
 //! `relational_executor` and the model workers already speak
@@ -10,7 +8,8 @@
 //! storage graph as `lattice.data` frames, and hands back exactly those
 //! envelopes with the fence tail intact.
 //!
-//! That is deliberate and it is the point. §30 asks whether combined
+//! That is deliberate and it is the point. The question is whether
+//! combined
 //! and separated placements produce equivalent histories, and the
 //! cleanest way to make that answerable is for the layer above the
 //! boundary to be unable to tell which side of it it is on. Same
@@ -27,7 +26,7 @@
 //!
 //! - **Multiplexing.** Many requests in flight on one connection, each
 //!   correlated by `request_id`. Responses may return in any order.
-//! - **Fence validation.** §21 invariant 11 says a fence is valid only
+//! - **Fence validation.** A fence is valid only
 //!   with the right source identity and a live epoch. A response whose
 //!   `source_epoch` is BELOW one already seen from this connection came
 //!   from an authority that has since been superseded, and serving it
@@ -39,8 +38,8 @@
 //!
 //! ## What it does not own yet, and why each is named
 //!
-//! §14.9 also assigns this module a routing cache, cancellation, and
-//! continuation. None is silently faked:
+//! This module also owns, by design, a routing cache, cancellation,
+//! and continuation. None is silently faked:
 //!
 //! - **Routing cache.** `resolve_span` is the operation that produces a
 //!   route, and the storage anchor refuses it — a storage graph has no
@@ -49,7 +48,7 @@
 //!   deployment that IS the correct route, and it is the honest shape
 //!   of "no cache yet": one configured entry rather than an invented
 //!   lookup. When `subscribe_topology` exists, this is what it replaces.
-//! - **Session identity.** §14.9 puts the session directory in compute,
+//! - **Session identity.** The session directory lives in compute,
 //!   and it does not exist yet, so `session_id` is a parameter too.
 //!   `admit_request` requires one for every operation but `open`, and
 //!   supplying a configured value is the difference between "this
@@ -119,9 +118,9 @@ use data_surface::{
 use types::{
     KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS, KV_OP_FLUSH, KV_OP_GET,
     KV_OP_GET_AT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE,
-    KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS, KV_OP_STRLEN, KV_OP_TXN,
-    KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_CROSS_RANGE,
-    KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND, KV_RESULT_OK, KV_RESULT_QUOTA,
+    KV_OP_RANGE_META, KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS,
+    KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE,
+    KV_RESULT_CROSS_RANGE, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND, KV_RESULT_OK, KV_RESULT_QUOTA,
 };
 use wire::{KV_RESPONSE_FENCE_TAIL_LEN, MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -149,8 +148,9 @@ define_params! {
 
     // Tags 1, 2, 8, 9, 10 and 11 are retired.
 
-    // The route this client addresses. Stands in for the routing cache
-    // §14.9 will own — see the module header. Written into the low 8
+    // The route this client addresses. Stands in for the routing
+    // cache this module will own — see the module header. Written
+    // into the low 8
     // bytes of the 16-byte range identity.
     // u32 rather than u64 because `define_params!` has no u64 type.
     // Not a constraint worth working around: this is a configured
@@ -162,8 +162,8 @@ define_params! {
     4, range_generation, u32, 1
         => |s, d, len| { s.range_generation = p_u32(d, len, 0, 1); };
 
-    // Session identity. Stands in for the session directory §14.9 puts
-    // in compute — see the module header.
+    // Session identity. Stands in for the session directory that
+    // belongs in compute — see the module header.
     5, session_id, u32, 1
         => |s, d, len| { s.session_id = p_u32(d, len, 0, 1); };
 
@@ -184,7 +184,7 @@ define_params! {
         }
     };
 
-    // Additional storage replicas (RFC §30's three-replica range), each
+    // Additional storage replicas (the three-replica range), each
     // an optional `host[:port]` with the same default port.
     //
     // The client talks to ONE peer at a time and rotates on evidence —
@@ -262,7 +262,7 @@ struct ClientState {
     next_request_id: u64,
 
     /// Highest fence epoch observed on this connection. A response
-    /// below it came from a superseded authority (§21 invariant 11).
+    /// below it came from a superseded authority.
     seen_epoch: u64,
 
     recv_len: usize,
@@ -406,9 +406,10 @@ const fn op_for(kv_op: u8) -> Option<DataOp> {
     match kv_op {
         KV_OP_GET | KV_OP_GET_AT | KV_OP_EXISTS | KV_OP_STRLEN => Some(DataOp::GetAt),
         KV_OP_MGET => Some(DataOp::BatchGet),
-        KV_OP_SCAN | KV_OP_SCAN_AT | KV_OP_RANGE | KV_OP_RANGE_SCAN | KV_OP_SCAN_VERSIONS => {
-            Some(DataOp::ScanOpen)
-        }
+        // `RANGE_META` is the ordered, revision-pinned read with each
+        // entry's metadata (the document executor's reads).
+        KV_OP_SCAN | KV_OP_SCAN_AT | KV_OP_RANGE | KV_OP_RANGE_SCAN | KV_OP_SCAN_VERSIONS
+        | KV_OP_RANGE_META => Some(DataOp::ScanOpen),
         KV_OP_PUT | KV_OP_DELETE | KV_OP_CAS | KV_OP_INCR | KV_OP_DECR | KV_OP_APPEND
         | KV_OP_PREPEND | KV_OP_MSET | KV_OP_FLUSH | KV_OP_TXN | KV_OP_TXN_RECORD => {
             Some(DataOp::Write)
@@ -576,7 +577,7 @@ unsafe fn handle_kv_request(client: &mut ClientState) -> bool {
         request.context.max_keys = u32::MAX;
     }
     if op.is_mutation() {
-        // §21 invariant 17: a retryable mutation must be discoverable.
+        // A retryable mutation must be discoverable.
         // The caller's correlation identity is the natural key — it is
         // already unique per request on this path and it is what the
         // caller would use to ask "did mine apply?".
@@ -730,7 +731,7 @@ unsafe fn handle_response_frame(client: &mut ClientState, frame: &[u8]) {
     };
     client.m_responses = client.m_responses.wrapping_add(1);
 
-    // ── Rotation evidence (§30's leader replacement) ──────────────────
+    // ── Rotation evidence (leader replacement) ────────────────────────
     //
     // A refusal with `UnavailableAuthority` on a MUTATION is the typed
     // "this node is not the leader" signal (the gateway's NOT_LEADER
@@ -768,7 +769,8 @@ unsafe fn handle_response_frame(client: &mut ClientState, frame: &[u8]) {
 
     let f = &response.fences;
 
-    // §21 invariant 11. An epoch below one already seen came from an
+    // The fence-epoch rule. An epoch below one already seen came from
+    // an
     // authority that has since been superseded; forwarding it would let
     // compute observe the past after observing the present. Refuse
     // rather than serve, and count it — a rising count is a leader
@@ -896,7 +898,7 @@ unsafe fn drop_connection(client: &mut ClientState) {
     // Fail every outstanding request closed. `UnavailableAuthority`
     // shaped: the request may or may not have applied, and the caller's
     // idempotency identity is how it finds out — which is exactly the
-    // discovery path §28 requires instead of a silent hang.
+    // discovery path the surface requires instead of a silent hang.
     for i in 0..MAX_INFLIGHT {
         if !client.inflight[i].in_use {
             continue;

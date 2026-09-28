@@ -3,8 +3,8 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Consistent database backup and restore (RFC database foundation
-# §17.2, Phase 6). Drives §17.2's numbered machine over the db_ops
+# Consistent database backup and restore. Drives the numbered backup
+# machine over the db_ops
 # contracts: every exported record is read at ONE protected revision
 # (a backup assembled from several revisions is a set of records that
 # never existed together), a COMPACTED answer ABORTS rather than

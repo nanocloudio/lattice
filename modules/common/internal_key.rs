@@ -1,4 +1,4 @@
-//! Canonical internal key encoding — RFC database-foundation §9.1.
+//! Canonical internal key encoding.
 //!
 //! One versioned, order-preserving byte encoding shared by every
 //! state-store provider (memory and disk) and every future sorted-file
@@ -27,7 +27,7 @@
 //!   `0x00 0xFF`, and the component ends with the terminator
 //!   `0x00 0x01`. Terminator (`0x01`) < escape (`0xFF`) guarantees a
 //!   proper prefix sorts before its extensions and no encoded key is a
-//!   prefix of another (prefix-ambiguity rule in §9.1).
+//!   prefix of another (the prefix-ambiguity rule).
 //! - The MVCC timestamp is stored bit-inverted so **newer versions sort
 //!   before older versions** of the same user key under ascending byte
 //!   order.
@@ -36,7 +36,7 @@
 //!
 //! The version constant is recorded in engine manifests / snapshot
 //! headers — not in every key — and any layout change requires a bump
-//! plus an explicit format migration (§9.1). Golden vectors live in
+//! plus an explicit format migration. Golden vectors live in
 //! `tests/contract_internal_key.rs`; changing them is a format break.
 
 #![allow(
@@ -65,7 +65,7 @@ pub const fn encoded_max_len(user_key_len: usize) -> usize {
 
 // ── Value kind ────────────────────────────────────────────────────────
 
-/// Discriminates what an internal key's payload *is* (§9.1). The byte
+/// Discriminates what an internal key's payload *is*. The byte
 /// participates in ordering only as a stable tie-breaker after the
 /// timestamp; semantic visibility rules live in the engine, not here.
 #[repr(u8)]
@@ -77,9 +77,9 @@ pub enum ValueKind {
     PointTombstone = 0x02,
     /// Start marker of a range tombstone (span metadata in payload).
     RangeTombstone = 0x03,
-    /// Provisional transactional intent (§13.2).
+    /// Provisional transactional intent.
     Intent = 0x04,
-    /// Authoritative transaction record (home range, §13.2).
+    /// Authoritative transaction record (home range).
     TxnRecord = 0x05,
     /// Engine-internal metadata record.
     Metadata = 0x06,
@@ -103,7 +103,7 @@ impl ValueKind {
 
 /// Encode a full internal key into `out`. Returns the encoded length,
 /// or `None` if `out` is too small (fail closed — never truncate a
-/// key). `mvcc_timestamp` is the logical MVCC timestamp (§10); it is
+/// key). `mvcc_timestamp` is the logical MVCC timestamp; it is
 /// stored inverted so newer sorts first.
 pub fn encode(
     out: &mut [u8],

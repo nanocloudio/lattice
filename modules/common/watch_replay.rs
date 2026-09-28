@@ -1,4 +1,4 @@
-//! Watch-replay codec (RFC database foundation §15, Phase-2 slice C).
+//! Watch-replay codec.
 //!
 //! Dual-target facade — `no_std` inside the PIC module, host-testable
 //! here — holding the three transformations a resume backfill needs:
@@ -48,9 +48,19 @@ const PLAN_HEAD: usize = 24;
 /// longer than the key) plus `from`, `to`, `cursor`, `limit`.
 pub const SCAN_BODY_MAX: usize = 2 + PLAN_KEY_MAX + 2 + (PLAN_KEY_MAX + 1) + 8 + 8 + 8 + 2;
 
-/// Event kinds on the wire, mirroring `watch_hub`.
-pub const WATCH_EVENT_PUT: u8 = 0;
-pub const WATCH_EVENT_DELETE: u8 = 1;
+/// A frame's op on the wire, as the live path writes it: the frame is
+/// `MSG_WATCH_EVENT`'s payload, whose op is `types::KV_OP_PUT` /
+/// `types::KV_OP_DELETE` (mirrored here; `tests/integration_watch_replay.rs`
+/// holds them equal). The watch hub's own event kinds are a different
+/// numbering and never reach a frame.
+pub const FRAME_OP_PUT: u8 = 0x02;
+pub const FRAME_OP_DELETE: u8 = 0x03;
+/// A put whose value is a large value's manifest (`types::KV_OP_PUT_MANIFEST`):
+/// the anchor fetches the value before delivering the event.
+pub const FRAME_OP_PUT_MANIFEST: u8 = 0x26;
+/// A marked `KV_RESULT_VERSIONS` entry's flags byte: its value is a
+/// manifest (`types::RECORD_FLAG_MANIFEST`).
+pub const ENTRY_FLAG_MANIFEST: u8 = 0x01;
 
 /// Version kinds in a `KV_RESULT_VERSIONS` entry, mirroring `types`.
 pub const VERSION_KIND_PUT: u8 = 0x00;
@@ -196,6 +206,9 @@ pub struct VersionEntry<'a> {
     pub kind: u8,
     pub key: &'a [u8],
     pub value: &'a [u8],
+    /// The value is a large value's manifest (a page read with
+    /// `VERSIONS_FLAG_MANIFESTS`).
+    pub manifest: bool,
 }
 
 /// Walk a `KV_RESULT_VERSIONS` body, calling `f` per entry, and return
@@ -239,6 +252,7 @@ pub fn walk_versions_page(body: &[u8], mut f: impl FnMut(VersionEntry<'_>)) -> O
             kind,
             key,
             value,
+            manifest: false,
         });
     }
     Some(next_cursor)
@@ -270,9 +284,11 @@ pub fn build_frame(
     // empty value would leave the client believing the key still exists
     // with no content, which is a different and wrong fact.
     out[18] = if entry.kind == VERSION_KIND_DELETE {
-        WATCH_EVENT_DELETE
+        FRAME_OP_DELETE
+    } else if entry.manifest {
+        FRAME_OP_PUT_MANIFEST
     } else {
-        WATCH_EVENT_PUT
+        FRAME_OP_PUT
     };
     out[19..21].copy_from_slice(&(entry.key.len() as u16).to_le_bytes());
     out[21..21 + entry.key.len()].copy_from_slice(entry.key);
@@ -280,6 +296,118 @@ pub fn build_frame(
     out[vo..vo + 2].copy_from_slice(&(entry.value.len() as u16).to_le_bytes());
     out[vo + 2..vo + 2 + entry.value.len()].copy_from_slice(entry.value);
     Some(need)
+}
+
+/// [`walk_versions_page`] for a page requested with
+/// `VERSIONS_FLAG_META`: each PUT entry is followed by its
+/// `[create_revision][version][lease]`, handed to `f` beside the entry
+/// (`None` for a DELETE, which carries none). `marked`: the page was
+/// requested with `VERSIONS_FLAG_MANIFESTS` too, and each entry ends with
+/// its flags byte.
+pub fn walk_versions_page_meta(
+    body: &[u8],
+    marked: bool,
+    mut f: impl FnMut(VersionEntry<'_>, Option<[u64; 3]>),
+) -> Option<u64> {
+    if body.len() < 10 {
+        return None;
+    }
+    let next_cursor = u64::from_le_bytes(sl8(body, 0)?);
+    let count = u16::from_le_bytes([body[8], body[9]]) as usize;
+    let mut p = 10usize;
+    for _ in 0..count {
+        if body.len() < p + 23 {
+            return None;
+        }
+        let revision = u64::from_le_bytes(sl8(body, p)?);
+        let commit_ts = u64::from_le_bytes(sl8(body, p + 8)?);
+        let kind = body[p + 16];
+        let klen = u16::from_le_bytes([body[p + 17], body[p + 18]]) as usize;
+        p += 19;
+        let key = body.get(p..p + klen)?;
+        p += klen;
+        let vlen = u32::from_le_bytes(sl4(body, p)?) as usize;
+        p += 4;
+        let value = body.get(p..p + vlen)?;
+        p += vlen;
+        let meta = if kind == VERSION_KIND_PUT {
+            let m = [
+                u64::from_le_bytes(sl8(body, p)?),
+                u64::from_le_bytes(sl8(body, p + 8)?),
+                u64::from_le_bytes(sl8(body, p + 16)?),
+            ];
+            p += 24;
+            Some(m)
+        } else {
+            None
+        };
+        let manifest = marked && {
+            let flags = *body.get(p)?;
+            p += 1;
+            flags & ENTRY_FLAG_MANIFEST != 0
+        };
+        f(
+            VersionEntry {
+                revision,
+                commit_ts,
+                kind,
+                key,
+                value,
+                manifest,
+            },
+            meta,
+        );
+    }
+    Some(next_cursor)
+}
+
+/// A watch frame with its metadata tail, as live events carry it
+/// (`MSG_WATCH_EVENT`): the base frame ([`build_frame`]), then
+/// `[create:8][version:8][lease:8][prev:1]` and, when `prev` is given,
+/// `[pvlen:2][pvalue][pcreate:8][pmod:8][pversion:8][plesase:8]`. `meta`
+/// is the entry's `[create, version, lease]` (zeros for a delete).
+pub fn build_frame_full(
+    watch_id: u64,
+    kpg_id: u16,
+    entry: &VersionEntry<'_>,
+    meta: [u64; 3],
+    prev: Option<(&[u8], [u64; 4])>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut n = build_frame(watch_id, kpg_id, entry, out)?;
+    let tail = 25 + prev.map_or(0, |(v, _)| 2 + v.len() + 32);
+    if out.len() < n + tail || prev.is_some_and(|(v, _)| v.len() > u16::MAX as usize) {
+        return None;
+    }
+    for v in meta {
+        out[n..n + 8].copy_from_slice(&v.to_le_bytes());
+        n += 8;
+    }
+    match prev {
+        Some((v, pm)) => {
+            out[n] = 1;
+            out[n + 1..n + 3].copy_from_slice(&(v.len() as u16).to_le_bytes());
+            n += 3;
+            out[n..n + v.len()].copy_from_slice(v);
+            n += v.len();
+            for x in pm {
+                out[n..n + 8].copy_from_slice(&x.to_le_bytes());
+                n += 8;
+            }
+        }
+        None => {
+            out[n] = 0;
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
+fn sl4(buf: &[u8], at: usize) -> Option<[u8; 4]> {
+    let s = buf.get(at..at + 4)?;
+    let mut out = [0u8; 4];
+    out.copy_from_slice(s);
+    Some(out)
 }
 
 fn sl8(buf: &[u8], at: usize) -> Option<[u8; 8]> {
@@ -492,12 +620,13 @@ mod tests {
             kind: VERSION_KIND_DELETE,
             key: b"gone",
             value: b"",
+            manifest: false,
         };
         let mut out = [0u8; 128];
         let n = build_frame(42, 0, &entry, &mut out).unwrap();
         assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 42);
         assert_eq!(u64::from_le_bytes(out[10..18].try_into().unwrap()), 9);
-        assert_eq!(out[18], WATCH_EVENT_DELETE);
+        assert_eq!(out[18], FRAME_OP_DELETE);
         assert_eq!(&out[21..25], b"gone");
         assert_eq!(n, 8 + 2 + 8 + 1 + 2 + 4 + 2);
     }
@@ -510,10 +639,11 @@ mod tests {
             kind: VERSION_KIND_PUT,
             key: b"k",
             value: b"hello",
+            manifest: false,
         };
         let mut out = [0u8; 128];
         let n = build_frame(1, 0, &entry, &mut out).unwrap();
-        assert_eq!(out[18], WATCH_EVENT_PUT);
+        assert_eq!(out[18], FRAME_OP_PUT);
         assert_eq!(&out[n - 5..n], b"hello");
     }
 
@@ -527,6 +657,7 @@ mod tests {
             kind: VERSION_KIND_PUT,
             key: b"k",
             value: b"hello",
+            manifest: false,
         };
         let mut out = [0u8; 8];
         assert!(build_frame(1, 0, &entry, &mut out).is_none());

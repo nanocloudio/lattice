@@ -1,10 +1,9 @@
-//! relational_executor — the shared relational execution engine
-//! (RFC database foundation §14.2, §14.5).
+//! relational_executor — the shared relational execution engine.
 //!
 //! Compiles typed relational operations into bounded Lattice KV reads,
-//! ordered scans and writes. ONE executor serves both connectors: §14.2
-//! makes the intermediate representation, catalogs, name resolution,
-//! binding, planning and execution shared modules rather than
+//! ordered scans and writes. ONE executor serves both connectors: the
+//! intermediate representation, catalogs, name resolution,
+//! binding, planning and execution are shared modules rather than
 //! per-connector ones. Two executors would satisfy the letter of that
 //! and break its intent — they would eventually disagree about what a
 //! statement means for a given schema, and nothing would surface the
@@ -15,7 +14,7 @@
 //! Every write leaves here as a `MSG_KV_REQUEST` and acquires its
 //! durability from the same Raft + WAL path a Redis `SET` takes. This
 //! module contains no persistence of its own, which is the point of
-//! §14.1's "client of the canonical KV API, not another storage engine":
+//! A client of the canonical KV API, not another storage engine:
 //! a `CREATE TABLE` that survived a crash differently from a `SET` would
 //! mean there were two durability stories to reason about.
 //!
@@ -40,7 +39,8 @@
 //!
 //! ## Atomicity: statement, and transaction
 //!
-//! A multi-row `INSERT` executes as ONE `KV_OP_TXN` (§13.1): every row key
+//! A multi-row `INSERT` executes as ONE `KV_OP_TXN` (statement
+//! atomicity): every row key
 //! is compared absent, then every row is written, inside a single Raft
 //! entry. A crash cannot leave a partial statement, and a duplicate key
 //! anywhere in the batch fails the WHOLE statement with nothing written.
@@ -118,7 +118,7 @@ use wire::{
 /// Staged result rows. The cap on a result set: a `SELECT` whose rows
 /// exceed it is reported `ERR_RESULT_TOO_LARGE` rather than truncated,
 /// because a short result set is indistinguishable from a complete one.
-/// Cursors are the real answer and are Phase 9 work.
+/// Cursors are the real answer and are future work.
 const ROWS_BUF: usize = 24576;
 
 /// Response payload buffer: the staged rows plus a header, the column
@@ -421,7 +421,7 @@ struct ExecState {
     /// the TXN reply the executor answers `TAG_COMMIT` and frees it.
     committing_slot: i8,
 
-    // ── Catalog name cache (RFC §14.2 schema generation) ─────────────
+    // ── Catalog name cache (schema generation) ───────────────────────
     //
     // The name -> id lookup is a whole KV round trip and ~45% of a
     // point read's latency. Caching it is only sound with a validator:
@@ -1801,7 +1801,7 @@ fn after_ct_alloc(exec: &mut ExecState, result: u8, body: &[u8]) {
         return;
     };
     // `catalog_revision` is the table id for now. It exists so a plan can
-    // detect a schema change and rebind (§14.5); with no online schema
+    // detect a schema change and rebind; with no online schema
     // change implemented there is nothing yet to bump it, and using a
     // fabricated clock value would be worse than a stable one.
     let td = match bind_create_table(&ct, exec.table_id, DATABASE_ID, u64::from(exec.table_id)) {
@@ -2223,8 +2223,8 @@ fn commit_txn(exec: &mut ExecState) {
 /// and NOTHING is written. On an ordered multi-range map the router
 /// executes the TXN only when every key lives in ONE range and refuses
 /// `KV_RESULT_CROSS_RANGE` otherwise — refusing loudly beats writing
-/// half a statement; the cross-range path is the Phase 5 coordinator's
-/// to earn.
+/// half a statement; the cross-range path is the cross-range
+/// transaction coordinator's to earn.
 fn send_insert_txn(exec: &mut ExecState, ins: &sql_core::Insert<'_>) {
     let rows = ins.row_count();
     // Body budget: the request must fit every hop's 4 KiB scratch
@@ -2304,7 +2304,7 @@ fn send_insert_txn(exec: &mut ExecState, ins: &sql_core::Insert<'_>) {
         exec.env[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
         p += 8;
 
-        // §14.4: the row's index entries ride the SAME transaction.
+        // The row's index entries ride the SAME transaction.
         // Entry values are empty — the entry IS its key; the row is
         // fetched by the primary key embedded in it.
         for i in 0..exec.idx_count as usize {
@@ -2718,7 +2718,7 @@ fn after_sel_ixrow(exec: &mut ExecState, result: u8, body: &[u8]) {
     }
 }
 
-// ── CREATE INDEX / DROP INDEX (Phase 6) ──────────────────────────────
+// ── CREATE INDEX / DROP INDEX ────────────────────────────────────────
 
 /// Start a DROP INDEX: resolve the index NAME (kind Index).
 fn start_index_name_lookup(exec: &mut ExecState, name: &[u8]) {
@@ -3073,8 +3073,8 @@ fn send_insert_row(exec: &mut ExecState) {
         reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
         return;
     };
-    // Statement atomicity (§13.1): more than one row — or ANY row of a
-    // table with secondary indexes (§14.4: index entries update in the
+    // Statement atomicity: more than one row — or ANY row of a
+    // table with secondary indexes (index entries update in the
     // same transaction as primary records) — goes as ONE atomic TXN
     // command instead of a resumable PUT loop. Inside an open `BEGIN …
     // COMMIT` EVERY insert takes the TXN path too, so its comparisons and
@@ -3341,7 +3341,8 @@ fn start_select(exec: &mut ExecState, s: &sql_core::Select<'_>) {
             //
             // An exact, readable index on this column serves an EQUALITY
             // predicate in `(value, primary key)` order instead of a full
-            // scan + post-filter (§14.4's reason to exist). A range
+            // scan + post-filter (the secondary index's reason to
+            // exist). A range
             // predicate has no such single-probe form here, so it falls
             // through to the filtered full scan. An active ORDER BY also
             // takes the full-scan path, which captures a sort key per row;

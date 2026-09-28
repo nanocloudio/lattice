@@ -31,13 +31,13 @@ capabilities = ["transport.anchor.stream.secure"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # MSG_KV_REQUEST envelopes out to kv_request_router for any command
 # that isn't handled inline (GET, SET, DEL, INCR, … and the rest).

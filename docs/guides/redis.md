@@ -52,6 +52,18 @@ Notes:
   keyspace; on a split keyspace they are refused (today as a generic
   `-ERR internal error`). There is no hash-tag co-location scheme.
 
+## Large values
+
+A value over one chunk (1969 bytes) is stored as a chunk tree: `SET`,
+`SETNX`, `GETSET` and `MSET` send its chunks ahead of the write, in the
+connection's order (a chunk that did not land makes the write fail,
+never half-land); `GET`, `MGET`, `GETSET` and `SET … GET` answer it
+whole. `STRLEN` answers its length. `APPEND` and the counters do not
+apply to a large value and say so.
+
+A whole command must fit the 4 KiB receive buffer, and a whole answer
+one 4 KiB reply (an `MGET` past it is refused `-ERR value too large`).
+
 ## Not implemented
 
 No handler, answers `-ERR unknown command`:
@@ -80,6 +92,9 @@ Exact wire strings, from `modules/common/redis_codec.rs`:
 | No authority for a fenced operation | `-CLUSTERDOWN no authority available for this operation` |
 | Wrong value type | `-WRONGTYPE Operation against a key holding the wrong kind of value` |
 | Quota refused | `-BUSY tenant quota exceeded` |
+| A request or answer past what its path carries | `-ERR value too large` |
+| A command that does not apply to a large value (`APPEND`, `INCR`, … over one) | `-ERR the command does not apply to a large value` |
+| The anchor's queues full (retry) | `-BUSY router backpressured`, `-BUSY large values backlogged, retry`, `-BUSY reply backlog full, retry` |
 | Unknown command | `-ERR unknown command` |
 
 `-MOVED` and `-CLUSTERDOWN` reuse the closest standard client-retry

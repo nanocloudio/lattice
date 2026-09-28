@@ -1,5 +1,5 @@
 //! Native database request context, consistency/durability classes, and
-//! retry classification — RFC database foundation §8.
+//! retry classification.
 //!
 //! Protocol adapters translate into this native contract; database
 //! features are never designed as special cases of RESP/etcd/Memcached.
@@ -19,7 +19,7 @@ pub const DB_CONTEXT_VERSION: u16 = 1;
 
 // ── Consistency / durability classes ──────────────────────────────────
 
-/// Read consistency policy (§20). Explicit — a request that does not
+/// Read consistency policy. Explicit — a request that does not
 /// meet its policy's fence conditions fails closed rather than being
 /// silently served weaker.
 #[repr(u8)]
@@ -35,7 +35,7 @@ pub enum Consistency {
     Eventual = 0x04,
 }
 
-/// Acknowledgement durability class (§6). A signal named or consumed as
+/// Acknowledgement durability class. A signal named or consumed as
 /// a quorum durability proof is valid only for `ReplicatedDurable`.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,7 +74,7 @@ impl Durability {
 
 // ── Retry classification ──────────────────────────────────────────────
 
-/// Typed outcome classification (§8). Every failure a client can see
+/// Typed outcome classification. Every failure a client can see
 /// maps to exactly one class; ambiguity ("indeterminate") is a first-
 /// class result, never collapsed into success or failure.
 #[repr(u8)]
@@ -114,7 +114,7 @@ impl RetryClass {
 
 // ── Request context ───────────────────────────────────────────────────
 
-/// Bounded native request context (§8). Fixed layout; every field is a
+/// Bounded native request context. Fixed layout; every field is a
 /// catalog-resolved bounded identifier or an explicit limit. Adapters
 /// fill defaults for protocols that cannot express a field.
 #[repr(C)]
@@ -124,13 +124,13 @@ pub struct RequestContext {
     pub database_id: u32,
     pub keyspace_id: u32,
     /// Correlation identity carried through adapter → router → proposal
-    /// → apply → response (§24).
+    /// → apply → response.
     pub request_id: u64,
     /// Absolute deadline, unix ms. 0 = no deadline.
     pub deadline_unix_ms: u64,
     pub consistency: Consistency,
     pub durability: Durability,
-    /// Routing epoch + range generation fences (§11.3).
+    /// Routing epoch + range generation fences.
     pub routing_epoch: u32,
     pub range_generation: u32,
     /// 0 = not transactional.

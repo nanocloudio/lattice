@@ -19,7 +19,7 @@
 //! case) and drops anything else — clients that need to send a body
 //! larger than ~1400 bytes must use the TCP anchor instead.
 //!
-//! ## Supported commands (Phase 1)
+//! ## Supported commands
 //!
 //! `get k\r\n` → `VALUE k flags bytes\r\n<data>\r\nEND\r\n`
 //! `set k flags exp bytes\r\n<data>\r\n` → `STORED\r\n` / `NOT_STORED\r\n`
@@ -143,7 +143,7 @@ struct AnchorState {
 
     corr_seq: u64,
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=requests, 1=forwarded, 2=errors).
     m_requests: u64,
@@ -724,7 +724,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             budget -= 1;
         }
 
-        // Phase-14: emit module-scope counters on `metrics_out` at a
+        // Emit module-scope counters on `metrics_out` at a
         // coarse cadence (no-op until the port is wired). ids follow the
         // manifest `[observability] metrics` order.
         anchor.step_ctr = anchor.step_ctr.wrapping_add(1);

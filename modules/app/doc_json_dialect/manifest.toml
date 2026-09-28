@@ -1,0 +1,45 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# JSON documents over the document executor: a record adapter (Chronicle's
+# store connectors) states operations on req_in as MSG_JSON_DOC_REQUEST
+# (modules/common/doc_json.rs); this module sends each to document_executor
+# as MSG_DOC_REQUEST and answers MSG_JSON_DOC_RESPONSE, rendered by the
+# graph's schema. Params: `schema` and `patch_keys` (nanocloud's grammar,
+# modules/common/doc_schema.rs), `id_paths` (the dotted paths a document's
+# id is read from, `,`-separated; several make a compound id) and
+# `rv_path` (where every answered object carries its revision).
+
+# MSG_JSON_DOC_REQUEST (and MSG_PART parts) from the client.
+[[ports]]
+name = "req_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_DOC_RESPONSE (and MSG_PART parts) from document_executor.
+[[ports]]
+name = "exec_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_JSON_DOC_RESPONSE (and MSG_PART parts) to the client.
+[[ports]]
+name = "resp_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_DOC_REQUEST (and MSG_PART parts) to document_executor.
+[[ports]]
+name = "exec_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["requests", "answers", "refused", "timeouts"]

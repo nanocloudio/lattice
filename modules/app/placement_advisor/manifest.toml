@@ -3,10 +3,10 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# §12.4 load-policy recommender (RFC database foundation Phase 10).
-# Surveys key counts and REPORTS what §12.4 permits saying about the
+# Load-policy recommender.
+# Surveys key counts and REPORTS what policy permits saying about the
 # load. It has no port that can reach the lifecycle machinery, by
-# design: "execution remains bounded by operator policy", and an
+# design: execution remains bounded by operator policy, and an
 # advisor wired to the supervisor would turn every policy bug into a
 # topology change. Write rate and hot-key concentration are not
 # attributable to ranges in this graph yet, so they are reported as
@@ -18,7 +18,7 @@ name = "kv_in"
 direction = "input"
 content_type = "OctetStream"
 
-# The router's metrics port: §12.4's MEASURED load signal. Optional —
+# The router's metrics port: the MEASURED load signal. Optional —
 # compositions that omit it leave the advisor on its growth-derived
 # lower bound, which still works.
 [[ports]]
@@ -36,7 +36,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# §12.4 opt-in: MSG_PLACEMENT_SPLIT_CMD to a range_supervisor (op_kind 4).
+# Opt-in: MSG_PLACEMENT_SPLIT_CMD to a range_supervisor (op_kind 4).
 # Output index 2; unwired unless the operator opts into auto-execution.
 [[ports]]
 name = "exec_out"

@@ -1,5 +1,4 @@
-//! Ordered disk state-store provider — Phase 1 of the RFC database
-//! foundation (§9, §9.2, §9.3, §9.4, §30).
+//! Ordered disk state-store provider.
 //!
 //! Log-structured, single level, v1: one bounded sorted memtable plus a
 //! bounded set of immutable sorted run files named by a versioned,
@@ -7,7 +6,7 @@
 //! `RunStorage` trait (`run_storage.rs`) so the identical provider
 //! logic compiles into the no_std PIC module (Fluxor FS opcodes) and
 //! into host tests (`std::fs`). Clustor's per-partition WAL remains the
-//! sole authoritative logical WAL (§9.3): every file written here is a
+//! sole authoritative logical WAL: every file written here is a
 //! discardable materialization, rebuilt from an authorized snapshot
 //! plus committed-entry replay.
 //!
@@ -108,12 +107,12 @@
 //! valid one with the HIGHER internal generation. There is therefore no
 //! instant at which zero valid manifests exist — the old one stays
 //! intact and authoritative until the new one is proven durable — which
-//! is exactly the guarantee delete-last used to provide, obtained now
+//! is exactly the guarantee a delete-last scheme provides, obtained
 //! without deleting anything. The new manifest is written only after
 //! the run it names is proven durable, so whichever slot recovery
 //! picks, every run it references is on media.
 //!
-//! Recovery (§9.4 steps 1-4, `recover()`): the valid slot with the
+//! Recovery (`recover()`): the valid slot with the
 //! highest internal generation wins; runs it does not reference are
 //! orphans and are deleted; a referenced-but-missing or corrupt run
 //! means QUARANTINE — `StoreError::StorageFault`, never a guess.
@@ -162,7 +161,7 @@ pub mod run_storage;
 #[path = "state_store.rs"]
 pub mod state_store;
 
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use internal_key::{ValueKind, IDENTITY_PREFIX_LEN, VERSION_SUFFIX_LEN};
 use run_storage::{FileKind, FsyncState, FsyncTicket, RunStorage, StorageError};
 use state_store::{
@@ -172,11 +171,13 @@ use state_store::{
 
 // ── Capacities ────────────────────────────────────────────────────────
 
-/// Maximum encoded internal key length the provider stores. Covers a
-/// user key of `kv_store::MAX_KEY_LEN` (256) bytes at worst-case
-/// escaping: `internal_key::encoded_max_len(256)` = 535, rounded up.
-/// Longer keys are rejected `Malformed` — fail closed, never truncate.
-pub const MAX_ENCODED_KEY: usize = 544;
+/// The longest key the provider is handed: `kv_store::MAX_KEY_LEN` (this
+/// file is also mounted alone; a contract test holds the two equal).
+pub const MAX_USER_KEY: usize = 2584;
+/// Maximum encoded internal key length the provider stores: a user key
+/// of [`MAX_USER_KEY`] bytes at worst-case escaping. Longer keys are
+/// rejected `Malformed` — fail closed, never truncate.
+pub const MAX_ENCODED_KEY: usize = internal_key::encoded_max_len(MAX_USER_KEY);
 /// Maximum value length: `kv_store::MAX_VALUE_LEN` (4096) plus the
 /// engine's 54-byte record-metadata prefix (`kv_store::DISK_META_LEN`)
 /// that the disk composition stores inside the value payload.
@@ -211,8 +212,9 @@ pub const RUN_FORMAT_VERSION: u16 = 1;
 
 // ── Per-run Bloom filter ──────────────────────────────────────────────
 //
-// WHY. A point lookup used to cost a sequential block scan of every
-// run: `Merge::init` opens each run and reads forward until it reaches
+// WHY. Without the filter a point lookup costs a sequential block
+// scan of every run: `Merge::init` opens each run and reads forward
+// until it reaches
 // the start bound. On FAT32/NVMe each block read is a synchronous
 // sector read plus a cluster-chain walk, and the rig measured a SINGLE
 // such command at **11-15 ms** against just ONE run — past the burst
@@ -491,8 +493,12 @@ pub const MANIFEST_MAX_LEN: usize = MANIFEST_HDR_LEN + MAX_RUNS * MANIFEST_ENTRY
 /// Recovery list buffer for manifest ids; steady state is 1 (plus a
 /// possible torn newer generation).
 pub const MAX_MANIFEST_FILES: usize = 8;
-/// Recovery list buffer for run ids: live runs plus orphans.
-pub const MAX_LISTED_RUNS: usize = 64;
+/// Recovery list buffer for run ids: live runs plus orphans. Orphans are
+/// what a crash leaves of retirements not yet drained; recovery deletes
+/// them, and it must see them all to do so (a listing that overflows is a
+/// fault, never a truncation), so the bound is generous: it costs 4 KB of
+/// stack, once, at recovery.
+pub const MAX_LISTED_RUNS: usize = 1024;
 
 // ── Snapshot stream format v1 ─────────────────────────────────────────
 
@@ -614,13 +620,52 @@ const fn crc32_table() -> [u32; 256] {
 
 static CRC32_TABLE: [u32; 256] = crc32_table();
 
+/// The slicing-by-8 tables: `[k][b]` is the CRC of byte `b` followed by
+/// `k` zero bytes, so eight bytes fold in one step. Every run block is
+/// verified on every load, and a byte at a time the check was most of a
+/// point read's cost; eight at a time, the same CRC for a fraction.
+const fn crc32_tables8() -> [[u32; 256]; 8] {
+    let t0 = crc32_table();
+    let mut t = [[0u32; 256]; 8];
+    t[0] = t0;
+    let mut i = 0;
+    while i < 256 {
+        let mut k = 1;
+        while k < 8 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev >> 8) ^ t0[(prev & 0xFF) as usize];
+            k += 1;
+        }
+        i += 1;
+    }
+    t
+}
+
+static CRC32_T8: [[u32; 256]; 8] = crc32_tables8();
+
 /// Rolling CRC32 state seed.
 pub const CRC32_INIT: u32 = 0xFFFF_FFFF;
 
 /// Fold `data` into a rolling CRC32 state (start from `CRC32_INIT`,
-/// finish with `crc32_finish`).
+/// finish with `crc32_finish`): eight bytes a step, then the rest one at
+/// a time.
 pub fn crc32_update(mut state: u32, data: &[u8]) -> u32 {
-    for &b in data {
+    let t = &CRC32_T8;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let w: [u8; 8] = c.try_into().unwrap_or([0; 8]);
+        let lo = state ^ u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let hi = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+        state = t[7][(lo & 0xFF) as usize]
+            ^ t[6][((lo >> 8) & 0xFF) as usize]
+            ^ t[5][((lo >> 16) & 0xFF) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xFF) as usize]
+            ^ t[2][((hi >> 8) & 0xFF) as usize]
+            ^ t[1][((hi >> 16) & 0xFF) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
         state = CRC32_TABLE[((state ^ b as u32) & 0xFF) as usize] ^ (state >> 8);
     }
     state
@@ -910,7 +955,11 @@ struct ScanState {
     /// `page_next_cursor`), kept so a retry of the same request is
     /// answered from it without moving the walk.
     page_complete: bool,
-    _pad2: [u8; 3],
+    /// The parked page's request shape: its entry limit, and whether
+    /// its PUT entries carry metadata. A page answers only the request
+    /// it was built for.
+    page_shape: u8,
+    page_limit: u16,
     /// A record the merge yielded that did not fit the caller's
     /// output: kept here, yielded first on the next call, so the merge
     /// stays live across a page boundary instead of being rebuilt.
@@ -940,6 +989,17 @@ impl ScanState {
         self.last_key[..key.len()].copy_from_slice(key);
         self.last_key_len = key.len() as u16;
     }
+}
+
+/// The request a parked version page answers: its window `(from, hi]`,
+/// the cursor it started at, and its shape (entry limit, the request's
+/// entry flags).
+pub struct ScanPageKey {
+    pub from: u64,
+    pub hi: u64,
+    pub ordinal: u64,
+    pub limit: u16,
+    pub shape: u8,
 }
 
 /// Multi-step snapshot capture bookkeeping.
@@ -1123,7 +1183,7 @@ pub struct DiskState {
     pub next_run_id: u32,
     /// Last published manifest generation (0 = none yet).
     pub generation: u32,
-    /// Identity fence checked against `SnapshotRequest` (§17.1).
+    /// Identity fence checked against `SnapshotRequest`.
     pub range_generation: u32,
     /// Which manifest slot currently holds the authoritative manifest
     /// (`MANIFEST_SLOT_A`/`_B`). The next publish writes the OTHER one,
@@ -1136,6 +1196,11 @@ pub struct DiskState {
     _pad: u32,
     pub highest_revision: u64,
     pub compaction_floor: u64,
+    /// The revision a Compact command (etcd's) has retired history
+    /// below. Reads under it are refused at once; the physical
+    /// compaction to it follows as maintenance. Rebuilt by replaying the
+    /// command, never persisted on its own.
+    pub compact_revision: u64,
     /// Raft position covered by the PUBLISHED manifest's run set —
     /// what the last manifest recorded (recovered at boot, advanced on
     /// flush publish). Everything at or below it is reconstructible
@@ -1239,10 +1304,53 @@ pub struct DiskState {
     flush: FlushState,
     scan: ScanState,
     range: RangeMemo,
+    /// The point read's merge, kept between reads: positioned in place
+    /// (no merge built and copied per read), and each of its run scans
+    /// keeps the verified block it last read, so a hot key read again
+    /// parses its blocks where they lie. Behind a cell because a point
+    /// read borrows the state shared; no point read nests another.
+    point: UnsafeCell<Merge>,
     pub entries: [MemEntry; MEMTABLE_MAX_ENTRIES],
 }
 
 impl DiskState {
+    /// The revision the most recent flush froze the memtable at (0: none
+    /// yet): everything at or below it is in that flush's run once it
+    /// publishes. A command log opens a segment there
+    /// (`command_log.rs`).
+    pub fn last_freeze(&self) -> u64 {
+        self.flush.revision_at_freeze
+    }
+
+    /// Is a flush draining the memtable? Its frozen prefix stays counted
+    /// in `mem_count` until the run publishes, and meanwhile a write that
+    /// finds the memtable full is refused (backpressure).
+    pub fn flush_active(&self) -> bool {
+        self.flush.active
+    }
+
+    /// Is a snapshot capture or a REPLACE install holding the apply
+    /// exclusion? Every write is refused (backpressure) until it ends.
+    pub fn apply_excluded(&self) -> bool {
+        self.capture.active || self.install.active
+    }
+
+    /// A compaction under way: `(its floor, the input ordinal it has
+    /// reached)` — the cursor its next step takes. Whoever next needs it
+    /// finished (maintenance's next step, or a write making room) drives
+    /// this one on; starting another would abort it.
+    pub fn compaction_in_flight(&self) -> Option<(u64, u64)> {
+        self.compact
+            .active
+            .then_some((self.compact.floor, self.compact.input_ordinal))
+    }
+
+    /// The revision below which a historical read is refused: the
+    /// physical floor, or a Compact's, whichever is higher.
+    pub fn read_floor(&self) -> u64 {
+        self.compaction_floor.max(self.compact_revision)
+    }
+
     /// Reset to the empty state, preserving nothing but the struct.
     pub fn init(&mut self) {
         self.mem_count = 0;
@@ -1254,6 +1362,7 @@ impl DiskState {
         self.prepared = 0;
         self.highest_revision = 0;
         self.compaction_floor = 0;
+        self.compact_revision = 0;
         self.durable_applied_index = 0;
         self.durable_applied_term = 0;
         self.pending_applied_index = 0;
@@ -1270,6 +1379,8 @@ impl DiskState {
         self.flush.active = false;
         self.scan_reset();
         self.range_reset();
+        // No block held: an id may name another file after a reset.
+        *self.point.get_mut() = Merge::idle();
         self.memo_valid = false;
     }
 
@@ -1292,25 +1403,26 @@ impl DiskState {
     // correlation) asks for the same request again, and answering it
     // from the parked page keeps the walk where it is.
 
-    /// Does the parked page belong to the request at `ordinal` in the
-    /// window `(from, hi]` over the memo's span?
-    fn scan_page_is(&self, span: KeySpan<'_>, from: u64, hi: u64, ordinal: u64) -> bool {
+    /// Does the parked page belong to the request `key` over `span`?
+    fn scan_page_is(&self, span: KeySpan<'_>, key: &ScanPageKey) -> bool {
         let sc = &self.scan;
         sc.page_valid
-            && sc.page_ordinal == ordinal
-            && sc.from == from
-            && sc.hi == hi
+            && sc.page_ordinal == key.ordinal
+            && sc.page_limit == key.limit
+            && sc.page_shape == key.shape
+            && sc.from == key.from
+            && sc.hi == key.hi
             && sc.span_start[..sc.span_start_len as usize] == *span.start
             && sc.span_end[..sc.span_end_len as usize] == *span.end
     }
 
-    /// Park `page` for the request that started at `ordinal` in the
-    /// memo's window: the transcoded prefix of an unfinished reply
-    /// (`complete = false`), or a finished reply whose cursor is
-    /// `next_cursor`. A page over `SCAN_PAGE_MAX` is not parked.
+    /// Park `page` for the request `key` in the memo's window: the
+    /// transcoded prefix of an unfinished reply (`complete = false`),
+    /// or a finished reply whose cursor is `next_cursor`. A page over
+    /// `SCAN_PAGE_MAX` is not parked.
     pub fn scan_page_park(
         &mut self,
-        ordinal: u64,
+        key: &ScanPageKey,
         emitted: u16,
         page: &[u8],
         complete: bool,
@@ -1323,28 +1435,28 @@ impl DiskState {
         self.scan.page[..page.len()].copy_from_slice(page);
         self.scan.page_len = page.len() as u32;
         self.scan.page_emitted = emitted;
-        self.scan.page_ordinal = ordinal;
+        self.scan.page_ordinal = key.ordinal;
+        self.scan.page_limit = key.limit;
+        self.scan.page_shape = key.shape;
         self.scan.page_complete = complete;
         self.scan.page_next_cursor = next_cursor;
         self.scan.page_valid = true;
     }
 
-    /// Take back the parked page for the request `(span, from, hi,
-    /// ordinal)`: `(emitted, bytes, complete, next_cursor)` copied into
-    /// `out`, or `None` when nothing matching is parked. An unfinished
-    /// page is taken exactly once; a complete one stays parked, so
-    /// retries answer alike for as long as the park survives — until
-    /// the memo is displaced or the store's high water moves past the
-    /// pinned ceiling, after which a retry re-walks a fresh window.
+    /// Take back the parked page for the request `key` over `span`:
+    /// `(emitted, bytes, complete, next_cursor)` copied into `out`, or
+    /// `None` when nothing matching is parked. An unfinished page is
+    /// taken exactly once; a complete one stays parked, so retries
+    /// answer alike for as long as the park survives — until the memo
+    /// is displaced or the store's high water moves past the pinned
+    /// ceiling, after which a retry re-walks a fresh window.
     pub fn scan_page_take(
         &mut self,
         span: KeySpan<'_>,
-        from: u64,
-        hi: u64,
-        ordinal: u64,
+        key: &ScanPageKey,
         out: &mut [u8],
     ) -> Option<(u16, usize, bool, u64)> {
-        if !self.scan_page_is(span, from, hi, ordinal) || self.scan.page_len as usize > out.len() {
+        if !self.scan_page_is(span, key) || self.scan.page_len as usize > out.len() {
             return None;
         }
         let sc = &mut self.scan;
@@ -1366,18 +1478,27 @@ impl DiskState {
     }
 
     /// The ceiling pinned for the window `(from, ..]` over `span` that
-    /// is currently open, if one is. While the scan memo holds the
-    /// window — a paused walk being re-driven, or its next page — a
-    /// caller that asked for "up to now" without naming the ceiling it
-    /// was told gets the SAME window each time: "now" moves with every
-    /// write that lands while the window is open, and a window
-    /// re-pinned to it would count its ordinals against a different
-    /// set of records on every call. The pin lives exactly as long as
-    /// the memo: once the walk completes (or another span displaces
-    /// it), a fresh unversioned request re-resolves "now".
-    pub fn scan_window_ceiling(&self, span: KeySpan<'_>, from: u64) -> Option<u64> {
+    /// is currently open, if one is, for the request at `cursor`. While
+    /// the scan memo holds the window — a paused walk being re-driven,
+    /// or its next page — a caller that asked for "up to now" without
+    /// naming the ceiling it was told gets the SAME window each time:
+    /// "now" moves with every write that lands while the window is
+    /// open, and a window re-pinned to it would count its ordinals
+    /// against a different set of records on every call. The pin lives
+    /// at most as long as the memo: once the walk completes (or another
+    /// span displaces it), a fresh unversioned request re-resolves
+    /// "now".
+    ///
+    /// A first page (`cursor` 0) opens a window rather than continuing
+    /// one, so it is pinned only when it IS the paused request being
+    /// re-driven (its unfinished page is parked). Otherwise it is an
+    /// independent request that happens to name the same window as a
+    /// walk its caller abandoned, and "now" is now.
+    pub fn scan_window_ceiling(&self, span: KeySpan<'_>, from: u64, cursor: u64) -> Option<u64> {
         let sc = &self.scan;
+        let continues = cursor != 0 || (sc.page_valid && !sc.page_complete && sc.page_ordinal == 0);
         (sc.valid
+            && continues
             && sc.from == from
             && sc.span_start[..sc.span_start_len as usize] == *span.start
             && sc.span_end[..sc.span_end_len as usize] == *span.end)
@@ -1621,6 +1742,20 @@ struct RunScan {
     key_len: usize,
     val_off: usize,
     val_len: usize,
+    /// The block `buf` holds, verified: its run and offset (`held_run`
+    /// 0: none). Run files are immutable once published and a run id
+    /// names one file, so a scan positioned on that block again — a hot
+    /// key's next point read — parses it where it lies, with no read and
+    /// no CRC. Cleared before any read into `buf`.
+    held_run: u32,
+    held_off: u64,
+    /// The digest of the run file the scan is open on, and of the one
+    /// the held block came from: an id names one file only while it is
+    /// published — a restore or install may publish the same id again
+    /// with other contents — so a held block counts only for the same id
+    /// AND the same file.
+    run_digest: u32,
+    held_digest: u32,
     /// One whole block as read from the file: header, payload, CRC.
     buf: [u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
 }
@@ -1642,6 +1777,10 @@ impl RunScan {
             key_len: 0,
             val_off: 0,
             val_len: 0,
+            held_run: 0,
+            held_off: 0,
+            run_digest: 0,
+            held_digest: 0,
             buf: [0u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
         }
     }
@@ -1657,6 +1796,7 @@ impl RunScan {
     fn open_at(meta: &RunMeta, start_off: u64) -> Self {
         let mut rs = Self::idle();
         rs.run_id = meta.id;
+        rs.run_digest = meta.digest;
         rs.data_end = meta.file_len.saturating_sub(RUN_FOOTER_LEN as u64);
         rs.next_block_off = if start_off >= RUN_HDR_LEN as u64 && start_off < rs.data_end {
             start_off
@@ -1667,6 +1807,41 @@ impl RunScan {
         rs.cur_block_off = rs.next_block_off;
         rs.cur_rec_idx = u32::MAX;
         rs
+    }
+
+    /// [`Self::idle`] in place: every position reset, the block buffer —
+    /// and the block it holds (`held_*`) — left as they are, so no 4 KB
+    /// buffer is built and copied per run per read.
+    fn make_idle(&mut self) {
+        self.blocks_loaded = 0;
+        self.run_id = 0;
+        self.has_cur = false;
+        self.exhausted = true;
+        self.cur_block_off = 0;
+        self.cur_rec_idx = u32::MAX;
+        self.next_block_off = 0;
+        self.data_end = 0;
+        self.payload_len = 0;
+        self.pos = 0;
+        self.key_off = 0;
+        self.key_len = 0;
+        self.val_off = 0;
+        self.val_len = 0;
+    }
+
+    /// [`Self::open_at`] in place (see [`Self::make_idle`]).
+    fn reopen_at(&mut self, meta: &RunMeta, start_off: u64) {
+        self.make_idle();
+        self.run_id = meta.id;
+        self.run_digest = meta.digest;
+        self.data_end = meta.file_len.saturating_sub(RUN_FOOTER_LEN as u64);
+        self.next_block_off = if start_off >= RUN_HDR_LEN as u64 && start_off < self.data_end {
+            start_off
+        } else {
+            RUN_HDR_LEN as u64
+        };
+        self.exhausted = meta.record_count == 0;
+        self.cur_block_off = self.next_block_off;
     }
 
     /// The scan's resume position: `(block_off, rec_idx)` of the
@@ -1747,6 +1922,25 @@ impl RunScan {
                 self.has_cur = false;
                 return Ok(false);
             }
+            if self.held_run != 0
+                && self.held_run == self.run_id
+                && self.held_digest == self.run_digest
+                && self.held_off == self.next_block_off
+            {
+                // The block is already here, verified when it was read.
+                let payload_len = rd_u32(&self.buf, 0) as usize;
+                let block_end = self.next_block_off + (BLOCK_OVERHEAD + payload_len) as u64;
+                if payload_len == 0 || payload_len > BLOCK_MAX_PAYLOAD || block_end > self.data_end
+                {
+                    return Err(StoreError::StorageFault);
+                }
+                self.payload_len = 8 + payload_len;
+                self.pos = 8;
+                self.cur_block_off = self.next_block_off;
+                self.cur_rec_idx = u32::MAX;
+                self.next_block_off = block_end;
+                return self.parse_record();
+            }
             // ONE read per block: header, payload and CRC together.
             // The payload length is not known until the header is
             // parsed, so the read is speculative — the largest block
@@ -1761,6 +1955,7 @@ impl RunScan {
             if want < BLOCK_OVERHEAD {
                 return Err(StoreError::StorageFault);
             }
+            self.held_run = 0;
             read_exact(
                 storage,
                 FileKind::Run,
@@ -1782,6 +1977,9 @@ impl RunScan {
             if crc32(&self.buf[payload.clone()]) != rd_u32(&self.buf, payload.end) {
                 return Err(StoreError::StorageFault);
             }
+            self.held_run = self.run_id;
+            self.held_digest = self.run_digest;
+            self.held_off = self.next_block_off;
             // `pos`/`payload_len` index into `buf`, whose first 8 bytes
             // are the block header.
             self.payload_len = payload.end;
@@ -1790,7 +1988,11 @@ impl RunScan {
             self.cur_rec_idx = u32::MAX;
             self.next_block_off = block_end;
         }
-        // Parse one record at `pos`.
+        self.parse_record()
+    }
+
+    /// Parse the record at `pos` of the loaded block: the current record.
+    fn parse_record(&mut self) -> Result<bool, StoreError> {
         if self.pos + RECORD_FIXED > self.payload_len {
             return Err(StoreError::StorageFault);
         }
@@ -1911,22 +2113,6 @@ impl Merge {
         Self::init_filtered(state, storage, include_mem, start_bound, None)
     }
 
-    /// `Merge` for an EXACT-KEY probe. `point_key` is the full lookup
-    /// prefix; any run whose Bloom filter rules it out is skipped
-    /// without a single read.
-    ///
-    /// Only legal for a point lookup. A range scan must NOT use this:
-    /// its start bound is a lower bound, so a run whose filter lacks
-    /// that exact key may still hold later keys the scan must return.
-    /// Passing `Some(..)` there would silently drop records.
-    fn init_point<S: RunStorage>(
-        state: &DiskState,
-        storage: &S,
-        point_key: &[u8],
-    ) -> Result<Self, StoreError> {
-        Self::init_filtered(state, storage, true, point_key, Some(point_key))
-    }
-
     fn init_filtered<S: RunStorage>(
         state: &DiskState,
         storage: &S,
@@ -1934,17 +2120,46 @@ impl Merge {
         start_bound: &[u8],
         point_key: Option<&[u8]>,
     ) -> Result<Self, StoreError> {
-        let mut m = Self {
-            include_mem,
-            mem_pos: if include_mem {
-                state.mem_lower_bound(start_bound)
-            } else {
-                0
-            },
-            run_count: state.run_count as usize,
+        let mut m = Self::idle();
+        m.fill_filtered(state, storage, include_mem, start_bound, point_key)?;
+        Ok(m)
+    }
+
+    /// A merge with no source positioned: every run scan idle.
+    const fn idle() -> Self {
+        Self {
+            include_mem: false,
+            mem_pos: 0,
+            run_count: 0,
             runs: [RunScan::idle(); MAX_RUNS],
+        }
+    }
+
+    /// [`Self::init_filtered`] into this merge, in place: a point read
+    /// positions its sources without building a merge (16 run scans,
+    /// each with its block) and copying it out.
+    ///
+    /// `point_key`: an EXACT-KEY probe (the full lookup prefix) — any run
+    /// whose Bloom filter rules it out is skipped without a read. Only
+    /// legal for a point lookup: a range scan's start bound is a lower
+    /// bound, and a run whose filter lacks that exact key may still hold
+    /// later keys the scan must return.
+    fn fill_filtered<S: RunStorage>(
+        &mut self,
+        state: &DiskState,
+        storage: &S,
+        include_mem: bool,
+        start_bound: &[u8],
+        point_key: Option<&[u8]>,
+    ) -> Result<(), StoreError> {
+        self.include_mem = include_mem;
+        self.mem_pos = if include_mem {
+            state.mem_lower_bound(start_bound)
+        } else {
+            0
         };
-        for (i, rs) in m.runs.iter_mut().take(m.run_count).enumerate() {
+        self.run_count = state.run_count as usize;
+        for (i, rs) in self.runs.iter_mut().take(self.run_count).enumerate() {
             if let Some(key) = point_key {
                 if !bloom_maybe_contains(&state.run_blooms[i], key) {
                     state.bump_skipped();
@@ -1952,7 +2167,7 @@ impl Merge {
                     // it contributes no head, so the merge behaves
                     // exactly as if the run held nothing at or after the
                     // bound — which, for this key, it does.
-                    *rs = RunScan::idle();
+                    rs.make_idle();
                     continue;
                 }
             }
@@ -1963,7 +2178,7 @@ impl Merge {
             // answers "the block a scan for this key may safely START
             // at", which is exactly the range-scan question. (The Bloom
             // pre-check above is the one point-only optimisation.)
-            *rs = RunScan::open_at(&state.runs[i], idx_seek(&state.run_index[i], start_bound));
+            rs.reopen_at(&state.runs[i], idx_seek(&state.run_index[i], start_bound));
             while rs.next(storage)? {
                 if rs.cur_key() >= start_bound {
                     break;
@@ -1971,7 +2186,7 @@ impl Merge {
             }
             state.add_blocks(rs.take_blocks());
         }
-        Ok(m)
+        Ok(())
     }
 
     /// Open every source for a walk that will START at `bound` — but
@@ -2000,7 +2215,7 @@ impl Merge {
         };
         for (i, rs) in m.runs.iter_mut().take(m.run_count).enumerate() {
             state.bump_opened();
-            *rs = RunScan::open_at(&state.runs[i], idx_seek(&state.run_index[i], bound));
+            rs.reopen_at(&state.runs[i], idx_seek(&state.run_index[i], bound));
             rs.next(storage)?;
             state.add_blocks(rs.take_blocks());
         }
@@ -2047,7 +2262,7 @@ impl Merge {
         key_out: &mut [u8],
         val_out: &mut [u8],
     ) -> Result<Option<(usize, usize)>, StoreError> {
-        // Phase 1: pick the smallest head. Priority on ties: memtable,
+        // Step 1: pick the smallest head. Priority on ties: memtable,
         // then runs newest-first (runs[0] is newest).
         let mut winner: Option<usize> = None; // 0 = memtable, 1+i = run i
         let klen;
@@ -2076,7 +2291,7 @@ impl Merge {
             klen = best_key.len();
             key_out[..klen].copy_from_slice(best_key);
         }
-        // Phase 2: copy the winner's value.
+        // Step 2: copy the winner's value.
         let win = winner.unwrap_or(0);
         let vlen = if win == 0 {
             let v = mem.value(self.mem_pos);
@@ -2087,7 +2302,7 @@ impl Merge {
             val_out[..v.len()].copy_from_slice(v);
             v.len()
         };
-        // Phase 3: advance every source whose head equals the winner
+        // Step 3: advance every source whose head equals the winner
         // key (dedupe — the highest-priority copy was emitted).
         if self.include_mem && self.mem_pos < mem.count && mem.key(self.mem_pos) == &key_out[..klen]
         {
@@ -2803,7 +3018,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.prepared & 3 == 3
     }
 
-    /// §9.4 steps 1-4: load the newest checksum-valid manifest,
+    /// Recovery: load the newest checksum-valid manifest,
     /// validate every referenced run (identity, sizes, checksums,
     /// format versions), quarantine on any inconsistency, and remove
     /// orphan files. The memtable starts empty; committed-entry replay
@@ -3633,11 +3848,16 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         {
             return Err(StoreError::Malformed);
         }
-        if revision != 0 && revision < self.state.compaction_floor {
+        if revision != 0 && revision < self.state.read_floor() {
             return Err(StoreError::Compacted);
         }
         let revn = normalize_revision(revision);
-        let mut m = Merge::init_point(self.state, &*self.storage, key)?;
+        // SAFETY: the point merge is only ever borrowed here, for this
+        // read, and no point read runs inside another — the reference
+        // ends with this function; `fill_filtered` and `next` read the
+        // rest of the state, never `point`.
+        let m = unsafe { &mut *self.state.point.get() };
+        m.fill_filtered(self.state, &*self.storage, true, key, Some(key))?;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         loop {
@@ -3688,7 +3908,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         limit: usize,
         out: &mut [u8],
     ) -> Result<ScanProgress, StoreError> {
-        if revision != 0 && revision < self.state.compaction_floor {
+        if revision != 0 && revision < self.state.read_floor() {
             return Err(StoreError::Compacted);
         }
         let r = self.scan_at_walk(
@@ -3719,7 +3939,11 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         // Checking the upper bound instead would accept a window whose
         // early events had already been reclaimed, and the caller would
         // receive a partial history it could not tell from a whole one.
-        if from_revision < self.state.compaction_floor {
+        // A Compact at C still serves history from C on: a window opening
+        // at C (`from` = C - 1) is whole.
+        if from_revision < self.state.compaction_floor
+            || from_revision.saturating_add(1) < self.state.compact_revision
+        {
             return Err(StoreError::Compacted);
         }
         let hi = normalize_revision(to_revision);
@@ -4125,7 +4349,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
     /// already decided. Shadowing considers RUN content only (a
     /// memtable version additionally shadowing run versions is left
     /// for the next cycle — conservative, never wrong). The floor is
-    /// trusted, never computed (§18).
+    /// trusted, never computed.
     fn compact(&mut self, floor: Revision, cursor: u64) -> Result<Progress, StoreError> {
         if self.state.install.active || self.state.capture.active || self.state.flush.active {
             return Err(StoreError::Backpressure);
@@ -4531,7 +4755,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
         // deletion instead of doing it here: each FAT32 delete walks
         // and frees the file's whole cluster chain synchronously, and
         // several of them in this one step is exactly the deadline
-        // overrun that used to kill the worker at manifest adoption.
+        // overrun that would kill the worker at manifest adoption.
         // The maintenance loop drains one per step; a crash merely
         // leaves orphans for recovery.
         for meta in old_runs.iter().take(old_count) {
@@ -4541,11 +4765,18 @@ impl<S: RunStorage> DiskStore<'_, S> {
             if (self.state.retire_count as usize) < MAX_RUNS {
                 self.state.retire_ids[self.state.retire_count as usize] = meta.id;
                 self.state.retire_count += 1;
+            } else {
+                // The queue is full: deletions are being outpaced (a long
+                // import, a burst of writes that never lets the drain
+                // run). Deleted now, whatever it costs this step — a
+                // dropped id would leave the file for recovery, and a
+                // store killed with enough of them could not list its
+                // runs to recover.
+                match self.storage.delete(FileKind::Run, meta.id) {
+                    Ok(()) | Err(StorageError::NotFound) => {}
+                    Err(e) => return Err(map_storage(e)),
+                }
             }
-            // A full queue would only mean deletions are outpaced by
-            // compactions, which the one-per-step drain plus the
-            // 3-run merge threshold makes impossible; dropping the id
-            // would still only orphan a file for recovery.
         }
         Ok(Progress::Done)
     }

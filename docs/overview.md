@@ -50,5 +50,7 @@ durable channel of its own.
   surface: command set, differences, errors
 - [guides/etcd.md](guides/etcd.md) — the etcd v3 surface: RPCs,
   differences, errors
+- [guides/documents.md](guides/documents.md) — the document model
+  and its MongoDB dialect: commands, semantics, limits, errors
 - [guides/metrics.md](guides/metrics.md) — the Prometheus metrics
   surface: endpoints, the PromQL/MetricsQL/KQL query subsets, bounds

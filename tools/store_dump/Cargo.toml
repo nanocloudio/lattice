@@ -1,0 +1,46 @@
+[package]
+name = "lattice-store-dump"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Print a lattice disk store's live keys and values: recover its runs and replay its command log (on a copy), exactly as kv_state_worker does, then list the flat keyspace. The inspection side of lattice-as-fluxor's-store (in place of reading a host store.log)."
+
+# A standalone crate (its own [workspace]); tools/ci/host_crates.sh
+# fmt/clippy/builds/tests it. It #[path]-mounts the no_std cores the worker
+# runs (kv_store with the disk store, command_log, kv_large), so it reads a
+# store with the worker's own code, never a reimplementation.
+# The mounted cores are no_std module sources, linted where they live
+# (the module build); here they are a whole surface this tool uses a subset
+# of, with the module ABI's arities. Those allows are structural, so they
+# are stated here rather than at the crate root.
+[lints.rust]
+# The cores' own unsafe (the SDK's SHA-256, the no_std buffers) and this
+# tool's one zeroed heap allocation of the provider state.
+unsafe_code     = "allow"
+unused_must_use = "deny"
+dead_code       = "allow"
+unused_imports  = "allow"
+
+[lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+allow_attributes                = "allow"
+allow_attributes_without_reason = "deny"
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+unwrap_used        = "allow"
+expect_used        = "allow"
+panic              = "allow"
+print_stdout       = "allow"
+print_stderr       = "allow"
+disallowed_macros  = "allow"
+too_many_arguments = "allow"
+duplicate_mod      = "allow"
+
+[[bin]]
+name = "lattice-store-dump"
+path = "src/main.rs"
+
+[workspace]

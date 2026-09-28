@@ -1,39 +1,33 @@
-//! Multi-model capability contracts — RFC database foundation
-//! §14.15-§14.23, §21 invariants 18/19/20, delivery Phase 8.
+//! Multi-model capability contracts: ownership, derivation, freshness,
+//! and honest response labels.
 //!
-//! Phase 8 slice 1: the contract layer every model worker (document,
-//! wide-column, graph, time-series, search, vector) composes over. This
-//! file is contracts only — no ports, no I/O, no clocks, no module. It
-//! stands in the same relationship to the Phase-8 model workers that
-//! `relational.rs` does to the Phase-7 connectors and `db_ops.rs` does
-//! to the Phase-6 workers.
+//! The contract layer every model worker (document, wide-column,
+//! graph, time-series, search, vector) composes over. This file is
+//! contracts only — no ports, no I/O, no clocks, no module. It stands
+//! in the same relationship to the model workers that `relational.rs`
+//! does to the SQL connectors and `db_ops.rs` does to the KV workers.
 //!
 //! ## 1. The governing rule: shared foundations, separate meanings
 //!
-//! §14.15:
-//!
-//! > “Multi-model” does not mean that a graph traversal, text ranking,
-//! > vector-nearest-neighbour query, time window, and relational join
-//! > are represented as one vague generic operation.
-//!
-//! and §28 rejects the alternative outright:
-//!
-//! > **One generic NoSQL semantic engine.** Erases important
-//! > differences in missing document fields, cell timestamps, graph
-//! > traversal, time windows, text ranking, and approximate vector
-//! > results. Models share foundations, not meanings.
+//! “Multi-model” does not mean that a graph traversal, text ranking,
+//! vector-nearest-neighbour query, time window, and relational join
+//! are represented as one vague generic operation. The alternative —
+//! one generic NoSQL semantic engine — is rejected outright: it erases
+//! important differences in missing document fields, cell timestamps,
+//! graph traversal, time windows, text ranking, and approximate vector
+//! results. Models share foundations, not meanings.
 //!
 //! So this file is deliberately **not** a generic document/graph/vector
 //! engine. It is exactly two things:
 //!
 //! - **Shared**: the ownership, derivation, and freshness contracts
-//!   every model obeys (§14.22, §14.23), plus one generic *byte*
-//!   helper — [`KeyWriter`] / [`KeyReader`] — because key composition
-//!   is a foundation, not a meaning.
+//!   every model obeys, plus one generic *byte* helper —
+//!   [`KeyWriter`] / [`KeyReader`] — because key composition is a
+//!   foundation, not a meaning.
 //! - **Per-model**: each capability's canonical key encoding and its
 //!   own declared semantic contract, so that authoritative mutations
-//!   compile into canonical Lattice keys (§14.15) and no model can
-//!   bypass another's invariants (§14.23).
+//!   compile into canonical Lattice keys and no model can bypass
+//!   another's invariants.
 //!
 //! The split is drawn at exactly that line. A cell timestamp
 //! ([`cell_timestamp_is_committed_input`]), a traversal bound
@@ -46,14 +40,15 @@
 //!
 //! ## 2. What this file does NOT own
 //!
-//! - Physical key framing, escaping, MVCC suffix: `internal_key` (§9.1).
+//! - Physical key framing, escaping, MVCC suffix: `internal_key`.
 //! - Secondary-index composites, unique ownership, [`IndexFreshness`],
-//!   change-feed cursors, retention-claim arithmetic: `db_ops` (§14,
-//!   §15, §18). [`DerivedState`] **embeds** an `IndexFreshness` rather
+//!   change-feed cursors, retention-claim arithmetic: `db_ops`.
+//!   [`DerivedState`] **embeds** an `IndexFreshness` rather
 //!   than restating its fields, and [`derived_satisfies`] delegates to
-//!   `index_satisfies_freshness` before applying §14.22's extra rules.
-//! - The SQL type system and the ordered value encoding: `relational`
-//!   (§14.2, §14.4). The wide-column clustering encoder
+//!   `index_satisfies_freshness` before applying the derived-state
+//!   contract's extra rules.
+//! - The SQL type system and the ordered value encoding: `relational`.
+//!   The wide-column clustering encoder
 //!   ([`encode_wide_key`]) calls `relational::encode_value_ordered`;
 //!   it does not grow a second ordered encoder.
 //! - Foreign-protocol refusal for *relational* keyspaces:
@@ -68,7 +63,7 @@
 //! re-declared below with a documented byte-identity requirement — the
 //! same accommodation `relational.rs` makes.
 //!
-//! ## 3. Keyspace mutual unambiguity (§14.15, §14.23)
+//! ## 3. Keyspace mutual unambiguity
 //!
 //! Every model key family gets its own reserved `keyspace: u32`
 //! ([`KS_DOCUMENT_DATA`] … [`KS_VECTOR_JOB`]). `internal_key` writes
@@ -77,7 +72,8 @@
 //! inside their first 12 bytes**: neither can equal the other and
 //! neither can be a byte prefix of the other. Within one family, every
 //! component is either fixed width or escaped-and-terminated, which is
-//! §9.1's prefix-ambiguity rule one level down. Together those two
+//! `internal_key`'s prefix-ambiguity rule one level down. Together
+//! those two
 //! facts are the whole proof that a document write can never land in
 //! graph space and a search posting scan can never sweep up vector
 //! embeddings. `tests/contract_models.rs` makes it executable with a
@@ -125,7 +121,7 @@ pub use relational::{
 /// `Index`, …), re-exported under an unambiguous name. It is the
 /// `<object-kind>` byte of a *relational catalog key*, a different
 /// concept from this file's [`ObjectKind`], which names a **model
-/// object** in the shared cross-model catalog (§14.23).
+/// object** in the shared cross-model catalog.
 #[allow(
     unused_imports,
     reason = "re-export surface: a model worker that also touches the relational catalog needs both object-kind enums from one import"
@@ -133,7 +129,7 @@ pub use relational::{
 pub use relational::ObjectKind as RelationalObjectKind;
 
 // ══════════════════════════════════════════════════════════════════════
-// 0. Shared key composition (§14.15 “models share foundations”)
+// 0. Shared key composition (“models share foundations”)
 // ══════════════════════════════════════════════════════════════════════
 
 /// Escape sequence for a literal `0x00` inside a variable-length model
@@ -165,7 +161,8 @@ pub const fn var_component_max_len(n: usize) -> usize {
 /// This is the one generic helper the six models share, and it is
 /// deliberately about *bytes*, not meaning: fixed-width big-endian
 /// integers (trivially order-preserving and self-delimiting) and
-/// escaped-terminated variable components (§9.1's discipline). The
+/// escaped-terminated variable components (`internal_key`'s
+/// discipline). The
 /// resulting composite is handed to `internal_key::encode` with the
 /// family's reserved keyspace, which supplies the identity triple, the
 /// outer escape, and the MVCC suffix.
@@ -237,6 +234,23 @@ impl<'a> KeyWriter<'a> {
             }
         }
         self.raw(&COMPONENT_TERMINATOR)
+    }
+
+    /// A variable component's leading bytes, escaped and left open: a
+    /// prefix of every component that begins with `src`.
+    pub fn var_open(&mut self, src: &[u8], max: usize) -> Option<()> {
+        if self.poisoned || src.len() > max {
+            self.poisoned = true;
+            return None;
+        }
+        for &b in src {
+            if b == 0x00 {
+                self.raw(&COMPONENT_ESCAPE)?;
+            } else {
+                self.raw(&[b])?;
+            }
+        }
+        Some(())
     }
 
     /// Bytes written so far, or `None` if any write failed.
@@ -330,10 +344,10 @@ impl<'a> KeyReader<'a> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 1. Reserved model keyspaces (§14.16-§14.21)
+// 1. Reserved model keyspaces
 // ══════════════════════════════════════════════════════════════════════
 
-/// The reserved model keyspaces, one per key family named by the RFC.
+/// The reserved model keyspaces, one per model key family.
 ///
 /// The high bit is set on every one, as with the relational keyspaces:
 /// catalog-assigned user keyspaces are allocated below `0x8000_0000`,
@@ -351,6 +365,8 @@ impl<'a> KeyReader<'a> {
 /// 0x8005_00xx  search
 /// 0x8006_00xx  vector
 /// 0x8007_00xx  shared cross-model catalog
+/// 0x8008_00xx  the store's own: large values' chunks (`kv_chunks.rs`)
+/// 0x800C_00xx  the store provider's own records (`store_provider.rs`)
 /// ```
 pub const KS_DOCUMENT_CATALOG: u32 = 0x8001_0001;
 pub const KS_DOCUMENT_DATA: u32 = 0x8001_0002;
@@ -359,6 +375,15 @@ pub const KS_DOCUMENT_JOB: u32 = 0x8001_0004;
 pub const KS_DOCUMENT_STATS: u32 = 0x8001_0005;
 
 pub const KS_WIDE_TABLE: u32 = 0x8002_0001;
+
+/// A large value's chunks by content hash, their reference counts, the
+/// releases waiting for the compaction floor, and the chunks nothing
+/// references yet (`kv_chunks.rs`). Written only by the chunk ops: the
+/// store refuses any other write to them.
+pub const KS_CHUNK_DATA: u32 = 0x8008_0001;
+pub const KS_CHUNK_REF: u32 = 0x8008_0002;
+pub const KS_CHUNK_RETIRE: u32 = 0x8008_0003;
+pub const KS_CHUNK_ZERO: u32 = 0x8008_0004;
 
 pub const KS_GRAPH_VERTEX: u32 = 0x8003_0001;
 pub const KS_GRAPH_EDGE_OUT: u32 = 0x8003_0002;
@@ -387,7 +412,7 @@ pub const KS_VECTOR_ANN: u32 = 0x8006_0004;
 /// `vector/meta` — per-entity metadata tags for filtered nearest-neighbour.
 pub const KS_VECTOR_META: u32 = 0x8006_0005;
 
-/// The shared cross-model catalog (§14.23) and its projection
+/// The shared cross-model catalog and its projection
 /// declarations. Owned by no single model: it is the record of *which*
 /// model owns what, so it is written by the catalog authority alone.
 pub const KS_MODEL_CATALOG: u32 = 0x8007_0001;
@@ -482,8 +507,9 @@ pub fn encode_zscore_key(out: &mut [u8], set_id: u32, score: i64, member: &[u8])
 /// Which capability owns writes to `keyspace`, or `None` if it is not a
 /// reserved model keyspace.
 ///
-/// This is the executable form of §14.23's “raw KV connectors cannot
-/// write model-owned keyspaces”: a keyspace with an owner is closed to
+/// This is the executable form of the rule that raw KV connectors
+/// cannot write model-owned keyspaces: a keyspace with an owner is
+/// closed to
 /// every other writer except through a declared projection, and the
 /// relational keyspaces are delegated to `relational` so there is one
 /// table, not two.
@@ -516,7 +542,7 @@ pub const fn is_reserved_model(keyspace: u32) -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 2. Shared catalog and model ownership (§14.23, §21 invariant 18)
+// 2. Shared catalog and model ownership
 // ══════════════════════════════════════════════════════════════════════
 
 /// Version of the [`CatalogObject`] wire encoding.
@@ -532,12 +558,13 @@ pub const SEARCH_RESULT_LABEL_VERSION: u16 = 1;
 /// Version of the [`VectorResponseLabel`] wire encoding.
 pub const VECTOR_RESPONSE_LABEL_VERSION: u16 = 1;
 
-/// A model object in the shared cross-model catalog (§14.23).
+/// A model object in the shared cross-model catalog.
 ///
 /// Distinct from `relational::ObjectKind` (re-exported here as
 /// [`RelationalObjectKind`]), which enumerates the *relational
 /// catalog's* internal object types. This enum enumerates the things
-/// §14.23's catalog listing names — one variant per capability, plus
+/// the cross-model catalog listing names — one variant per capability,
+/// plus
 /// `KvKeyspace` so a plain KV keyspace is expressible and therefore
 /// checkable rather than invisible.
 ///
@@ -582,8 +609,8 @@ impl ObjectKind {
     }
 
     /// The **one** capability that may write this kind of object
-    /// directly (§14.23: “each object has exactly one write-owning
-    /// capability”). The mapping is total and injective-by-model, which
+    /// directly: each object has exactly one write-owning capability.
+    /// The mapping is total and injective-by-model, which
     /// is what makes a `CatalogObject` whose declared `owner` disagrees
     /// with its `kind` structurally malformed rather than merely odd.
     pub const fn owning_capability(self) -> ModelOwner {
@@ -601,7 +628,7 @@ impl ObjectKind {
 }
 
 /// Whether an object's state is the source of truth or a materialized
-/// consequence of one (§14.22).
+/// consequence of one.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateAuthority {
@@ -627,12 +654,12 @@ impl StateAuthority {
 }
 
 /// Every way a model contract refuses. No catch-all: a refusal names
-/// what it refused (house rule, and the reason §14.23's ownership rule
-/// is auditable at all).
+/// what it refused (house rule, and the reason the catalog's
+/// ownership rule is auditable at all).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelError {
     /// The object's declared owner is not the one its kind implies.
-    /// §14.23: exactly one write-owning capability, and it is a
+    /// There is exactly one write-owning capability, and it is a
     /// property of the kind.
     OwnerKindMismatch {
         kind: ObjectKind,
@@ -646,10 +673,10 @@ pub enum ModelError {
         keyspace_owner: ModelOwner,
         declared: ModelOwner,
     },
-    /// §14.23: “raw KV connectors cannot write model-owned keyspaces”.
+    /// Raw KV connectors cannot write model-owned keyspaces.
     ForeignProtocolWrite { keyspace: u32, writer: ModelOwner },
-    /// §21 invariant 18: a second capability tried to write an object
-    /// it does not own, with no declared projection.
+    /// Single-writer ownership: a second capability tried to write an
+    /// object it does not own, with no declared projection.
     NotWriteOwner {
         owner: ModelOwner,
         writer: ModelOwner,
@@ -674,7 +701,7 @@ pub enum ModelError {
         source_timestamp: Timestamp,
         resolved_timestamp: Timestamp,
     },
-    /// §21 invariant 19 in its rawest form: a derived structure's
+    /// Staleness-reporting in its rawest form: a derived structure's
     /// declared frontier is **ahead** of the source it has consumed.
     /// That is a claim of freshness it has not reached, stored on disk.
     ResolvedAheadOfSource {
@@ -692,7 +719,7 @@ pub enum ModelError {
     /// A structurally invalid record: an unknown discriminant, a
     /// version mismatch, a zero bound where a bound is mandatory.
     Malformed,
-    /// §14.17: a logical partition exceeded its configured bounds with
+    /// A logical partition exceeded its configured bounds with
     /// no declared bucketing strategy — the “silently unbounded hot
     /// range” this check exists to prevent.
     PartitionUnbounded {
@@ -701,37 +728,38 @@ pub enum ModelError {
         observed_bytes: u64,
         max_bytes: u64,
     },
-    /// §14.17: a cell timestamp was sampled by a replica rather than
-    /// supplied as a committed input. That is §21 invariant 3's
-    /// determinism rule in wide-column clothing.
+    /// A cell timestamp was sampled by a replica rather than supplied
+    /// as a committed input. That is the replica-determinism rule in
+    /// wide-column clothing.
     CellTimestampSampled,
-    /// §14.19: a retention decision was based on local file age.
+    /// A retention decision was based on local file age.
     RetentionBasisNotCommitted { basis: RetentionBasis },
-    /// §14.19: a sample fell outside the accepted window and the
+    /// A sample fell outside the accepted window and the
     /// series' late policy rejects it.
     SampleTooLate {
         sample_timestamp: Timestamp,
         watermark: Timestamp,
     },
-    /// §14.20: a posting was offered for an index generation whose
-    /// analyzer version differs from the writer's — mixing incompatible
-    /// postings, which §14.20 forbids in favour of a rebuild.
+    /// A posting was offered for an index generation whose analyzer
+    /// version differs from the writer's — mixing incompatible
+    /// postings, which the search contract forbids in favour of a
+    /// rebuild.
     AnalyzerGenerationMismatch {
         generation_analyzer_version: u32,
         writer_analyzer_version: u32,
     },
-    /// §14.18: a traversal did not declare one of its mandatory bounds.
+    /// A traversal did not declare one of its mandatory bounds.
     TraversalBoundMissing { bound: TraversalBound },
-    /// §14.18: the edge mutation plan is not the complete bounded set —
+    /// The edge mutation plan is not the complete bounded set —
     /// a missing adjacency direction, a missing change record, or more
     /// entries than the format permits.
     EdgePlanIncomplete,
-    /// §14.21 / §21 invariant 20: a response label claims more than the
-    /// execution achieved.
+    /// Label honesty: a response label claims more than the execution
+    /// achieved.
     DishonestLabel { claim: LabelClaim },
 }
 
-/// Which mandatory traversal bound was absent (§14.18).
+/// Which mandatory traversal bound was absent.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraversalBound {
@@ -743,7 +771,7 @@ pub enum TraversalBound {
     Deadline = 6,
 }
 
-/// Which part of a response label was dishonest (§21 invariant 20).
+/// Which part of a response label was dishonest.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelClaim {
@@ -763,7 +791,7 @@ pub enum LabelClaim {
 
 /// A catalog object: identity, kind, its one write owner, the keyspace
 /// its authoritative records live in, and whether that state is the
-/// source of truth (§14.22, §14.23).
+/// source of truth.
 ///
 /// Wire layout ([`CATALOG_OBJECT_VERSION`] 1, integers LE):
 ///
@@ -776,7 +804,7 @@ pub enum LabelClaim {
 /// ```
 ///
 /// `source_object_id` is `0` for an object with no source and the
-/// source object's id for §14.23's `source:` objects (a search index
+/// source object's id for catalog `source:` objects (a search index
 /// over a collection, a vector index over a field). It is *not* an
 /// authority grant — the projection is (see [`ProjectionDescriptor`]);
 /// it is the catalog's record of the relationship.
@@ -796,8 +824,8 @@ impl CatalogObject {
     pub const WIRE_LEN: usize = 4 + 19;
 
     /// Build an object whose owner is the one its kind implies. This is
-    /// the only constructor a model worker should need: §14.23's rule
-    /// is that the kind determines the owner, so making the owner an
+    /// the only constructor a model worker should need: the catalog
+    /// rule is that the kind determines the owner, so making the owner an
     /// input invites the mismatch [`check_invariants`] then has to
     /// reject.
     ///
@@ -821,8 +849,9 @@ impl CatalogObject {
         }
     }
 
-    /// §14.23's structural rules: the declared owner must be the one the
-    /// kind implies, and if the keyspace is reserved it must be reserved
+    /// The catalog's structural rules: the declared owner must be the
+    /// one the kind implies, and if the keyspace is reserved it must
+    /// be reserved
     /// by that same capability. A `KvKeyspace` object in an unreserved
     /// keyspace is fine — that is what a plain KV keyspace *is*.
     pub fn check_invariants(&self) -> Result<(), ModelError> {
@@ -919,8 +948,9 @@ pub fn decode_model_catalog_key(src: &[u8]) -> Option<(u32, ObjectKind, u32)> {
     Some((db, kind, id))
 }
 
-/// §14.23 + §21 invariant 18 as one executable gate, widened from
-/// `relational::check_object_write` to every model keyspace.
+/// Catalog ownership and the single-write-owner invariant as one
+/// executable gate, widened from `relational::check_object_write` to
+/// every model keyspace.
 ///
 /// Clause order is the contract:
 ///
@@ -929,7 +959,7 @@ pub fn decode_model_catalog_key(src: &[u8]) -> Option<(u32, ObjectKind, u32)> {
 /// 2. a raw KV writer addressing a *model-owned* keyspace directly is
 ///    refused unconditionally, regardless of any descriptor, because a
 ///    Redis `SET` into `graph/edge-out/...` bypasses adjacency,
-///    indexes, and the change record (§14.23);
+///    indexes, and the change record;
 /// 3. only then does ownership matter, and only a **declared**
 ///    projection ([`AccessPath::DeclaredProjection`]) excuses a
 ///    cross-model write. Declaring it here is not sufficient by itself:
@@ -969,8 +999,7 @@ pub fn check_model_write(
         .map_err(ModelError::Catalog)
 }
 
-/// How a projection's target is maintained relative to its source
-/// (§14.23).
+/// How a projection's target is maintained relative to its source.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Maintenance {
@@ -978,9 +1007,9 @@ pub enum Maintenance {
     /// is exact at every committed source timestamp.
     Synchronous = 1,
     /// Maintained from the source's change stream. The target reports a
-    /// frontier and can never claim currency it has not reached
-    /// (§14.22). §14.23: “broad derived fanout normally consumes change
-    /// streams rather than expanding foreground transactions”.
+    /// frontier and can never claim currency it has not reached.
+    /// Broad derived fanout normally consumes change streams rather
+    /// than expanding foreground transactions.
     Asynchronous = 2,
 }
 
@@ -994,7 +1023,7 @@ impl Maintenance {
     }
 }
 
-/// The consistency a projection's target claims (§14.23).
+/// The consistency a projection's target claims.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionConsistency {
@@ -1020,8 +1049,7 @@ impl ProjectionConsistency {
     }
 }
 
-/// What happens to the target when the projection must be rebuilt
-/// (§14.23, §14.22).
+/// What happens to the target when the projection must be rebuilt.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RebuildBehaviour {
@@ -1032,10 +1060,10 @@ pub enum RebuildBehaviour {
     /// failure restarts it.
     FullScanOnly = 2,
     /// Cannot be rebuilt from the source. Then the target is not
-    /// derived at all — it holds unique state, which §14.22 forbids for
-    /// derived structures and §28 lists as a rejected alternative
-    /// (“make derived indexes authoritative by accident”). Expressible
-    /// so that it is visibly wrong.
+    /// derived at all — it holds unique state, which the derived-state
+    /// contract forbids: a derived index made authoritative by
+    /// accident is a rejected design. Expressible so that it is
+    /// visibly wrong.
     NotRebuildable = 3,
 }
 
@@ -1050,7 +1078,7 @@ impl RebuildBehaviour {
     }
 }
 
-/// What the projection does when maintenance fails (§14.23).
+/// What the projection does when maintenance fails.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionFailurePolicy {
@@ -1076,15 +1104,15 @@ impl ProjectionFailurePolicy {
     }
 }
 
-/// §14.23's explicit cross-model access path.
+/// The explicit cross-model access path.
 ///
-/// > Cross-model access uses an explicit view or projection declaring
-/// > source, target, write authority, synchronous or asynchronous
-/// > maintenance, consistency, resolved timestamp, rebuild behavior,
-/// > and failure policy. This permits document-to-search,
-/// > document-to-vector, row-to-graph, or sample-to-rollup projections
-/// > **without allowing either side to bypass the source model's
-/// > invariants**.
+/// Cross-model access uses an explicit view or projection declaring
+/// source, target, write authority, synchronous or asynchronous
+/// maintenance, consistency, resolved timestamp, rebuild behavior,
+/// and failure policy. This permits document-to-search,
+/// document-to-vector, row-to-graph, or sample-to-rollup projections
+/// **without allowing either side to bypass the source model's
+/// invariants**.
 ///
 /// That last clause is why this is a record and not a boolean: the
 /// projection names exactly one source, one target, one authority, and
@@ -1102,7 +1130,7 @@ impl ProjectionFailurePolicy {
 /// [rebuild:u8][failure_policy:u8]
 /// ```
 ///
-/// The resolved timestamp §14.23 also lists is deliberately **not** a
+/// The resolved timestamp is deliberately **not** a
 /// field here: it is per-instant state, not descriptor state, and it
 /// lives in [`DerivedState::resolved_timestamp`]. Putting a moving
 /// value in a durable descriptor is how a descriptor starts lying.
@@ -1137,8 +1165,7 @@ impl ProjectionDescriptor {
     ///
     /// - source is its own target — a projection with no direction;
     /// - asynchronous maintenance claiming transactional consistency —
-    ///   §14.22's “never an unreported second authority” in descriptor
-    ///   form;
+    ///   “never an unreported second authority” in descriptor form;
     /// - asynchronous maintenance with `FailSourceWrite` — a change-
     ///   stream consumer cannot fail a write that already committed;
     /// - `NotRebuildable` combined with `InvalidateAndRebuild` — a
@@ -1242,13 +1269,13 @@ pub fn decode_projection_key(src: &[u8]) -> Option<(u32, u32)> {
 /// the projection is well formed; it names this source and this target;
 /// it grants this writer authority; and the target object it names is
 /// the one being written, in the keyspace it names. Any deviation is
-/// [`ModelError::ProjectionNotDeclared`] — the point of §14.23's
-/// projection is that it is a *grant of a specific edge*, not a general
-/// exemption from ownership.
+/// [`ModelError::ProjectionNotDeclared`] — the point of a declared
+/// projection is that it is a *grant of a specific edge*, not a
+/// general exemption from ownership.
 ///
 /// The source object is checked too: a projection cannot be used to
 /// write the source (that would be the target model bypassing the
-/// source model's invariants, which §14.23 forbids by name).
+/// source model's invariants, which the catalog contract forbids).
 pub fn check_projection_write(
     projection: &ProjectionDescriptor,
     source: &CatalogObject,
@@ -1268,17 +1295,18 @@ pub fn check_projection_write(
         return Err(ModelError::ProjectionNotDeclared);
     }
     // The grant covers the target only. Writing the source through a
-    // projection is exactly the bypass §14.23 rules out.
+    // projection is exactly the bypass the ownership rule exists to
+    // prevent.
     check_model_write(target, writer, AccessPath::DeclaredProjection)
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 3. Authoritative and derived state (§14.22, §21 invariant 19)
+// 3. Authoritative and derived state
 // ══════════════════════════════════════════════════════════════════════
 
-/// The four shapes derived state may take (§14.22: “synchronous,
-/// asynchronous with an explicit frontier, rebuildable from a
-/// snapshot/change stream, or a disposable cache”).
+/// The four shapes derived state may take: synchronous, asynchronous
+/// with an explicit frontier, rebuildable from a snapshot/change
+/// stream, or a disposable cache.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DerivedMode {
@@ -1311,15 +1339,15 @@ impl DerivedMode {
     }
 }
 
-/// What a query gets when the derived structure is behind (§14.22's
+/// What a query gets when the derived structure is behind (the
 /// `stale_query_policy`).
 ///
 /// None of the three is “silently serve stale as current”. The
 /// difference between [`Report`] and [`Serve`] is whether the caller
 /// must surface the staleness to its user, not whether the staleness is
-/// known: both return the reached frontier, because §21 invariant 19
-/// forbids a derived structure from claiming freshness it has not
-/// achieved regardless of policy.
+/// known: both return the reached frontier, because a derived
+/// structure may never claim freshness it has not achieved,
+/// regardless of policy.
 ///
 /// [`Report`]: StaleQueryPolicy::Report
 /// [`Serve`]: StaleQueryPolicy::Serve
@@ -1345,16 +1373,17 @@ impl StaleQueryPolicy {
     }
 }
 
-/// §14.22's `derived_state:` block as a record.
+/// The derived-state declaration as a record.
 ///
-/// The RFC's YAML has `source_object`, `source_revision`, `generation`,
-/// `mode`, `rebuildable`, `resolved_timestamp`, `stale_query_policy`.
+/// A derived structure declares `source_object`, `source_revision`,
+/// `generation`, `mode`, `rebuildable`, `resolved_timestamp`, and
+/// `stale_query_policy`.
 /// Four of those (source revision, source timestamp, range generation,
 /// exactness) are already `db_ops::IndexFreshness`, so this record
 /// **embeds** it rather than restating it: one freshness record, one
 /// freshness check, in one place. The mapping is:
 ///
-/// | §14.22 field | here |
+/// | declared field | here |
 /// |---|---|
 /// | `source_object` | [`source_object_id`] + [`source_kind`] |
 /// | `source_revision` | `freshness.source_revision` |
@@ -1366,9 +1395,10 @@ impl StaleQueryPolicy {
 /// | `stale_query_policy` | [`stale_query_policy`] |
 ///
 /// `freshness.range_generation` remains the *range descriptor*
-/// generation (§11.3) that `db_ops` checks; [`generation`] is the
-/// derived structure's own build generation (§14.20's index generation,
-/// §14.21's manifest generation). Two different numbers with two
+/// generation (partition-map metadata) that `db_ops` checks;
+/// [`generation`] is the derived structure's own build generation
+/// (the search index generation, the vector manifest generation).
+/// Two different numbers with two
 /// different jobs, which is why both are present.
 ///
 /// Wire layout ([`DERIVED_STATE_VERSION`] 1, integers LE):
@@ -1406,7 +1436,7 @@ pub struct DerivedState {
     /// rebuilt without replaying older history. `0` means **none
     /// exists**, which is the fail-closed default: with no rebuild-safe
     /// snapshot, compaction must preserve history back to the
-    /// structure's cursor (§14.22).
+    /// structure's cursor.
     pub rebuild_safe_snapshot: Timestamp,
     pub stale_query_policy: StaleQueryPolicy,
 }
@@ -1415,13 +1445,13 @@ impl DerivedState {
     /// Header (4) + 4 + 1 + freshness + 4 + 1 + 8 + 8 + 1.
     pub const WIRE_LEN: usize = 4 + 4 + 1 + IndexFreshness::WIRE_LEN + 4 + 1 + 8 + 8 + 1;
 
-    /// §14.22's structural rules:
+    /// The derived-state structural rules:
     ///
     /// - a `Synchronous` structure cannot lag (it is maintained inside
     ///   the writing transaction), so a resolved timestamp behind its
     ///   consumed source timestamp is a contradiction;
     /// - a resolved timestamp *ahead* of the consumed source timestamp
-    ///   is the invariant-19 violation this whole section exists to
+    ///   is the freshness overclaim this whole section exists to
     ///   prevent, in stored form.
     pub fn check_invariants(&self) -> Result<(), ModelError> {
         if self.resolved_timestamp > self.freshness.source_timestamp {
@@ -1496,7 +1526,7 @@ pub struct QueryFreshness {
     /// The MVCC timestamp the answer must reflect.
     pub required_timestamp: Timestamp,
     /// The range descriptor generation the answer must be built under
-    /// (§11.3).
+    /// (partition-map metadata).
     pub required_generation: u32,
     /// `Synchronous` means “exact, no frontier” — only a synchronous
     /// derived structure can satisfy it.
@@ -1508,7 +1538,7 @@ pub struct QueryFreshness {
 pub struct Served {
     /// The frontier the answer reflects. Always reported, never
     /// implied: an answer carries its own timestamp so a caller can
-    /// label it (§14.20, §14.21).
+    /// label it.
     pub resolved_timestamp: Timestamp,
     /// The derived structure's build generation, for the caller's label.
     pub generation: u32,
@@ -1518,7 +1548,7 @@ pub struct Served {
 
 /// The honest ways a derived structure fails to serve a query at the
 /// requested freshness. Every variant carries the numbers, because
-/// §21 invariant 19 is about *reporting*, not about failing.
+/// the staleness contract is about *reporting*, not about failing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Degradation {
     /// The structure refuses: policy is [`StaleQueryPolicy::Refuse`], or
@@ -1548,8 +1578,9 @@ pub enum Degradation {
     },
 }
 
-/// §21 invariant 19 as one function: **a derived structure can never
-/// silently claim freshness or exactness it has not reached.**
+/// The staleness-reporting rule as one function: **a derived
+/// structure can never silently claim freshness or exactness it has
+/// not reached.**
 ///
 /// The order of the gates is the contract:
 ///
@@ -1644,8 +1675,8 @@ pub fn derived_satisfies(
     })
 }
 
-/// §14.22: “Compaction preserves its source and cursor requirements
-/// until a rebuild-safe snapshot or frontier exists.”
+/// Compaction preserves a derived structure's source and cursor
+/// requirements until a rebuild-safe snapshot or frontier exists.
 ///
 /// Returns the **oldest MVCC timestamp compaction must keep** on this
 /// structure's behalf. `Timestamp::MAX` means “no claim”: this
@@ -1656,7 +1687,7 @@ pub fn derived_satisfies(
 /// | mode | floor | why |
 /// |---|---|---|
 /// | `Synchronous` | `MAX` | maintained in-transaction; it never replays history |
-/// | `DisposableCache` | `MAX` | droppable by definition; §14.22 grants it no claim |
+/// | `DisposableCache` | `MAX` | droppable by definition; it gets no claim |
 /// | `AsynchronousWithFrontier` | cursor | it must replay from where it stopped |
 /// | `Rebuildable`, no safe snapshot | cursor | fail closed: with no snapshot the change stream is the only route back |
 /// | `Rebuildable`, safe snapshot | `min(snapshot, cursor)` | the snapshot is the new floor, but never above the cursor it still has to replay from |
@@ -1687,7 +1718,7 @@ pub fn compaction_floor_for_derived(derived: &DerivedState) -> Timestamp {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 4. Document capability (§14.16)
+// 4. Document capability
 // ══════════════════════════════════════════════════════════════════════
 
 /// Maximum encoded index-value bytes in a document index key. Matches
@@ -1695,23 +1726,38 @@ pub fn compaction_floor_for_derived(derived: &DerivedState) -> Timestamp {
 /// of ordered tuple.
 pub const MAX_DOC_INDEX_VALUE_LEN: usize = 256;
 
+/// Longest document id key (`doc_ops::id_key`: the id's ordered key,
+/// a compound id's components concatenated). A policy, not a buffer:
+/// MongoDB's historical index-key limit is 1024 bytes, and Kubernetes'
+/// longest object id (namespace 63 + name 253, with framing) is about a
+/// third of it.
+pub const MAX_DOCUMENT_ID_KEY: usize = 1024;
+
 /// Worst case `document/data/<collection>/<shard-key>/<doc-id>`:
 /// collection id, plus two escaped-and-terminated variable components.
-pub const DOCUMENT_DATA_KEY_MAX_LEN: usize = 4 + var_component_max_len(MAX_MODEL_ID_LEN) * 2;
+pub const DOCUMENT_DATA_KEY_MAX_LEN: usize =
+    4 + var_component_max_len(MAX_MODEL_ID_LEN) + var_component_max_len(MAX_DOCUMENT_ID_KEY);
 /// Worst case `document/index/<index-id>/<encoded-values>/<doc-id>`.
 pub const DOCUMENT_INDEX_KEY_MAX_LEN: usize =
-    4 + var_component_max_len(MAX_DOC_INDEX_VALUE_LEN) + var_component_max_len(MAX_MODEL_ID_LEN);
+    4 + var_component_max_len(MAX_DOC_INDEX_VALUE_LEN) + var_component_max_len(MAX_DOCUMENT_ID_KEY);
+/// The longest key the document model writes (data or index), before
+/// its keyspace.
+pub const DOCUMENT_KEY_MAX_LEN: usize = if DOCUMENT_INDEX_KEY_MAX_LEN > DOCUMENT_DATA_KEY_MAX_LEN {
+    DOCUMENT_INDEX_KEY_MAX_LEN
+} else {
+    DOCUMENT_DATA_KEY_MAX_LEN
+};
 
-/// §14.16's canonical document value tree types.
+/// The document model's canonical value tree types.
 ///
-/// > Connector-specific JSON or binary encodings translate to a
-/// > canonical versioned document value tree containing explicit null,
-/// > boolean, integer, decimal, string, binary, timestamp, identifier,
-/// > array, and object types.
+/// Connector-specific JSON or binary encodings translate to a
+/// canonical versioned document value tree containing explicit null,
+/// boolean, integer, decimal, string, binary, timestamp, identifier,
+/// array, and object types.
 ///
 /// Ten types, closed set, explicit `Null`. “Explicit null” is the whole
-/// point and it is the first difference §28 says a generic engine
-/// erases: a field present with value null and a field that is absent
+/// point and it is the first difference a generic engine would
+/// erase: a field present with value null and a field that is absent
 /// are different facts, and only a type tag can carry that difference.
 /// `Absent` is therefore deliberately **not** a variant — absence is
 /// the lack of an entry, not a value.
@@ -1774,9 +1820,9 @@ impl DocValueType {
     }
 }
 
-/// §14.16's canonical deterministic mutations. Named individually
+/// The canonical deterministic document mutations. Named individually
 /// because they are individually deterministic: “update” as a single
-/// opaque verb is the generic-engine failure §28 rejects.
+/// opaque verb is the rejected generic-engine failure.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocMutationKind {
@@ -1814,15 +1860,15 @@ impl DocMutationKind {
     }
 }
 
-/// How the mutation reached storage (§14.16's closing prohibition).
+/// How the mutation reached storage.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationOrigin {
-    /// One canonical Lattice transaction, fenced (§14.15).
+    /// One canonical Lattice transaction, fenced.
     FencedTransaction = 1,
     /// A connector read the document, computed a new one, and wrote it
-    /// back with no fence. §14.16: “It must not be implemented as an
-    /// unfenced connector-side read followed by write.” Representable
+    /// back with no fence. A mutation must not be implemented as an
+    /// unfenced connector-side read followed by write. Representable
     /// precisely so it can be refused.
     UnfencedConnectorReadWrite = 2,
 }
@@ -1839,11 +1885,11 @@ impl MutationOrigin {
 
 /// One document mutation, described by what its transaction covers.
 ///
-/// The fields are the four things §14.16 requires the *same*
-/// transaction to update, plus the origin. It is a description, not an
-/// engine: the document worker builds one of these and asks
-/// [`document_mutation_is_atomic_unit`] whether it is the atomic unit
-/// the RFC demands.
+/// The fields are the four things the document model requires the
+/// *same* transaction to update, plus the origin. It is a description,
+/// not an engine: the document worker builds one of these and asks
+/// [`document_mutation_is_atomic_unit`] whether it is the required
+/// atomic unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocumentMutation {
     pub collection_id: u32,
@@ -1859,16 +1905,16 @@ pub struct DocumentMutation {
     pub uniqueness_record_count: u16,
     /// Number of those the transaction actually writes.
     pub uniqueness_records_in_txn: u16,
-    /// The change record is in the transaction (§15).
+    /// The change record is in the transaction.
     pub writes_change_record: bool,
 }
 
-/// §14.16's atomicity rule as one predicate:
+/// The document atomicity rule as one predicate:
 ///
-/// > A document mutation transactionally updates the document,
-/// > synchronous indexes, uniqueness records, and change record. It
-/// > must not be implemented as an unfenced connector-side read
-/// > followed by write.
+/// A document mutation transactionally updates the document,
+/// synchronous indexes, uniqueness records, and change record. It
+/// must not be implemented as an unfenced connector-side read
+/// followed by write.
 ///
 /// So: a fenced transaction, containing the document, **every**
 /// declared synchronous index, **every** declared uniqueness record,
@@ -1896,7 +1942,7 @@ pub fn document_mutation_is_atomic_unit(m: &DocumentMutation) -> bool {
 ///
 /// Hand to `internal_key::encode` with [`KS_DOCUMENT_DATA`].
 ///
-/// The shard key precedes the document id because §14.16 routes on it:
+/// The shard key precedes the document id because routing is on it:
 /// “complete shard keys route directly; incomplete keys produce an
 /// explicit bounded fanout plan”. With the shard key in front, a
 /// complete shard key is a *prefix scan of one point*, and an
@@ -1911,7 +1957,7 @@ pub fn encode_document_data_key(
     let mut w = KeyWriter::new(out);
     w.u32(collection_id)?;
     w.var(shard_key, MAX_MODEL_ID_LEN)?;
-    w.var(document_id, MAX_MODEL_ID_LEN)?;
+    w.var(document_id, MAX_DOCUMENT_ID_KEY)?;
     w.finish()
 }
 
@@ -1932,8 +1978,8 @@ pub fn decode_document_data_key(
 }
 
 /// The scan prefix for one collection's documents, or for one shard key
-/// within it when `shard_key` is `Some` (§14.16's “complete shard keys
-/// route directly”).
+/// within it when `shard_key` is `Some` (“complete shard keys route
+/// directly”).
 pub fn encode_document_data_prefix(
     out: &mut [u8],
     collection_id: u32,
@@ -1954,8 +2000,9 @@ pub fn encode_document_data_prefix(
 /// ```
 ///
 /// `encoded_values` is a `relational::encode_index_value` tuple — the
-/// document layer does not grow a second ordered encoder (§14.2's type
-/// system is the shared one). The document id sits *inside* the key for
+/// document layer does not grow a second ordered encoder (the
+/// relational type system is the shared one). The document id sits
+/// *inside* the key for
 /// the same reason a primary key does in `db_ops::IndexEntry`: a prefix
 /// scan of one index value yields that value's documents, in document
 /// id order, with no secondary filter.
@@ -1968,7 +2015,23 @@ pub fn encode_document_index_key(
     let mut w = KeyWriter::new(out);
     w.u32(index_id)?;
     w.var(encoded_values, MAX_DOC_INDEX_VALUE_LEN)?;
-    w.var(document_id, MAX_MODEL_ID_LEN)?;
+    w.var(document_id, MAX_DOCUMENT_ID_KEY)?;
+    w.finish()
+}
+
+/// `document/data/<collection>/<shard-key>/<id-prefix…`: the scan prefix
+/// of every document in one shard whose id key begins with `id_prefix`
+/// (a compound id's leading components).
+pub fn encode_document_id_prefix(
+    out: &mut [u8],
+    collection_id: u32,
+    shard_key: &[u8],
+    id_prefix: &[u8],
+) -> Option<usize> {
+    let mut w = KeyWriter::new(out);
+    w.u32(collection_id)?;
+    w.var(shard_key, MAX_MODEL_ID_LEN)?;
+    w.var_open(id_prefix, MAX_DOCUMENT_ID_KEY)?;
     w.finish()
 }
 
@@ -1999,7 +2062,7 @@ pub fn encode_document_index_prefix(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 5. Wide-column capability (§14.17)
+// 5. Wide-column capability
 // ══════════════════════════════════════════════════════════════════════
 
 /// Maximum clustering-key columns in one wide-column table. Matches
@@ -2014,8 +2077,8 @@ pub const WIDE_KEY_MAX_LEN: usize = 4
     + 4
     + 8;
 
-/// Clustering order for one clustering column. §14.17: “Partition-key
-/// locality and clustering order are explicit schema properties.”
+/// Clustering order for one clustering column. Partition-key
+/// locality and clustering order are explicit schema properties.
 /// Explicit means the encoder takes it — a table declaring
 /// `CLUSTERING ORDER BY (ts DESC)` must physically sort that way, not
 /// re-sort after the scan.
@@ -2119,12 +2182,12 @@ impl ClusteringKey<'_> {
 ///
 /// - one partition's cells are contiguous, because the fixed-width
 ///   table id and the escaped-terminated partition key are a strict
-///   prefix of every one of them (§14.17's “partition-key locality”);
+///   prefix of every one of them (partition-key locality);
 /// - within a partition, cells sort by the clustering key in the
 ///   schema's declared per-column direction;
 /// - within a cell, `!version` puts the **newest** logical cell version
 ///   first, matching `internal_key`'s treatment of the MVCC timestamp.
-///   The version here is the §14.17 *logical cell timestamp*, a
+///   The version here is the *logical cell timestamp*, a
 ///   committed input — see [`cell_timestamp_is_committed_input`].
 ///
 /// A complete clustering key is required ([`ClusteringKey::check`] with
@@ -2245,16 +2308,16 @@ pub fn decode_wide_key<'b>(
     Some((table_id, partition_len, types.len(), column_id, version))
 }
 
-/// Where a cell's logical timestamp came from (§14.17).
+/// Where a cell's logical timestamp came from.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellTimestampSource {
     /// Supplied by the client and committed through the log: every
     /// replica applies the same number.
     CommittedInput = 1,
-    /// Read from a replica's local clock at apply time. §14.17 forbids
-    /// it (“never sampled independently by replicas”) and §21 invariant
-    /// 3 says why: local time must not affect logical outcome.
+    /// Read from a replica's local clock at apply time. Forbidden —
+    /// never sampled independently by replicas — and determinism says
+    /// why: local time must not affect logical outcome.
     /// Representable so it can be refused, not so it can be used.
     ReplicaSampled = 2,
 }
@@ -2274,14 +2337,14 @@ impl CellTimestampSource {
 pub struct Cell {
     pub table_id: u32,
     pub column_id: u32,
-    /// §14.17's logical cell timestamp: the value that decides last-
+    /// The logical cell timestamp: the value that decides last-
     /// write-wins between two cells.
     pub logical_timestamp: u64,
     pub timestamp_source: CellTimestampSource,
 }
 
-/// §14.17: “Logical cell timestamps are committed inputs and never
-/// sampled independently by replicas.”
+/// Logical cell timestamps are committed inputs and never sampled
+/// independently by replicas.
 ///
 /// A single predicate rather than a `Result` because there is exactly
 /// one way to fail it and the caller's response is always the same
@@ -2293,14 +2356,14 @@ pub fn cell_timestamp_is_committed_input(cell: &Cell) -> bool {
 }
 
 /// How a table splits a logical partition that would otherwise grow
-/// without bound (§14.17).
+/// without bound.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BucketingStrategy {
     /// No bucketing. Legal only while the partition stays within its
     /// declared bounds; the moment it does not,
-    /// [`check_partition_bounds`] refuses, which is precisely §14.17's
-    /// “they cannot silently become unbounded single-range hot spots”.
+    /// [`check_partition_bounds`] refuses: a partition cannot silently
+    /// become an unbounded single-range hot spot.
     None = 1,
     /// Partition key is extended with a time bucket of
     /// [`PartitionBounds::bucket_parameter`] milliseconds.
@@ -2325,7 +2388,7 @@ impl BucketingStrategy {
     }
 }
 
-/// A table's declared logical-partition bounds (§14.17).
+/// A table's declared logical-partition bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PartitionBounds {
     pub max_rows: u64,
@@ -2340,7 +2403,7 @@ pub struct PartitionBounds {
 impl PartitionBounds {
     /// A bound of zero is not a bound, and a bucketing strategy with no
     /// parameter is not a strategy. Both are refused at declaration
-    /// time, because §14.17 requires *configured* bounds and a
+    /// time, because the contract requires *configured* bounds and a
     /// *declared* strategy — the failure mode this prevents is a table
     /// that appears to have a policy and does not.
     pub fn check_invariants(&self) -> Result<(), ModelError> {
@@ -2354,7 +2417,7 @@ impl PartitionBounds {
     }
 }
 
-/// §14.17's partition-size rule: a logical partition over its declared
+/// The partition-size rule: a logical partition over its declared
 /// bounds is legal **only** when the table declares a bucketing
 /// strategy that will split it. With [`BucketingStrategy::None`] the
 /// same overflow is [`ModelError::PartitionUnbounded`] — the silent hot
@@ -2382,7 +2445,7 @@ pub fn check_partition_bounds(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 6. Graph capability (§14.18)
+// 6. Graph capability
 // ══════════════════════════════════════════════════════════════════════
 
 /// Maximum length of a vertex identifier. Shorter than
@@ -2397,7 +2460,7 @@ pub const GRAPH_EDGE_KEY_MAX_LEN: usize = 4 + var_component_max_len(MAX_VERTEX_I
 pub const GRAPH_VERTEX_KEY_MAX_LEN: usize = 4 + var_component_max_len(MAX_VERTEX_ID_LEN);
 
 /// Maximum synchronous property indexes one edge mutation maintains.
-/// A format bound: §21 invariant 14 requires bounded work, so an edge
+/// A format bound: all work must be bounded, so an edge
 /// write with more declared indexes than this is a typed refusal rather
 /// than an unbounded plan.
 pub const MAX_GRAPH_SYNC_INDEXES: usize = 4;
@@ -2432,8 +2495,8 @@ pub fn decode_graph_vertex_key(src: &[u8], vertex_out: &mut [u8]) -> Option<(u32
 ///
 /// A prefix scan of `[graph_id][esc(source)][TERM]` is “all out-edges of
 /// this vertex”, and extending it with `[label_id]` narrows to one
-/// label — bounded adjacency expansion (§14.18) as a scan bound rather
-/// than a filter.
+/// label — bounded adjacency expansion as a scan bound rather than a
+/// filter.
 pub fn encode_graph_edge_out_key(
     out: &mut [u8],
     graph_id: u32,
@@ -2532,7 +2595,7 @@ impl Edge {
 
 /// Derive an edge's in-adjacency key from its out-adjacency key.
 ///
-/// This is §14.18's adjacency invariant in its sharpest form: the two
+/// This is the adjacency invariant in its sharpest form: the two
 /// directions carry the same three facts, so either key determines the
 /// other, and a plan that writes one without the other is detectably
 /// incomplete rather than merely unlucky.
@@ -2589,21 +2652,21 @@ impl EdgePlanEntry {
     }
 }
 
-/// §14.18's bounded mutation set:
+/// The bounded edge mutation set:
 ///
-/// > Creating or deleting an edge atomically maintains the edge record,
-/// > incoming and outgoing adjacency, synchronous property indexes, and
-/// > change record.
+/// Creating or deleting an edge atomically maintains the edge record,
+/// incoming and outgoing adjacency, synchronous property indexes, and
+/// change record.
 ///
-/// A fixed array, never a growable list: §21 invariant 14 requires
-/// bounded work, so an edge with more synchronous indexes than
+/// A fixed array, never a growable list: all work must be bounded,
+/// so an edge with more synchronous indexes than
 /// [`MAX_GRAPH_SYNC_INDEXES`] is a refusal, not a bigger plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EdgeMutationPlan {
     pub op: EdgeOp,
     entries: [EdgePlanEntry; MAX_EDGE_PLAN_ENTRIES],
     len: u8,
-    /// The change record (§15) is in the same transaction. It is a flag
+    /// The change record is in the same transaction. It is a flag
     /// rather than an entry because it is not a key in a model
     /// keyspace — the change feed owns its own encoding — and inventing
     /// a fake key for it would be less honest, not more.
@@ -2628,7 +2691,7 @@ impl EdgeMutationPlan {
         self.entries().iter().any(|e| e.role == role)
     }
 
-    /// The complete-set check §14.18 demands: exactly one out entry,
+    /// The complete-set check: exactly one out entry,
     /// exactly one in entry, every declared property index, and the
     /// change record. Anything less is
     /// [`ModelError::EdgePlanIncomplete`] — a graph whose in-adjacency
@@ -2660,8 +2723,8 @@ impl EdgeMutationPlan {
     }
 }
 
-/// Build the complete bounded key set one edge create/delete must touch
-/// (§14.18).
+/// Build the complete bounded key set one edge create/delete must
+/// touch.
 ///
 /// `index_values` supplies one already-encoded ordered value per
 /// declared synchronous property index, paired with the index id. The
@@ -2739,8 +2802,8 @@ pub fn edge_mutation_plan(
     Some(plan)
 }
 
-/// What a traversal does when it hits one of its bounds (§14.18's
-/// “partial-result policy”).
+/// What a traversal does when it hits one of its bounds (the
+/// partial-result policy).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartialResultPolicy {
@@ -2762,15 +2825,15 @@ impl PartialResultPolicy {
     }
 }
 
-/// §14.18: “Every traversal declares maximum depth, frontier size,
-/// visited state, bytes, work, deadline, and partial-result policy.”
+/// Every traversal declares maximum depth, frontier size, visited
+/// state, bytes, work, deadline, and partial-result policy.
 ///
 /// Seven fields, all mandatory, because a traversal is the one model
 /// operation whose cost is not bounded by its input size — this record
 /// is what stops “find related things” from becoming a whole-graph
 /// scan. `0` is not a legal value for any of the six numeric bounds:
-/// an unset bound and an infinite bound are the same thing, and §21
-/// invariant 14 forbids both.
+/// an unset bound and an infinite bound are the same thing, and the
+/// bounded-work rule forbids both.
 ///
 /// Wire layout ([`TRAVERSAL_BOUNDS_VERSION`] 1, integers LE):
 ///
@@ -2864,7 +2927,7 @@ impl TraversalBounds {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 7. Time-series capability (§14.19)
+// 7. Time-series capability
 // ══════════════════════════════════════════════════════════════════════
 
 /// Worst case `timeseries/series/<metric>/<labels-digest>`:
@@ -2910,7 +2973,7 @@ pub fn decode_timeseries_series_key(src: &[u8]) -> Option<(u32, [u8; 16])> {
 /// right for a *version chain* (`internal_key`, and the wide-column
 /// cell version) because there the newest is the answer; here every
 /// sample is an answer. Two different orders for two different
-/// meanings — §14.15's rule in one field.
+/// meanings — shared foundations, separate meanings, in one field.
 pub fn encode_timeseries_sample_key(
     out: &mut [u8],
     series_id: u64,
@@ -2961,16 +3024,16 @@ pub fn decode_timeseries_rollup_key(src: &[u8]) -> Option<(u64, u32, u64)> {
     Some((series_id, resolution_ms, bucket))
 }
 
-/// What a series does with a sample older than its watermark (§14.19's
+/// What a series does with a sample older than its watermark (the
 /// out-of-order policy).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatePolicy {
     /// Refuse the sample. The window is closed.
     Reject = 1,
-    /// Accept and repair every affected rollup in the same transaction.
-    /// §14.19: “Backfill and late samples define whether affected
-    /// rollups are repaired synchronously…”
+    /// Accept and repair every affected rollup in the same
+    /// transaction: backfill and late samples define whether affected
+    /// rollups are repaired synchronously…
     AcceptRepairSynchronously = 2,
     /// Accept, and move the affected rollups' resolved timestamp back
     /// so they report the repair as pending. “…or become current
@@ -2999,22 +3062,20 @@ pub enum SampleAdmission {
     AcceptedRepairRollups { affected_bucket: u64 },
     /// Before the watermark, accepted, and the affected rollups must
     /// move their resolved timestamp back to `regressed_resolved` so
-    /// they never claim to include a sample they have not folded in
-    /// (§21 invariant 19).
+    /// they never claim to include a sample they have not folded in.
     AcceptedReportStale {
         affected_bucket: u64,
         regressed_resolved: Timestamp,
     },
 }
 
-/// §14.19's out-of-order/late-sample rule as one function.
+/// The out-of-order/late-sample rule as one function.
 ///
 /// A sample at or after `watermark` is ordinary. Below it, the series'
 /// declared [`LatePolicy`] decides, and two of the three outcomes
 /// impose obligations on the *rollups* rather than on the sample — a
 /// late sample that quietly landed while a rollup went on reporting its
-/// old value is exactly the “unreported second authority” §14.22
-/// forbids.
+/// old value is exactly the forbidden “unreported second authority”.
 ///
 /// `bucket_width_ms` must be nonzero (a zero-width bucket is not a
 /// bucket).
@@ -3055,14 +3116,14 @@ pub struct TimeSeriesSchema {
     pub metric_id: u32,
     pub bucket_width_ms: u64,
     pub late_policy: LatePolicy,
-    /// §14.19: “rollups are derived **unless a schema explicitly makes
-    /// them authoritative**.” Explicit means this flag; the default is
-    /// `false`, and §28 lists making derived state authoritative by
-    /// accident as a rejected alternative.
+    /// Rollups are derived **unless a schema explicitly makes them
+    /// authoritative**. Explicit means this flag; the default is
+    /// `false`, and making derived state authoritative by accident is
+    /// a rejected design.
     pub rollups_authoritative: bool,
 }
 
-/// §14.19's rollup-authority rule.
+/// The rollup-authority rule.
 ///
 /// Samples and series metadata are always authoritative; compressed
 /// segments are physical materialization and carry no authority at all.
@@ -3076,7 +3137,7 @@ pub fn rollup_authority(schema: &TimeSeriesSchema) -> StateAuthority {
     }
 }
 
-/// What a retention decision was based on (§14.19).
+/// What a retention decision was based on.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetentionBasis {
@@ -3084,12 +3145,12 @@ pub enum RetentionBasis {
     /// deterministic.
     CommittedPolicy = 1,
     /// A protected timestamp held by a backup, watch, or derived
-    /// structure (§18, §21 invariant 13).
+    /// structure (the GC-floor contract).
     ProtectedTimestamp = 2,
-    /// The mtime of a file on one node's disk. §14.19: “Retention
-    /// advances through committed policy and protected timestamps, not
-    /// local file age.” Representable so it can be refused; §21
-    /// invariant 3 is the underlying reason — local state must not
+    /// The mtime of a file on one node's disk. Retention advances
+    /// through committed policy and protected timestamps, not local
+    /// file age. Representable so it can be refused; replica
+    /// determinism is the underlying reason — local state must not
     /// affect logical outcome.
     LocalFileAge = 3,
 }
@@ -3105,7 +3166,7 @@ impl RetentionBasis {
     }
 }
 
-/// §14.19's retention rule: only a committed policy or a protected
+/// The retention rule: only a committed policy or a protected
 /// timestamp may advance a retention horizon.
 pub fn check_retention_basis(basis: RetentionBasis) -> Result<(), ModelError> {
     match basis {
@@ -3115,7 +3176,7 @@ pub fn check_retention_basis(basis: RetentionBasis) -> Result<(), ModelError> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 8. Search capability (§14.20)
+// 8. Search capability
 // ══════════════════════════════════════════════════════════════════════
 
 /// Maximum indexed term length, bytes. A format bound; a longer token
@@ -3142,7 +3203,8 @@ pub const SEARCH_TERM_STATS_KEY_MAX_LEN: usize = 4 + 4 + var_component_max_len(M
 /// is the shape the query operator depends on.
 ///
 /// Note the *generation* is not in the key: postings for two generations
-/// live in two index ids, because §14.20 requires a rebuild rather than
+/// live in two index ids, because an analyzer change requires a
+/// rebuild rather than
 /// mixed postings, and a rebuild that shared a keyspace with the index
 /// it replaces could not be abandoned cleanly.
 pub fn encode_search_posting_key(
@@ -3214,7 +3276,7 @@ pub fn decode_search_term_stats_key(src: &[u8], term_out: &mut [u8]) -> Option<(
 }
 
 /// One search index generation: which analyzer built it, and which
-/// index id its postings live under (§14.20's versioning).
+/// index id its postings live under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchGeneration {
     pub index_id: u32,
@@ -3223,13 +3285,13 @@ pub struct SearchGeneration {
     pub analyzer_version: u32,
 }
 
-/// What an analyzer change implies (§14.20).
+/// What an analyzer change implies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchTransition {
     /// Same analyzer, same version: no rebuild.
     NoChange,
-    /// §14.20: “Changing an analyzer starts a resumable rebuild rather
-    /// than mixing incompatible postings.” The new generation is built
+    /// Changing an analyzer starts a resumable rebuild rather than
+    /// mixing incompatible postings. The new generation is built
     /// alongside, and the swap is a catalog change, not a merge.
     ResumableRebuild {
         from_generation: u32,
@@ -3264,7 +3326,7 @@ pub fn analyzer_change_plan(
     })
 }
 
-/// §14.20's anti-mixing rule: a writer may only add postings to a
+/// The anti-mixing rule: a writer may only add postings to a
 /// generation built by the same analyzer version it is running. A
 /// mismatch means the writer is on the wrong side of a rebuild, and its
 /// postings would be incomparable with the ones already there.
@@ -3284,9 +3346,9 @@ pub fn check_posting_write(
     Ok(())
 }
 
-/// §14.20: “Query results identify index generation and resolved source
+/// Query results identify index generation and resolved source
 /// timestamp. Ranking is deterministic for a declared
-/// algorithm/version and supplies a stable tie-breaker.”
+/// algorithm/version and supplies a stable tie-breaker.
 ///
 /// Every field is mandatory, which is the point: a search result
 /// without a generation is a result nobody can reproduce, and a ranking
@@ -3316,7 +3378,7 @@ pub struct SearchResultLabel {
     pub tie_breaker: SearchTieBreaker,
 }
 
-/// The declared stable tie-breaker (§14.20). “Whatever order the scan
+/// The declared stable tie-breaker. “Whatever order the scan
 /// returned” is not one of the options: an unstable tie-break makes
 /// pagination lose and duplicate documents.
 #[repr(u8)]
@@ -3381,7 +3443,7 @@ impl SearchResultLabel {
         })
     }
 
-    /// §14.20's honesty check, the search analogue of
+    /// The search honesty check, the analogue of
     /// [`label_is_honest`]: the label must name the generation and
     /// analyzer that actually answered, and may not claim a source
     /// frontier ahead of the one the index reached.
@@ -3395,7 +3457,7 @@ impl SearchResultLabel {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 9. Vector capability (§14.21, §21 invariant 20)
+// 9. Vector capability
 // ══════════════════════════════════════════════════════════════════════
 
 /// `vector/embedding/<index-id>/<entity-id>` worst case.
@@ -3406,7 +3468,7 @@ pub const VECTOR_MANIFEST_KEY_LEN: usize = 4 + 4;
 /// `vector/embedding/<index-id>/<entity-id>` user key:
 /// `[index_id:u32 BE][esc(entity_id)][0x00 0x01]`.
 ///
-/// §14.21: the canonical embedding and its source association are
+/// The canonical embedding and its source association are
 /// **authoritative Lattice records**. So this key is an ordinary
 /// authoritative keyspace, and the approximate structure built over it
 /// is not addressable here at all — “their private graph/list/
@@ -3509,7 +3571,7 @@ pub fn decode_vector_manifest_key(src: &[u8]) -> Option<(u32, u32)> {
     Some((index_id, generation))
 }
 
-/// Distance metric (§14.21). Part of the label because a cosine result
+/// Distance metric. Part of the label because a cosine result
 /// and an L2 result over the same vectors are different answers, and a
 /// caller that assumed the wrong one gets silently wrong neighbours.
 #[repr(u8)]
@@ -3531,7 +3593,7 @@ impl DistanceMetric {
     }
 }
 
-/// Exact versus approximate execution (§14.21).
+/// Exact versus approximate execution.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorExecution {
@@ -3552,7 +3614,7 @@ impl VectorExecution {
     }
 }
 
-/// How candidates were rescored (§14.21).
+/// How candidates were rescored.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RerankingMode {
@@ -3576,7 +3638,7 @@ impl RerankingMode {
     }
 }
 
-/// §14.21's degradation state.
+/// The vector degradation state.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DegradationState {
@@ -3586,8 +3648,8 @@ pub enum DegradationState {
     /// candidates were scored than the plan asked for.
     PartialCandidates = 2,
     /// The approximate provider was unavailable and the exact bounded
-    /// fallback ran instead (§14.21's “exact bounded fallback may be
-    /// offered when its resource and latency limits permit it”).
+    /// fallback ran instead (an exact bounded fallback may be offered
+    /// when its resource and latency limits permit it).
     ExactFallback = 3,
     /// The index is behind its source and the answer reflects an older
     /// frontier.
@@ -3610,12 +3672,12 @@ impl DegradationState {
     }
 }
 
-/// §14.21: “Every vector response declares metric, index generation,
-/// source resolved timestamp, exact versus approximate execution,
-/// reranking mode, and degradation state.”
+/// Every vector response declares metric, index generation, source
+/// resolved timestamp, exact versus approximate execution, reranking
+/// mode, and degradation state.
 ///
 /// Six mandatory fields, exactly as listed. This record is the response
-/// contract; [`label_is_honest`] is §21 invariant 20.
+/// contract; [`label_is_honest`] is the honesty check.
 ///
 /// Wire layout ([`VECTOR_RESPONSE_LABEL_VERSION`] 1, integers LE):
 ///
@@ -3694,11 +3756,9 @@ pub struct VectorExecutionFacts {
     pub degradation: DegradationState,
 }
 
-/// §21 invariant 20 as a predicate, and §14.21's two named prohibitions
-/// made mechanical:
-///
-/// > An approximate result cannot be labelled exact, and a lagging
-/// > index cannot claim current visibility.
+/// Label honesty as a predicate, two named prohibitions made
+/// mechanical: an approximate result cannot be labelled exact, and a
+/// lagging index cannot claim current visibility.
 ///
 /// Six clauses, each naming one way a label can overstate. The
 /// asymmetry in the freshness clause is deliberate: a label may claim

@@ -1,24 +1,18 @@
-//! Range-lifecycle contracts — RFC database foundation §12.
+//! Range-lifecycle contracts.
 //!
-//! Phase 4 slice 1: the versioned lifecycle-operation record and the
-//! three executable state machines (split, merge, relocation). This
-//! file is contracts only — no ports, no I/O, no module. The range
-//! supervisor is a later slice; it will be a thin pump over the
-//! functions defined here, in the same relationship the transaction
-//! coordinator has to `txn.rs` and the timestamp allocator has to
-//! `mvcc.rs`.
+//! The versioned lifecycle-operation record and the three executable
+//! state machines (split, merge, relocation). This file is contracts
+//! only — no ports, no I/O, no module. The range supervisor is a thin
+//! pump over the functions defined here, in the same relationship the
+//! transaction coordinator has to `txn.rs` and the timestamp allocator
+//! has to `mvcc.rs`.
 //!
-//! §12's opening two sentences are the whole reason this file exists:
-//!
-//! > Every lifecycle operation is an explicit state machine with
-//! > generation fencing. **Routing metadata is published only after the
-//! > new ownership state is durable.**
-//!
-//! and, from §12.1:
-//!
-//! > **No phase may expose overlapping writable ownership.** A failed
-//! > split is resumable by operation ID or is rolled back before
-//! > metadata publication.
+//! Two rules are the whole reason this file exists. Every lifecycle
+//! operation is an explicit state machine with generation fencing, and
+//! **routing metadata is published only after the new ownership state
+//! is durable**. And for splits: **no phase may expose overlapping
+//! writable ownership** — a failed split is resumable by operation ID
+//! or is rolled back before metadata publication.
 //!
 //! Those become [`writable_ranges_at`] / [`apply_to_map`] and
 //! [`rollback_target`] / [`is_resumable`] respectively.
@@ -30,10 +24,11 @@
 //! [`MergePhase::DescriptorsReplaced`],
 //! [`RelocatePhase::DescriptorPublished`]). Before it, the routing map
 //! is **byte-for-byte the pre-operation map** — a partially applied map
-//! is never published, so §21 invariants 4 and 5 hold trivially at
-//! every intermediate phase and an abandoned operation needs no map
-//! repair. After it, the operation is **forward-only**: descriptors
-//! have been observed, caches hold them, and unwinding would resurrect
+//! is never published, so the no-overlap and no-gap map invariants
+//! hold trivially at every intermediate phase and an abandoned
+//! operation needs no map repair. After it, the operation is
+//! **forward-only**: descriptors have been observed, caches hold
+//! them, and unwinding would resurrect
 //! ownership a client already stopped believing in.
 //! [`rollback_target`] returns `None` exactly on the published side of
 //! that line.
@@ -49,26 +44,26 @@
 //! of writable ownership happens at the *consensus* step, one or more
 //! phases before publication:
 //!
-//! - split: at [`SplitPhase::Finalized`] — §12.1 step 7's `SplitFinalize`
-//!   is what gives "each child one authoritative bound and generation";
+//! - split: at [`SplitPhase::Finalized`] — split step 7's
+//!   `SplitFinalize` is what gives each child one authoritative bound
+//!   and generation;
 //! - merge: at [`MergePhase::Quiesced`] the source stops accepting
 //!   writes, and at [`MergePhase::TargetOwns`] the target owns the
-//!   combined interval (§12.2 steps 2 and 5);
-//! - relocation: never — §12.3 changes replicas, not key bounds, so the
+//!   combined interval (merge steps 2 and 5);
+//! - relocation: never — it changes replicas, not key bounds, so the
 //!   writable set is the same single range at every phase.
 //!
 //! [`writable_ranges_at`] reports that separately from [`apply_to_map`],
 //! and the split machine's answer is *always exactly one* of
 //! {parent} or {children} — [`WritableOwner::SourceAndTargets`] is
 //! unreachable for [`LifecycleKind::Split`] at every phase. That is the
-//! executable form of "no phase may expose overlapping writable
-//! ownership".
+//! executable form of the no-overlapping-writable-ownership rule.
 //!
 //! ## Conflating the three operations is the named hazard
 //!
-//! §12.3 closes with "split, merge, and relocation must not be
-//! conflated. Each has different rollback, availability, and stale-
-//! message hazards." So the record's shape is per-kind and validated
+//! Split, merge, and relocation must not be conflated: each has
+//! different rollback, availability, and stale-message hazards. So the
+//! record's shape is per-kind and validated
 //! closed: a split carries a split key and two fresh child identities,
 //! a merge carries one surviving target, and a relocation carries the
 //! *same* range id with a new physical binding. Any other combination
@@ -106,8 +101,8 @@ pub const LIFECYCLE_OP_VERSION: u16 = 1;
 
 /// Maximum source or target ranges named by one lifecycle operation.
 ///
-/// Two: a split names two children, and no operation defined by §12
-/// names more. This is a *format* bound — widening it (an N-way merge,
+/// Two: a split names two children, and no lifecycle operation names
+/// more. This is a *format* bound — widening it (an N-way merge,
 /// say) is a version bump, not a policy change.
 pub const MAX_LIFECYCLE_RANGES: usize = 2;
 
@@ -132,18 +127,18 @@ pub const LIFECYCLE_OP_MAX_WIRE_LEN: usize = LIFECYCLE_OP_FIXED_WIRE_LEN
 
 // ── Kinds ─────────────────────────────────────────────────────────────
 
-/// Which §12 operation this record describes.
+/// Which lifecycle operation this record describes.
 ///
 /// Discriminants start at 1 so a zeroed buffer never decodes as a valid
 /// kind — a zeroed record is not "a split", it is garbage.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LifecycleKind {
-    /// §12.1 — one parent becomes two children at a split key.
+    /// One parent becomes two children at a split key.
     Split = 1,
-    /// §12.2 — two adjacent ranges become one surviving target.
+    /// Two adjacent ranges become one surviving target.
     Merge = 2,
-    /// §12.3 — one range changes replicas, never key bounds.
+    /// One range changes replicas, never key bounds.
     Relocate = 3,
 }
 
@@ -160,9 +155,9 @@ impl LifecycleKind {
     }
 }
 
-// ── Split phases and events (§12.1) ───────────────────────────────────
+// ── Split phases and events ───────────────────────────────────────────
 
-/// Split phase lattice, mirroring §12.1's numbered steps.
+/// Split phase lattice, one phase per numbered step below.
 ///
 /// Step 1 (validate policy, key choice, capacity, placement; allocate
 /// fresh identities) is what *constructs* the record, so
@@ -204,10 +199,10 @@ impl SplitPhase {
         Self::DescriptorsPublished,
         Self::TombstoneRetained,
     ];
-    /// The initial phase: a record exists only after §12.1 step 1.
+    /// The initial phase: a record exists only after split step 1.
     pub const INITIAL: Self = Self::Validated;
     /// The phase at which replacement descriptors enter the routing
-    /// map (§12.1 step 8). At and after this phase the operation is
+    /// map (split step 8). At and after this phase the operation is
     /// forward-only.
     pub const PUBLICATION: Self = Self::DescriptorsPublished;
 
@@ -252,8 +247,8 @@ impl SplitPhase {
     }
 
     /// The event that produced this phase, or `None` for the initial
-    /// phase. Redelivering it is an idempotent no-op (§21 invariant 17:
-    /// remote mutations stay idempotently identifiable).
+    /// phase. Redelivering it is an idempotent no-op: remote
+    /// mutations stay idempotently identifiable.
     pub const fn producing_event(self) -> Option<SplitEvent> {
         match self {
             Self::Validated => None,
@@ -275,22 +270,22 @@ impl SplitPhase {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SplitEvent {
-    /// §12.1 step 2: `SplitPrepare` committed in the parent.
+    /// Split step 2: `SplitPrepare` committed in the parent.
     PrepareCommitted = 1,
-    /// §12.1 step 3: exact parent apply index and engine snapshot
+    /// Split step 3: exact parent apply index and engine snapshot
     /// boundary established.
     BoundaryEstablished = 2,
-    /// §12.1 steps 4-5: child snapshots built, installed, validated,
+    /// Split steps 4-5: child snapshots built, installed, validated,
     /// and the bounded mutation tail caught up.
     ChildSnapshotsInstalled = 3,
-    /// §12.1 step 6: cutover barrier committed; no new ambiguous
+    /// Split step 6: cutover barrier committed; no new ambiguous
     /// writes.
     CutoverBarrierCommitted = 4,
-    /// §12.1 step 7: `SplitFinalize` committed.
+    /// Split step 7: `SplitFinalize` committed.
     FinalizeCommitted = 5,
-    /// §12.1 step 8: replacement descriptors published atomically.
+    /// Split step 8: replacement descriptors published atomically.
     DescriptorsPublished = 6,
-    /// §12.1 step 10: descriptor-cache, snapshot, transaction, and
+    /// Split step 10: descriptor-cache, snapshot, transaction, and
     /// replay safety floors all satisfied.
     TombstoneFloorsSatisfied = 7,
 }
@@ -307,12 +302,12 @@ impl SplitEvent {
     ];
 }
 
-// ── Merge phases and events (§12.2) ───────────────────────────────────
+// ── Merge phases and events ───────────────────────────────────────────
 
-/// Merge phase lattice, mirroring §12.2's numbered steps.
+/// Merge phase lattice, one phase per numbered step below.
 ///
 /// ```text
-/// Validated            compatibility + adjacency checked (§12.2 preamble)
+/// Validated            compatibility + adjacency checked
 /// Committed            1. shared merge operation committed; target chosen
 /// Quiesced             2. source writes quiesced/generation-fenced at a committed boundary
 /// Transferred          3-4. snapshot + tail transferred; intents/watches/leases/timestamps preserved
@@ -343,7 +338,7 @@ impl MergePhase {
         Self::SourceTombstoned,
     ];
     pub const INITIAL: Self = Self::Validated;
-    /// §12.2 step 6. At and after this phase the operation is
+    /// Merge step 6. At and after this phase the operation is
     /// forward-only.
     pub const PUBLICATION: Self = Self::DescriptorsReplaced;
 
@@ -397,21 +392,21 @@ impl MergePhase {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MergeEvent {
-    /// §12.2 step 1: shared merge operation committed.
+    /// Merge step 1: shared merge operation committed.
     MergeCommitted = 1,
-    /// §12.2 step 2: new writes quiesced or generation-fenced at a
+    /// Merge step 2: new writes quiesced or generation-fenced at a
     /// committed boundary.
     WritesQuiesced = 2,
-    /// §12.2 steps 3-4: source snapshot and mutation tail transferred;
+    /// Merge steps 3-4: source snapshot and mutation tail transferred;
     /// intents, watches, leases, retention claims, and timestamps
     /// resolved or preserved without changing their meaning.
     StateTransferred = 3,
-    /// §12.2 step 5: target ownership of the combined interval
+    /// Merge step 5: target ownership of the combined interval
     /// committed.
     TargetOwnershipCommitted = 4,
-    /// §12.2 step 6: both descriptors atomically replaced.
+    /// Merge step 6: both descriptors atomically replaced.
     DescriptorsReplaced = 5,
-    /// §12.2 step 7: source group tombstoned.
+    /// Merge step 7: source group tombstoned.
     SourceTombstoned = 6,
 }
 
@@ -426,9 +421,9 @@ impl MergeEvent {
     ];
 }
 
-// ── Relocation phases and events (§12.3) ──────────────────────────────
+// ── Relocation phases and events ──────────────────────────────────────
 
-/// Relocation phase lattice, mirroring §12.3's numbered steps.
+/// Relocation phase lattice, one phase per numbered step below.
 ///
 /// ```text
 /// LearnerAdded         1. destination added as a learner
@@ -466,7 +461,7 @@ impl RelocatePhase {
         Self::OldStateRemovable,
     ];
     pub const INITIAL: Self = Self::LearnerAdded;
-    /// §12.3 step 5's publish half. At and after this phase the
+    /// Relocation step 5's publish half. At and after this phase the
     /// operation is forward-only.
     pub const PUBLICATION: Self = Self::DescriptorPublished;
 
@@ -521,18 +516,19 @@ impl RelocatePhase {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RelocateEvent {
-    /// §12.3 step 2: verified snapshot installed and WAL tail caught up.
+    /// Relocation step 2: verified snapshot installed and WAL tail
+    /// caught up.
     SnapshotInstalled = 1,
-    /// §12.3 step 3: Clustor joint consensus entered.
+    /// Relocation step 3: Clustor joint consensus entered.
     JointConsensusEntered = 2,
-    /// §12.3 step 4: learner promoted and old replica removed.
+    /// Relocation step 4: learner promoted and old replica removed.
     LearnerPromoted = 3,
-    /// §12.3 step 5a: placement epoch advanced.
+    /// Relocation step 5a: placement epoch advanced.
     PlacementEpochAdvanced = 4,
-    /// §12.3 step 5b: new descriptor published.
+    /// Relocation step 5b: new descriptor published.
     DescriptorPublished = 5,
-    /// §12.3 step 6: membership and retention floors permit deleting
-    /// the old state.
+    /// Relocation step 6: membership and retention floors permit
+    /// deleting the old state.
     RetentionFloorsPermit = 6,
 }
 
@@ -554,7 +550,7 @@ impl RelocateEvent {
 /// The record stores `kind` and `phase` as two bytes, but in memory the
 /// kind is *derived* from the phase: there is no representable
 /// `LifecycleOperation` whose kind byte and phase byte disagree, so the
-/// conflated-operation hazard §12.3 warns about cannot be constructed,
+/// conflated-operation hazard cannot be constructed,
 /// only decoded — and [`LifecycleOperation::decode`] rejects it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -654,7 +650,7 @@ impl LifecycleEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleError {
     /// The event belongs to a different machine than the operation
-    /// (§12.3: "split, merge, and relocation must not be conflated").
+    /// (split, merge, and relocation must not be conflated).
     KindMismatch {
         expected: LifecycleKind,
         actual: LifecycleKind,
@@ -669,17 +665,17 @@ pub enum LifecycleError {
         from: RelocatePhase,
         event: RelocateEvent,
     },
-    /// Rollback requested at or after the publication point. §12.1
-    /// permits rollback only "before metadata publication"; once
+    /// Rollback requested at or after the publication point. Rollback
+    /// is permitted only before metadata publication; once
     /// replacement descriptors are observable the only path is forward.
     RollbackAfterPublication { kind: LifecycleKind, phase: u8 },
-    /// §21 invariant 6 / §11.3: the operation was validated against a
-    /// descriptor generation that is no longer current.
+    /// The operation was validated against a descriptor generation
+    /// that is no longer current.
     StaleGeneration { current: u32, presented: u32 },
-    /// §21 invariant 6: the operation was validated at a placement
-    /// epoch that is no longer current.
+    /// The operation was validated at a placement epoch that is no
+    /// longer current.
     StaleEpoch { current: u32, presented: u32 },
-    /// §11.3: the operation names a partition incarnation that is no
+    /// The operation names a partition incarnation that is no
     /// longer current — a delayed message or file from a previously
     /// reused physical ID.
     StaleIncarnation { current: u32, presented: u32 },
@@ -688,11 +684,11 @@ pub enum LifecycleError {
     /// The operation's target range is not in the supplied map (merge:
     /// the surviving target must already exist).
     TargetNotInMap,
-    /// The supplied map already violates §21 invariants 4/5. Nothing is
-    /// published off a broken map.
+    /// The supplied map already violates the no-overlap/no-gap map
+    /// invariants. Nothing is published off a broken map.
     InputMapInvalid { violation: MapViolation },
-    /// The map that *would* be published violates §21 invariants 4/5.
-    /// It is refused, not published.
+    /// The map that *would* be published violates the no-overlap/
+    /// no-gap map invariants. It is refused, not published.
     OutputMapInvalid { violation: MapViolation },
     /// The post-transition map needs more descriptors than
     /// [`MAX_RANGES`].
@@ -707,19 +703,19 @@ pub enum LifecycleError {
     SplitKeyOutOfBounds,
     /// Merge sources are not adjacent: neither `source.end == target.
     /// start` nor `target.end == source.start`. Merging them would
-    /// swallow the keys in between (§21 invariant 4).
+    /// swallow the keys in between, giving them a second owner.
     NotAdjacent,
     /// Merge participants disagree on database, partition map, routing
-    /// kind, or cluster domain (§12.2 preamble).
+    /// kind, or cluster domain.
     IncompatibleKeyspace,
-    /// Merge participants disagree on replica placement (§12.2
-    /// preamble: "placement policy … compatible").
+    /// Merge participants disagree on replica placement — their
+    /// placement policies must be compatible.
     IncompatiblePlacement,
     /// A participant descriptor is not `Active`. A lifecycle operation
     /// starts from live ranges, never from a pending or tombstoned one.
     NotActive { lifecycle: Lifecycle },
-    /// Relocation changed key bounds (§12.3: "relocation changes
-    /// replicas, not key bounds").
+    /// Relocation changed key bounds (relocation changes replicas,
+    /// not key bounds).
     BoundsChanged,
     /// Relocation left the replica set and binding untouched — there is
     /// nothing to relocate, and publishing a new generation for a
@@ -756,8 +752,8 @@ impl LifecycleError {
 // ── Target placement ──────────────────────────────────────────────────
 
 /// One target range of a lifecycle operation: its logical identity plus
-/// the physical binding it will hold (§11.3, §12.1 step 1 "allocate
-/// fresh range identities and incarnations").
+/// the physical binding it will hold (split step 1 allocates fresh
+/// range identities and incarnations).
 ///
 /// Wire layout ([`TARGET_WIRE_LEN`] = 22, integers LE):
 ///
@@ -787,9 +783,9 @@ impl TargetPlacement {
 
 // ── Lifecycle operation record ────────────────────────────────────────
 
-/// The durable record of one in-flight §12 operation.
+/// The durable record of one in-flight lifecycle operation.
 ///
-/// This is the thing §12.1 means by "resumable by operation ID": after
+/// This is what makes an operation resumable by operation ID: after
 /// a crash the supervisor reloads this record, reads its phase, and
 /// continues — or, if the phase is pre-publication, rolls back. It is
 /// replicated, so it is versioned and fail-closed.
@@ -811,28 +807,28 @@ impl TargetPlacement {
 ///
 /// Field notes:
 ///
-/// - `apply_index_boundary` is §12.1 step 3's "exact parent apply
-///   index": the apply prefix the child snapshots describe, and the
+/// - `apply_index_boundary` is split step 3's exact parent apply
+///   index: the apply prefix the child snapshots describe, and the
 ///   point after which the bounded mutation tail begins. It is zero
 ///   until [`SplitEvent::BoundaryEstablished`] fixes it. Merge reuses
-///   it for the source's transfer boundary (§12.2 step 3); relocation
-///   for the snapshot's apply index (§12.3 step 2).
+///   it for the source's transfer boundary (merge step 3); relocation
+///   for the snapshot's apply index (relocation step 2).
 /// - `source_generation`, `placement_epoch`, and `partition_incarnation`
 ///   are the *fences*: the values the operation was validated against.
 ///   [`stale_op_rejected`] compares them to the live values, so a
 ///   delayed operation from a superseded topology can never mutate
-///   current state (§21 invariant 6, §11.3).
+///   current state.
 /// - `next_generation` is the generation the published descriptors will
 ///   carry. It must be strictly greater than `source_generation`, so a
 ///   cached pre-operation descriptor can never match a post-operation
 ///   one.
 /// - `started_unix_ms` is wall time for operator observability and
-///   cooldown policy (§12.4) only. It is never an input to a decision:
-///   §21 invariant 3 forbids local time from affecting logical outcome.
+///   cooldown policy only. It is never an input to a decision: local
+///   time must never affect a logical outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LifecycleOperation {
-    /// Globally unique operation identity — the handle §12.1 means by
-    /// "resumable by operation ID". All-zero is rejected.
+    /// Globally unique operation identity — the handle that makes the
+    /// operation resumable after a crash. All-zero is rejected.
     pub operation_id: [u8; 16],
     phase: Phase,
     source_count: u8,
@@ -871,7 +867,7 @@ impl LifecycleOperation {
     /// that is not a legal record of its kind — see [`shape_ok`].
     #[allow(
         clippy::too_many_arguments,
-        reason = "contract constructor mirrors the §12 record shape one-to-one"
+        reason = "contract constructor mirrors the lifecycle record shape one-to-one"
     )]
     pub fn new(
         operation_id: [u8; 16],
@@ -913,8 +909,8 @@ impl LifecycleOperation {
         Some(op)
     }
 
-    /// Which §12 operation this is. Derived from the phase, so it can
-    /// never disagree with it.
+    /// Which lifecycle operation this is. Derived from the phase, so
+    /// it can never disagree with it.
     pub const fn kind(&self) -> LifecycleKind {
         self.phase.kind()
     }
@@ -945,7 +941,7 @@ impl LifecycleOperation {
     }
 
     /// The single source (parent / merge source / relocating range).
-    /// Every §12 operation has exactly one today; the array shape is a
+    /// Every lifecycle operation has exactly one; the array shape is a
     /// format allowance for a future N-way merge.
     pub fn source_range_id(&self) -> &[u8; 16] {
         &self.sources[0]
@@ -956,8 +952,8 @@ impl LifecycleOperation {
         &self.split_key[..self.split_key_len as usize]
     }
 
-    /// Per-kind shape validation — the executable form of §12.3's "must
-    /// not be conflated".
+    /// Per-kind shape validation — the executable form of the
+    /// must-not-be-conflated rule.
     ///
     /// Common to all kinds: a non-zero operation id, exactly one
     /// source, and a strictly advancing generation.
@@ -1151,7 +1147,7 @@ impl LifecycleOperation {
 
 // ── State machines ────────────────────────────────────────────────────
 
-/// Advance the split machine (§12.1).
+/// Advance the split machine.
 ///
 /// Exactly two events are legal in any phase:
 ///
@@ -1159,8 +1155,8 @@ impl LifecycleOperation {
 /// - the phase's [`SplitPhase::producing_event`], which is an
 ///   *idempotent redelivery* of the fact that already put it here and
 ///   returns the phase unchanged. Committed events are replayed by
-///   Raft apply and by resume-after-crash, so a machine that faulted on
-///   redelivery would be unable to recover (§21 invariant 17).
+///   Raft apply and by resume-after-crash, so a machine that faulted
+///   on redelivery would be unable to recover.
 ///
 /// Everything else — every backwards event, every skipped step, and
 /// every event delivered to the terminal phase — is
@@ -1202,7 +1198,7 @@ const fn next_split(p: SplitPhase) -> SplitPhase {
     }
 }
 
-/// Advance the merge machine (§12.2). Same legality rule as
+/// Advance the merge machine. Same legality rule as
 /// [`advance_split`].
 pub fn advance_merge(
     op: &LifecycleOperation,
@@ -1238,7 +1234,7 @@ const fn next_merge(p: MergePhase) -> MergePhase {
     }
 }
 
-/// Advance the relocation machine (§12.3). Same legality rule as
+/// Advance the relocation machine. Same legality rule as
 /// [`advance_split`].
 pub fn advance_relocate(
     op: &LifecycleOperation,
@@ -1276,7 +1272,7 @@ const fn next_relocate(p: RelocatePhase) -> RelocatePhase {
 
 /// Kind-dispatching form of the three machines. An event from a
 /// different machine than the operation is
-/// [`LifecycleError::KindMismatch`] — §12.3's "must not be conflated"
+/// [`LifecycleError::KindMismatch`] — the must-not-be-conflated rule
 /// enforced at the dispatch point rather than left to the caller.
 pub fn advance(op: &LifecycleOperation, event: LifecycleEvent) -> Result<Phase, LifecycleError> {
     if event.kind() != op.kind() {
@@ -1292,13 +1288,13 @@ pub fn advance(op: &LifecycleOperation, event: LifecycleEvent) -> Result<Phase, 
     }
 }
 
-// ── Resume and rollback (§12.1: "resumable … or rolled back") ─────────
+// ── Resume and rollback ───────────────────────────────────────────────
 
 /// Can an operation sitting at `phase` be picked up and driven forward
 /// after a crash or leader change?
 ///
-/// Every phase except the terminal one: §12.1's "resumable by operation
-/// ID" applies on both sides of the publication point, because after
+/// Every phase except the terminal one: resumability by operation ID
+/// applies on both sides of the publication point, because after
 /// publication forward is the *only* direction and resumption is how it
 /// gets there. A terminal phase has nothing left to do.
 pub const fn is_resumable(phase: Phase) -> bool {
@@ -1308,8 +1304,8 @@ pub const fn is_resumable(phase: Phase) -> bool {
 /// The phase an operation rolls back to, or `None` if rollback is
 /// illegal.
 ///
-/// §12.1: "A failed split is resumable by operation ID **or is rolled
-/// back before metadata publication**." That clause draws a hard line:
+/// A failed split is resumable by operation ID **or is rolled back
+/// before metadata publication**. That rule draws a hard line:
 ///
 /// - **Before publication** the routing map still names only the
 ///   pre-operation ranges ([`apply_to_map`] returns it unchanged), so
@@ -1322,7 +1318,7 @@ pub const fn is_resumable(phase: Phase) -> bool {
 ///   the new generations, and the source group may already be
 ///   tombstoned. Unwinding would resurrect ownership the cluster has
 ///   stopped believing in — a second authority for keys that already
-///   moved, violating §21 invariant 4. So this returns `None`, and the
+///   moved — a second writable owner. So this returns `None`, and the
 ///   only path is forward.
 pub const fn rollback_target(phase: Phase) -> Option<Phase> {
     if phase.is_published() {
@@ -1340,7 +1336,7 @@ pub fn rollback(phase: Phase) -> Result<Phase, LifecycleError> {
     })
 }
 
-// ── Writable ownership (§12.1: "no overlapping writable ownership") ───
+// ── Writable ownership ────────────────────────────────────────────────
 
 /// Who holds writable authority at a given phase.
 #[repr(u8)]
@@ -1353,8 +1349,8 @@ pub enum WritableOwner {
     /// Source and targets both — legal ONLY for a merge before its
     /// quiesce boundary, where the two ranges are *adjacent and
     /// disjoint* and each still serves its own interval. Unreachable
-    /// for a split, which is the whole content of §12.1's "no phase may
-    /// expose overlapping writable ownership".
+    /// for a split, which is the whole content of the rule that no
+    /// phase may expose overlapping writable ownership.
     SourceAndTargets = 3,
 }
 
@@ -1396,10 +1392,10 @@ impl WritableSet {
 
 /// Which ranges may accept writes while `op` sits at `phase`.
 ///
-/// This is the executable form of §12.1's "**No phase may expose
-/// overlapping writable ownership**", and it is deliberately separate
-/// from [`apply_to_map`]: routing metadata lags the truth (§12
-/// preamble), so the phase at which ownership *moves* is earlier than
+/// This is the executable form of the rule that **no phase may expose
+/// overlapping writable ownership**, and it is deliberately separate
+/// from [`apply_to_map`]: routing metadata lags the truth by design,
+/// so the phase at which ownership *moves* is earlier than
 /// the phase at which descriptors are *published*, and both facts have
 /// to be stateable independently.
 ///
@@ -1410,14 +1406,14 @@ impl WritableSet {
 /// Validated … CutoverBarrier   {parent}    children are learners installing snapshots;
 ///                                          at CutoverBarrier new ambiguous writes are
 ///                                          barred but in-flight transactions still
-///                                          finish under the parent generation (§12.1 step 6)
+///                                          finish under the parent generation (split step 6)
 /// Finalized … TombstoneRetained {children} SplitFinalize gave each child one
-///                                          authoritative bound (§12.1 step 7)
+///                                          authoritative bound (split step 7)
 /// ```
 ///
 /// The flip is at `Finalized`, not at publication: publication is when
 /// *routing* learns about it, and a router that is behind gets a stale-
-/// route redirect from the parent generation (§12.1 step 9), never a
+/// route redirect from the parent generation (split step 9), never a
 /// second writable owner.
 ///
 /// **Merge** — before the quiesce boundary source and target are two
@@ -1425,7 +1421,7 @@ impl WritableSet {
 /// ([`WritableOwner::SourceAndTargets`]); from `Quiesced` on the source
 /// accepts nothing and only the target is writable. The bounded
 /// unavailability of the source interval between `Quiesced` and
-/// `TargetOwns` is §12.2 step 2's explicit cost.
+/// `TargetOwns` is merge step 2's explicit cost.
 ///
 /// **Relocate** — always exactly {the range}. Relocation changes
 /// replicas, not bounds; there is no second owner at any phase.
@@ -1467,7 +1463,7 @@ pub fn writable_ranges_at(
 
 // ── Per-kind precondition checks ──────────────────────────────────────
 
-/// §12.1 step 1's key check: is `split_key` a legal interior split
+/// Split step 1's key check: is `split_key` a legal interior split
 /// point of `parent`?
 ///
 /// The parent must be `Active`, and the key must be strictly inside its
@@ -1494,9 +1490,9 @@ pub fn validate_split(parent: &RangeDescriptor, split_key: &[u8]) -> Result<(), 
     Ok(())
 }
 
-/// §12.2's compatibility preamble: "Adjacent ranges may merge only when
-/// their database, partition map, format, placement policy, and
-/// protected-state constraints are compatible."
+/// Merge compatibility preconditions: adjacent ranges may merge only
+/// when their database, partition map, format, placement policy, and
+/// protected-state constraints are compatible.
 ///
 /// The descriptor-observable subset of that is checked here and each
 /// clause refuses on its own:
@@ -1504,13 +1500,13 @@ pub fn validate_split(parent: &RangeDescriptor, split_key: &[u8]) -> Result<(), 
 /// 1. both `Active` — a lifecycle operation starts from live ranges;
 /// 2. same `database_id`, `partition_map_id`, `routing_kind`, and
 ///    Clustor `cluster_id` (a range cannot merge across cluster
-///    domains — §11.3's physical binding is cluster-local);
+///    domains — the physical binding is cluster-local);
 /// 3. same placement policy, approximated by an identical voter/learner
-///    node set and replica count (§11.5);
+///    node set and replica count;
 /// 4. **adjacency**: `source.end == target.start` or `target.end ==
 ///    source.start`, with the shared bound non-empty. Merging
 ///    non-adjacent ranges would swallow every key in between, giving
-///    them a second owner and breaking §21 invariant 4.
+///    them a second owner.
 ///
 /// Format version and protected-state constraints live in engine
 /// manifests and retention claims, not in the descriptor, so they
@@ -1546,7 +1542,7 @@ pub fn validate_merge(
     Ok(())
 }
 
-/// Placement-policy compatibility (§11.5): same replica count, and the
+/// Placement-policy compatibility: same replica count, and the
 /// same `(node_id, role, failure_domain)` multiset. Order is not
 /// significant — a descriptor may list the same replicas in a
 /// different order without that being a policy difference.
@@ -1582,17 +1578,17 @@ fn merge_order(source: &RangeDescriptor, target: &RangeDescriptor) -> Option<boo
     None
 }
 
-/// §12.3's one-line rule made a typed refusal: **relocation changes
-/// replicas, not key bounds.**
+/// The one-line relocation rule made a typed refusal: **relocation
+/// changes replicas, not key bounds.**
 ///
 /// `pre` and `post` are the descriptor before and after the operation.
 /// Refuses if:
 ///
 /// - the logical identity changed ([`LifecycleError::RangeIdentityChanged`])
-///   — a renamed range is a split or merge in disguise, and §12.3 says
-///   the three must not be conflated;
+///   — a renamed range is a split or merge in disguise, and the three
+///   operations must not be conflated;
 /// - either key bound changed ([`LifecycleError::BoundsChanged`]) — this
-///   is the hazard the RFC calls out, because a bounds change smuggled
+///   is the central hazard here, because a bounds change smuggled
 ///   through the relocation path skips every ownership barrier the
 ///   split and merge machines exist to provide;
 /// - nothing about the placement changed ([`LifecycleError::PlacementUnchanged`])
@@ -1622,12 +1618,12 @@ pub fn validate_relocation(
     Ok(())
 }
 
-// ── Fencing (§21 invariant 6, §11.3) ──────────────────────────────────
+// ── Fencing ───────────────────────────────────────────────────────────
 
-/// §21 invariant 6 — "a stale generation, placement epoch, or partition
-/// incarnation cannot mutate current state" — and §11.3's incarnation
-/// rule: "a `partition_incarnation` prevents delayed messages or files
-/// from a previously reused physical ID from becoming valid."
+/// A stale generation, placement epoch, or partition incarnation must
+/// never mutate current state, and a `partition_incarnation` prevents
+/// delayed messages or files from a previously reused physical ID from
+/// becoming valid.
 ///
 /// `Ok(())` means the operation's fences match the live topology and it
 /// may proceed. `Err` names which fence rejected it, with both values,
@@ -1673,18 +1669,19 @@ pub fn stale_op_rejected(
     Ok(())
 }
 
-// ── Map application (§21 invariants 4 and 5) ──────────────────────────
+// ── Map application ───────────────────────────────────────────────────
 
 /// The published routing map while `op` sits at `phase`.
 ///
-/// This is where §21 invariants 4 and 5 get enforced mechanically. Both
+/// This is where the no-overlap and no-gap map invariants get
+/// enforced mechanically. Both
 /// the input and the produced map are run through
 /// [`OrderedRangeMap::validate`], so a transition that *would* create a
 /// gap, an overlap, an ordering inversion, or an inactive descriptor is
 /// **refused rather than published**.
 ///
-/// The phase semantics follow §12's "routing metadata is published only
-/// after the new ownership state is durable":
+/// The phase semantics follow the publication rule — routing metadata
+/// is published only after the new ownership state is durable:
 ///
 /// - **before the publication point** the result is the input map
 ///   copied unchanged. A half-applied map never exists, so there is no
@@ -1816,10 +1813,10 @@ fn split_map(
 /// binding, the operation's `next_generation`, and the half-open
 /// sub-interval it owns.
 ///
-/// The children inherit the parent's replica set because §12.1 step 5
+/// The children inherit the parent's replica set because split step 5
 /// bootstraps them from the parent's snapshot; moving replicas at the
-/// same time would be a relocation, and §12.3 forbids conflating the
-/// two.
+/// same time would be a relocation, and conflating the two is
+/// forbidden.
 fn child_descriptor(
     parent: &RangeDescriptor,
     target: &TargetPlacement,
@@ -1922,8 +1919,8 @@ fn relocate_map(
 
 /// The post-relocation descriptor: identical bounds and identity, new
 /// physical binding from the operation's target placement, generation
-/// `next_generation`, and placement epoch advanced by one (§12.3 step
-/// 5, the `EpochAdvanced` phase). Advancing rather than carrying the
+/// `next_generation`, and placement epoch advanced by one (relocation
+/// step 5, the `EpochAdvanced` phase). Advancing rather than carrying the
 /// epoch is what makes a message fenced at the old epoch stale.
 fn relocated_descriptor(
     pre: &RangeDescriptor,

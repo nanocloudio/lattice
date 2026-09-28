@@ -17,12 +17,12 @@ capabilities = ["transport.anchor.stream.secure"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # Routed responses from kv_request_router (KV/Txn responses).
 [[ports]]
@@ -69,6 +69,13 @@ content_type = "OctetStream"
 
 [[ports]]
 name = "watch_sess1_in"
+direction = "input"
+content_type = "OctetStream"
+
+# `MSG_LEASE_REVOKE` from lease_manager: a lease ended (revoked or
+# expired); the anchor deletes its keys through the store.
+[[ports]]
+name = "lease_revoke_in"
 direction = "input"
 content_type = "OctetStream"
 

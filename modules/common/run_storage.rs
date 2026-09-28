@@ -1,6 +1,5 @@
 //! `RunStorage` — the storage-backend boundary beneath the ordered
-//! disk state-store provider (`disk_store.rs`, RFC database foundation
-//! §9.5).
+//! disk state-store provider (`disk_store.rs`).
 //!
 //! The provider performs ALL of its I/O through this trait so that the
 //! exact same provider logic compiles into two targets:
@@ -46,6 +45,9 @@ pub enum FileKind {
     Run,
     /// Versioned manifest file (`disk_store.rs` manifest format v1).
     Manifest,
+    /// A command-log segment (`command_log.rs`): the op log of a worker
+    /// nothing orders (id = segment sequence).
+    Log,
 }
 
 /// Typed backend error. Fail closed: callers treat every variant as

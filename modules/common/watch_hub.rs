@@ -294,13 +294,17 @@ impl WatchRecord {
 
     /// True iff this watch should receive an event for `event_key`.
     /// Single-key watches match exact bytes; range watches match
-    /// every key with `key <= k < range_end`.
+    /// every key with `key <= k < range_end`; a range_end of `\0` is
+    /// etcd's "every key from `key` on" (with key `\0`: every key).
     pub fn matches_key(&self, event_key: &[u8]) -> bool {
         let key = self.key();
         if self.range_end_len == 0 {
             return key == event_key;
         }
         let range_end = self.range_end();
+        if range_end == [0] {
+            return event_key >= key;
+        }
         // event_key in [key, range_end) — lexicographic.
         if event_key < key {
             return false;

@@ -64,9 +64,13 @@ mod telemetry;
 #[path = "../../common/watch_replay.rs"]
 mod watch_replay;
 
-use types::{KV_OP_SCAN_VERSIONS, KV_RESULT_COMPACTED, KV_RESULT_VERSIONS, PROTO_INTERNAL_WATCH};
+use types::{
+    KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS, KV_RESULT_COMPACTED, KV_RESULT_KVS, KV_RESULT_VERSIONS,
+    PROTO_INTERNAL_WATCH, VERSIONS_FLAG_META,
+};
 use watch_replay::{
-    build_frame, parse_replay_plan, walk_versions_page, ReplayPlan, PLAN_KEY_MAX, SCAN_BODY_MAX,
+    build_frame, parse_replay_plan, walk_versions_page_meta, ReplayPlan, ENTRY_FLAG_MANIFEST,
+    FRAME_OP_DELETE, FRAME_OP_PUT_MANIFEST, PLAN_KEY_MAX, SCAN_BODY_MAX,
 };
 use wire::{
     MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_WATCH_EVENT, MSG_WATCH_FRAME, MSG_WATCH_PROGRESS,
@@ -74,7 +78,10 @@ use wire::{
     WATCH_PROGRESS_DELIVERED,
 };
 
-const SCRATCH_BUF_SIZE: usize = 4096;
+/// One envelope in or out: the largest watch event behind its watch id
+/// (`wire::WATCH_EVENT_MAX` + 8), and the largest KV reply a backfill
+/// page reads (the router's 8320).
+const SCRATCH_BUF_SIZE: usize = 8832;
 
 /// Queued replay plans. One is in flight at a time; this bounds how
 /// many reconnects can be absorbed before plans start being dropped.
@@ -88,11 +95,18 @@ const MAX_PENDING_PLANS: usize = 16;
 /// module_step never spends its budget draining one client's history.
 const REPLAY_PAGE_LIMIT: u16 = 32;
 
-/// Staging buffer per replayed frame. Bounds the largest event this
-/// module can re-emit; an entry that does not fit fails the backfill
-/// rather than being skipped, because a skipped event is a hole the
-/// client cannot see.
-const FRAME_BUF: usize = 512;
+/// Bytes of the versions a window's events replaced that lie below the
+/// window (read back one point read each: the window holds the rest).
+const PREV_BYTES: usize = 65536;
+
+/// Bytes of one backfill window held for ordering. The provider walks a
+/// span key by key (and a key's versions newest-first); a watch delivers
+/// in revision order, so the whole window is gathered, sorted, then sent.
+/// A window past this (or past `WINDOW_FRAMES`) is refused as compacted —
+/// the client relists — never sent out of order or cut.
+const WINDOW_BYTES: usize = 65536;
+/// Frames one backfill window holds for ordering.
+const WINDOW_FRAMES: usize = 256;
 
 #[repr(C)]
 struct FanoutState {
@@ -128,6 +142,27 @@ struct FanoutState {
     /// one watcher's history under another watcher's id.
     corr_seq: u64,
 
+    /// The in-flight backfill's frames, gathered across its pages to be
+    /// sent in revision order: frame bytes packed in `win`, and per frame
+    /// (offset, length, revision).
+    win: [u8; WINDOW_BYTES],
+    win_len: usize,
+    win_idx: [(u32, u16, u64); WINDOW_FRAMES],
+    win_n: usize,
+    /// Per window frame (in revision order, once sorted): where the
+    /// version it replaced comes from — `PREV_NONE`, `PREV_WINDOW` (the
+    /// frame `prev_ref` names), `PREV_STORED` (at `prev_ref` in
+    /// `prev_buf`, `[vlen:2][value][create][mod][version][lease]`) or
+    /// `PREV_FETCH` (a point read still to make).
+    prev_kind: [u8; WINDOW_FRAMES],
+    prev_ref: [u32; WINDOW_FRAMES],
+    prev_buf: [u8; PREV_BYTES],
+    prev_len: usize,
+    /// Gathering pages (false), or reading back replaced versions (true)
+    /// from `fill_at` on.
+    filling: bool,
+    fill_at: usize,
+
     // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=events, 1=delivered, 2=dropped, 3=replayed,
@@ -158,6 +193,11 @@ impl FanoutState {
         self.current = ReplayPlan::empty();
         self.pending_len = 0;
         self.corr_seq = 0;
+        self.win_len = 0;
+        self.win_n = 0;
+        self.prev_len = 0;
+        self.filling = false;
+        self.fill_at = 0;
         self.m_events = 0;
         self.m_delivered = 0;
         self.m_dropped = 0;
@@ -335,16 +375,21 @@ fn issue_backfill_page(fanout: &mut FanoutState) {
     let corr = fanout.corr_seq;
     let plan = fanout.current;
 
-    let mut body = [0u8; SCAN_BODY_MAX];
-    let Some(n) = plan.scan_body(REPLAY_PAGE_LIMIT, &mut body) else {
+    let mut body = [0u8; SCAN_BODY_MAX + 1];
+    let Some(n) = plan.scan_body(REPLAY_PAGE_LIMIT, &mut body[..SCAN_BODY_MAX]) else {
         finish_backfill(fanout, false);
         return;
     };
+    // Each version with its own metadata, as a live event carries it; a
+    // large value's version as its manifest (marked), which the anchor
+    // resolves as it does a live one's.
+    body[n] = VERSIONS_FLAG_META | types::VERSIONS_FLAG_MANIFESTS;
+    let n = n + 1;
 
     // MSG_KV_REQUEST payload:
     //   [corr:8][protocol:1][tenant:4][conn:1][consistency:1][op:1]
     //   [body_len:2][body]
-    let mut env = [0u8; 18 + SCAN_BODY_MAX];
+    let mut env = [0u8; 18 + SCAN_BODY_MAX + 1];
     env[0..8].copy_from_slice(&corr.to_le_bytes());
     env[8] = PROTO_INTERNAL_WATCH;
     env[9..13].copy_from_slice(&0u32.to_le_bytes());
@@ -372,6 +417,11 @@ fn finish_backfill(fanout: &mut FanoutState, serviced: bool) {
     if !serviced {
         unserviceable(fanout);
     }
+    fanout.win_len = 0;
+    fanout.win_n = 0;
+    fanout.prev_len = 0;
+    fanout.filling = false;
+    fanout.fill_at = 0;
     fanout.active = false;
     if fanout.pending_len > 0 {
         fanout.current = fanout.pending[0];
@@ -404,6 +454,14 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
         return;
     }
     let result = payload[9];
+    // A replaced version read back below the window (a point read's
+    // answer, not a page).
+    if fanout.filling {
+        let blen = u16::from_le_bytes([payload[18], payload[19]]) as usize;
+        let body = payload.get(20..20 + blen).unwrap_or(&[]);
+        fill_answer(fanout, result, body);
+        return;
+    }
     if result == KV_RESULT_COMPACTED {
         // The window is genuinely gone. Delivering the surviving tail
         // would hand the client a partial history it could not tell
@@ -436,28 +494,34 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
     let body = &payload[20..20 + blen];
     let watch_id = fanout.current.watch_id;
 
-    // Frame first, deliver second. The walker borrows `body`, which
-    // lives inside the response buffer, so the frames are staged here
-    // and shipped after the walk rather than emitted inside it.
-    let mut staged = [[0u8; FRAME_BUF]; REPLAY_PAGE_LIMIT as usize];
-    let mut staged_len = [0usize; REPLAY_PAGE_LIMIT as usize];
-    let mut staged_n = 0usize;
+    // Each version framed straight into the window — the base frame and
+    // its `[create][version][lease]` — to be sorted, given the version it
+    // replaced, and sent once the window is whole. A window past its
+    // bounds is refused as compacted at the newest revision seen: the
+    // client relists, never receives it cut.
     let mut overflow = false;
-    let next_cursor = walk_versions_page(body, |entry| {
-        if staged_n >= staged.len() {
+    let mut newest = 0u64;
+    let next_cursor = walk_versions_page_meta(body, true, |entry, meta| {
+        newest = newest.max(entry.revision);
+        let at = fanout.win_len;
+        if overflow || fanout.win_n == WINDOW_FRAMES {
             overflow = true;
             return;
         }
-        match build_frame(watch_id, 0, &entry, &mut staged[staged_n]) {
-            Some(n) => {
-                staged_len[staged_n] = n;
-                staged_n += 1;
-            }
-            // An entry too large to frame cannot be delivered, and
-            // skipping it would leave a hole in the history the client
-            // could not detect. Fail the backfill instead.
-            None => overflow = true,
+        let Some(n) = build_frame(watch_id, 0, &entry, &mut fanout.win[at..]) else {
+            overflow = true;
+            return;
+        };
+        if at + n + 24 > WINDOW_BYTES {
+            overflow = true;
+            return;
         }
+        for (i, v) in meta.unwrap_or([0; 3]).iter().enumerate() {
+            fanout.win[at + n + i * 8..at + n + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        fanout.win_idx[fanout.win_n] = (at as u32, (n + 24) as u16, entry.revision);
+        fanout.win_n += 1;
+        fanout.win_len = at + n + 24;
     });
     let Some(next_cursor) = next_cursor else {
         // A malformed page abandons the backfill rather than delivering
@@ -468,19 +532,289 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
         return;
     };
     if overflow {
+        let seen = fanout.win_idx[..fanout.win_n]
+            .iter()
+            .map(|e| e.2)
+            .max()
+            .unwrap_or(0);
+        refuse_compacted(fanout, watch_id, seen.max(newest));
         finish_backfill(fanout, false);
         return;
     }
-    for i in 0..staged_n {
-        handle_event(fanout, &staged[i][..staged_len[i]]);
-        fanout.m_replayed = fanout.m_replayed.wrapping_add(1);
-    }
-
     if next_cursor == 0 {
-        finish_backfill(fanout, true);
+        sort_window(fanout);
+        plan_prevs(fanout);
+        fanout.filling = true;
+        fanout.fill_at = 0;
+        next_fill(fanout);
     } else {
         fanout.current.cursor = next_cursor;
         issue_backfill_page(fanout);
+    }
+}
+
+/// A window frame's parts: `(kind, key, value, [create, version, lease])`.
+fn frame_parts(f: &[u8]) -> Option<(u8, &[u8], &[u8], [u64; 3])> {
+    let kind = *f.get(18)?;
+    let kl = u16::from_le_bytes([*f.get(19)?, *f.get(20)?]) as usize;
+    let key = f.get(21..21 + kl)?;
+    let vo = 21 + kl;
+    let vl = u16::from_le_bytes([*f.get(vo)?, *f.get(vo + 1)?]) as usize;
+    let value = f.get(vo + 2..vo + 2 + vl)?;
+    let m = vo + 2 + vl;
+    let rd = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(f.get(at..at + 8)?.try_into().ok()?))
+    };
+    Some((kind, key, value, [rd(m)?, rd(m + 8)?, rd(m + 16)?]))
+}
+
+const PREV_NONE: u8 = 0;
+const PREV_WINDOW: u8 = 1;
+const PREV_STORED: u8 = 2;
+const PREV_FETCH: u8 = 3;
+
+/// Where each frame's replaced version comes from: the key's previous
+/// frame in the window, nothing (a creation, or a put after a delete),
+/// or a point read below the window.
+fn plan_prevs(fanout: &mut FanoutState) {
+    for i in 0..fanout.win_n {
+        let (at, len, _) = fanout.win_idx[i];
+        let fi = &fanout.win[at as usize..at as usize + len as usize];
+        let Some((kind, key, _, meta)) = frame_parts(fi) else {
+            fanout.prev_kind[i] = PREV_NONE;
+            continue;
+        };
+        let mut found = None;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            let (bt, bl, _) = fanout.win_idx[j];
+            let fj = &fanout.win[bt as usize..bt as usize + bl as usize];
+            if frame_parts(fj).is_some_and(|(_, k, _, _)| k == key) {
+                found = Some(j);
+                break;
+            }
+        }
+        let (k, r) = match found {
+            Some(j) => {
+                let (bt, bl, _) = fanout.win_idx[j];
+                let fj = &fanout.win[bt as usize..bt as usize + bl as usize];
+                let deleted = frame_parts(fj).is_some_and(|(kd, _, _, _)| kd == FRAME_OP_DELETE);
+                if deleted {
+                    (PREV_NONE, 0)
+                } else {
+                    (PREV_WINDOW, j as u32)
+                }
+            }
+            // A put at version 1 created the key: nothing was replaced.
+            None if kind != FRAME_OP_DELETE && meta[1] == 1 => (PREV_NONE, 0),
+            None => (PREV_FETCH, 0),
+        };
+        fanout.prev_kind[i] = k;
+        fanout.prev_ref[i] = r;
+    }
+}
+
+/// Read back the next replaced version below the window, or send the
+/// window when none is left.
+fn next_fill(fanout: &mut FanoutState) {
+    while fanout.fill_at < fanout.win_n && fanout.prev_kind[fanout.fill_at] != PREV_FETCH {
+        fanout.fill_at += 1;
+    }
+    if fanout.fill_at == fanout.win_n {
+        send_window(fanout);
+        finish_backfill(fanout, true);
+        return;
+    }
+    let (at, len, rev) = fanout.win_idx[fanout.fill_at];
+    let mut key = [0u8; PLAN_KEY_MAX + 160];
+    let kl = {
+        let f = &fanout.win[at as usize..at as usize + len as usize];
+        match frame_parts(f) {
+            Some((_, k, _, _)) if k.len() <= key.len() => {
+                key[..k.len()].copy_from_slice(k);
+                k.len()
+            }
+            _ => {
+                finish_backfill(fanout, false);
+                return;
+            }
+        }
+    };
+    // KV_OP_RANGE_META for the one key as of the revision before:
+    // [klen][key][elen=0][rev][limit=1][flags,target,order][4 × bound].
+    let mut body = [0u8; 2 + PLAN_KEY_MAX + 160 + 2 + 8 + 4 + 3 + 32];
+    let mut n = 0usize;
+    body[0..2].copy_from_slice(&(kl as u16).to_le_bytes());
+    body[2..2 + kl].copy_from_slice(&key[..kl]);
+    n += 2 + kl + 2;
+    body[n..n + 8].copy_from_slice(&rev.saturating_sub(1).to_le_bytes());
+    n += 8;
+    body[n..n + 4].copy_from_slice(&1u32.to_le_bytes());
+    n += 4;
+    // A large value read as its manifest (the entry then ends with its
+    // flags), passed on marked.
+    body[n] = types::RANGE_META_FLAG_MANIFESTS;
+    n += 3 + 32;
+    fanout.corr_seq = fanout.corr_seq.wrapping_add(1);
+    let mut env = [0u8; 18 + 2 + PLAN_KEY_MAX + 160 + 2 + 8 + 4 + 3 + 32];
+    env[0..8].copy_from_slice(&fanout.corr_seq.to_le_bytes());
+    env[8] = PROTO_INTERNAL_WATCH;
+    env[15] = KV_OP_RANGE_META;
+    env[16..18].copy_from_slice(&(n as u16).to_le_bytes());
+    env[18..18 + n].copy_from_slice(&body[..n]);
+    let ok = unsafe {
+        let sys = fanout.syscalls;
+        !sys.is_null() && write_envelope(&*sys, fanout.kv_out, MSG_KV_REQUEST, &env[..18 + n])
+    };
+    if !ok {
+        finish_backfill(fanout, false);
+    }
+}
+
+/// The version a frame replaced, read back: kept, and the next.
+fn fill_answer(fanout: &mut FanoutState, result: u8, body: &[u8]) {
+    let i = fanout.fill_at;
+    if result == KV_RESULT_COMPACTED {
+        let (_, _, rev) = fanout.win_idx[i];
+        refuse_compacted(fanout, fanout.current.watch_id, rev);
+        finish_backfill(fanout, false);
+        return;
+    }
+    if result != KV_RESULT_KVS || body.len() < 11 {
+        finish_backfill(fanout, false);
+        return;
+    }
+    let n = u16::from_le_bytes([body[9], body[10]]);
+    fanout.prev_kind[i] = PREV_NONE;
+    if n >= 1 {
+        // [klen:2][key][vlen:4][value][create][mod][version][lease][flags]
+        let kl = u16::from_le_bytes([body[11], body[12]]) as usize;
+        let vo = 13 + kl;
+        let Some(vl) = body
+            .get(vo..vo + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        else {
+            finish_backfill(fanout, false);
+            return;
+        };
+        let (Some(value), Some(meta), Some(&flags)) = (
+            body.get(vo + 4..vo + 4 + vl),
+            body.get(vo + 4 + vl..vo + 4 + vl + 32),
+            body.get(vo + 4 + vl + 32),
+        ) else {
+            finish_backfill(fanout, false);
+            return;
+        };
+        let at = fanout.prev_len;
+        if at + 2 + vl + 33 > PREV_BYTES {
+            refuse_compacted(fanout, fanout.current.watch_id, fanout.win_idx[i].2);
+            finish_backfill(fanout, false);
+            return;
+        }
+        // `[vlen:2][value][meta:32][flags:1]`.
+        fanout.prev_buf[at..at + 2].copy_from_slice(&(vl as u16).to_le_bytes());
+        fanout.prev_buf[at + 2..at + 2 + vl].copy_from_slice(value);
+        fanout.prev_buf[at + 2 + vl..at + 2 + vl + 32].copy_from_slice(meta);
+        fanout.prev_buf[at + 2 + vl + 32] = flags;
+        fanout.prev_len = at + 2 + vl + 33;
+        fanout.prev_kind[i] = PREV_STORED;
+        fanout.prev_ref[i] = at as u32;
+    }
+    fanout.fill_at += 1;
+    next_fill(fanout);
+}
+
+/// A frame's revision: `[watch_id:8][kpg:2][rev:8]…`.
+fn frame_rev(f: &[u8]) -> u64 {
+    match f.get(10..18) {
+        Some(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        None => 0,
+    }
+}
+
+/// Order the gathered window by revision (stable: a revision's frames
+/// keep the order the provider gave them).
+fn sort_window(fanout: &mut FanoutState) {
+    let n = fanout.win_n;
+    for i in 1..n {
+        let e = fanout.win_idx[i];
+        let mut j = i;
+        while j > 0 && fanout.win_idx[j - 1].2 > e.2 {
+            fanout.win_idx[j] = fanout.win_idx[j - 1];
+            j -= 1;
+        }
+        fanout.win_idx[j] = e;
+    }
+}
+
+/// Send the window, each frame with its metadata tail and the version
+/// it replaced — the shape a live event has.
+fn send_window(fanout: &mut FanoutState) {
+    let mut frame = [0u8; 8 + wire::WATCH_EVENT_MAX];
+    for i in 0..fanout.win_n {
+        let (at, len, _) = fanout.win_idx[i];
+        let (at, len) = (at as usize, len as usize);
+        let mut n = len;
+        frame[..len].copy_from_slice(&fanout.win[at..at + len]);
+        // The replaced version: its value and `[create][mod][version][lease]`.
+        let mut pv = [0u8; 4096];
+        let mut pm = [0u64; 4];
+        let mut pl = usize::MAX;
+        // The replaced value is a large value's manifest.
+        let mut p_manifest = false;
+        match fanout.prev_kind[i] {
+            PREV_WINDOW => {
+                let j = fanout.prev_ref[i] as usize;
+                let (bt, bl, brev) = fanout.win_idx[j];
+                let fj = &fanout.win[bt as usize..bt as usize + bl as usize];
+                if let Some((kind, _, v, m)) = frame_parts(fj) {
+                    if v.len() <= pv.len() {
+                        pv[..v.len()].copy_from_slice(v);
+                        pl = v.len();
+                        pm = [m[0], brev, m[1], m[2]];
+                        p_manifest = kind == FRAME_OP_PUT_MANIFEST;
+                    }
+                }
+            }
+            PREV_STORED => {
+                let r = fanout.prev_ref[i] as usize;
+                let b = &fanout.prev_buf;
+                let vl = u16::from_le_bytes([b[r], b[r + 1]]) as usize;
+                if vl <= pv.len() {
+                    pv[..vl].copy_from_slice(&b[r + 2..r + 2 + vl]);
+                    pl = vl;
+                    let m = r + 2 + vl;
+                    for (k, x) in pm.iter_mut().enumerate() {
+                        let mut e = [0u8; 8];
+                        e.copy_from_slice(&b[m + k * 8..m + k * 8 + 8]);
+                        *x = u64::from_le_bytes(e);
+                    }
+                    p_manifest = b[m + 32] & ENTRY_FLAG_MANIFEST != 0;
+                }
+            }
+            _ => {}
+        }
+        if pl == usize::MAX {
+            frame[n] = 0;
+            n += 1;
+        } else {
+            frame[n] = if p_manifest {
+                types::JOURNAL_PREV_MANIFEST
+            } else {
+                types::JOURNAL_PREV
+            };
+            frame[n + 1..n + 3].copy_from_slice(&(pl as u16).to_le_bytes());
+            n += 3;
+            frame[n..n + pl].copy_from_slice(&pv[..pl]);
+            n += pl;
+            for x in pm {
+                frame[n..n + 8].copy_from_slice(&x.to_le_bytes());
+                n += 8;
+            }
+        }
+        handle_event(fanout, &frame[..n]);
+        fanout.m_replayed = fanout.m_replayed.wrapping_add(1);
     }
 }
 

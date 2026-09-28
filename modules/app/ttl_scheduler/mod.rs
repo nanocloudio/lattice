@@ -1,6 +1,6 @@
 //! ttl_scheduler — deterministic expiry service.
 //!
-//! Phase 4 module. Consumes deterministic-time tick envelopes
+//! Consumes deterministic-time tick envelopes
 //! from the substrate (or, in single-node mode, from a graph-
 //! local emitter wired to `tick_in`), maintains a deadline queue
 //! of lease + KV-record expiries via the dual-target
@@ -119,7 +119,7 @@ struct TtlState {
     /// Deterministic time advanced by the most recent tick.
     now_ms: u64,
 
-    // Phase-14 telemetry. Monotonic counters emitted on `metrics_out` at
+    // Telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=scheduled, 1=expired).
     m_scheduled: u64,
@@ -527,7 +527,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         maybe_propose_tick(sched);
 
-        // Phase-14: emit module-scope counters on `metrics_out` at a
+        // Emit module-scope counters on `metrics_out` at a
         // coarse cadence (no-op until the port is wired). ids follow the
         // manifest `[observability] metrics` order.
         sched.step_ctr = sched.step_ctr.wrapping_add(1);

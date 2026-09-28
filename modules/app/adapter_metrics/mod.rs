@@ -1,6 +1,6 @@
 //! adapter_metrics — high-cardinality adapter observability rollup.
 //!
-//! Phase 6b minimal implementation. Consumes per-anchor counter
+//! Minimal implementation. Consumes per-anchor counter
 //! envelopes (`MSG_METRIC_DELTA`) and maintains a fixed-size table of
 //! `(protocol, op, count)` rollups. Every `SNAPSHOT_INTERVAL` ticks
 //! it emits a `MSG_METRIC_SNAPSHOT` envelope carrying the full table
@@ -60,7 +60,7 @@ struct MetricsState {
     // path on out_chan/telemetry_out.
     metrics_out: i32,
     tick_since_snapshot: u32,
-    // Phase-14 counters (ids follow manifest `[observability] metrics`).
+    // Module-scope counters (ids follow manifest `[observability] metrics`).
     m_deltas_in: u64,
     m_snapshots_out: u64,
     step_ctr: u64,
@@ -193,7 +193,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Phase-14: emit this module's own operational counters on its
+        // Observability: emit this module's own operational counters on its
         // dedicated metrics port at a coarse cadence (no-op until wired).
         s.step_ctr = s.step_ctr.wrapping_add(1);
         if s.step_ctr.is_multiple_of(5000) {

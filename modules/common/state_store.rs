@@ -1,5 +1,4 @@
-//! `KvStateStore` — the shared state-store contract (RFC database
-//! foundation §9).
+//! `KvStateStore` — the shared state-store contract.
 //!
 //! There is ONE Lattice semantic engine (`kv_store.rs::apply` today) and
 //! one committed command format. Memory and disk are replaceable
@@ -8,7 +7,7 @@
 //! must satisfy, plus the bounded progress types that keep every method
 //! resumable inside a cooperative Fluxor step.
 //!
-//! Contract rules (§9, §9.3, §9.4):
+//! Contract rules:
 //!
 //! - The engine must not contain conditionals that change command
 //!   *meaning* according to the provider.
@@ -30,7 +29,7 @@
 
 /// Monotonic per-range revision (mirrors `types::Revision`).
 pub type Revision = u64;
-/// Logical MVCC timestamp (§10). Assigned before proposal, encoded in
+/// Logical MVCC timestamp. Assigned before proposal, encoded in
 /// the committed command; never derived from a local clock during apply.
 pub type MvccTimestamp = u64;
 
@@ -68,7 +67,7 @@ pub enum StoreError {
     Malformed,
     /// Underlying storage fault; the range must quarantine, not guess.
     StorageFault,
-    /// Snapshot/install generation or identity mismatch (§17.1).
+    /// Snapshot/install generation or identity mismatch.
     FenceMismatch,
 }
 
@@ -124,7 +123,7 @@ pub struct ApplyResult {
     pub flush_wanted: bool,
 }
 
-/// Snapshot capture request (§17.1). `applied_index` is the exact
+/// Snapshot capture request. `applied_index` is the exact
 /// Clustor apply prefix the snapshot must represent — never "roughly
 /// now".
 #[derive(Clone, Copy, Debug)]
@@ -143,9 +142,9 @@ pub struct SnapshotChunk<'a> {
 
 // ── The provider contract ─────────────────────────────────────────────
 
-/// Physical state-store provider contract (§9). Implemented by the
-/// bounded in-memory table (current `KvStore`) and by the ordered disk
-/// provider (Phase 1). The semantic engine calls exactly this surface;
+/// Physical state-store provider contract. Implemented by the
+/// bounded in-memory table (`KvStore`) and by the ordered disk
+/// provider. The semantic engine calls exactly this surface;
 /// deployment composition selects the provider at graph construction.
 pub trait KvStateStore {
     /// Point read of `key`'s newest version visible at `revision`.
@@ -243,7 +242,7 @@ pub trait KvStateStore {
 
     /// Reclaim history below `floor` in bounded steps. Must never
     /// advance past the retention floor handed down by the compaction
-    /// coordinator (§18) — the provider trusts, and never computes, the
+    /// coordinator — the provider trusts, and never computes, the
     /// floor.
     fn compact(&mut self, floor: Revision, cursor: u64) -> Result<Progress, StoreError>;
 }

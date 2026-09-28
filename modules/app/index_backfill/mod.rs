@@ -1,10 +1,10 @@
-//! index_backfill — the §26 Phase 6 online index backfill worker.
+//! index_backfill — the online index backfill worker.
 //!
 //! Completes indexes created over POPULATED tables. `CREATE INDEX` on
 //! such a table writes its descriptor at `SchemaPhase::Backfilling`:
 //! from that phase on, every writer maintains the index inside its own
 //! transaction (`write_insert_allowed`), while readers refuse it
-//! (`read_allowed` is `Public` only — §21 invariant 19: an index that
+//! (`read_allowed` is `Public` only — an index that
 //! has not reached exactness must not serve). This worker's whole job
 //! is to make the pre-existing rows catch up and then flip the phase.
 //!
@@ -12,7 +12,7 @@
 //!
 //! The row scan resumes by the provider's ordinal cursor, persisted in
 //! `KS_RELATIONAL_JOB` after every page — so a crash resumes, not
-//! restarts (§26: "every operation is resumable"). An ordinal is not
+//! restarts (every operation is resumable). An ordinal is not
 //! stable under concurrent INSERTs, but every insert since the
 //! descriptor reached `Backfilling` ALSO wrote its own index entry
 //! (executor-side maintenance), so a row the shifted cursor skips is a

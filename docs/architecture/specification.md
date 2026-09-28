@@ -291,22 +291,24 @@ renders them on its own wire. The conditions clients most often see:
 
 | Condition | Redis | Memcached | etcd v3 |
 |---|---|---|---|
-| Routing epoch advanced / stale map | `-MOVED routing epoch advanced` | `NOT_STORED` | status 13 |
-| No authority for a fenced operation | `-CLUSTERDOWN no authority available for this operation` | `SERVER_ERROR backpressure` | status 13 |
+| Routing epoch advanced / stale map | `-MOVED routing epoch advanced` | `NOT_STORED` | status 14, "etcdserver: leader changed" |
+| No authority for a fenced operation | `-CLUSTERDOWN no authority available for this operation` | `SERVER_ERROR backpressure` | status 14, "etcdserver: request timed out" |
+| A request or answer past what its path carries (a value over one log entry is stored as chunks first) | `-ERR value too large` | `SERVER_ERROR object too large for cache` | status 3, "etcdserver: request is too large" |
+| A command that cannot apply to a large value (APPEND, INCR over one) | `-ERR the command does not apply to a large value` | — | — |
 | Wrong value type | `-WRONGTYPE Operation against a key holding the wrong kind of value` | `CLIENT_ERROR cannot increment or decrement non-numeric value` | — |
 | Read below the compaction floor | — | — | status 11 (OUT_OF_RANGE, matching etcd's compacted error) |
-| Quota refused | `-BUSY tenant quota exceeded` | — | — |
-| Cross-range multi-key operation | `-ERR internal error (result 16)` | — | — |
+| Quota refused | `-BUSY tenant quota exceeded` | — | status 8, "etcdserver: too many requests" |
+| Cross-range multi-key operation | `-ERR internal error (result 16)` | — | status 9 |
 
 The Redis `-MOVED`/`-CLUSTERDOWN` strings reuse the closest standard
 client-retry signals so an unmodified client re-resolves routing on
 an epoch flip; they are not Redis Cluster redirection and carry no
 slot or address. The Memcached ASCII surface has no dedicated
-routing or linearizability strings. The etcd surface emits
-`grpc-status` only, never a `grpc-message` text, and currently maps
-both the routing-epoch and no-authority results to status 13
-(INTERNAL); a key miss is status 0 with absence expressed in the
-response body. The generic `-ERR internal error` rendering of the
+routing or linearizability strings. The etcd surface answers with
+etcd's own status and `grpc-message` text (the full table is in
+[the etcd guide](../guides/etcd.md#errors)); the routing-epoch and
+no-authority results are UNAVAILABLE, which etcd's clients retry, and
+a key miss is status 0 with absence expressed in the response body. The generic `-ERR internal error` rendering of the
 cross-range refusal on the Redis surface is a known gap.
 
 ## Multi-tenancy
@@ -358,22 +360,15 @@ observable behaviour today.
   bucket (`modules/common/quota_bucket.rs`) and its
   throttle/disconnect envelopes exist, but no producer drives the
   refill tick in a shipped graph.
-- **Durable watch/lease state** — persisting `last_sent_revision`
-  and the lease table so watches and leases survive restart.
-- **Per-request read consistency on the client wire** — honouring
-  etcd's `serializable` flag and a Redis-side linearizable read
-  opt-in, mapping them to the fence path per request.
+- **Per-request read consistency on the Redis wire** — a Redis-side
+  linearizable read opt-in mapped to the fence path per request (etcd's
+  `serializable` flag is honoured already).
 - **Idempotent retry ledger** — a keyed table of acknowledged
   outcomes so adapter retries are deduplicated; today only an
   idempotency-key field exists on the data-surface envelope.
-- **Distinct error strings** — dedicated routing-epoch and
-  linearizability errors on the Memcached surface, and
-  FAILED_PRECONDITION/UNAVAILABLE statuses with messages on the etcd
-  surface in place of the current status-13 mapping.
-- **TLS in front of the etcd anchor** — the gRPC listener is
-  plaintext HTTP/2 in every shipped graph; TLS termination is
-  composed by wiring the fluxor `tls` module in front of an anchor,
-  as the TLS-fronted Redis graph does.
+- **Distinct error strings on the Memcached surface** — dedicated
+  routing-epoch and linearizability errors in place of the generic
+  `NOT_STORED` / `SERVER_ERROR backpressure`.
 - **Cross-partition transactions** — the two-phase protocol exists
   as a config-driven demonstrator (`txn_coordinator`); it is not a
   client-facing transaction API.

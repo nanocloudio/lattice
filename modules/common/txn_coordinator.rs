@@ -1,4 +1,4 @@
-//! The cross-range transaction coordinator's decision logic (§13.2),
+//! The cross-range transaction coordinator's decision logic,
 //! as a pure state machine.
 //!
 //! Separated from the module that will drive it for the same reason the
@@ -8,8 +8,8 @@
 //! not get exercised. Everything here is `no_std`, allocation-free, and
 //! driven by explicit events.
 //!
-//! The coordinator owns one transaction at a time and drives it through
-//! §13.2:
+//! The coordinator owns one transaction at a time and drives it
+//! through the cross-range commit protocol:
 //!
 //! ```text
 //!   Begin        write the home record as Pending
@@ -72,7 +72,7 @@ pub enum Step {
     Done(TxnOutcome),
 }
 
-/// Where the transaction is in §13.2.
+/// Where the transaction is in the commit protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Nothing started.
@@ -398,7 +398,7 @@ impl Coordinator {
     }
 
     /// Can the transaction commit? Every participant voted yes, and
-    /// `may_commit` — the §13.2 gate — agrees, given what this
+    /// `may_commit` — the commit gate — agrees, given what this
     /// coordinator observed of the participants.
     fn commit_is_permitted(&self) -> bool {
         if self.force_abort {

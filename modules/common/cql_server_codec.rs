@@ -1,14 +1,14 @@
 //! Server-side CQL native-protocol framing for the wide-column
-//! capability (RFC database foundation §14.17, Phase 8).
+//! capability.
 //!
 //! The wide-column capability's first connector speaks the Cassandra
 //! CQL native protocol v4, because that is what real wide-column
-//! clients speak. This file owns the CONNECTOR half per the §14.3
-//! split: frame parsing, the STARTUP/OPTIONS handshake surface, and
-//! RESULT/ERROR encoding. It does NOT own cell semantics — those are
-//! `models.rs`'s (§14.15: models share foundations, not meanings) —
-//! nor CQL text parsing, which reuses the ONE SQL front end
-//! (`sql_core`) exactly as §14.2 built it to be reused.
+//! clients speak. This file owns the CONNECTOR half of the
+//! connector/executor split: frame parsing, the STARTUP/OPTIONS
+//! handshake surface, and RESULT/ERROR encoding. It does NOT own cell
+//! semantics — those are `models.rs`'s (models share foundations, not
+//! meanings) — nor CQL text parsing, which reuses the ONE SQL front
+//! end (`sql_core`) exactly as it is built to be reused.
 //!
 //! Frame layer comes from `cql_core.rs` — the OUTBOUND cassandra
 //! client's own core, one mount chain — so the two sides of the
@@ -210,7 +210,7 @@ impl<'a> RowsResult<'a> {
 // Deliberately NOT the shared SQL front end: `sql_core`'s tree mounts
 // `relational` as a sibling of `models`, and a consumer needing both
 // would hold two non-unifying type trees (the #[path] trap). More to
-// the point, CQL is not SQL — §14.15's rule is that models share
+// the point, CQL is not SQL — the rule is that models share
 // foundations, not meanings, and a shared parser would be the first
 // step toward the rejected generic engine. The subset here is small
 // enough that a dedicated recognizer is the honest cost:

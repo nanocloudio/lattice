@@ -1,0 +1,340 @@
+# Lattice — a replicated store on three voters, served to fluxor modules
+# through the `storage.object` / `storage.namespace` contracts on every node
+# (`kv_state_worker_store` as one replica of the group).
+#
+# `configs/multi-3node.yaml`'s graph with the state worker swapped for the
+# store worker: its provider proposes the writes it is asked on `prov_out`,
+# straight to consensus's untagged `proposals` (relayed to the leader by a
+# follower, `forward_proposals: 1`), and every replica applies them once by
+# their origin's record (`modules/common/origin.rs`). `provider_probe`
+# writes and reads through the contracts on each node.
+#
+# TEMPLATE — rendered per node by `tests/harness/tests/cluster.rs`:
+#   __SELF_ID__ and the ports, as `multi-3node.yaml`;
+#   __PROBE_WRITES__ / __PROBE_BIG__  each probe's writes and large value.
+
+target: linux
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+module_search_paths:
+  - ../deps/clustor/modules/app
+  - ./modules/app
+
+modules:
+  # ── Lattice edge + KV ───────────────────────────────────────────
+  - name: redis_edge_anchor
+    params:
+      listen_port: __REDIS_PORT__
+  - name: kv_request_router
+    params:
+      # Bench lever: ALL reads take the ReadIndex fence
+      # (leadership probe + apply-horizon wait). 0 = snapshot reads.
+      # ⚠ With 1: read-only or serial-per-conn clients only — mixed
+      # pipelined conns reorder responses (no per-conn FIFO yet).
+      lin_reads: __LIN_READS__
+      # Declares that this graph replicates writes through Raft. Checked
+      # against the `proposal_out` wiring at init: if that edge is missing
+      # the module refuses to start, instead of silently serving every
+      # write on the direct local path. See the router's `replicated` param.
+      replicated: 1
+  - name: kv_state_worker_store
+    params:
+      state_store: 1
+      sweep_wrap: 1
+      replica_id: __SELF_ID__
+      group_epoch: 1
+      group_quorum: 2
+      # durability's `fsync_mode: 1`: a commit is on a quorum's disks.
+      group_durable: 1
+  - name: provider_probe
+    params:
+      node: __SELF_ID__
+      writes: __PROBE_WRITES__
+      big: __PROBE_BIG__
+      nodes: 3
+  - name: lattice_apply_bridge
+
+  # ── Clustor client-proposal pipeline ────────────────────────────
+  - name: peer_router
+    params:
+      self_id: __SELF_ID__
+      peer_count: 3
+      listen_port: __LISTEN_PORT__
+      peer0: "__PEER0_HOST__:__PEER0_PORT__"
+      peer1: "__PEER1_HOST__:__PEER1_PORT__"
+      peer2: "__PEER2_HOST__:__PEER2_PORT__"
+      # Per-peer IPv4 host. Localhost L2 renders these 127.0.0.1 (the
+      # peer_router default); cross-machine L4 (Pi 5 voter + host voters)
+      # renders real LAN IPs so raft peers dial across the wire.
+  - name: gateway
+    params:
+      self_id: __SELF_ID__
+  # ReadIndex permit source — bench posture: the CP proof input is
+  # unwired, so the gate emits standing CP_FRESH permits (the same
+  # CP-bypass as clustor's benches).
+  - name: admission
+  - name: control_plane
+  - name: consensus
+    params:
+      self_id: __SELF_ID__
+      voter_count: 3
+      heartbeat_interval_ms: 150
+      # Localhost 3-runtime rig shares 4 cores with a live substrate;
+      # scheduler jitter under load delays heartbeats past the default
+      # 1000 ms and churns elections. Widen the timeout so the rig
+      # tolerates that jitter. Real timing verification belongs on
+      # dedicated hardware (task #15), not this shared-host rig.
+      election_timeout_ms: 4000
+      # Latency: don't hold sparse proposals for the default 10 ms
+      # batching window before append+AE.
+      proposal_batch_timeout_ms: 1
+      peer_count: 3
+      # A follower's store provider proposes too: relay it to the leader.
+      forward_proposals: 1
+  - name: durability
+    params:
+      fsync_mode: 1
+      # gw0: proven strictly better on the rig sweep —
+      # the wall-clock window is pure ack latency; batching still
+      # engages under burst via group_max_pending.
+      group_window_ms: 0
+      group_max_pending: 8
+      # 4 MiB (not 256 KiB): each rotation runs a synchronous ~40 ms
+      # snapshot persist — small segments put that stall in p99.
+      segment_bytes: 4194304
+      # Fresh log each boot (localhost bench) — no manual wal wipe needed
+      # between runs. OMIT for crash-recovery scenarios.
+      skip_replay: 1
+      self_id: __SELF_ID__
+      voter_count: 3
+      partition_id: 0
+  # `durability` runs the local snapshot/compaction loop and the peer
+  # snapshot transfer. CAVEAT: manifest-only snapshots (no state body)
+  # — crash-recovery replay only reconstructs ≥ the compaction floor.
+
+  # ── Observability: metric fan-in + HTTP /metrics ────────────────
+  - name: adapter_metrics
+  - name: operations
+    params:
+      emit_interval_ms: 250
+  # wave http (`app` variant): terminates the diagnostic listener
+  # and exchanges HttpRequest/HttpResponse envelopes with operations.
+  # The catch-all app route forwards every path; operations owns the
+  # 404. HTTP mechanics are wave's; what a request MEANS is not.
+  - name: http
+    variant: app
+    port: __HTTP_PORT__
+    host_tcp: 1
+    routes:
+      - path: "/"
+        app: true
+
+  # ── TTL clock ────────────────────────────────────────────────────
+  - name: ttl_scheduler
+    params:
+      propose_wrap: 1
+
+wiring:
+  # ── Transport: linux_net ↔ peer_router ──────────────────────────
+  # net_out fans (via an auto-inserted tee) to peer_router + redis_anchor
+  # + operations. That tee is min-space gated: if ANY consumer's net_in
+  # ring fills, the WHOLE fan-out stalls and every consumer starves (the
+  # multi-node wedge — dialer nodes churned peer sockets and stalled their
+  # own redis too). Size each consumer ring to 256 KiB so no slow/idle
+  # consumer can gate the others — same pattern as chunk's 3-node config.
+  - from: linux_net.net_out
+    to: peer_router.net_in
+    buffer_bytes: 262144
+  - from: peer_router.net_out
+    to: linux_net.net_in
+
+  # ── Lattice edge: anchor ↔ router (own linux_net lanes) ─────────
+  - from: linux_net.net_out
+    to: redis_edge_anchor.net_in
+    buffer_bytes: 262144
+  - from: redis_edge_anchor.net_out
+    to: linux_net.net_in
+  - from: redis_edge_anchor.kv_out
+    to: kv_request_router.redis_in
+  - from: kv_request_router.redis_out
+    to: redis_edge_anchor.kv_in
+
+  # ── Inbound peer traffic (peer_router demux) ────────────────────
+  - from: peer_router.peer_rx
+    to: consensus.ack
+  - from: peer_router.raft_rpc
+    to: consensus.rpc
+
+  # ── Outbound peer traffic ───────────────────────────────────────
+  - from: consensus.rpc_out
+    to: peer_router.peer_tx
+  - from: consensus.net_out
+    to: peer_router.repl_tx
+
+  # ── Proposal ingress: router → gateway → consensus ─────────────
+  - from: kv_request_router.proposal_out
+    to: gateway.client_requests
+  # Reject feedback: the gateway refuses a proposal BEFORE assigning it
+  # a correlation id (NOT_LEADER precedes next_corr_id), and without
+  # this edge that refusal is dropped and the write waits out the 5s
+  # inflight sweep instead of failing in milliseconds.
+  - from: gateway.responses
+    to: kv_request_router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control_plane.routing
+    to: gateway.placement
+
+  - from: consensus.lag_signal
+    to: admission.lag
+
+  # ── Apply path: committed entries → KV worker → response ────────
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker_store.commands
+  - from: kv_request_router.kv_out
+    to: kv_state_worker_store.commands
+  - from: kv_state_worker_store.responses
+    to: kv_request_router.kv_in
+
+  # ── Linearizable-read fence (ReadIndex) ─────────────────────────
+  - from: kv_request_router.lin_read_out
+    to: consensus.read
+  - from: consensus.applied
+    to: kv_request_router.read_release
+  - from: admission.permits
+    to: consensus.read_permits
+
+  # ── Clustor persistence ─────────────────────────────────────────
+  - from: consensus.log_append
+    to: durability.entries
+    # Without a rate class the WAL entry-pump gets grant=0 and runs
+    # `process_entries` once per step — 1 entry/tick regardless of backlog.
+    # See `bare-metal-pi5-relational-disk.yaml` for the full note
+    # (~3.75× on durable writes).
+    rate: transaction
+  # A restarted replica reads its replayed log bodies back out of the
+  # local WAL: replay restores the log, so raft log-matching succeeds and
+  # the leader never re-ships those entries. Without this pair the apply
+  # pipeline stalls at the first gap. Shares the WAL's random-access ports
+  # with the replicator's NACK refetch of older entries; the request-id
+  # namespaces keep the replies separable.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  # Dedicated boot handoff: Raft must resume its index at the exact WAL
+  # replay high-water before proposal intake opens. Never multiplex this
+  # onto durability.flushed, which also fans out durability acknowledgements.
+  # (Present in every maintained clustor config.)
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  # Raft §5.3 conflict repair + post-snapshot trim share this edge.
+  - from: consensus.log_maintenance
+    to: durability.compact_before
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  # Cross-node DurabilityAck fan-in — REQUIRED for
+  # quorum-fsync; without it commit stalls indefinitely multi-node.
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # ── Snapshots: local loop + peer transfer ───────────────────────
+  # Retention floor: min follower match gates snapshot triggers so
+  # compaction never outruns a live-but-lagging voter — a replicator
+  # behind a compacted index would otherwise NACK-loop forever and the
+  # lag signal would strangle proposal credits. Durability drives its
+  # own retention floor; consensus exposes no floor port.
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
+    to: peer_router.peer_tx
+  # App state-machine snapshot bodies (clustor's app-snapshot contract).
+  # The worker
+  # labels each body with its own applied position; without this pair a
+  # follower installing a snapshot gets a bare (term, index) and cannot
+  # rebuild KV state.
+  - from: durability.app_snapshot_ctl
+    to: kv_state_worker_store.snapshot_import
+    rate: transaction
+  - from: kv_state_worker_store.snapshot_export
+    to: durability.app_snapshot_body
+    rate: transaction
+  - from: durability.metrics
+    to: operations.ingest
+
+  # ── Observability fan-in → operations → HTTP /metrics ───────────
+  - from: redis_edge_anchor.metrics
+    to: adapter_metrics.events_in
+  - from: kv_request_router.metrics
+    to: adapter_metrics.events_in
+  - from: kv_state_worker_store.metrics
+    to: adapter_metrics.events_in
+  - from: adapter_metrics.telemetry_out
+    to: operations.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+  - from: peer_router.metrics
+    to: operations.ingest
+
+  # ── HTTP diagnostic surface (per-node __HTTP_PORT__) ────────────
+  - from: linux_net.net_out
+    to: http.net_in
+    buffer_bytes: 262144
+  - from: http.net_out
+    to: linux_net.net_in
+  # Mailbox mode (`buffer_group`) is REQUIRED on both envelope
+  # edges: one write = one whole envelope. Distinct groups —
+  # the directions are independent channels.
+  - from: http.req_out
+    to: operations.request
+    buffer_group: 1
+  - from: operations.response
+    to: http.resp_in
+    buffer_group: 2
+
+  # ── The clock ───────────────────────────────────────────────────
+  # ttl_scheduler proposes a tick on a cadence and it becomes the
+  # cluster's time only once it comes back through the same ordering
+  # the commands use, so every replica and every replay decides a TTL
+  # against the same value. Without this the state machine's clock
+  # never starts and nothing with a TTL expires.
+  - from: ttl_scheduler.propose_out
+    to: gateway.client_requests
+  - from: lattice_apply_bridge.records_out
+    to: ttl_scheduler.tick_in
+  - from: kv_state_worker_store.expiry_out
+    to: ttl_scheduler.kv_expiry
+  - from: kv_state_worker_store.sweep_out
+    to: gateway.client_requests
+  # The store provider's writes, as origin entries for the log.
+  - from: kv_state_worker_store.prov_out
+    to: consensus.proposals
+  - from: ttl_scheduler.expire_out
+    to: kv_state_worker_store.expire

@@ -4,7 +4,7 @@
 //! them on its `metrics` output port at a coarse cadence. Metric ids
 //! follow the module manifest's `[observability] metrics` order (id N =
 //! the Nth declared name), matching the fluxor foundation-module
-//! convention (see `standards/observability.md` §3 and the foundation
+//! convention (see `standards/observability.md` and the foundation
 //! `ip`/`http` emit blocks).
 //!
 //! This file is path-mounted (`#[path]`) into each module, which has

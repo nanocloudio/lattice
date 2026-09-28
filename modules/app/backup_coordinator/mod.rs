@@ -1,15 +1,16 @@
-//! backup_coordinator — consistent database backup and restore
-//! (RFC database foundation §17.2, Phase 6).
+//! backup_coordinator — consistent database backup and restore.
 //!
-//! Drives §17.2's numbered machine over the contracts in
-//! `db_ops.rs`, which own every transition rule; this module is the
-//! pump that turns each phase into real KV work, exactly as
-//! `range_supervisor` is for §12 and `index_backfill` for §14.4.
+//! Drives the backup procedure's numbered machine over the contracts
+//! in `db_ops.rs`, which own every transition rule; this module is
+//! the pump that turns each phase into real KV work, exactly as
+//! `range_supervisor` is for range lifecycle and `index_backfill` is
+//! for secondary indexes.
 //!
 //! ## What makes the backup CONSISTENT
 //!
 //! Every exported record is read with `KV_OP_SCAN_AT` at ONE protected
-//! revision (§17.2 step 1's protected timestamp, taken as the store's
+//! revision (backup step 1's protected timestamp, taken as the
+//! store's
 //! current revision when the backup begins). A backup assembled from
 //! reads at different revisions would be a set of records that never
 //! existed together — the definition of an inconsistent backup — so
@@ -25,7 +26,7 @@
 //! `[backup_id][sequence]`. That is deliberate for this slice: the
 //! artifacts inherit the same durability, replication, and crash
 //! semantics as everything else, and a restore is a scan rather than a
-//! file-format reader. §17.2's external-object-store variant is a
+//! file-format reader. The external-object-store variant is a
 //! later slice and is named here rather than implied.
 //!
 //! ## Restore
@@ -118,7 +119,8 @@ define_params! {
     2, backup_id, u32, 1
         => |s, d, len| { s.backup_id_low = p_u32(d, len, 0, 1); };
 
-    // Manual execution gate (§12.4's rule, applied to §17.2): the
+    // Manual execution gate (the range-lifecycle rule, applied to
+    // backups): the
     // operation is declared in the config and starts this long after
     // boot.
     3, start_delay_ms, u32, 3000
@@ -385,7 +387,7 @@ fn artifact_bounds(c: &CoordState, start: &mut [u8], end: &mut [u8]) -> Option<(
 
 /// FNV-1a 64 over a page, widened into the contract's 32-byte digest
 /// slot. Not a cryptographic digest, and the module docs say so: it
-/// detects corruption, not tampering. §23's authenticated digests
+/// detects corruption, not tampering. Authenticated digests
 /// arrive with the external-object-store slice.
 fn page_digest(page: &[u8]) -> [u8; DIGEST_LEN] {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -431,8 +433,8 @@ fn begin_backup(c: &mut CoordState) {
     // Revision 0 means "current" to the provider's as-of read, which
     // is the protected point for this slice: the backup reads a single
     // consistent revision chosen by the store, and every page repeats
-    // it. The allocator-leased protected timestamp is the Phase 5
-    // upgrade, named here.
+    // it. An allocator-leased protected timestamp is the named
+    // upgrade path.
     let key = EncryptionKeyIdentity {
         key_id: [1; 16],
         key_version: 1,
@@ -576,7 +578,7 @@ fn finish_backup(c: &mut CoordState) {
 }
 
 /// Restore: read the manifest first — a restore from an INCOMPLETE
-/// backup is refused, never attempted (§17.2's completeness flag is
+/// backup is refused, never attempted (the completeness flag is
 /// the whole point of recording it).
 fn begin_restore(c: &mut CoordState) {
     let mut key = [0u8; KEY_MAX];
@@ -675,8 +677,8 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
         S_EXPORT_SCAN => {
             if result == KV_RESULT_COMPACTED {
                 // The protected history is gone: ABORT rather than
-                // ship a partial export (§17.2, and the whole reason
-                // the phase exists).
+                // ship a partial export (the whole reason the
+                // protection phase exists).
                 let _ = c.manifest.transition(BackupPhase::Aborted);
                 fault(c, b"[bkp] aborted: protected history compacted");
                 return;
@@ -829,7 +831,7 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
                 return;
             };
             if !m.is_complete() {
-                // Refusing an incomplete backup IS §17.2's contract.
+                // Refusing an incomplete backup IS the contract.
                 fault(c, b"[bkp] refusing restore of an incomplete backup");
                 return;
             }

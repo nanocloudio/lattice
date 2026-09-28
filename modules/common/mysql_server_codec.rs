@@ -1,7 +1,6 @@
-//! MySQL/MariaDB client-server protocol, SERVER side (RFC database
-//! foundation §14.3 — the connector owns its wire handshake,
-//! capabilities, authentication negotiation, text flow, dialect surface,
-//! error mapping and result encoding).
+//! MySQL/MariaDB client-server protocol, SERVER side. The connector
+//! owns its wire handshake, capabilities, authentication negotiation,
+//! text flow, dialect surface, error mapping and result encoding.
 //!
 //! Dual-target facade: compiles into the no_std `mysql_edge_anchor` and
 //! is host-tested here. The counterpart to `pg_server_codec`; the two
@@ -527,7 +526,8 @@ fn itoa(v: i64, out: &mut [u8]) -> Option<usize> {
 
 /// Render a value as MySQL text.
 ///
-/// The connector half of the §14.3 split, and the place the two
+/// The connector half of the connector/executor split, and the place
+/// the two
 /// connectors visibly differ: a boolean is `1`/`0` here where PostgreSQL
 /// writes `t`/`f`. Binary values are sent RAW rather than hex-escaped,
 /// because the column is declared with the `binary` charset and the

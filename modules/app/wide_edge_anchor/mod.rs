@@ -1,9 +1,8 @@
-//! wide_edge_anchor — the wide-column capability's CQL connector
-//! (RFC database foundation §14.17, Phase 8).
+//! wide_edge_anchor — the wide-column capability's CQL connector.
 //!
 //! A real Cassandra CQL client connects on 9042, negotiates STARTUP →
 //! READY, and can CREATE TABLE, INSERT, and SELECT. The semantics are
-//! §14.17's, not relational (§14.15: models share foundations, not
+//! wide-column, not relational (models share foundations, not
 //! meanings): a row INSERT decomposes into CELLS — one canonical KV
 //! key per column via `models::encode_wide_key` under `KS_WIDE_TABLE`,
 //! plus a row-marker cell so a row of nothing but its partition key
@@ -12,8 +11,8 @@
 //! transaction carries no absence comparisons; atomicity is the point,
 //! duplicate refusal is not.
 //!
-//! The logical cell timestamp is a COMMITTED INPUT (§14.17: "never
-//! sampled independently by replicas"): each writing statement INCRs a
+//! The logical cell timestamp is a COMMITTED INPUT (never
+//! sampled independently by replicas): each writing statement INCRs a
 //! model-owned sequence through consensus and stamps every cell it
 //! writes with the result. Last-write-wins between two cells compares
 //! those committed values and nothing else — `SELECT` reassembly picks
@@ -21,7 +20,8 @@
 //! on the memory provider) cannot change an answer.
 //!
 //! Like the document anchor: this connector also executes (one
-//! connector today; a second triggers the §14.2 split), one statement
+//! connector today; a second triggers the shared-front-end split),
+//! one statement
 //! is in flight at a time, and the router pairing is POSITIONAL —
 //! pair #1, the ports named `redis_in`/`redis_out`, stamped
 //! `PROTO_REDIS`, because the router's sixteen outputs are allocated

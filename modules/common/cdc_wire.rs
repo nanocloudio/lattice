@@ -5,15 +5,14 @@
 //! lattice file: its source is `modules/sdk/contracts/exchange.rs` in the
 //! fluxor repo (`deps/fluxor/modules/sdk/contracts/exchange.rs` in this
 //! checkout), and PIC modules mount the built copy `fluxor build` vendors
-//! into `target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`. It is
-//! re-exported below so existing `cdc_wire::Publish` call sites keep
-//! resolving. Edits to the frame layout go to the fluxor SDK, never here.
+//! into `target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`. Edits
+//! to the frame layout go to the fluxor SDK, never here.
 //!
-//! The surface moved because it was never a CDC concept: quantum implements
-//! it for MQTT, Kafka and AMQP, wave for HTTP, and the CDC RFC forbids
-//! lattice depending on quantum — so a contract owned here was one those
-//! providers could not name. CDC is ONE producer of the surface, and the
-//! envelope below is one possible `payload`.
+//! The surface is an SDK contract because it is not a CDC concept:
+//! quantum implements it for MQTT, Kafka and AMQP, wave for HTTP, and
+//! lattice must not depend on quantum — a contract owned here would be
+//! one those providers could not name. CDC is ONE producer of the
+//! surface, and the envelope below is one possible `payload`.
 //!
 //! Dual-target facade: `#[path]`-mounted by the PIC modules (`cdc_pump`,
 //! `loopback_sink`) and by the host conformance suite
@@ -111,9 +110,9 @@ pub const CDC_FLAG_BACKFILL: u8 = 0x01;
 /// Before-image present. Reserved: never set in v1.
 pub const CDC_FLAG_BEFORE_IMAGE: u8 = 0x02;
 
-/// Bounds. Key mirrors the store's user-key bound; value mirrors
-/// `kv_store::MAX_VALUE_LEN`.
-pub const CDC_MAX_KEY_LEN: usize = 256;
+/// Bounds. A change's key is any key the store holds
+/// (`kv_store::MAX_KEY_LEN`); its value mirrors `kv_store::MAX_VALUE_LEN`.
+pub const CDC_MAX_KEY_LEN: usize = 2584;
 pub const CDC_MAX_VALUE_LEN: usize = 4096;
 
 /// Fixed head bytes before the key: format(2)+kind(1)+flags(1)+
@@ -294,12 +293,12 @@ pub fn sink_msg_key(table_id: u32, key: &[u8], out: &mut [u8]) -> Option<usize> 
 //   #[path = "…/sdk/contracts/exchange.rs"]
 //   mod exchange;
 //
-// An earlier version re-exported them from here so call sites would not have
-// to change when the contract moved. That worked, but it left two paths to
-// one set of types — `cdc_wire::Publish` and `exchange::Publish` — and a
-// lattice-flavoured alias (`MSG_CDC_ACK` for `MSG_ACK`) that made a portable
-// contract look like a CDC one. Both are gone: this file owns the ENVELOPE,
-// the SDK owns the FRAME, and nothing owns both.
+// They are deliberately NOT re-exported from here: a re-export would
+// leave two paths to one set of types — `cdc_wire::Publish` and
+// `exchange::Publish` — and a lattice-flavoured alias (`MSG_CDC_ACK`
+// for `MSG_ACK`) would make a portable contract look like a CDC one.
+// This file owns the ENVELOPE, the SDK owns the FRAME, and nothing
+// owns both.
 //
 // `PUBLISH_FRAME_MAX` from the contract is the worst-case frame; there is no
 // CDC-specific ceiling to state, because the envelope is bounded by the

@@ -1,8 +1,7 @@
-//! PostgreSQL v3 frontend/backend protocol, SERVER side (RFC database
-//! foundation §14.3 — the connector owns "its wire handshake,
-//! authentication negotiation, simple and extended query flows, …
-//! dialect surface, compatibility catalogs, type aliases, error mapping,
-//! and result encoding").
+//! PostgreSQL v3 frontend/backend protocol, SERVER side. The
+//! connector owns its wire handshake, authentication negotiation,
+//! simple and extended query flows, dialect surface, compatibility
+//! catalogs, type aliases, error mapping, and result encoding.
 //!
 //! Dual-target facade: compiles into the no_std `pg_edge_anchor` and is
 //! host-tested here. This is the CONNECTOR half of the split — the
@@ -581,7 +580,7 @@ fn itoa(v: i64, out: &mut [u8]) -> Option<usize> {
 
 /// Render a value as PostgreSQL text.
 ///
-/// This is the half of the split §14.3 assigns to the connector, and
+/// This is the half of the split assigned to the connector, and
 /// booleans are why it exists: PostgreSQL writes `t`/`f` where MySQL
 /// writes `1`/`0`. If the executor had produced text, one of those would
 /// have had to win.

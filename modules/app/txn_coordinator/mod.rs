@@ -1,6 +1,6 @@
-//! Cross-range transaction coordinator (RFC database foundation §13).
+//! Cross-range transaction coordinator.
 //!
-//! Drives a cross-range transaction through the §13.2 two-phase decision,
+//! Drives a cross-range transaction through the two-phase decision,
 //! using the decision machine in `modules/common/txn_coordinator.rs` and
 //! the participant ops:
 //!
@@ -17,12 +17,14 @@
 //!   (keys, partitions, values, read timestamp), run `start_delay_ms`
 //!   after boot. Participant ops are addressed to a NAMED partition
 //!   through `KV_OP_TARGETED`, the one door the routing map allows to
-//!   reach a chosen range, so the whole of §13.2 is observable on a real
+//!   reach a chosen range, so the whole protocol is observable on a
+//!   real
 //!   graph with ordinary clients reading the result.
 //! - **Dynamic (`mode 2`)** — a transaction submitted at runtime by
 //!   `relational_executor` over `MSG_TXN_SUBMIT`: a `KV_OP_TXN` body the
 //!   router refused as single-range. The coordinator splits it into one
-//!   participant per row and drives §13.2 with NON-targeted participant
+//!   participant per row and drives the protocol with NON-targeted
+//!   participant
 //!   ops the router routes by key — so it needs no partition map — then
 //!   answers the outcome on `MSG_TXN_SUBMIT_RESULT`. One transaction runs
 //!   at a time; a second submit waits behind the first.

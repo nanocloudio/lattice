@@ -3,15 +3,14 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# The storage-side terminator of the internal `lattice.data` surface
-# (RFC §14.8, §14.10, §26 phase 9).
+# The storage-side terminator of the internal `lattice.data` surface.
 #
 # This is NOT a client-facing protocol anchor. Its peer is a
 # `lattice_data_client` in ANOTHER graph — separated compute — and the
 # bytes on the wire are the `data_surface.rs` request/response frames,
-# not RESP or the Postgres wire protocol. Everything it does is stated
-# in §14.10's one sentence: "terminate the internal multiplexed data
-# surface and admit requests into range routing."
+# not RESP or the Postgres wire protocol. Everything it does is one
+# sentence: terminate the internal multiplexed data
+# surface and admit requests into range routing.
 #
 # Continuity class: `drain_only`. The surface is multiplexed and every
 # response carries its own `request_id`, so the peer demultiplexes and
@@ -27,18 +26,18 @@ hardware_targets = ["bcm2712"]
 #     typed `DataResponse`
 #
 # Does NOT own: sessions, routing cache, retries, cancellation,
-# continuation. §14.9 puts all five in the data CLIENT. An operation
+# continuation. All five belong to the data CLIENT. An operation
 # that needs one of them is refused by name, never approximated.
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # MSG_KV_REQUEST envelopes out to kv_request_router's
 # `internal_data_in`, stamped PROTO_INTERNAL_DATA.
@@ -59,7 +58,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

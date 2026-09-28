@@ -86,7 +86,9 @@ use wire::{
     WATCH_PROGRESS_COMPACTED, WATCH_PROGRESS_DELIVERED,
 };
 
-const SCRATCH_BUF_SIZE: usize = 4096;
+/// One envelope in or out: the largest watch event behind its watch id
+/// (`wire::WATCH_EVENT_MAX` + 8), with room to spare.
+const SCRATCH_BUF_SIZE: usize = 8832;
 
 #[repr(C)]
 struct RegistryState {
@@ -372,7 +374,11 @@ fn handle_define(reg: &mut RegistryState, idx: usize, sid: &SessionId, def: &[u8
     }
     let watch_id = u64::from_le_bytes(slice8(def, 0));
     let tenant_id = u32::from_le_bytes(slice4(def, 8));
-    let start_rev = i64::from_le_bytes(slice8(def, 12));
+    // The client's start revision is INCLUSIVE (etcd's "from revision
+    // N"; 0 = from now). The hub records the last revision already
+    // seen, so a watch from N has seen N - 1.
+    let from_rev = i64::from_le_bytes(slice8(def, 12));
+    let start_rev = if from_rev > 0 { from_rev - 1 } else { 0 };
     let filters = def[20];
     let progress_notify = def[21] != 0;
     let key_len = u16::from_le_bytes([def[22], def[23]]) as usize;
@@ -408,6 +414,12 @@ fn handle_define(reg: &mut RegistryState, idx: usize, sid: &SessionId, def: &[u8
             rec.in_consumed = reg.sw.slots[idx].in_consumed;
         }
         reg.m_registered += 1;
+        // A watch from a past revision: the history since then is
+        // replayed (the fanout pages it, or refuses it as compacted)
+        // before the live events it already receives.
+        if from_rev > 0 {
+            emit_replay_plan(reg, watch_id, start_rev as u64, 0);
+        }
         emit_retention_floor(reg);
     }
 }
@@ -493,7 +505,9 @@ fn handle_mutation(reg: &mut RegistryState, payload: &[u8]) {
     }
     let key = &payload[key_off..key_off + key_len];
     let event_kind = match op {
-        types::KV_OP_PUT => WATCH_EVENT_PUT,
+        // A manifest's put is a put to every filter; the frame keeps
+        // its op.
+        types::KV_OP_PUT | types::KV_OP_PUT_MANIFEST => WATCH_EVENT_PUT,
         types::KV_OP_DELETE => WATCH_EVENT_DELETE,
         _ => return,
     };

@@ -493,8 +493,10 @@ fn emit_state(
     keepalive_deadline_ms: u64,
 ) {
     // [session_id:16][epoch:4][lease_id:8][status:1][ttl_ms:4]
-    // [granted_at:8][keepalive_deadline:8] = 49 bytes
-    let mut body = [0u8; sc::SESSION_HEADER + 8 + 1 + 4 + 8 + 8];
+    // [granted_at:8][keepalive_deadline:8][now:8] = 57 bytes; `now`
+    // is this manager's clock, against which the deadline reads as a
+    // remaining TTL.
+    let mut body = [0u8; sc::SESSION_HEADER + 8 + 1 + 4 + 8 + 8 + 8];
     sc::put_session_header(&mut body, sid, epoch);
     let mut p = sc::SESSION_HEADER;
     body[p..p + 8].copy_from_slice(&lease_id.to_le_bytes());
@@ -506,6 +508,8 @@ fn emit_state(
     body[p..p + 8].copy_from_slice(&granted_at_ms.to_le_bytes());
     p += 8;
     body[p..p + 8].copy_from_slice(&keepalive_deadline_ms.to_le_bytes());
+    p += 8;
+    body[p..p + 8].copy_from_slice(&mgr.now_ms.to_le_bytes());
     unsafe {
         let sys = mgr.syscalls;
         if !sys.is_null() {

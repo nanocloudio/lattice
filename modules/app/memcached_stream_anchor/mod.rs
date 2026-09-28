@@ -189,7 +189,7 @@ enum AnchorPhase {
 struct InflightVal {
     op: u8,
     conn_id: u16,
-    // For multi-key GET we'd need the full key list; Phase 2 keeps GET
+    // For multi-key GET we'd need the full key list; we keep GET
     // single-key (memcached `get k1 k2 k3` becomes one round-trip per
     // key — semantically equivalent, slightly chattier).
     key_len: u16,
@@ -228,7 +228,7 @@ struct AnchorState {
     cmd_get: u64,
     cmd_set: u64,
     total_connections: u64,
-    // Phase-14 telemetry. The three STATS counters above double as the
+    // Telemetry. The three STATS counters above double as the
     // module-scope metrics emitted on `metrics_out`; ids follow the
     // manifest `[observability] metrics` order (0=cmd_get, 1=cmd_set,
     // 2=total_connections). `step_ctr` paces the coarse emit cadence.
@@ -516,7 +516,7 @@ unsafe fn handle_stats(anchor: &mut AnchorState, slot_idx: usize) {
 }
 
 unsafe fn handle_get(anchor: &mut AnchorState, slot_idx: usize, line: &Line, gets: bool) {
-    // For simplicity Phase 2 issues one envelope per key; a real
+    // For simplicity we issue one envelope per key; a real
     // implementation would batch via KV_OP_MGET.
     let mem_op = if gets { MemOp::Gets } else { MemOp::Get };
     let recv_buf = anchor.slots[slot_idx].recv_buf;
@@ -593,7 +593,7 @@ unsafe fn handle_storage(
         ..line.tokens[1].offset as usize + line.tokens[1].len as usize];
     // tokens 2, 3, 4 are flags, exp, bytes — we honour exp (expiry)
     // but ignore the memcached flags field (Lattice doesn't surface it
-    // back via GET in Phase 2; full flags support requires extending
+    // back via GET; full flags support requires extending
     // KV_OP_PUT body shape).
     let _flags = parse_u32_dec(token_bytes(&recv_buf, line.tokens[2])).unwrap_or(0);
     let exp = parse_u32_dec(token_bytes(&recv_buf, line.tokens[3])).unwrap_or(0);
@@ -1308,7 +1308,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         poll_kv_in(anchor);
         flush_slots(anchor);
 
-        // Phase-14: emit module-scope counters on `metrics_out` at a
+        // Emit module-scope counters on `metrics_out` at a
         // coarse cadence (no-op until the port is wired). ids follow the
         // manifest `[observability] metrics` order.
         anchor.step_ctr = anchor.step_ctr.wrapping_add(1);

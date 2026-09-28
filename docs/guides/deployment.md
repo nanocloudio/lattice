@@ -61,9 +61,12 @@ Transport security is composition, not a config section: the fluxor
 (`tls.clear_out` → anchor, anchor → `tls.clear_in`), so client
 traffic is TLS-terminated before it reaches the protocol code. The
 run guide's graphs are cleartext; add the `tls` module and its
-wiring for a TLS-terminated deployment. The etcd anchor has no TLS
-of its own — without the `tls` module in front of it, gRPC is
-plaintext HTTP/2.
+wiring for a TLS-terminated deployment — one `tls` instance per TLS
+anchor, since an instance claims the connections of the one listener
+its anchor binds. `configs/single.yaml` (etcd and Redis) and
+`configs/single-minimal-etcd-tls.yaml` are TLS-fronted;
+`tools/dev-certs.sh` mints their development certificate, and a
+deployment points `cert_file` / `key_file` at its own.
 
 ## Running
 

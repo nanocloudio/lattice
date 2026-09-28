@@ -1,8 +1,7 @@
 //! lattice_data_anchor — storage-side terminator of `lattice.data`.
 //!
-//! RFC database foundation §14.8, §14.10, §26 phase 9. §14.10 states
-//! the whole job in one sentence: "terminate the internal multiplexed
-//! data surface and admit requests into range routing."
+//! The whole job in one sentence: terminate the internal multiplexed
+//! data surface and admit requests into range routing.
 //!
 //! ## This is not a protocol anchor
 //!
@@ -16,11 +15,11 @@
 //!   RESP has nothing to correlate with but arrival order; this has an
 //!   identity on every message and needs none.
 //! - **No session, retry, route cache, cancellation, or continuation
-//!   state.** §14.9 puts all five in the data client, and it is the
+//!   state.** All five live in the data client, and it is the
 //!   client that owns them precisely so that losing this graph loses
 //!   nothing a caller was relying on.
 //! - **No parsing decisions.** The compute layer already compiled the
-//!   operation into a canonical KV opcode (§14.2, §19); the frame
+//!   operation into a canonical KV opcode; the frame
 //!   carries it. This module never infers what a `DataOp::Write` meant.
 //!
 //! ## What it refuses, and why refusing is the feature
@@ -33,7 +32,7 @@
 //! resolution (`resolve_span`), and cancellation (`cancel`).
 //!
 //! Every one needs machinery that is genuinely not in a storage graph.
-//! §28 rejects treating this surface as a transparent FIFO exactly
+//! Treating this surface as a transparent FIFO is rejected exactly
 //! because a caller must be able to tell "not supported here" from
 //! "your request was lost", and a silent drop or a plausible-looking
 //! empty success would be indistinguishable from both. The match on
@@ -42,8 +41,8 @@
 //!
 //! ## What a response can prove, and what it cannot
 //!
-//! §14.8 requires every response to carry "applied index and
-//! source-aware consistency/durability fences". `MSG_KV_RESPONSE`
+//! Every response must carry an applied index and
+//! source-aware consistency/durability fences. `MSG_KV_RESPONSE`
 //! carries a fence tail for exactly this: the worker's applied
 //! index and term, the partition group that answered, and the
 //! durability class the router's path can support.
@@ -57,12 +56,13 @@
 //! - `serving_range_id` / `serving_range_generation` — the envelope
 //!   does not say which range served. Echoing the request's range back
 //!   would be the caller's own claim wearing the costume of an
-//!   observation, and §21 invariant 16 compares these fields across
+//!   observation, and placement equivalence compares these fields
+//!   across
 //!   placements, so a fabricated one would make the comparison pass by
 //!   construction.
 //!
 //! `durability_achieved` is whatever the router reports and is checked
-//! against §21 invariant 2 before it leaves: a claim of
+//! for soundness before it leaves: a claim of
 //! `ReplicatedDurable` from a source that cannot observe a quorum
 //! durable proof is refused rather than forwarded. An unrecognised
 //! durability byte is refused too, instead of being read as
@@ -118,9 +118,10 @@ use types::{
     KV_OP_PREPEND, KV_OP_PUT, KV_OP_TARGETED, KV_OP_TXN, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD,
     KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED, KV_RESULT_COMPACTED,
     KV_RESULT_CROSS_DOMAIN, KV_RESULT_CROSS_RANGE, KV_RESULT_DIRTY_EPOCH, KV_RESULT_EXISTS,
-    KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
-    KV_RESULT_QUOTA, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN, KV_RESULT_TXN_PENDING,
-    KV_RESULT_UNAUTH, KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PROTO_INTERNAL_DATA,
+    KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_KVS, KV_RESULT_LIN_BOUND, KV_RESULT_NOT_FOUND,
+    KV_RESULT_OK, KV_RESULT_QUOTA, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, KV_RESULT_TOO_LARGE,
+    KV_RESULT_TXN, KV_RESULT_TXN_PENDING, KV_RESULT_UNAUTH, KV_RESULT_VERSIONS,
+    KV_RESULT_WRONG_TYPE, PROTO_INTERNAL_DATA,
 };
 use wire::{KV_RESPONSE_FENCE_TAIL_LEN, MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -365,7 +366,7 @@ const fn op_disposition(op: DataOp) -> Disposition {
         // anchor depend on liveness of the range.
         DataOp::KeepAlive => Disposition::Inline,
 
-        // Session lifecycle (§14.9: the session directory lives with
+        // Session lifecycle (the session directory lives with
         // compute), capability and catalog negotiation, subscriptions,
         // route resolution, and cancellation. Each needs a component
         // that is genuinely absent here, and each is refused by name so
@@ -426,11 +427,12 @@ const fn map_result(result: u8) -> (Outcome, Option<DataRetryClass>) {
         | KV_RESULT_SCAN_CURSOR
         | KV_RESULT_TXN
         | KV_RESULT_RANGE
-        | KV_RESULT_VERSIONS => (Outcome::Ok, None),
+        | KV_RESULT_VERSIONS
+        | KV_RESULT_KVS => (Outcome::Ok, None),
 
         // The route this request named is not the route that owns the
         // key any more. Refresh descriptors and retry. `CROSS_DOMAIN` is
-        // the same at the cluster-domain granularity (§11.3/§26.5): the
+        // the same at the cluster-domain granularity: the
         // key's home range is in another domain, and the response
         // payload carries which one so the caller can redirect there.
         KV_RESULT_CROSS_RANGE | KV_RESULT_DIRTY_EPOCH | KV_RESULT_CROSS_DOMAIN => {
@@ -452,7 +454,9 @@ const fn map_result(result: u8) -> (Outcome, Option<DataRetryClass>) {
         // The request is wrong in a way retrying identically cannot
         // fix: wrong type for the key, not permitted, or reading below
         // the retention floor.
-        KV_RESULT_WRONG_TYPE | KV_RESULT_UNAUTH | KV_RESULT_COMPACTED => {
+        // A command larger than the replicated path carries is the same:
+        // no retry of it can succeed.
+        KV_RESULT_WRONG_TYPE | KV_RESULT_UNAUTH | KV_RESULT_COMPACTED | KV_RESULT_TOO_LARGE => {
             (Outcome::Refused, Some(DataRetryClass::Malformed))
         }
 
@@ -496,15 +500,15 @@ fn fences_for(
         fence: SourceFence {
             kind: FenceSource::RangeLeader,
             source_id,
-            // The Raft term the applied position was reached in. §21
-            // invariant 11: identity and epoch travel together, so a
+            // The Raft term the applied position was reached in.
+            // Identity and epoch travel together, so a
             // fence with the right group and a stale term is still
             // stale and the caller can see that it is.
             source_epoch: applied_term,
         },
         durability_achieved: Durability::from_u8(durability)?,
     };
-    // §21 invariant 2, checked rather than assumed. A follower or
+    // Durability honesty, checked rather than assumed. A follower or
     // observer can never have watched a quorum durable proof, so a
     // response claiming `ReplicatedDurable` from one is not a strong
     // answer — it is a false one, and it must not leave this module.
@@ -604,7 +608,7 @@ fn handle_frame(anchor: &mut AnchorState, slot_idx: usize, frame: &[u8]) {
     let request_id = request.context.request_id;
     let session_id = request.session_id;
 
-    // Admission first (§14.8, §21 invariants 14 and 17). The contract
+    // Admission first. The contract
     // classifies its own refusals; this module does not get an opinion.
     if let Err(err) = admit_request(&request) {
         anchor.m_admission_refusals = anchor.m_admission_refusals.wrapping_add(1);
@@ -704,7 +708,7 @@ fn forward(
 
     // Envelope head: [corr:8][proto:1][tenant:4][conn:1][cons:1][op:1][body_len:2] = 18
     const HEAD_LEN: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
-    // §23 canonical identity: the tenant rides in the head; the database
+    // Canonical identity: the tenant rides in the head; the database
     // and keyspace ride in an 8-byte tail after the body. This anchor
     // has the native RequestContext, so it always appends the tail (the
     // router reads it and forwards all three to the store).
@@ -771,7 +775,7 @@ fn forward(
         p += 2;
         scratch[p..p + body_len].copy_from_slice(payload);
         p += body_len;
-        // §23 identity tail: [database:4][keyspace:4].
+        // Canonical identity tail: [database:4][keyspace:4].
         scratch[p..p + 4].copy_from_slice(&request.context.database_id.to_le_bytes());
         p += 4;
         scratch[p..p + 4].copy_from_slice(&request.context.keyspace_id.to_le_bytes());
@@ -857,7 +861,7 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     let body_off = wire::KvResponseHead::LEN;
     // The fence tail is not optional. A router that does not send one
     // is not an older router to be tolerated — it is a router this
-    // build cannot build a §14.8 response from, and treating its
+    // build cannot build a fenced response from, and treating its
     // replies as unfenced would answer callers with a fence-shaped
     // hole they have no way to distinguish from a real zero.
     let tail_off = body_off + body_len;
@@ -921,7 +925,7 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     };
     // A refusal describes no execution, so it carries no rows — EXCEPT a
     // cross-domain redirect, whose body is not rows but the owning
-    // cluster domain the caller must go to (§11.3/§26.5). Forwarding it
+    // cluster domain the caller must go to. Forwarding it
     // is the difference between "wrong domain" and "wrong domain, go to
     // N".
     let payload: &[u8] = if outcome == Outcome::Ok || result == KV_RESULT_CROSS_DOMAIN {

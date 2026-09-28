@@ -1,11 +1,11 @@
-//! mysql_edge_anchor — MySQL/MariaDB wire connector (RFC database
-//! foundation §14.3).
+//! mysql_edge_anchor — MySQL/MariaDB wire connector.
 //!
 //! The counterpart to `pg_edge_anchor`, and deliberately its structural
 //! twin: the same slot table, the same "text out, typed values back"
 //! boundary, the same refusal discipline. What differs is entirely
-//! MySQL's spelling of things, which is exactly the division §14.3
-//! draws — a connector owns wire, auth, session, error mapping and
+//! MySQL's spelling of things, which is exactly the division this
+//! codebase draws — a connector owns wire, auth, session, error
+//! mapping and
 //! result encoding, and owns nothing about what a statement MEANS.
 //!
 //! The clearest evidence the split is real: a boolean renders `1`/`0`
@@ -474,7 +474,7 @@ fn forward_statement(anchor: &mut AnchorState, idx: usize, sql: &[u8]) {
     anchor.corr_seq = anchor.corr_seq.wrapping_add(1);
     let corr = anchor.corr_seq;
     // The executor head's conn byte carries this anchor's SLOT INDEX,
-    // not the net conn id — net conn ids are u16 now and no longer fit
+    // not the net conn id — net conn ids are u16 and do not fit
     // the 1-byte field. Replies are matched by `corr`, so the byte only
     // has to be stable for the statement's lifetime, which the slot
     // index is.

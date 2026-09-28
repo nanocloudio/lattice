@@ -1,24 +1,24 @@
-//! Shared relational contracts — RFC database foundation §14.1-14.6,
-//! §14.11, §21 invariants 15/18, delivery Phase 7.
+//! Shared relational contracts: the type system, the ordered and
+//! plain value encodings, catalogs, schema-change machinery.
 //!
-//! Phase 7 slice 1: the *representation* both connectors must target.
+//! The *representation* both connectors must target.
 //! This file is contracts only — no SQL parser, no binder, no planner,
 //! no connector, no ports, no I/O, no clocks, no module. It stands in
-//! the same relationship to the future relational modules that
-//! `db_ops.rs` does to the Phase-6 workers.
+//! the same relationship to the relational modules that
+//! `db_ops.rs` does to the KV workers.
 //!
-//! §14.3 states the rule this file exists to make mechanically true:
+//! The rule this file exists to make mechanically true:
 //!
-//! > Connectors may parse dialect-specific syntax, but must bind into
-//! > the shared relational representation. They **must not introduce
-//! > connector-specific table formats, transaction managers, indexes,
-//! > catalogs of record, or persistence paths.**
+//! Connectors may parse dialect-specific syntax, but must bind into
+//! the shared relational representation. They **must not introduce
+//! connector-specific table formats, transaction managers, indexes,
+//! catalogs of record, or persistence paths.**
 //!
 //! A rule like that is not enforceable by review. It is enforceable by
 //! there being exactly one encoder, in one file, with golden vectors:
 //! if the PostgreSQL connector and the MySQL connector both call
-//! [`encode_row`] and [`encode_primary_key`], "equivalent logical
-//! state for their shared SQL subset" (§26 Phase 7 acceptance) is a
+//! [`encode_row`] and [`encode_primary_key`], equivalent logical
+//! state for their shared SQL subset is a
 //! consequence of the code rather than a hope about it.
 //!
 //! ## 1. Two encodings, on purpose
@@ -38,7 +38,7 @@
 //! The reason for the split is that order preservation is expensive and
 //! only ever needed in key position. A length prefix sorts short values
 //! before long ones *by length*, which destroys lexical ordering — so
-//! key-position strings must use §9.1's escape discipline instead
+//! key-position strings must use the shared escape discipline instead
 //! ([`internal_key`]'s `0x00 -> 0x00 0xFF`, terminator `0x00 0x01`).
 //! Off the key path that cost buys nothing, so payload strings are
 //! length-prefixed, integers keep their natural two's-complement bits,
@@ -52,7 +52,7 @@
 //! ## 2. What this file does NOT own
 //!
 //! Secondary-index key encoding and unique-ownership records already
-//! exist, one layer down, in `db_ops.rs` (§14, §14.4). This file does
+//! exist, one layer down, in `db_ops.rs`. This file does
 //! not duplicate them. It produces the *index value tuple*
 //! ([`encode_index_value`]) that `db_ops::IndexEntry` consumes, and
 //! re-exports the db_ops surface so a connector needs one import.
@@ -63,11 +63,9 @@
 //!
 //! ## 3. Schema change is a machine, not a flag
 //!
-//! §14.5:
-//!
-//! > Schema changes are resumable state machines recorded through
-//! > Lattice. Publication uses versioned descriptors so old and new
-//! > binaries can identify compatible read and write phases.
+//! Schema changes are resumable state machines recorded through
+//! Lattice. Publication uses versioned descriptors so old and new
+//! binaries can identify compatible read and write phases.
 //!
 //! [`SchemaPhase`] is the classic safe sequence
 //! `Absent → DeleteOnly → WriteOnly → Backfilling → Public`, and the
@@ -87,7 +85,7 @@
 //! out-of-bounds length, non-ascending column ids, a decimal that would
 //! lose a nonzero digit on rescale, a NaN in key position, an
 //! unevaluated enforced CHECK constraint: all refusals, none of them
-//! best-effort. §14.3's closing sentence is the governing style —
+//! best-effort. One sentence is the governing style —
 //! behavior that cannot be represented honestly is *rejected*, never
 //! silently approximated.
 //!
@@ -131,8 +129,9 @@ use core::cmp::Ordering;
 /// Version of the [`encode_row`] payload layout.
 pub const ROW_FORMAT_VERSION: u16 = 1;
 /// Version of the key composites ([`encode_primary_key`],
-/// [`encode_index_value`]). Keys carry no inline version byte — §9.1
-/// records key-format versions in manifests, not in every key — so this
+/// [`encode_index_value`]). Keys carry no inline version byte — the
+/// key layer records key-format versions in manifests, not in every
+/// key — so this
 /// constant is published in [`TableDescriptor::format_generation`] and
 /// a bump is a full table rewrite.
 pub const KEY_FORMAT_GENERATION: u16 = 1;
@@ -218,19 +217,19 @@ const TERM: [u8; 2] = [0x00, 0x01];
 /// Ordered null marker. `0x00` sorts below the present marker, so
 /// Lattice's declared key order is **NULLS FIRST**. A connector whose
 /// dialect defaults to NULLS LAST reverses in the planner, never in the
-/// encoder: the physical order is one thing for both connectors (§14.3).
+/// encoder: the physical order is one thing for both connectors.
 pub const ORDERED_NULL: u8 = 0x00;
 /// Ordered present marker; the type's body follows.
 pub const ORDERED_PRESENT: u8 = 0x01;
 
 // ══════════════════════════════════════════════════════════════════════
-// 1. Logical type system (§14.2 "logical types and explicit connector
-//    type mappings")
+// 1. Logical type system (logical types and explicit connector
+//    type mappings)
 // ══════════════════════════════════════════════════════════════════════
 
 /// The closed shared SQL type set. Closed is the point: a connector
 /// that meets a dialect type outside this set maps it to one of these
-/// or reports it unsupported (§14.3), and it may not extend the set on
+/// or reports it unsupported, and it may not extend the set on
 /// its own — an extension is a version bump here, visible to both.
 ///
 /// Wire form, [`TYPE_WIRE_LEN`] bytes:
@@ -253,7 +252,7 @@ pub const ORDERED_PRESENT: u8 = 0x01;
 ///   no zone attached.
 /// - `TimestampTz` is the same integer, already normalized to UTC. The
 ///   session time zone is connector-owned presentation state and never
-///   reaches storage (§14.3).
+///   reaches storage.
 /// - `Char` is **blank-padded to its declared length at encode time**,
 ///   which is the one storage form both dialects agree on; trimming on
 ///   output is connector semantics.
@@ -553,7 +552,7 @@ const fn pow10(n: u32) -> Option<i128> {
 ///
 /// Scaling up multiplies (checked). Scaling down is permitted only when
 /// every discarded digit is zero: a decimal that would lose a nonzero
-/// digit is refused, never rounded. §14.3 — behavior that cannot be
+/// digit is refused, never rounded. Behavior that cannot be
 /// represented honestly is rejected, not approximated. Rounding mode is
 /// exactly the kind of thing PostgreSQL and MySQL disagree about, so
 /// the shared layer refuses to have one.
@@ -680,8 +679,8 @@ const fn f32_from_order_bits(m: u32) -> f32 {
 /// the property test compares the two directly. Three rules worth
 /// naming:
 ///
-/// - `NULL` sorts before every non-null value (NULLS FIRST, §1 of this
-///   file's docs).
+/// - `NULL` sorts before every non-null value (NULLS FIRST, section 1
+///   of this file's docs).
 /// - `-0.0 < +0.0`. IEEE `==` says they are equal; a byte encoding
 ///   cannot make two distinct bit patterns equal, so the *order* is the
 ///   thing that gets adjusted, and it is adjusted consistently in both
@@ -843,7 +842,7 @@ fn put(out: &mut [u8], n: usize, src: &[u8]) -> Option<usize> {
 /// sorts `"z"` before `"aa"` because 1 < 2. Escaping with a terminator
 /// that sorts below every escaped byte preserves lexical order *and*
 /// makes no encoded value a prefix of another, which is what lets a
-/// composite key be a plain concatenation (§9.1's prefix-ambiguity
+/// composite key be a plain concatenation (the prefix-ambiguity
 /// rule, applied one level up).
 ///
 /// Refusals: a value that does not inhabit `ty`, a text/binary value
@@ -1147,10 +1146,10 @@ pub fn decode_value_plain(src: &[u8], ty: LogicalType) -> Option<(Value<'_>, usi
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 5. Relational keyspaces (§14.4)
+// 5. Relational keyspaces
 // ══════════════════════════════════════════════════════════════════════
 
-/// §14.4's reserved keyspaces. The high bit is set on every one of
+/// The reserved relational keyspaces. The high bit is set on every one of
 /// them: catalog-assigned user keyspaces are allocated below
 /// `0x8000_0000`, so [`is_reserved_relational`] is a single bit test
 /// and a foreign protocol cannot collide into relational space by
@@ -1221,9 +1220,9 @@ impl ObjectKind {
     }
 }
 
-/// Which model owns an object's writes (§21 invariant 18: "every
-/// catalog object has one authoritative write owner; other models
-/// access it only through declared views or projections").
+/// Which model owns an object's writes: every catalog object has one
+/// authoritative write owner; other models access it only through
+/// declared views or projections.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelOwner {
@@ -1263,8 +1262,8 @@ pub enum AccessPath {
     /// The writer addressed the object's own keyspace.
     Direct = 1,
     /// The writer went through an explicitly declared view or
-    /// projection with transactional maintenance (§14.4's escape
-    /// hatch).
+    /// projection with transactional maintenance (the one sanctioned
+    /// escape hatch).
     DeclaredProjection = 2,
 }
 
@@ -1272,12 +1271,12 @@ pub enum AccessPath {
 /// refusal must name what it refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CatalogError {
-    /// §14.4: relational keyspaces are not writable through
+    /// Relational keyspaces are not writable through
     /// unrestricted Redis, etcd, or Memcached commands. Such a write
     /// would bypass types, indexes, constraints, and schema state.
     ForeignProtocolWrite { keyspace: u32, writer: ModelOwner },
-    /// §21 invariant 18: a second model tried to write an object it
-    /// does not own, without a declared projection.
+    /// Single-writer ownership: a second model tried to write an
+    /// object it does not own, without a declared projection.
     NotWriteOwner {
         owner: ModelOwner,
         writer: ModelOwner,
@@ -1291,14 +1290,15 @@ pub enum CatalogError {
     /// The index's freshness record names a different index.
     FreshnessWrongIndex { expected: u32, found: u32 },
     /// The index's freshness record claims a different exactness than
-    /// the descriptor declares. §21 invariant 19 — an index cannot
-    /// claim an exactness it was not built with.
+    /// the descriptor declares — an index cannot claim an exactness
+    /// it was not built with.
     FreshnessExactnessMismatch,
     /// The delegated `db_ops` freshness check refused.
     Freshness(FreshnessError),
 }
 
-/// §14.4 + §21 invariant 18 as one executable gate.
+/// Keyspace reservation and single-writer ownership as one executable
+/// gate.
 ///
 /// Ordering of the clauses is the contract: the keyspace rule is
 /// checked first and is unconditional, because a Redis `SET` into
@@ -1361,7 +1361,7 @@ pub fn decode_catalog_key(src: &[u8]) -> Option<(u32, ObjectKind, u32)> {
     ))
 }
 
-/// Reserved keyspace for the catalog's NAME index (§14.4). Separate
+/// Reserved keyspace for the catalog's NAME index. Separate
 /// from [`KS_RELATIONAL_CATALOG`] rather than a differently-shaped key
 /// inside it, so a scan of the catalog keyspace still yields exactly
 /// descriptors and nothing has to distinguish an index entry from an
@@ -1430,7 +1430,7 @@ pub fn encode_stats_key(out: &mut [u8], table_id: u32, statistic_id: u32) -> Opt
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 6. Primary-key and index-value composites (§14.4)
+// 6. Primary-key and index-value composites
 // ══════════════════════════════════════════════════════════════════════
 
 /// Width of the table identifier inside a primary-key composite.
@@ -1446,7 +1446,7 @@ pub const TABLE_ID_LEN: usize = 4;
 /// and hand the result to `internal_key::encode` with
 /// [`KS_RELATIONAL_TABLE`] — this function deliberately stops short of
 /// the physical key, because `internal_key` owns the identity triple,
-/// the MVCC suffix, and the outer escape (§9.1). One encoder per
+/// the MVCC suffix, and the outer escape. One encoder per
 /// concern.
 ///
 /// Two properties, both load-bearing:
@@ -1595,7 +1595,7 @@ pub fn encode_index_value(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 7. Row payload encoding (§14.4)
+// 7. Row payload encoding
 // ══════════════════════════════════════════════════════════════════════
 
 /// One column of a row, on the way in or out of [`encode_row`].
@@ -1617,7 +1617,7 @@ pub struct ColumnValue<'a> {
 ///
 /// `payload_len` covers everything after the first four bytes.
 ///
-/// The layout is built around one requirement from §14.5 — old and new
+/// The layout is built around one requirement — old and new
 /// binaries must both be able to read a row while a schema change is in
 /// flight:
 ///
@@ -1853,14 +1853,14 @@ pub fn row_entry(src: &[u8], i: usize) -> Option<RowEntry> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 8. Catalog descriptors (§14.2, §14.5)
+// 8. Catalog descriptors
 // ══════════════════════════════════════════════════════════════════════
 //
 // Every descriptor carries `catalog_revision`. That field is not
-// decoration: §14.5 requires a plan to record the catalog revision it
-// bound against, and requires that "before execution, stale catalog or
-// routing generations cause rebind/replan rather than execution under
-// mixed metadata". [`PlanBinding`] in §11 below is the consumer.
+// decoration: a plan records the catalog revision it bound against,
+// and before execution, stale catalog or routing generations cause
+// rebind/replan rather than execution under mixed metadata.
+// [`PlanBinding`] in section 11 below is the consumer.
 //
 // Every descriptor is versioned, length-declared, and bounded, in the
 // same `[version:u16][payload_len:u16][payload]` shape `db_ops` uses,
@@ -1917,7 +1917,7 @@ impl Name {
 
 // ── DatabaseDescriptor ────────────────────────────────────────────────
 
-/// A relational database (§14.2's "database ... catalog").
+/// A relational database (the database catalog).
 ///
 /// Wire layout ([`DATABASE_DESCRIPTOR_VERSION`] 1, integers LE):
 ///
@@ -2007,7 +2007,7 @@ const COLUMN_FLAG_MASK: u8 = COLUMN_FLAG_NULLABLE | COLUMN_FLAG_DEFAULT_PRESENT;
 /// One column of a table.
 ///
 /// `default_present` is a *flag*, not a value: defaults are expressions
-/// and this layer does not evaluate expressions (§14.6). It records
+/// and this layer does not evaluate expressions. It records
 /// that a default exists so [`check_not_null`] can say whether an
 /// absent column is recoverable, and so a connector can report the
 /// column honestly in its compatibility catalog.
@@ -2099,7 +2099,7 @@ impl ColumnDescriptor {
     }
 }
 
-/// A relational table (§14.2's "table, column ... catalogs").
+/// A relational table (the table and column catalogs).
 ///
 /// Wire layout ([`TABLE_DESCRIPTOR_VERSION`] 1, integers LE):
 ///
@@ -2113,8 +2113,9 @@ impl ColumnDescriptor {
 /// ```
 ///
 /// `format_generation` is [`KEY_FORMAT_GENERATION`] at creation time.
-/// Keys carry no inline version (§9.1 keeps key-format versions out of
-/// keys), so this field is where a reader learns which key encoding a
+/// Keys carry no inline version (the key layer keeps key-format
+/// versions out of keys), so this field is where a reader learns
+/// which key encoding a
 /// table's rows were written with — and a mismatch is a full rewrite,
 /// not a migration in place.
 ///
@@ -2326,7 +2327,7 @@ impl TableDescriptor {
 pub const INDEX_FLAG_UNIQUE: u8 = 0b0000_0001;
 const INDEX_FLAG_MASK: u8 = INDEX_FLAG_UNIQUE;
 
-/// A secondary index (§14.2's "index ... catalog").
+/// A secondary index (the index catalog).
 ///
 /// Wire layout ([`INDEX_DESCRIPTOR_VERSION`] 1, integers LE):
 ///
@@ -2341,13 +2342,14 @@ const INDEX_FLAG_MASK: u8 = INDEX_FLAG_UNIQUE;
 /// Three fields tie this descriptor to machinery that already exists:
 ///
 /// - `index_generation` is the generation `db_ops::IndexFreshness`
-///   must match (§11.3): an index built before a topology change cannot
+///   must match (partition-map metadata): an index built before a
+///   topology change cannot
 ///   answer for the span after it.
 /// - `exactness` is `db_ops::IndexExactness`. A `Synchronous` index is
 ///   maintained inside the writing transaction and is exact at every
 ///   committed timestamp; a `Derived` index must advertise its lag and
-///   cannot satisfy a freshness contract it has not reached (§21
-///   invariant 19). [`IndexDescriptor::freshness_ok`] is the gate.
+///   cannot satisfy a freshness contract it has not reached.
+///   [`IndexDescriptor::freshness_ok`] is the gate.
 /// - `phase`/`direction` are the index's live [`SchemaPhase`]. An index
 ///   that is not `Public` is not readable no matter how fresh it is —
 ///   see [`IndexDescriptor::readable`].
@@ -2440,7 +2442,7 @@ impl IndexDescriptor {
         read_allowed(self.phase)
     }
 
-    /// The §21-invariant-19 gate, delegated to `db_ops` and fenced by
+    /// The freshness-honesty gate, delegated to `db_ops` and fenced by
     /// this descriptor's identity.
     ///
     /// Order of the clauses is the contract: identity first (a
@@ -2542,11 +2544,11 @@ impl IndexDescriptor {
 pub const SEQUENCE_FLAG_CYCLE: u8 = 0b0000_0001;
 const SEQUENCE_FLAG_MASK: u8 = SEQUENCE_FLAG_CYCLE;
 
-/// A sequence (§14.2's "sequence ... catalog").
+/// A sequence (the sequence catalog).
 ///
-/// §14.11 assigns durable sequences to "Lattice transactional or lease
-/// records" — the compute holds no authority over them, which is §21
-/// invariant 15. This descriptor is the durable shape; [`sequence_next`]
+/// Durable sequences live in Lattice transactional or lease records —
+/// the compute holds no authority over them; compute never holds
+/// unique state. This descriptor is the durable shape; [`sequence_next`]
 /// is the pure arithmetic a transaction applies to it. Nothing here
 /// caches, allocates a block, or reads a clock.
 ///
@@ -2572,7 +2574,7 @@ pub struct SequenceDescriptor {
     pub max_value: i64,
     /// How many values one durable allocation may hand out. Recorded
     /// so a cached block is auditable; the cache itself lives in
-    /// compute and is disposable (§14.11).
+    /// compute and is disposable.
     pub cache: u32,
     pub cycle: bool,
     pub name: Name,
@@ -2694,7 +2696,7 @@ impl SequenceDescriptor {
 /// Pure: no clock, no cache, no I/O. The caller applies it inside a
 /// Lattice transaction against the durable record, which is what makes
 /// the sequence's authority live in the range rather than in the
-/// compute worker (§14.11, §21 invariant 15).
+/// compute worker.
 ///
 /// Overflow of `i64` itself is treated as running off the bound, so a
 /// cycling sequence wraps to its far end and a non-cycling one refuses
@@ -2711,14 +2713,14 @@ pub fn sequence_next(d: &SequenceDescriptor, current: i64) -> Result<i64, Sequen
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 9. Schema-change state machine (§14.5)
+// 9. Schema-change state machine
 // ══════════════════════════════════════════════════════════════════════
 //
-// > Schema changes are resumable state machines recorded through
-// > Lattice. Publication uses versioned descriptors so old and new
-// > binaries can identify compatible read and write phases. Backfill,
-// > validation, cutover, and cleanup each have explicit fences and
-// > retention claims.
+// Schema changes are resumable state machines recorded through
+// Lattice. Publication uses versioned descriptors so old and new
+// binaries can identify compatible read and write phases. Backfill,
+// validation, cutover, and cleanup each have explicit fences and
+// retention claims.
 //
 // The classic safe sequence, and why each step exists:
 //
@@ -2776,7 +2778,7 @@ impl SchemaDirection {
 }
 
 /// The publication phase of an index (or any added/dropped schema
-/// element) — §14.5's "compatible read and write phases".
+/// element) — the compatible read and write phases.
 ///
 /// Discriminants start at 1 so a zeroed buffer never decodes as a phase.
 #[repr(u8)]
@@ -2908,7 +2910,7 @@ pub enum SchemaError {
         to: SchemaPhase,
         direction: SchemaDirection,
     },
-    /// §14.5: a phase may only advance once **every** node is known to
+    /// A phase may only advance once **every** node is known to
     /// be at-or-past the previous phase. `fleet_min` is the slowest
     /// node's phase; advancing while it lags would put two
     /// non-adjacent phases in the fleet at once and break the
@@ -2917,10 +2919,10 @@ pub enum SchemaError {
         current: SchemaPhase,
         fleet_min: SchemaPhase,
     },
-    /// Entering `Backfilling` without a retention claim. §14.5 requires
-    /// backfill to carry an explicit retention claim; without one the
+    /// Entering `Backfilling` without a retention claim. Backfill
+    /// must carry an explicit retention claim; without one the
     /// history the backfill reads can be compacted out from under it
-    /// (§18, §21 invariant 13).
+    /// (the GC-floor contract).
     BackfillWithoutRetentionClaim,
     /// Rollback was requested where there is nothing to roll back to:
     /// the job's start (nothing done) or its terminal phase (the change
@@ -2990,7 +2992,7 @@ pub fn rollback_target(dir: SchemaDirection, phase: SchemaPhase) -> Option<Schem
     SchemaPhase::at_rank(dir, r - 1)
 }
 
-/// A resumable schema-change job (§14.5), recorded in
+/// A resumable schema-change job, recorded in
 /// `relational/job/<schema-job-id>`.
 ///
 /// Wire layout ([`SCHEMA_JOB_VERSION`] 1, integers LE):
@@ -3007,16 +3009,17 @@ pub fn rollback_target(dir: SchemaDirection, phase: SchemaPhase) -> Option<Schem
 /// completed through — the resume point. Empty means "not started".
 /// Storing it as a key rather than a row count is what makes the job
 /// resumable across a compute failure: a replacement worker re-reads
-/// the job record and continues from the watermark (§14.11).
+/// the job record and continues from the watermark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaJob {
     pub job_id: u64,
     pub index_id: u32,
     pub table_id: u32,
     /// The catalog revision this job was planned against. A plan bound
-    /// to an older revision must rebind (§14.5).
+    /// to an older revision must rebind.
     pub catalog_revision: u64,
-    /// The protected timestamp the backfill claims (§18). Zero means
+    /// The protected timestamp the backfill claims (the GC-floor
+    /// contract). Zero means
     /// no claim, and entering `Backfilling` without one is refused.
     pub retention_claim_ts: Timestamp,
     pub direction: SchemaDirection,
@@ -3102,7 +3105,7 @@ impl SchemaJob {
     /// 1. the transition must be legal in this direction (no skips, no
     ///    reversals, no leaving terminal);
     /// 2. the fleet must be at-or-past the phase we are leaving —
-    ///    §14.5's convergence fence, and the reason
+    ///    the convergence fence, and the reason
     ///    [`adjacent_phases_safe`] only ever has to reason about
     ///    *adjacent* pairs;
     /// 3. entering `Backfilling` requires a retention claim.
@@ -3200,15 +3203,14 @@ impl SchemaJob {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 10. Constraints (§14.2 "unique, check, not-null, and referential
-//     constraints")
+// 10. Constraints (unique, check, not-null, and referential
+//     constraints)
 // ══════════════════════════════════════════════════════════════════════
 //
 // All four are *pure functions over already-fetched state*. Nothing
 // here probes storage. The executor fetches; this file decides. That
 // split is what lets the same constraint logic run in a combined graph
-// and a separated relational-compute graph and reach the same answer
-// (§14.7, §21 invariant 16).
+// and a separated relational-compute graph and reach the same answer.
 
 /// Every way a constraint check refuses. No catch-all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3226,8 +3228,8 @@ pub enum ConstraintError {
     /// A different primary key already owns this unique-index slot.
     UniqueConflict { index_id: u32 },
     /// The candidate ownership presented an epoch older than the stored
-    /// record: a delayed message from a superseded attempt (§21
-    /// invariant 6).
+    /// record: a delayed message from a superseded attempt (epoch
+    /// fencing).
     UniqueStaleEpoch {
         index_id: u32,
         current: u64,
@@ -3242,8 +3244,8 @@ pub enum ConstraintError {
     /// An enforced `CHECK` evaluated false.
     CheckViolated { check_id: u32 },
     /// The executor returned a verdict for a predicate version this
-    /// binary does not recognise (§14.6 — the expression capability's
-    /// version contract must match, not merely exist).
+    /// binary does not recognise — the expression capability's
+    /// version contract must match, not merely exist.
     CheckVersionMismatch { check_id: u32, version: u16 },
     /// `MATCH FULL`: some but not all foreign-key columns are NULL.
     ForeignKeyPartialNull { fk_id: u32 },
@@ -3260,11 +3262,11 @@ pub enum ConstraintError {
 ///
 /// Defaults are applied by the writer *before* this check —
 /// `default_present` on a [`ColumnDescriptor`] is metadata, not a value
-/// this layer can evaluate (§14.6). So an absent non-nullable column is
+/// this layer can evaluate. So an absent non-nullable column is
 /// a refusal here, deliberately: the alternative is inventing a value.
 ///
 /// Returns the *first* violation in column order, which makes the error
-/// deterministic across binaries — §21 invariant 3's spirit applied to
+/// deterministic across binaries — determinism's spirit applied to
 /// error reporting.
 pub fn check_not_null(table: &TableDescriptor, row: &[u8]) -> Result<(), ConstraintError> {
     for c in table.columns() {
@@ -3335,8 +3337,8 @@ pub fn check_unique(
 
 /// A `CHECK` constraint, as a **versioned opaque predicate id**.
 ///
-/// This layer deliberately does not evaluate expressions. §14.6 says
-/// relational expressions *may* reuse a shared deterministic expression
+/// This layer deliberately does not evaluate expressions. Relational
+/// expressions *may* reuse a shared deterministic expression
 /// capability, but "PostgreSQL/MySQL correctness must not depend on an
 /// optional general-purpose language runtime" — so the shared
 /// representation carries the *identity* of the predicate and the
@@ -3429,7 +3431,7 @@ impl CheckConstraint {
 ///   one of the other two, and collapsing it into "satisfied" writes
 ///   rows that violate a declared constraint.
 /// - A verdict whose `reason_version` disagrees with the predicate's
-///   compiled version is refused (§14.6's version-contract clause).
+///   compiled version is refused (the version-contract clause).
 pub fn apply_check_verdict(
     c: &CheckConstraint,
     verdict: CheckVerdict,
@@ -3507,7 +3509,7 @@ const FK_FLAG_MASK: u8 = FK_FLAG_MATCH_FULL;
 /// names the index used to find children of a parent value; it is `0`
 /// when no such index exists, and a parent-side plan then has to
 /// declare a table scan, which [`fk_parent_change_plan`] refuses to
-/// hide (§14.13 bounded pushdown — an unbounded probe is not a plan).
+/// hide (bounded pushdown — an unbounded probe is not a plan).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForeignKeyDescriptor {
     pub fk_id: u32,
@@ -3578,7 +3580,7 @@ impl ForeignKeyDescriptor {
             // Types must match exactly. A referential constraint across
             // types would need an implicit cast, and PostgreSQL and
             // MySQL do not agree about implicit casts — so the shared
-            // layer refuses rather than picking a dialect (§14.3).
+            // layer refuses rather than picking a dialect.
             if c.ty != p.ty {
                 return Err(ConstraintError::Malformed);
             }
@@ -3692,8 +3694,7 @@ pub enum ProbeTarget {
     IndexValue { index_id: u32 },
     /// No index exists to answer this probe. The executor must either
     /// refuse or plan an explicit bounded scan; this variant exists so
-    /// that fact is *declared* rather than discovered at runtime
-    /// (§14.13).
+    /// that fact is *declared* rather than discovered at runtime.
     UnindexedScan { table_id: u32 },
 }
 
@@ -3720,7 +3721,7 @@ pub enum ProbeExpectation {
 /// The executor does the probing. This struct is the complete statement
 /// of what it must probe — bounded by [`MAX_FK_PROBES`] keys of
 /// [`MAX_PROBE_KEY_LEN`] bytes, so a referential check can never turn
-/// into an unbounded fan-out (§21 invariant 14).
+/// into an unbounded fan-out (the bounded-work rule).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FkProbePlan {
     pub fk_id: u32,
@@ -3890,8 +3891,7 @@ pub fn fk_check_plan(
 /// If the child has no index on the FK columns (`child_index_id == 0`)
 /// the target is [`ProbeTarget::UnindexedScan`] and the plan *says so*.
 /// A referential check that silently becomes a table scan is an
-/// unbounded operation wearing a constraint's clothes (§14.13, §21
-/// invariant 14).
+/// unbounded operation wearing a constraint's clothes.
 pub fn fk_parent_change_plan(
     old_row: &[u8],
     new_row: Option<&[u8]>,
@@ -3957,12 +3957,11 @@ pub fn fk_parent_change_plan(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 11. Plan binding and compute-disposable state (§14.5, §14.11,
-//     §21 invariants 15 and 18)
+// 11. Plan binding and compute-disposable state
 // ══════════════════════════════════════════════════════════════════════
 
 /// Isolation levels the shared layer represents. Serializable is the
-/// contract Lattice offers (§13.3); the weaker levels are listed so a
+/// contract Lattice offers; the weaker levels are listed so a
 /// connector can *record* what a session asked for rather than
 /// silently upgrading or downgrading it.
 #[repr(u8)]
@@ -3984,26 +3983,27 @@ impl Isolation {
     }
 }
 
-/// §14.5's plan record: "a plan records its catalog revision, required
+/// The plan record: a plan records its catalog revision, required
 /// Lattice capabilities, consistency/isolation level, partition spans,
-/// memory budget, spill allowance, and maximum result size".
+/// memory budget, spill allowance, and maximum result size.
 ///
-/// This is **not** a durable record. It is compute-local and disposable
-/// (§14.11), which is exactly why it is safe for a replacement worker
-/// to throw it away and rebind. It carries no encode/decode for that
-/// reason: giving it a wire format would invite someone to persist it,
-/// and a persisted plan is a durable outcome held by compute — §21
-/// invariant 15's failure mode.
+/// This is **not** a durable record. It is compute-local and
+/// disposable, which is exactly why it is safe for a replacement
+/// worker to throw it away and rebind. It carries no encode/decode
+/// for that reason: giving it a wire format would invite someone to
+/// persist it, and a persisted plan is a durable outcome held by
+/// compute — the exact failure mode the no-compute-authority rule
+/// forbids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanBinding {
     /// The catalog revision every descriptor in the plan was read at.
     pub catalog_revision: u64,
     /// The partition-map generation the routing decisions were made
-    /// against (§11.3).
+    /// against (partition-map metadata).
     pub partition_map_generation: u32,
     pub isolation: Isolation,
     /// Number of partition spans the plan touches. Bounded up front so
-    /// a plan's fan-out is knowable before execution (§14.13).
+    /// a plan's fan-out is knowable before execution.
     pub partition_spans: u16,
     pub memory_budget_bytes: u64,
     pub spill_allowance_bytes: u64,
@@ -4014,18 +4014,18 @@ pub struct PlanBinding {
 /// Why a bound plan may not execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanError {
-    /// The catalog moved under the plan. §14.5: rebind/replan, never
+    /// The catalog moved under the plan: rebind/replan, never
     /// execution under mixed metadata.
     StaleCatalog { bound: u64, current: u64 },
-    /// Routing moved under the plan (§21 invariant 6).
+    /// Routing moved under the plan (epoch fencing).
     StaleRoutingGeneration { bound: u32, current: u32 },
     /// The plan declares no bound on some resource. A missing bound is
-    /// not "unlimited", it is "unknown", and unknown blocks (§21
-    /// invariant 14).
+    /// not "unlimited", it is "unknown", and unknown blocks (the
+    /// bounded-work rule).
     UnboundedResource,
 }
 
-/// §14.5's pre-execution gate.
+/// The pre-execution gate.
 ///
 /// Clause order is the contract: a stale catalog is reported before a
 /// stale routing generation, because rebinding the catalog may change
@@ -4056,7 +4056,7 @@ pub fn check_rebind(
     Ok(())
 }
 
-/// §14.11's state categories.
+/// The relational state categories.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelationalState {
@@ -4071,7 +4071,7 @@ pub enum RelationalState {
     MovableSessionState = 9,
 }
 
-/// §14.11's authority column.
+/// Who holds authority over each state category.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
@@ -4100,7 +4100,8 @@ impl RelationalState {
     ];
 }
 
-/// §14.11's table, as a function. Total over [`RelationalState`], so
+/// The state-to-authority table, as a function. Total over
+/// [`RelationalState`], so
 /// adding a state category without assigning it an authority does not
 /// compile.
 pub const fn authority_of(state: RelationalState) -> Authority {
@@ -4131,8 +4132,8 @@ pub const fn holds_durable_authority(a: Authority) -> bool {
     )
 }
 
-/// §21 invariant 15, executable: **relational compute holds no unique
-/// durable database outcome or storage file.**
+/// The no-compute-authority rule, executable: **relational compute
+/// holds no unique durable database outcome or storage file.**
 ///
 /// Every state category whose authority is [`Authority::ComputeDisposable`]
 /// must be reconstructible, and no durable authority may live in
@@ -4145,7 +4146,7 @@ pub const fn invariant_15_holds(state: RelationalState) -> bool {
 }
 
 /// What a replacement worker may do with a state category after a
-/// compute failure (§14.11's closing paragraph).
+/// compute failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeRecovery {
     /// Reload from Lattice and continue.
@@ -4159,10 +4160,10 @@ pub enum ComputeRecovery {
     ExportIfContractRequires,
 }
 
-/// §14.11: "After compute failure, a replacement worker reloads catalog
+/// After compute failure, a replacement worker reloads catalog
 /// and routing state, checks durable transaction status by identity,
 /// resumes only explicitly resumable operations, and fails all others
-/// cleanly. Client disconnect never decides a transaction outcome."
+/// cleanly. Client disconnect never decides a transaction outcome.
 pub const fn compute_recovery(state: RelationalState) -> ComputeRecovery {
     match state {
         RelationalState::RowsIndexesCatalog

@@ -3,8 +3,8 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Replicated MVCC timestamp authority (RFC database foundation §10,
-# Phase 2 slice 1). Leases monotone half-open timestamp intervals to
+# Replicated MVCC timestamp authority.
+# Leases monotone half-open timestamp intervals to
 # transaction coordinators out of a high water that is established ONLY
 # by committed allocator records.
 #
@@ -61,7 +61,7 @@ index = 2
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the
 # emitter in module_step passes values in this exact order.

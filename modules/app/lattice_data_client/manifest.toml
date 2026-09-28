@@ -3,8 +3,7 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# The compute-side originator of the internal `lattice.data` surface
-# (RFC §14.8, §14.9, §26 phase 9).
+# The compute-side originator of the internal `lattice.data` surface.
 #
 # It is a DROP-IN FOR THE ROUTER, seen from compute. `relational_executor`
 # and the model workers already speak MSG_KV_REQUEST / MSG_KV_RESPONSE
@@ -12,7 +11,8 @@ hardware_targets = ["bcm2712"]
 # carries them to a remote storage graph as `lattice.data` frames, and
 # hands back exactly those envelopes — fence tail included.
 #
-# That is the whole point. §30 asks whether combined and separated
+# That is the whole point. The question is whether combined and
+# separated
 # placements produce equivalent histories, and the cleanest way to make
 # that answerable is for the thing above the boundary not to be able to
 # tell which side of it it is on. Same executor, same envelopes, one
@@ -22,7 +22,7 @@ hardware_targets = ["bcm2712"]
 # (CMD_CONNECT_TO to an `authority`), because its peer is a storage
 # graph, not a client.
 #
-# Owns, per §14.9: multiplexing and fence validation. See the module
+# Owns: multiplexing and fence validation. See the module
 # header for what it deliberately does NOT own yet, and why each of
 # those is a named gap rather than a silent one.
 #
@@ -32,13 +32,13 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # CMD_CONNECT_TO / CMD_SEND / CMD_CLOSE to foundation/ip.
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # MSG_KV_REQUEST envelopes in from compute (relational_executor, a
 # model worker) — the same port shape `kv_request_router` presents.
@@ -60,7 +60,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────
 # Declaration order IS the id contract (id N = the Nth name); the
 # emitter in module_step passes values in this exact order.
 [observability]

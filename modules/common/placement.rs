@@ -1,25 +1,23 @@
-//! Placement recommendation contracts — RFC database foundation §12.4
-//! and Phase 10's hot-range policy.
+//! Placement recommendation contracts — the hot-range policy and its
+//! operator bounds.
 //!
-//! §12.4 draws the line this file exists to make executable:
-//!
-//! > Automatic split and merge recommendations may consider size, key
-//! > count, write rate, scan pressure, compaction debt, request
-//! > latency, and replica capacity. **Execution remains bounded by
-//! > operator policy**: minimum range size, cooldown, maximum
-//! > concurrent operations, reserved partition capacity, and
-//! > per-tenant limits.
+//! The rule this file exists to make executable: automatic split and
+//! merge recommendations may consider size, key count, write rate,
+//! scan pressure, compaction debt, request latency, and replica
+//! capacity, but **execution remains bounded by operator policy** —
+//! minimum range size, cooldown, maximum concurrent operations,
+//! reserved partition capacity, and per-tenant limits.
 //!
 //! So this layer RECOMMENDS and never executes. That is not timidity;
-//! it is the §12.4 requirement, and the split/merge machinery it would
+//! it is the rule above, and the split/merge machinery it would
 //! otherwise drive is the same machinery an operator drives today by
 //! declaring an operation in a config. A recommender that could act
 //! would turn every policy bug into a topology change.
 //!
 //! ## The refusal that matters most
 //!
-//! > Hot-key load cannot always be solved by splitting and should be
-//! > reported as such.
+//! Hot-key load cannot always be solved by splitting and should be
+//! reported as such.
 //!
 //! A range whose load concentrates on ONE key cannot be split into two
 //! less-loaded ranges — the hot key lands wholly on one side. Splitting
@@ -34,7 +32,7 @@
     reason = "shared via #[path] into modules and host tests; each consumer uses a subset"
 )]
 
-/// Operator policy bounds (§12.4). Every field is a REFUSAL threshold,
+/// Operator policy bounds. Every field is a REFUSAL threshold,
 /// never a target: the recommender may only say "no" more often as
 /// these tighten.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +59,7 @@ pub struct LoadPolicy {
     /// operation. Cooldown is what stops split/merge oscillation.
     pub cooldown_ms: u64,
     /// Recommend a split on SIZE alone, without waiting for a write
-    /// rate. §12.4 lists "size, key count" among the valid inputs, and
+    /// rate. Size and key count are valid inputs on their own, and
     /// a range past its size ceiling is worth splitting whether or not
     /// it is currently busy — a quiet oversized range is still an
     /// oversized range, and it will be busy eventually.
@@ -113,7 +111,7 @@ pub enum Recommendation {
     /// Merge this range with its right-hand neighbour.
     Merge { range_index: u8 },
     /// The range is hot, and splitting WILL NOT HELP because the load
-    /// is concentrated on one key (§12.4). Reported as its own answer
+    /// is concentrated on one key. Reported as its own answer
     /// so an operator is told the truth rather than handed a split.
     HotKeyNotSplittable { range_index: u8, percent: u8 },
     /// Within cooldown since its last operation.
@@ -131,7 +129,8 @@ impl Recommendation {
     }
 }
 
-/// The §12.4 decision, in the order the clauses must be applied.
+/// The recommendation decision, in the order the clauses must be
+/// applied.
 ///
 /// Ordering is the contract, not a style choice:
 ///
@@ -174,8 +173,8 @@ pub fn recommend(
     // it. Placing it beside the split made the answer non-monotone:
     // raising `hot_write_rate` (caring LESS about load) flipped a
     // "cannot help" refusal into a size-driven split while the key was
-    // still concentrated — which is precisely the recommendation §12.4
-    // forbids. The property test caught it; the ordering is the fix.
+    // still concentrated — which is precisely the recommendation the
+    // policy forbids. The property test caught it; the ordering is the fix.
     if would_split
         && load.busiest_key_percent > 0
         && load.busiest_key_percent >= policy.hot_key_percent
@@ -342,7 +341,7 @@ pub fn recommend_relocation(
     ClusterRecommendation::Balanced
 }
 
-// ── Capacity forecasting (Phase 10) ──────────────────────────────────
+// ── Capacity forecasting ─────────────────────────────────────────────
 
 /// How long until a range reaches a ceiling, or why that question has
 /// no answer. Every non-numeric variant is a REFUSAL to forecast, and

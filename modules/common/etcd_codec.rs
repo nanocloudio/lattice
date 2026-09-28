@@ -15,10 +15,10 @@
 //!   │
 //!   ├── HTTP/2 connection preface  ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 //!   │
-//!   ├── HTTP/2 frames               (this file: `frame.rs`-flavoured §)
+//!   ├── HTTP/2 frames               (`frame.rs`-flavoured, below)
 //!   │     DATA / HEADERS / SETTINGS / PING / GOAWAY / WINDOW_UPDATE
 //!   │
-//!   ├── HPACK header blocks         (static table only — §)
+//!   ├── HPACK header blocks         (static table only)
 //!   │     :method, :path, :scheme, :authority, content-type, te
 //!   │
 //!   ├── gRPC frames                 (5-byte prefix + protobuf body)
@@ -29,13 +29,12 @@
 //!           shared `kv_state_worker`.
 //! ```
 //!
-//! ## Phase status
+//! ## Layout
 //!
-//! This file lands in slices. The current slice (the **frame layer**)
-//! ships the HTTP/2 connection preface check and a frame-header
-//! parser / serializer with typed payload accessors. HPACK, gRPC, and
-//! the protobuf KV subset land in follow-up commits, each behind its
-//! own `mod` section below.
+//! The **frame layer** owns the HTTP/2 connection preface check and a
+//! frame-header parser / serializer with typed payload accessors.
+//! HPACK, gRPC, and the protobuf KV subset each sit behind their own
+//! `mod`-style section below.
 
 #![allow(
     dead_code,
@@ -285,6 +284,9 @@ pub const ERROR_INTERNAL_ERROR: u32 = 0x2;
 pub const ERROR_FLOW_CONTROL_ERROR: u32 = 0x3;
 pub const ERROR_FRAME_SIZE_ERROR: u32 = 0x6;
 pub const ERROR_REFUSED_STREAM: u32 = 0x7;
+/// A peer generating (or leaving) load it should not: here, a watch
+/// client not draining its stream.
+pub const ERROR_ENHANCE_YOUR_CALM: u32 = 0xB;
 
 pub fn build_goaway(out: &mut [u8], last_stream_id: u32, error_code: u32) -> Option<()> {
     const BODY: usize = 8;
@@ -505,7 +507,8 @@ pub fn write_length_delimited(
 
 /// Skip an unknown field given its wire type. Used when we encounter
 /// fields we don't understand inside a protobuf message — protobuf
-/// requires forward compatibility (RFC 0001 §3).
+/// requires forward compatibility: unknown fields are skipped, never
+/// an error.
 pub fn skip_field(buf: &[u8], wire_type: u8) -> Option<usize> {
     match wire_type {
         WIRE_VARINT => read_varint(buf).map(|(_, n)| n),
@@ -559,13 +562,24 @@ pub fn skip_field(buf: &[u8], wire_type: u8) -> Option<usize> {
 //     bool  prev_kv   = 3;
 //   }
 
-/// Subset of `etcdserverpb.RangeRequest` Lattice consumes.
+/// `etcdserverpb.RangeRequest`, every field.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct RangeRequest<'a> {
     pub key: &'a [u8],
     pub range_end: &'a [u8],
     pub limit: i64,
     pub revision: i64,
+    /// 0 NONE, 1 ASCEND, 2 DESCEND.
+    pub sort_order: u8,
+    /// 0 KEY, 1 VERSION, 2 CREATE, 3 MOD, 4 VALUE.
+    pub sort_target: u8,
+    pub serializable: bool,
+    pub keys_only: bool,
+    pub count_only: bool,
+    pub min_mod_revision: i64,
+    pub max_mod_revision: i64,
+    pub min_create_revision: i64,
+    pub max_create_revision: i64,
 }
 
 impl<'a> RangeRequest<'a> {
@@ -595,6 +609,21 @@ impl<'a> RangeRequest<'a> {
                     req.revision = v as i64;
                     buf = &buf[n..];
                 }
+                (5..=13, WIRE_VARINT) => {
+                    let (v, n) = read_varint(buf)?;
+                    match field {
+                        5 => req.sort_order = v as u8,
+                        6 => req.sort_target = v as u8,
+                        7 => req.serializable = v != 0,
+                        8 => req.keys_only = v != 0,
+                        9 => req.count_only = v != 0,
+                        10 => req.min_mod_revision = v as i64,
+                        11 => req.max_mod_revision = v as i64,
+                        12 => req.min_create_revision = v as i64,
+                        _ => req.max_create_revision = v as i64,
+                    }
+                    buf = &buf[n..];
+                }
                 _ => {
                     let n = skip_field(buf, wire)?;
                     buf = &buf[n..];
@@ -605,6 +634,104 @@ impl<'a> RangeRequest<'a> {
     }
 }
 
+/// A `RangeRequest` as a `KV_OP_RANGE_META` body (types.rs): the span in
+/// etcd's own terms (no range_end = the key; `\0` = every key from it),
+/// revision, limit, keys_only/count_only, sort, and the revision bounds.
+/// Negative limits and revisions are read as 0 (none / latest).
+pub fn encode_range_meta_body(req: &RangeRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    let (start, end) = (req.key, req.range_end);
+    if start.len() > u16::MAX as usize || end.len() > u16::MAX as usize {
+        return None;
+    }
+    let need = 2 + start.len() + 2 + end.len() + 8 + 4 + 3 + 32;
+    let dst = out.get_mut(..need)?;
+    let mut p = 0usize;
+    let mut put = |b: &[u8]| {
+        let mut i = 0;
+        while i < b.len() {
+            dst[p + i] = b[i];
+            i += 1;
+        }
+        p += b.len();
+    };
+    put(&(start.len() as u16).to_le_bytes());
+    put(start);
+    put(&(end.len() as u16).to_le_bytes());
+    put(end);
+    put(&(req.revision.max(0) as u64).to_le_bytes());
+    put(&(req.limit.clamp(0, i64::from(u32::MAX)) as u32).to_le_bytes());
+    put(&[
+        u8::from(req.keys_only) | (u8::from(req.count_only) << 1),
+        req.sort_target,
+        req.sort_order,
+    ]);
+    for v in [
+        req.min_mod_revision,
+        req.max_mod_revision,
+        req.min_create_revision,
+        req.max_create_revision,
+    ] {
+        put(&(v.max(0) as u64).to_le_bytes());
+    }
+    Some(p)
+}
+
+/// Build a `RangeResponse` from a `KV_RESULT_KVS` body
+/// (`[total:u64][more:u8][count:u16]` then entries, types.rs): every
+/// KeyValue with its own create/mod revision, version and lease; `count`
+/// the total matched; `more` when the store left matches out or an entry
+/// did not fit this response.
+pub fn build_range_meta_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    body: &[u8],
+) -> Option<()> {
+    if body.len() < 11 {
+        return None;
+    }
+    let total = u64::from_le_bytes(body[0..8].try_into().ok()?);
+    let mut more = body[8] != 0;
+    let n = u16::from_le_bytes([body[9], body[10]]) as usize;
+    write_response_header(out, off, revision)?;
+    let mut p = 11usize;
+    let rd8 = |b: &[u8], at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+    };
+    for _ in 0..n {
+        let klen = u16::from_le_bytes([*body.get(p)?, *body.get(p + 1)?]) as usize;
+        p += 2;
+        let key = body.get(p..p + klen)?;
+        p += klen;
+        let vlen = u32::from_le_bytes(body.get(p..p + 4)?.try_into().ok()?) as usize;
+        p += 4;
+        let value = body.get(p..p + vlen)?;
+        p += vlen;
+        let (create, modr, ver, lease) = (
+            rd8(body, p)?,
+            rd8(body, p + 8)?,
+            rd8(body, p + 16)?,
+            rd8(body, p + 24)?,
+        );
+        p += 32;
+        // Room for this entry and the tail (`more`, `count`).
+        if *off + klen + vlen + 64 + 16 > out.len() {
+            more = true;
+            break;
+        }
+        write_keyvalue_full(out, off, 2, key, value, create, modr, ver, lease)?;
+    }
+    if more {
+        write_tag(out, off, 3, WIRE_VARINT)?;
+        write_varint(out, off, 1)?;
+    }
+    if total > 0 {
+        write_tag(out, off, 4, WIRE_VARINT)?;
+        write_varint(out, off, total)?;
+    }
+    Some(())
+}
+
 /// gRPC status code etcd uses for a read below the compaction floor:
 /// `rpctypes.ErrGRPCCompacted` is `codes.OutOfRange` (11) with the
 /// message "etcdserver: mvcc: required revision has been compacted".
@@ -613,9 +740,30 @@ impl<'a> RangeRequest<'a> {
 /// matters that it is 11 and not 13 (INTERNAL): etcd clients treat
 /// OUT_OF_RANGE on a Range as "re-read from the current revision" and
 /// INTERNAL as "the server is broken". A watch or a mirror that gets
-/// the wrong one either spins or gives up. Lattice's trailers carry the
-/// status only, not the message string — see `build_grpc_trailers_block`.
+/// the wrong one either spins or gives up. The anchor adds the message
+/// as `grpc-message`.
 pub const GRPC_STATUS_COMPACTED: u8 = 11;
+
+/// The revision of an `etcdserverpb.CompactionRequest`
+/// (`{ int64 revision = 1; bool physical = 2; }`). `physical` asks the
+/// call to wait for the reclamation; the logical compaction it answers
+/// after is what every later read observes either way.
+pub fn decode_compaction_revision(mut buf: &[u8]) -> Option<i64> {
+    let mut rev = 0i64;
+    while !buf.is_empty() {
+        let (field, wire, n) = read_tag(buf)?;
+        buf = &buf[n..];
+        if (field, wire) == (1, WIRE_VARINT) {
+            let (v, n) = read_varint(buf)?;
+            rev = v as i64;
+            buf = &buf[n..];
+        } else {
+            let n = skip_field(buf, wire)?;
+            buf = &buf[n..];
+        }
+    }
+    Some(rev)
+}
 
 /// Encode a decoded `RangeRequest` into the native KV op body.
 ///
@@ -625,10 +773,10 @@ pub const GRPC_STATUS_COMPACTED: u8 = 11;
 ///   `KV_OP_GET` shape (latest read, the pre-existing behaviour).
 /// - `historical == true` → `revision > 0` was set, and the body is
 ///   `[revision:u64 LE][key_len:u16 LE][key…]`, the `KV_OP_GET_AT`
-///   shape. This is RFC §26 Phase 2's "etcd behavior gains real
-///   retained revisions": before this, `revision` was decoded off the
-///   wire and then dropped, so `Range{revision: 5}` silently answered
-///   with the CURRENT value — a wrong answer to a historical question.
+///   shape. etcd behavior rests on real retained revisions: the
+///   `revision` a client sets must reach the store, or
+///   `Range{revision: 5}` would silently answer with the CURRENT
+///   value — a wrong answer to a historical question.
 ///
 /// etcd treats a negative `revision` as an error; here it is clamped to
 /// "latest" rather than accepted, because a negative revision cannot
@@ -979,6 +1127,41 @@ impl LeaseKeepAliveRequest {
     }
 }
 
+/// Subset of `etcdserverpb.LeaseTimeToLiveRequest`:
+/// `{ int64 ID = 1; bool keys = 2; }`.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct LeaseTimeToLiveRequest {
+    pub id: i64,
+    pub keys: bool,
+}
+
+impl LeaseTimeToLiveRequest {
+    pub fn decode(mut buf: &[u8]) -> Option<Self> {
+        let mut req = Self::default();
+        while !buf.is_empty() {
+            let (field, wire, n) = read_tag(buf)?;
+            buf = &buf[n..];
+            match (field, wire) {
+                (1, WIRE_VARINT) => {
+                    let (v, n) = read_varint(buf)?;
+                    req.id = v as i64;
+                    buf = &buf[n..];
+                }
+                (2, WIRE_VARINT) => {
+                    let (v, n) = read_varint(buf)?;
+                    req.keys = v != 0;
+                    buf = &buf[n..];
+                }
+                _ => {
+                    let n = skip_field(buf, wire)?;
+                    buf = &buf[n..];
+                }
+            }
+        }
+        Some(req)
+    }
+}
+
 // ── etcd v3 Watch service request decoder ────────────────────────────
 //
 // Wire-level protos (etcdserverpb.rpc.proto / Watch subset):
@@ -1022,6 +1205,9 @@ pub struct WatchRequest<'a> {
     pub prev_kv: bool,
     pub create_watch_id: i64,
     pub cancel_watch_id: i64,
+    /// `filters` as bits: 1 = NOPUT, 2 = NODELETE (watch_hub's
+    /// WATCH_FILTER_*). etcd's FilterType values are 0 and 1.
+    pub filters: u8,
 }
 
 impl<'a> WatchRequest<'a> {
@@ -1083,6 +1269,21 @@ fn decode_create<'a>(mut buf: &'a [u8], req: &mut WatchRequest<'a>) -> Option<()
                 req.progress_notify = v != 0;
                 buf = &buf[n..];
             }
+            // `repeated FilterType filters = 5`: packed or one per tag.
+            (5, WIRE_VARINT) => {
+                let (v, n) = read_varint(buf)?;
+                req.filters |= filter_bit(v)?;
+                buf = &buf[n..];
+            }
+            (5, WIRE_LENGTH_DELIMITED) => {
+                let (mut packed, n) = read_length_delimited(buf)?;
+                while !packed.is_empty() {
+                    let (v, m) = read_varint(packed)?;
+                    req.filters |= filter_bit(v)?;
+                    packed = &packed[m..];
+                }
+                buf = &buf[n..];
+            }
             (6, WIRE_VARINT) => {
                 let (v, n) = read_varint(buf)?;
                 req.prev_kv = v != 0;
@@ -1100,6 +1301,15 @@ fn decode_create<'a>(mut buf: &'a [u8], req: &mut WatchRequest<'a>) -> Option<()
         }
     }
     Some(())
+}
+
+/// An etcd `FilterType` as a watch_hub filter bit (NOPUT = 0, NODELETE = 1).
+fn filter_bit(v: u64) -> Option<u8> {
+    match v {
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    }
 }
 
 fn decode_cancel(mut buf: &[u8]) -> Option<i64> {
@@ -1150,6 +1360,527 @@ pub fn write_response_header(out: &mut [u8], off: &mut usize, revision: i64) -> 
     write_length_delimited(out, off, 1, &buf[..sub])
 }
 
+// ── etcd v3 Auth service ─────────────────────────────────────────────
+
+/// The first four fields of an Auth request, whichever wire type each
+/// has: `s[i]` field `i + 1` as bytes (a string or nested message),
+/// `v[i]` as a varint. Every `etcdserverpb.Auth*` / `User*` / `Role*`
+/// request is a few of these.
+#[derive(Default)]
+pub struct AuthFields<'a> {
+    pub s: [&'a [u8]; 4],
+    pub v: [u64; 4],
+}
+
+pub fn auth_fields(mut b: &[u8]) -> Option<AuthFields<'_>> {
+    let mut f = AuthFields::default();
+    while !b.is_empty() {
+        let (field, wire, n) = read_tag(b)?;
+        b = &b[n..];
+        let i = (field as usize).wrapping_sub(1);
+        if wire == WIRE_LENGTH_DELIMITED && i < 4 {
+            let (v, n) = read_length_delimited(b)?;
+            f.s[i] = v;
+            b = &b[n..];
+        } else if wire == WIRE_VARINT && i < 4 {
+            let (v, n) = read_varint(b)?;
+            f.v[i] = v;
+            b = &b[n..];
+        } else {
+            let n = skip_field(b, wire)?;
+            b = &b[n..];
+        }
+    }
+    Some(f)
+}
+
+/// `AuthStatusResponse { header = 1; bool enabled = 2; uint64
+/// authRevision = 3; }`.
+pub fn build_auth_status_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    enabled: bool,
+    auth_revision: u64,
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    if enabled {
+        write_tag(out, off, 2, WIRE_VARINT)?;
+        write_varint(out, off, 1)?;
+    }
+    if auth_revision != 0 {
+        write_tag(out, off, 3, WIRE_VARINT)?;
+        write_varint(out, off, auth_revision)?;
+    }
+    Some(())
+}
+
+/// A response of a header and one repeated string, field 2 — the shape
+/// of `AuthenticateResponse` (its token), `UserGetResponse` (roles),
+/// `UserListResponse` (users) and `RoleListResponse` (roles). `names`
+/// is `n × [len:u8][name]`.
+pub fn build_strings_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    names: &[u8],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    let mut p = 0usize;
+    while p < names.len() {
+        let l = *names.get(p)? as usize;
+        write_length_delimited(out, off, 2, names.get(p + 1..p + 1 + l)?)?;
+        p += 1 + l;
+    }
+    Some(())
+}
+
+/// `RoleGetResponse { header = 1; repeated authpb.Permission perm = 2; }`,
+/// `Permission { Type permType = 1; bytes key = 2; bytes range_end = 3; }`.
+/// `perms` is `n × [type:u8][klen:u16][key][elen:u16][end]`.
+pub fn build_role_get_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    perms: &[u8],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    let mut p = 0usize;
+    while p < perms.len() {
+        let t = *perms.get(p)?;
+        let kl = u16::from_le_bytes([*perms.get(p + 1)?, *perms.get(p + 2)?]) as usize;
+        let key = perms.get(p + 3..p + 3 + kl)?;
+        let at = p + 3 + kl;
+        let el = u16::from_le_bytes([*perms.get(at)?, *perms.get(at + 1)?]) as usize;
+        let end = perms.get(at + 2..at + 2 + el)?;
+        let mut m = [0u8; 300];
+        let mut o = 0usize;
+        if t != 0 {
+            write_tag(&mut m, &mut o, 1, WIRE_VARINT)?;
+            write_varint(&mut m, &mut o, u64::from(t))?;
+        }
+        if !key.is_empty() {
+            write_length_delimited(&mut m, &mut o, 2, key)?;
+        }
+        if !end.is_empty() {
+            write_length_delimited(&mut m, &mut o, 3, end)?;
+        }
+        write_length_delimited(out, off, 2, &m[..o])?;
+        p = at + 2 + el;
+    }
+    Some(())
+}
+
+/// Append one `RequestOp` to a `TxnRequest`'s success branch (field 2):
+/// a put of `key = value`, or (`value` `None`) a delete of `key`.
+pub fn txn_success_op(
+    out: &mut [u8],
+    off: &mut usize,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Option<()> {
+    // Auth records are small (a user's roles, a role's permissions).
+    let mut inner = [0u8; 2048];
+    let mut io = 0usize;
+    write_length_delimited(&mut inner, &mut io, 1, key)?;
+    if let Some(v) = value {
+        if !v.is_empty() {
+            write_length_delimited(&mut inner, &mut io, 2, v)?;
+        }
+    }
+    let mut op = [0u8; 2048 + 16];
+    let mut oo = 0usize;
+    let kind = if value.is_some() { 2 } else { 3 };
+    write_length_delimited(&mut op, &mut oo, kind, &inner[..io])?;
+    write_length_delimited(out, off, 2, &op[..oo])
+}
+
+/// What an access needs of a key range, as [`txn_walk`] reports it.
+pub const ACCESS_READ: u8 = 1;
+pub const ACCESS_WRITE: u8 = 2;
+
+/// Walk every key range an `etcdserverpb.TxnRequest` touches — each
+/// compare (read), and each op of BOTH branches, as etcd checks them:
+/// a range reads, a put writes, a delete writes, and a `prev_kv` on
+/// either also reads. `f(key, range_end, access)` answers whether that
+/// access is allowed; the walk stops at the first refusal. `None` when
+/// the message does not parse.
+pub fn txn_walk<F: FnMut(&[u8], &[u8], u8) -> bool>(
+    buf: &[u8],
+    depth: u8,
+    f: &mut F,
+) -> Option<bool> {
+    if depth > 4 {
+        return None;
+    }
+    let mut b = buf;
+    while !b.is_empty() {
+        let (field, wire, n) = read_tag(b)?;
+        b = &b[n..];
+        if wire != WIRE_LENGTH_DELIMITED {
+            let n = skip_field(b, wire)?;
+            b = &b[n..];
+            continue;
+        }
+        let (msg, n) = read_length_delimited(b)?;
+        b = &b[n..];
+        let ok = match field {
+            1 => {
+                let (key, end, _) = key_fields(msg, 3, 64, 0)?;
+                f(key, end, ACCESS_READ)
+            }
+            2 | 3 => op_walk(msg, depth, f)?,
+            _ => true,
+        };
+        if !ok {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// One `RequestOp`: `request_range` 1, `request_put` 2,
+/// `request_delete_range` 3, `request_txn` 4.
+fn op_walk<F: FnMut(&[u8], &[u8], u8) -> bool>(buf: &[u8], depth: u8, f: &mut F) -> Option<bool> {
+    let (field, wire, n) = read_tag(buf)?;
+    if wire != WIRE_LENGTH_DELIMITED {
+        return Some(true);
+    }
+    let (msg, _) = read_length_delimited(&buf[n..])?;
+    Some(match field {
+        1 => {
+            let (key, end, _) = key_fields(msg, 1, 2, 0)?;
+            f(key, end, ACCESS_READ)
+        }
+        2 => {
+            // PutRequest: key 1, prev_kv 4.
+            let (key, _, prev) = key_fields(msg, 1, 0, 4)?;
+            f(key, &[], ACCESS_WRITE) && (!prev || f(key, &[], ACCESS_READ))
+        }
+        3 => {
+            // DeleteRangeRequest: key 1, range_end 2, prev_kv 3.
+            let (key, end, prev) = key_fields(msg, 1, 2, 3)?;
+            f(key, end, ACCESS_WRITE) && (!prev || f(key, end, ACCESS_READ))
+        }
+        4 => txn_walk(msg, depth + 1, f)?,
+        _ => true,
+    })
+}
+
+/// The key (field `kf`), range end (field `ef`, 0 = none) and a bool
+/// flag (field `bf`, 0 = none) of one message.
+fn key_fields(mut b: &[u8], kf: u32, ef: u32, bf: u32) -> Option<(&[u8], &[u8], bool)> {
+    let (mut key, mut end, mut flag): (&[u8], &[u8], bool) = (&[], &[], false);
+    while !b.is_empty() {
+        let (field, wire, n) = read_tag(b)?;
+        b = &b[n..];
+        if wire == WIRE_LENGTH_DELIMITED && (field == kf || field == ef) {
+            let (v, n) = read_length_delimited(b)?;
+            if field == kf {
+                key = v;
+            } else {
+                end = v;
+            }
+            b = &b[n..];
+        } else if wire == WIRE_VARINT && bf != 0 && field == bf {
+            let (v, n) = read_varint(b)?;
+            flag = v != 0;
+            b = &b[n..];
+        } else {
+            let n = skip_field(b, wire)?;
+            b = &b[n..];
+        }
+    }
+    Some((key, end, flag))
+}
+
+/// Whether a store answer holds a Range cut short by its space rather
+/// than by the client's limit (`KV_RESULT_KVS` `more` = 2) — directly, or
+/// inside an etcd Txn's answer (`[succeeded][count]` then per op
+/// `[kind][result][len:u32][answer]`, kind 1 a range, 4 a nested txn).
+/// Such an answer cannot be sent as a whole one.
+pub fn answer_is_partial(body: &[u8], txn: bool, depth: u8) -> bool {
+    if !txn {
+        return body.len() >= 11 && body[8] == 2;
+    }
+    if depth > 4 || body.len() < 2 {
+        return false;
+    }
+    let count = body[1] as usize;
+    let mut p = 2usize;
+    for _ in 0..count {
+        let (Some(&kind), Some(len)) = (
+            body.get(p),
+            body.get(p + 2..p + 6)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize),
+        ) else {
+            return false;
+        };
+        let Some(ans) = body.get(p + 6..p + 6 + len) else {
+            return false;
+        };
+        let partial = match kind {
+            1 => ans.len() >= 11 && ans[8] == 2,
+            4 => answer_is_partial(ans, true, depth + 1),
+            _ => false,
+        };
+        if partial {
+            return true;
+        }
+        p += 6 + len;
+    }
+    false
+}
+
+/// The identity an etcd `ResponseHeader` names: the cluster, the member
+/// answering, and the consensus term its state was applied under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderIds {
+    pub cluster_id: u64,
+    pub member_id: u64,
+    pub raft_term: u64,
+}
+
+/// Rewrite the leading `ResponseHeader` (field 1) of the encoded response
+/// `buf[..len]` to name `ids`, keeping its revision. The response
+/// builders write the header first with placeholder identity; the anchor
+/// stamps the real one here, the one place it knows it. Returns the new
+/// length (a response with no leading header is returned unchanged).
+pub fn stamp_header(buf: &mut [u8], len: usize, ids: &HeaderIds) -> Option<usize> {
+    if len == 0 || buf.first() != Some(&0x0A) {
+        return Some(len);
+    }
+    let (hl, n) = read_varint(buf.get(1..len)?)?;
+    let old_end = 1 + n + hl as usize;
+    let mut inner = buf.get(1 + n..old_end)?;
+    let mut revision = 0u64;
+    while !inner.is_empty() {
+        let (field, wire, k) = read_tag(inner)?;
+        inner = inner.get(k..)?;
+        if (field, wire) == (3, WIRE_VARINT) {
+            let (v, k) = read_varint(inner)?;
+            revision = v;
+            inner = inner.get(k..)?;
+        } else {
+            let k = skip_field(inner, wire)?;
+            inner = inner.get(k..)?;
+        }
+    }
+    let mut h = [0u8; 48];
+    let mut hoff = 0usize;
+    for (f, v) in [
+        (1u32, ids.cluster_id),
+        (2, ids.member_id),
+        (3, revision),
+        (4, ids.raft_term),
+    ] {
+        if v != 0 {
+            write_tag(&mut h, &mut hoff, f, WIRE_VARINT)?;
+            write_varint(&mut h, &mut hoff, v)?;
+        }
+    }
+    let mut lenv = [0u8; 10];
+    let mut loff = 0usize;
+    write_varint(&mut lenv, &mut loff, hoff as u64)?;
+    let new_end = 1 + loff + hoff;
+    let rest = len - old_end;
+    if new_end + rest > buf.len() {
+        return None;
+    }
+    // Move the rest of the message to follow the new header.
+    if new_end > old_end {
+        let mut i = rest;
+        while i > 0 {
+            i -= 1;
+            *buf.get_mut(new_end + i)? = *buf.get(old_end + i)?;
+        }
+    } else if new_end < old_end {
+        for i in 0..rest {
+            *buf.get_mut(new_end + i)? = *buf.get(old_end + i)?;
+        }
+    }
+    buf.get_mut(1..1 + loff)?.copy_from_slice(lenv.get(..loff)?);
+    buf.get_mut(1 + loff..new_end)?
+        .copy_from_slice(h.get(..hoff)?);
+    Some(new_end + rest)
+}
+
+/// Field 1 of a request, read as a varint (0 when absent): the one
+/// argument of `HashKVRequest.revision`, `MoveLeaderRequest.targetID`,
+/// `MemberRemoveRequest.ID`, `MemberUpdateRequest.ID`,
+/// `MemberPromoteRequest.ID`.
+pub fn decode_field1_varint(mut buf: &[u8]) -> Option<u64> {
+    let mut v1 = 0u64;
+    while !buf.is_empty() {
+        let (field, wire, n) = read_tag(buf)?;
+        buf = &buf[n..];
+        if (field, wire) == (1, WIRE_VARINT) {
+            let (v, n) = read_varint(buf)?;
+            v1 = v;
+            buf = &buf[n..];
+        } else {
+            let n = skip_field(buf, wire)?;
+            buf = &buf[n..];
+        }
+    }
+    Some(v1)
+}
+
+/// An `etcdserverpb.AlarmRequest`: `(action, memberID, alarm)`, where
+/// action is GET 0 / ACTIVATE 1 / DEACTIVATE 2 and alarm NONE 0 /
+/// NOSPACE 1 / CORRUPT 2.
+pub fn decode_alarm_request(mut buf: &[u8]) -> Option<(u64, u64, u64)> {
+    let mut r = (0u64, 0u64, 0u64);
+    while !buf.is_empty() {
+        let (field, wire, n) = read_tag(buf)?;
+        buf = &buf[n..];
+        if wire == WIRE_VARINT && (1..=3).contains(&field) {
+            let (v, n) = read_varint(buf)?;
+            match field {
+                1 => r.0 = v,
+                2 => r.1 = v,
+                _ => r.2 = v,
+            }
+            buf = &buf[n..];
+        } else {
+            let n = skip_field(buf, wire)?;
+            buf = &buf[n..];
+        }
+    }
+    Some(r)
+}
+
+/// `etcdserverpb.AlarmResponse { header = 1; repeated AlarmMember alarms = 2; }`
+/// with `AlarmMember { uint64 memberID = 1; AlarmType alarm = 2; }`.
+pub fn build_alarm_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    alarms: &[(u64, u64)],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    for &(member, alarm) in alarms {
+        let mut b = [0u8; 24];
+        let mut o = 0usize;
+        write_tag(&mut b, &mut o, 1, WIRE_VARINT)?;
+        write_varint(&mut b, &mut o, member)?;
+        write_tag(&mut b, &mut o, 2, WIRE_VARINT)?;
+        write_varint(&mut b, &mut o, alarm)?;
+        write_length_delimited(out, off, 2, &b[..o])?;
+    }
+    Some(())
+}
+
+/// What a member reports of itself in `StatusResponse`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemberStatus {
+    pub db_size: u64,
+    pub db_size_in_use: u64,
+    pub leader: u64,
+    pub raft_index: u64,
+    pub raft_term: u64,
+    pub raft_applied_index: u64,
+}
+
+/// `etcdserverpb.StatusResponse`: header 1, version 2, dbSize 3,
+/// leader 4, raftIndex 5, raftTerm 6, raftAppliedIndex 7, errors 8,
+/// dbSizeInUse 9, isLearner 10.
+pub fn build_status_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    version: &[u8],
+    st: &MemberStatus,
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    write_length_delimited(out, off, 2, version)?;
+    for (f, v) in [
+        (3u32, st.db_size),
+        (4, st.leader),
+        (5, st.raft_index),
+        (6, st.raft_term),
+        (7, st.raft_applied_index),
+        (9, st.db_size_in_use),
+    ] {
+        if v != 0 {
+            write_tag(out, off, f, WIRE_VARINT)?;
+            write_varint(out, off, v)?;
+        }
+    }
+    Some(())
+}
+
+/// `etcdserverpb.HashResponse { header = 1; uint32 hash = 2; }` and
+/// `HashKVResponse { header = 1; uint32 hash = 2; int64
+/// compact_revision = 3; int64 hash_revision = 4; }` — `Hash` is the
+/// former, leaving the revisions 0.
+pub fn build_hash_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    hash: u32,
+    compact_revision: u64,
+    hash_revision: u64,
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    for (f, v) in [
+        (2u32, u64::from(hash)),
+        (3, compact_revision),
+        (4, hash_revision),
+    ] {
+        if v != 0 {
+            write_tag(out, off, f, WIRE_VARINT)?;
+            write_varint(out, off, v)?;
+        }
+    }
+    Some(())
+}
+
+/// One `etcdserverpb.SnapshotResponse { header = 1; uint64
+/// remaining_bytes = 2; bytes blob = 3; }` of a snapshot stream.
+pub fn build_snapshot_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    remaining: u64,
+    blob: &[u8],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    if remaining != 0 {
+        write_tag(out, off, 2, WIRE_VARINT)?;
+        write_varint(out, off, remaining)?;
+    }
+    write_length_delimited(out, off, 3, blob)
+}
+
+/// `etcdserverpb.MemberListResponse { header = 1; repeated Member
+/// members = 2; }` naming one member, `Member { uint64 ID = 1; string
+/// name = 2; repeated string peerURLs = 3; repeated string clientURLs =
+/// 4; bool isLearner = 5; }`. `peer_url` empty is none.
+pub fn build_member_list_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    member_id: u64,
+    name: &[u8],
+    peer_url: &[u8],
+    client_url: &[u8],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    let mut m = [0u8; 256];
+    let mut o = 0usize;
+    write_tag(&mut m, &mut o, 1, WIRE_VARINT)?;
+    write_varint(&mut m, &mut o, member_id)?;
+    write_length_delimited(&mut m, &mut o, 2, name)?;
+    if !peer_url.is_empty() {
+        write_length_delimited(&mut m, &mut o, 3, peer_url)?;
+    }
+    if !client_url.is_empty() {
+        write_length_delimited(&mut m, &mut o, 4, client_url)?;
+    }
+    write_length_delimited(out, off, 2, &m[..o])
+}
+
 /// Build a `KeyValue` message — etcd's wire `mvccpb.KeyValue`:
 ///   bytes key = 1;
 ///   int64 create_revision = 2;
@@ -1176,6 +1907,42 @@ pub fn write_keyvalue(
     write_tag(&mut buf, &mut sub, 4, WIRE_VARINT)?;
     write_varint(&mut buf, &mut sub, version as u64)?;
     write_length_delimited(&mut buf, &mut sub, 5, value)?;
+    write_length_delimited(out, off, field_number, &buf[..sub])
+}
+
+/// An `mvccpb.KeyValue` with its own metadata; zero-valued fields are
+/// left out, as proto3 encodes them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one KeyValue: every argument is one of its protocol fields"
+)]
+pub fn write_keyvalue_full(
+    out: &mut [u8],
+    off: &mut usize,
+    field_number: u32,
+    key: &[u8],
+    value: &[u8],
+    create_revision: u64,
+    mod_revision: u64,
+    version: u64,
+    lease: u64,
+) -> Option<()> {
+    let mut buf = [0u8; 4096 + 320];
+    let mut sub = 0;
+    write_length_delimited(&mut buf, &mut sub, 1, key)?;
+    for (f, v) in [(2u32, create_revision), (3, mod_revision), (4, version)] {
+        if v != 0 {
+            write_tag(&mut buf, &mut sub, f, WIRE_VARINT)?;
+            write_varint(&mut buf, &mut sub, v)?;
+        }
+    }
+    if !value.is_empty() {
+        write_length_delimited(&mut buf, &mut sub, 5, value)?;
+    }
+    if lease != 0 {
+        write_tag(&mut buf, &mut sub, 6, WIRE_VARINT)?;
+        write_varint(&mut buf, &mut sub, lease)?;
+    }
     write_length_delimited(out, off, field_number, &buf[..sub])
 }
 
@@ -1217,6 +1984,42 @@ pub fn build_put_response(out: &mut [u8], off: &mut usize, revision: i64) -> Opt
     write_response_header(out, off, revision)
 }
 
+/// A `PutResponse` with its `prev_kv = 2` from a `[present:u8]` +
+/// `KV_RESULT_KVS`-entry body (the store's `PUT_FLAG_PREV_META` answer);
+/// no prev_kv when the key did not exist.
+pub fn build_put_response_prev(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    body: &[u8],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    if body.first() == Some(&1) {
+        write_kvs_entry(out, off, 2, &body[1..])?;
+    }
+    Some(())
+}
+
+/// One `KV_RESULT_KVS` entry (`[key_len:u16][key][value_len:u32][value]`
+/// `[create][mod][version][lease]`) written as a KeyValue at `field`;
+/// the bytes it used.
+pub fn write_kvs_entry(out: &mut [u8], off: &mut usize, field: u32, e: &[u8]) -> Option<usize> {
+    let klen = u16::from_le_bytes([*e.first()?, *e.get(1)?]) as usize;
+    let mut p = 2;
+    let key = e.get(p..p + klen)?;
+    p += klen;
+    let vlen = u32::from_le_bytes(e.get(p..p + 4)?.try_into().ok()?) as usize;
+    p += 4;
+    let value = e.get(p..p + vlen)?;
+    p += vlen;
+    let rd8 = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(e.get(at..at + 8)?.try_into().ok()?))
+    };
+    let (c, m, v, l) = (rd8(p)?, rd8(p + 8)?, rd8(p + 16)?, rd8(p + 24)?);
+    write_keyvalue_full(out, off, field, key, value, c, m, v, l)?;
+    Some(p + 32)
+}
+
 /// Build an `etcdserverpb.DeleteRangeResponse`:
 ///   message DeleteRangeResponse {
 ///     ResponseHeader header = 1;
@@ -1232,6 +2035,324 @@ pub fn build_delete_range_response(
     write_response_header(out, off, revision)?;
     write_tag(out, off, 2, WIRE_VARINT)?;
     write_varint(out, off, deleted as u64)?;
+    Some(())
+}
+
+/// A `DeleteRangeRequest` as a `KV_OP_DELETE_META` body (types.rs):
+/// `[start][end]` in etcd's own terms, then `[flags]` (1 = prev_kv).
+pub fn encode_delete_meta_body(req: &DeleteRangeRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    let (start, end) = (req.key, req.range_end);
+    if start.len() > u16::MAX as usize || end.len() > u16::MAX as usize {
+        return None;
+    }
+    let need = 2 + start.len() + 2 + end.len() + 1;
+    let dst = out.get_mut(..need)?;
+    let mut p = 0usize;
+    let mut put = |b: &[u8]| {
+        let mut i = 0;
+        while i < b.len() {
+            dst[p + i] = b[i];
+            i += 1;
+        }
+        p += b.len();
+    };
+    put(&(start.len() as u16).to_le_bytes());
+    put(start);
+    put(&(end.len() as u16).to_le_bytes());
+    put(end);
+    put(&[u8::from(req.prev_kv)]);
+    Some(p)
+}
+
+/// A `DeleteRangeResponse` from a `KV_OP_DELETE_META` answer: `deleted =
+/// 2` is the body's total, `prev_kvs = 3` its entries when prev_kv was
+/// asked (the answer says so in its flags byte, `body[8]`).
+pub fn build_delete_range_meta_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    body: &[u8],
+) -> Option<()> {
+    if body.len() < 11 {
+        return None;
+    }
+    let prev_kv = body[8] & 1 != 0;
+    let deleted = u64::from_le_bytes(body[0..8].try_into().ok()?);
+    let n = u16::from_le_bytes([body[9], body[10]]) as usize;
+    write_response_header(out, off, revision)?;
+    if deleted > 0 {
+        write_tag(out, off, 2, WIRE_VARINT)?;
+        write_varint(out, off, deleted)?;
+    }
+    if prev_kv {
+        let mut p = 11usize;
+        for _ in 0..n {
+            p += write_kvs_entry(out, off, 3, body.get(p..)?)?;
+        }
+    }
+    Some(())
+}
+
+/// The PUT flag values (types.rs `PUT_FLAG_*`), given by the caller: the
+/// codec is mounted without the types module.
+#[derive(Clone, Copy)]
+pub struct PutFlagBits {
+    pub lease: u8,
+    pub prev: u8,
+    pub ignore_value: u8,
+    pub ignore_lease: u8,
+}
+
+/// A `PutRequest` as a `KV_OP_PUT` body:
+/// `[key_len:u16][key][value_len:u32][value][flags:u8][expiry:u64 = 0]`
+/// `[lease:u64]`. `None` for what etcd refuses (a value with
+/// ignore_value, a lease with ignore_lease) or what does not fit.
+pub fn encode_put_body(req: &PutRequest<'_>, bits: &PutFlagBits, out: &mut [u8]) -> Option<usize> {
+    let (key, value) = (req.key, req.value);
+    if (req.ignore_value && !value.is_empty()) || (req.ignore_lease && req.lease != 0) {
+        return None;
+    }
+    if key.len() > u16::MAX as usize || value.len() > u32::MAX as usize {
+        return None;
+    }
+    let need = 2 + key.len() + 4 + value.len() + 1 + 8 + 8;
+    let dst = out.get_mut(..need)?;
+    let mut p = 0usize;
+    let mut put = |b: &[u8]| {
+        let mut i = 0;
+        while i < b.len() {
+            dst[p + i] = b[i];
+            i += 1;
+        }
+        p += b.len();
+    };
+    put(&(key.len() as u16).to_le_bytes());
+    put(key);
+    put(&(value.len() as u32).to_le_bytes());
+    put(value);
+    let mut flags = bits.lease;
+    if req.prev_kv {
+        flags |= bits.prev;
+    }
+    if req.ignore_value {
+        flags |= bits.ignore_value;
+    }
+    if req.ignore_lease {
+        flags |= bits.ignore_lease;
+    }
+    put(&[flags]);
+    put(&0u64.to_le_bytes());
+    put(&(req.lease.max(0) as u64).to_le_bytes());
+    Some(p)
+}
+
+/// Nesting a Txn may reach (the store's `ETCD_TXN_DEPTH`).
+pub const TXN_DEPTH_MAX: u8 = 4;
+
+/// A `TxnRequest` (compare = 1, success = 2, failure = 3, each repeated)
+/// as a `KV_OP_ETCD_TXN` body (types.rs). `Compare` is
+/// `{result = 1, target = 2, key = 3, version = 4, create_revision = 5,
+/// mod_revision = 6, value = 7, lease = 8, range_end = 64}`; a `RequestOp`
+/// is `{request_range = 1, request_put = 2, request_delete_range = 3,
+/// request_txn = 4}`.
+pub fn encode_txn_body(
+    proto: &[u8],
+    bits: &PutFlagBits,
+    out: &mut [u8],
+    depth: u8,
+) -> Option<usize> {
+    if depth > TXN_DEPTH_MAX {
+        return None;
+    }
+    let mut at = 1usize;
+    // Compares.
+    let mut ncmp = 0u8;
+    let mut buf = proto;
+    while !buf.is_empty() {
+        let (field, wire, n) = read_tag(buf)?;
+        buf = &buf[n..];
+        if field == 1 && wire == WIRE_LENGTH_DELIMITED {
+            let (cmp, n) = read_length_delimited(buf)?;
+            buf = &buf[n..];
+            at += encode_compare(cmp, out.get_mut(at..)?)?;
+            ncmp = ncmp.checked_add(1)?;
+        } else {
+            let n = skip_field(buf, wire)?;
+            buf = &buf[n..];
+        }
+    }
+    *out.first_mut()? = ncmp;
+    // The success ops, then the failure ops.
+    for branch in [2u32, 3] {
+        let count_at = at;
+        at += 1;
+        let mut n_ops = 0u8;
+        let mut buf = proto;
+        while !buf.is_empty() {
+            let (field, wire, n) = read_tag(buf)?;
+            buf = &buf[n..];
+            if field == branch && wire == WIRE_LENGTH_DELIMITED {
+                let (op, n) = read_length_delimited(buf)?;
+                buf = &buf[n..];
+                at += encode_request_op(op, bits, out.get_mut(at..)?, depth)?;
+                n_ops = n_ops.checked_add(1)?;
+            } else {
+                let n = skip_field(buf, wire)?;
+                buf = &buf[n..];
+            }
+        }
+        *out.get_mut(count_at)? = n_ops;
+    }
+    Some(at)
+}
+
+fn encode_compare(mut buf: &[u8], out: &mut [u8]) -> Option<usize> {
+    let (mut result, mut target, mut key, mut end, mut operand, mut value) =
+        (0u8, 0u8, &[][..], &[][..], 0u64, &[][..]);
+    while !buf.is_empty() {
+        let (field, wire, n) = read_tag(buf)?;
+        buf = &buf[n..];
+        match (field, wire) {
+            (1, WIRE_VARINT) | (2, WIRE_VARINT) | (4..=6, WIRE_VARINT) | (8, WIRE_VARINT) => {
+                let (v, n) = read_varint(buf)?;
+                buf = &buf[n..];
+                match field {
+                    1 => result = v as u8,
+                    2 => target = v as u8,
+                    _ => operand = v,
+                }
+            }
+            (3 | 7 | 64, WIRE_LENGTH_DELIMITED) => {
+                let (b, n) = read_length_delimited(buf)?;
+                buf = &buf[n..];
+                match field {
+                    3 => key = b,
+                    7 => value = b,
+                    _ => end = b,
+                }
+            }
+            _ => {
+                let n = skip_field(buf, wire)?;
+                buf = &buf[n..];
+            }
+        }
+    }
+    if key.len() > u16::MAX as usize || end.len() > u16::MAX as usize {
+        return None;
+    }
+    let need = 2 + 2 + key.len() + 2 + end.len() + 8 + 4 + value.len();
+    let dst = out.get_mut(..need)?;
+    let mut p = 0usize;
+    let mut put = |b: &[u8]| {
+        let mut i = 0;
+        while i < b.len() {
+            dst[p + i] = b[i];
+            i += 1;
+        }
+        p += b.len();
+    };
+    put(&[target, result]);
+    put(&(key.len() as u16).to_le_bytes());
+    put(key);
+    put(&(end.len() as u16).to_le_bytes());
+    put(end);
+    put(&operand.to_le_bytes());
+    put(&(value.len() as u32).to_le_bytes());
+    put(value);
+    Some(p)
+}
+
+/// One `RequestOp` as `[kind:u8][len:u32 LE][op body]`.
+fn encode_request_op(
+    mut buf: &[u8],
+    bits: &PutFlagBits,
+    out: &mut [u8],
+    depth: u8,
+) -> Option<usize> {
+    while !buf.is_empty() {
+        let (field, wire, n) = read_tag(buf)?;
+        buf = &buf[n..];
+        if wire != WIRE_LENGTH_DELIMITED || !(1..=4).contains(&field) {
+            let n = skip_field(buf, wire)?;
+            buf = &buf[n..];
+            continue;
+        }
+        let (sub, _) = read_length_delimited(buf)?;
+        let body = out.get_mut(5..)?;
+        let len = match field {
+            1 => encode_range_meta_body(&RangeRequest::decode(sub)?, body)?,
+            2 => encode_put_body(&PutRequest::decode(sub)?, bits, body)?,
+            3 => encode_delete_meta_body(&DeleteRangeRequest::decode(sub)?, body)?,
+            _ => encode_txn_body(sub, bits, body, depth + 1)?,
+        };
+        *out.first_mut()? = field as u8;
+        let l = (len as u32).to_le_bytes();
+        let h = out.get_mut(1..5)?;
+        h[0] = l[0];
+        h[1] = l[1];
+        h[2] = l[2];
+        h[3] = l[3];
+        return Some(5 + len);
+    }
+    None
+}
+
+/// Open a length-delimited field whose length is written afterwards:
+/// the tag, then 3 bytes reserved for the length as a padded varint
+/// (protobuf decoders read over-long varints; 3 bytes hold up to 2 MiB).
+fn begin_ld(out: &mut [u8], off: &mut usize, field: u32) -> Option<usize> {
+    write_tag(out, off, field, WIRE_LENGTH_DELIMITED)?;
+    let at = *off;
+    out.get_mut(at..at + 3)?;
+    *off += 3;
+    Some(at)
+}
+
+fn end_ld(out: &mut [u8], off: &mut usize, at: usize) -> Option<()> {
+    let len = *off - at - 3;
+    if len >= 1 << 21 {
+        return None;
+    }
+    let b = out.get_mut(at..at + 3)?;
+    b[0] = (len & 0x7F) as u8 | 0x80;
+    b[1] = ((len >> 7) & 0x7F) as u8 | 0x80;
+    b[2] = ((len >> 14) & 0x7F) as u8;
+    Some(())
+}
+
+/// A `TxnResponse` (`header = 1, succeeded = 2, responses = 3`) from a
+/// `KV_RESULT_ETCD_TXN` body: each op's answer as its `ResponseOp`
+/// (`response_range = 1, response_put = 2, response_delete_range = 3,
+/// response_txn = 4`), each with its own header.
+pub fn build_txn_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    body: &[u8],
+) -> Option<()> {
+    let (succeeded, n) = (*body.first()?, *body.get(1)?);
+    write_response_header(out, off, revision)?;
+    if succeeded != 0 {
+        write_tag(out, off, 2, WIRE_VARINT)?;
+        write_varint(out, off, 1)?;
+    }
+    let mut p = 2usize;
+    for _ in 0..n {
+        let kind = *body.get(p)?;
+        let rlen = u32::from_le_bytes(body.get(p + 2..p + 6)?.try_into().ok()?) as usize;
+        let rbody = body.get(p + 6..p + 6 + rlen)?;
+        p += 6 + rlen;
+        let op_at = begin_ld(out, off, 3)?;
+        let inner_at = begin_ld(out, off, u32::from(kind))?;
+        match kind {
+            1 => build_range_meta_response(out, off, revision, rbody)?,
+            2 => build_put_response_prev(out, off, revision, rbody)?,
+            3 => build_delete_range_meta_response(out, off, revision, rbody)?,
+            _ => build_txn_response(out, off, revision, rbody)?,
+        }
+        end_ld(out, off, inner_at)?;
+        end_ld(out, off, op_at)?;
+    }
     Some(())
 }
 
@@ -1289,6 +2410,69 @@ pub fn build_lease_keepalive_response(
     Some(())
 }
 
+/// Build an `etcdserverpb.LeaseTimeToLiveResponse`:
+///   message LeaseTimeToLiveResponse {
+///     ResponseHeader header     = 1;
+///     int64          ID         = 2;
+///     int64          TTL        = 3;
+///     int64          grantedTTL = 4;
+///     repeated bytes keys       = 5;
+///   }
+/// `keys` lists the lease's keys, `[n:u16]` then `n × [len:u16][key]`
+/// (empty: none asked for). A lease that does not exist answers TTL -1,
+/// as etcd does.
+pub fn build_lease_ttl_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    lease_id: i64,
+    ttl: i64,
+    granted_ttl: i64,
+    keys: &[u8],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    write_tag(out, off, 2, WIRE_VARINT)?;
+    write_varint(out, off, lease_id as u64)?;
+    write_tag(out, off, 3, WIRE_VARINT)?;
+    write_varint(out, off, ttl as u64)?;
+    if granted_ttl != 0 {
+        write_tag(out, off, 4, WIRE_VARINT)?;
+        write_varint(out, off, granted_ttl as u64)?;
+    }
+    if keys.len() >= 2 {
+        let n = u16::from_le_bytes([keys[0], keys[1]]) as usize;
+        let mut p = 2usize;
+        for _ in 0..n {
+            let kl = u16::from_le_bytes([*keys.get(p)?, *keys.get(p + 1)?]) as usize;
+            write_length_delimited(out, off, 5, keys.get(p + 2..p + 2 + kl)?)?;
+            p += 2 + kl;
+        }
+    }
+    Some(())
+}
+
+/// Build an `etcdserverpb.LeaseLeasesResponse`:
+///   message LeaseLeasesResponse {
+///     ResponseHeader         header = 1;
+///     repeated LeaseStatus   leases = 2;   // LeaseStatus { int64 ID = 1; }
+///   }
+pub fn build_lease_leases_response(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    ids: &[u64],
+) -> Option<()> {
+    write_response_header(out, off, revision)?;
+    for &id in ids {
+        let mut buf = [0u8; 16];
+        let mut sub = 0;
+        write_tag(&mut buf, &mut sub, 1, WIRE_VARINT)?;
+        write_varint(&mut buf, &mut sub, id)?;
+        write_length_delimited(out, off, 2, &buf[..sub])?;
+    }
+    Some(())
+}
+
 /// Build an `etcdserverpb.WatchResponse` header (no events). Events
 /// are appended by [`write_watch_event`] after this returns.
 ///
@@ -1311,6 +2495,26 @@ pub fn build_watch_response_header(
     created: bool,
     canceled: bool,
 ) -> Option<()> {
+    build_watch_response_header_full(out, off, revision, watch_id, created, canceled, 0, b"")
+}
+
+/// As [`build_watch_response_header`], with `compact_revision = 5` (a
+/// watch canceled because its start fell behind compaction: clients read
+/// it as ErrCompacted) and `cancel_reason = 6` when set.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one WatchResponse head: every field is a distinct protocol field"
+)]
+pub fn build_watch_response_header_full(
+    out: &mut [u8],
+    off: &mut usize,
+    revision: i64,
+    watch_id: i64,
+    created: bool,
+    canceled: bool,
+    compact_revision: i64,
+    cancel_reason: &[u8],
+) -> Option<()> {
     write_response_header(out, off, revision)?;
     write_tag(out, off, 2, WIRE_VARINT)?;
     write_varint(out, off, watch_id as u64)?;
@@ -1321,6 +2525,17 @@ pub fn build_watch_response_header(
     if canceled {
         write_tag(out, off, 4, WIRE_VARINT)?;
         write_varint(out, off, 1)?;
+    }
+    if compact_revision > 0 {
+        write_tag(out, off, 5, WIRE_VARINT)?;
+        write_varint(out, off, compact_revision as u64)?;
+    }
+    if !cancel_reason.is_empty() {
+        write_tag(out, off, 6, WIRE_LENGTH_DELIMITED)?;
+        write_varint(out, off, cancel_reason.len() as u64)?;
+        let end = *off + cancel_reason.len();
+        out.get_mut(*off..end)?.copy_from_slice(cancel_reason);
+        *off = end;
     }
     Some(())
 }
@@ -1334,6 +2549,35 @@ pub enum WatchEventKind {
 
 /// Append one `mvccpb.Event` (field 11) to a `WatchResponse` payload.
 ///   message Event { EventType type=1; KeyValue kv=2; KeyValue prev_kv=3; }
+/// A watch `mvccpb.Event` with the key's own metadata and, when asked,
+/// the version it replaced:
+///   message Event { EventType type = 1; KeyValue kv = 2; KeyValue prev_kv = 3; }
+/// `meta` and a `prev` entry's metadata are `[create, mod, version, lease]`.
+pub fn write_watch_event_full(
+    out: &mut [u8],
+    off: &mut usize,
+    kind: WatchEventKind,
+    key: &[u8],
+    value: &[u8],
+    meta: [u64; 4],
+    prev: Option<(&[u8], [u64; 4])>,
+) -> Option<()> {
+    // The Event holds two KeyValues (the key's and, asked, the one it
+    // replaced), each up to a 4 KiB value behind its key and metadata.
+    let mut ebuf = [0u8; 2 * (4096 + 320) + 16];
+    let mut eoff = 0;
+    if kind as u8 != 0 {
+        write_tag(&mut ebuf, &mut eoff, 1, WIRE_VARINT)?;
+        write_varint(&mut ebuf, &mut eoff, kind as u64)?;
+    }
+    let [c, m, v, l] = meta;
+    write_keyvalue_full(&mut ebuf, &mut eoff, 2, key, value, c, m, v, l)?;
+    if let Some((pv, [pc, pm, pver, pl])) = prev {
+        write_keyvalue_full(&mut ebuf, &mut eoff, 3, key, pv, pc, pm, pver, pl)?;
+    }
+    write_length_delimited(out, off, 11, &ebuf[..eoff])
+}
+
 pub fn write_watch_event(
     out: &mut [u8],
     off: &mut usize,
@@ -2159,7 +3403,7 @@ pub fn build_grpc_trailers_block(out: &mut [u8], off: &mut usize, grpc_status: u
 //
 // PIC builds gate these behind `#[cfg(test)]`; the file is listed as
 // an inline-tests exemption in `fluxor.toml` (see
-// `standards/tests.md §3`).
+// `standards/tests.md`).
 
 #[cfg(test)]
 mod tests {
@@ -2168,11 +3412,10 @@ mod tests {
     #[test]
     fn huffman_decodes_lease_keep_alive_path() {
         // Captured from tonic on the wire: 24 bytes of Huffman for
-        // `/etcdserverpb.Lease/LeaseKeepAlive`. Used as a regression
-        // for the `'A'` table entry — RFC 7541 Appendix B records
-        // `'A'` as a 6-bit code (`100001`); an earlier draft of this
-        // table had it as 7 bits (`0100001`) and rejected every header
-        // value containing an uppercase 'A'.
+        // `/etcdserverpb.Lease/LeaseKeepAlive`. Guards the `'A'`
+        // table entry — RFC 7541 Appendix B records `'A'` as a 6-bit
+        // code (`100001`); a 7-bit entry (`0100001`) would reject
+        // every header value containing an uppercase 'A'.
         let bytes: &[u8] = &[
             0x60, 0xa9, 0x24, 0x88, 0x2d, 0x9d, 0xcb, 0x65, 0x71, 0xaf, 0x9c, 0xa3, 0x41, 0x58,
             0xce, 0x51, 0xa0, 0xb9, 0x8a, 0x5a, 0xe1, 0xa0, 0xdd, 0xcb,

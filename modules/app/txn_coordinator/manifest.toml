@@ -3,9 +3,10 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Cross-range transaction coordinator (RFC database foundation §13).
+# Cross-range transaction coordinator.
 #
-# Drives a cross-range transaction through §13.2 using the decision
+# Drives a cross-range transaction through the two-phase decision
+# protocol using the decision
 # machine in modules/common/txn_coordinator.rs and the participant ops
 # TXN_PREPARE / TXN_RESOLVE / TXN_RECORD. mode 0 is inert; mode 1 runs one
 # transaction DECLARED in the graph config, addressing participants by

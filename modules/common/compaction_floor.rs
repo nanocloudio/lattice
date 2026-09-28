@@ -1,5 +1,5 @@
 //! Pure-logic per-kpg compaction-floor aggregator, and the MVCC GC
-//! floor decision machine — RFC database foundation §18, §21 inv. 13.
+//! floor decision machine.
 //!
 //! Dual-target: PIC `compaction_coordinator` mounts this; host tests
 //! run the aggregator under `cargo test`.
@@ -12,12 +12,10 @@
 //!
 //! The second half ([`ClaimTable`]) is the MVCC GC floor, and it is a
 //! different kind of object because reclaiming history cannot be
-//! undone. §18:
-//!
-//! > The compaction coordinator collects signed/source-fenced claims,
-//! > calculates a candidate floor, **proposes the durable floor
-//! > transition, and only then schedules physical reclamation. Missing
-//! > or stale claim sources block unsafe advancement.**
+//! undone. The compaction coordinator collects signed, source-fenced
+//! claims, calculates a candidate floor, **proposes the durable floor
+//! transition, and only then schedules physical reclamation. Missing
+//! or stale claim sources block unsafe advancement.**
 //!
 //! Three rules follow, and this file makes all three executable:
 //!
@@ -25,7 +23,8 @@
 //!    plan_propose`] produces a record to propose and moves to
 //!    `AwaitingCommit`; only [`ClaimTable::observe_committed_floor`]
 //!    moves `committed_floor`. A caller that reclaims on the strength
-//!    of a proposal has broken invariant 13, and no method here returns
+//!    of a proposal has broken the floor contract, and no method here
+//!    returns
 //!    anything that would let it.
 //! 2. **Fail closed on a missing or stale claim.** A required source
 //!    that has never spoken, or whose claim is past its expiry, yields
@@ -162,9 +161,9 @@ pub const GC_FLOOR_VERSION: u16 = 1;
 /// Fixed wire length of one encoded [`GcFloorRecord`].
 pub const GC_FLOOR_WIRE_LEN: usize = 32;
 
-// ── Claim sources (§18's claim set, single-range subset) ─────────────
+// ── Claim sources (the full claim set's single-range subset) ─────────
 //
-// §18 lists seven claim categories. Phase-2 slice B implements the two
+// Of the seven claim categories, this file implements the two
 // that exist today and RESERVES the slots for the rest, so adding one
 // later is a mask bit and a producer — not a re-layout. The slot index
 // IS the wire `source` byte; never renumber.
@@ -176,11 +175,11 @@ pub const CLAIM_SOURCE_ACTIVE_READ: u8 = 0;
 /// floor of 0 is a real, expressible answer ("retain everything"), so
 /// its ABSENCE must never be read as that.
 pub const CLAIM_SOURCE_OPERATOR: u8 = 1;
-/// Watch and change-feed cursors (§15). Reserved for slice C — the
-/// watch registry produces it once resume-from-history lands.
+/// Watch and change-feed cursors. Reserved — the watch registry
+/// produces it when it supports resume-from-history.
 pub const CLAIM_SOURCE_WATCH: u8 = 2;
 /// Backups, restores and application snapshots still eligible for
-/// restore (§17). Reserved.
+/// restore. Reserved.
 pub const CLAIM_SOURCE_BACKUP: u8 = 3;
 
 /// Bit set of sources that MUST have a fresh claim before the floor may
@@ -366,7 +365,7 @@ pub enum FloorBlocked {
     /// stopped needing history.
     SourceStale { source: u8 },
     /// No committed allocator high water has been observed, so there is
-    /// nothing safe to clamp against (§10 / `mvcc.rs`).
+    /// nothing safe to clamp against (see `mvcc.rs`).
     AllocatorUnestablished,
     /// The candidate does not move the floor forward. Not an error —
     /// just nothing to propose.

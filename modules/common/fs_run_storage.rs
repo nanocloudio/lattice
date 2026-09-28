@@ -1,7 +1,7 @@
 //! `FsRunStorage` — `RunStorage` over the Fluxor FS provider contract
 //! (`target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`), for the PIC
 //! module build of the ordered disk state-store provider
-//! (`disk_store.rs`, RFC database foundation §9.5).
+//! (`disk_store.rs`).
 //!
 //! Every call is synchronous *in-step* and bounded — the same idiom as
 //! clustor's `durability` WAL (`deps/clustor/modules/app/durability/
@@ -122,14 +122,17 @@ fn open_says_missing(rc: i32) -> bool {
     rc == FS_E_NOENT || rc == FS_E_NODEV
 }
 
-/// `"kv9/" + 8.3 name` worst case.
-const PATH_MAX: usize = 17;
+/// A named store directory, when one is set ([`FsRunStorage::set_dir`]).
+pub const DIR_MAX: usize = 128;
+/// The longest path built: the directory ([`DIR_MAX`]), `/`, and an 8.3
+/// name (16).
+const PATH_MAX: usize = 145;
 
 /// Highest `store_id` the linux layout can express: `kv/`, `kv1/` …
 /// `kv9/` — one digit, so the 8.3-adjacent path stays fixed-width.
 /// Far above any realistic per-process range count (a graph hosts a
 /// handful of statically provisioned ranges; thousands of ranges are
-/// §11.6 dense-hosting territory, not one-directory-each territory).
+/// dense-hosting territory, not one-directory-each territory).
 pub const STORE_ID_MAX: u8 = 9;
 /// FS_READDIR batch buffer. Each entry is `[len:1][type:1][name:≤255]`;
 /// our names are 12 bytes so this holds dozens per batch.
@@ -142,7 +145,8 @@ const READDIR_BUF: usize = 512;
 #[repr(C)]
 struct WriteCache {
     fd: i32,
-    kind_run: bool,
+    /// [`kind_code`] of the cached file.
+    kind: u8,
     id: u32,
     /// Append cursor == current file length.
     len: u64,
@@ -165,6 +169,10 @@ pub struct FsRunStorage {
     /// fails closed on `root_path = 1` with a non-zero id, because at
     /// the FAT32 root two stores would silently share the `K` names.
     store_id: u8,
+    /// The directory the store's files live in, when named
+    /// ([`FsRunStorage::set_dir`]; linux layout): in place of `kv/`.
+    dir_len: u8,
+    dir: [u8; DIR_MAX],
     /// FS_CAPS probe: 0 = not probed, else `bits | PROBED`.
     caps_probe: u32,
     cache: WriteCache,
@@ -206,10 +214,11 @@ impl FsRunStorage {
         self.syscalls = syscalls;
         self.root_path = root_path;
         self.store_id = store_id;
+        self.dir_len = 0;
         self.caps_probe = 0;
         self.cache = WriteCache {
             fd: -1,
-            kind_run: false,
+            kind: 0,
             id: 0,
             len: 0,
         };
@@ -221,6 +230,53 @@ impl FsRunStorage {
         // the one place a reset without closing is correct.
         self.read_fds = Cell::new(FdCache::new());
         true
+    }
+
+    /// Keep the store's files in `dir` (a path the FS provider resolves:
+    /// absolute, or relative to the process's working directory) instead
+    /// of `kv/`. `false` for a directory on the FAT32 root layout, or one
+    /// longer than [`DIR_MAX`], or holding a NUL.
+    #[must_use]
+    #[allow(
+        clippy::manual_contains,
+        reason = "slice::contains links core's memchr, which PIC modules cannot resolve"
+    )]
+    pub fn set_dir(&mut self, dir: &[u8]) -> bool {
+        let dir = dir.strip_suffix(b"/").unwrap_or(dir);
+        if self.root_path != 0
+            || dir.is_empty()
+            || dir.len() > DIR_MAX
+            || dir.iter().any(|b| *b == 0)
+        {
+            return false;
+        }
+        for (x, y) in self.dir.iter_mut().zip(dir) {
+            *x = *y;
+        }
+        self.dir_len = dir.len() as u8;
+        true
+    }
+
+    /// The directory's path into `out`: its length.
+    fn dir_path(&self, out: &mut [u8; PATH_MAX]) -> usize {
+        if self.root_path != 0 {
+            out[0] = b'/';
+            return 1;
+        }
+        if self.dir_len > 0 {
+            let n = self.dir_len as usize;
+            for (x, y) in out.iter_mut().zip(self.dir.iter().take(n)) {
+                *x = *y;
+            }
+            return n;
+        }
+        out[0] = b'k';
+        out[1] = b'v';
+        if self.store_id != 0 {
+            out[2] = b'0' + self.store_id;
+            return 3;
+        }
+        2
     }
 
     /// Monotonic `(read_at calls, bytes, FS_OPEN calls)` since `init`.
@@ -235,7 +291,7 @@ impl FsRunStorage {
     /// run's bytes and answer confidently with them.
     fn read_fd_drop(&self, kind: FileKind, id: u32) {
         let mut c = self.read_fds.get();
-        let victim = c.drop_entry(matches!(kind, FileKind::Run), id);
+        let victim = c.drop_entry(kind_code(kind), id);
         self.read_fds.set(c);
         if let Some(fd) = victim {
             self.close_fd(fd);
@@ -310,13 +366,7 @@ impl FsRunStorage {
     fn encode_path(&self, kind: FileKind, id: u32, out: &mut [u8; PATH_MAX]) -> usize {
         let mut i = 0usize;
         if self.root_path == 0 {
-            out[i] = b'k';
-            out[i + 1] = b'v';
-            i += 2;
-            if self.store_id != 0 {
-                out[i] = b'0' + self.store_id;
-                i += 1;
-            }
+            i = self.dir_path(out);
             out[i] = b'/';
             i += 1;
         }
@@ -331,11 +381,14 @@ impl FsRunStorage {
             };
             i += 1;
         }
-        let ext: &[u8; 4] = match kind {
-            FileKind::Run => b".KRN",
-            FileKind::Manifest => b".KMN",
+        // By value: a `match` choosing among slice literals lowers to a
+        // table of pointers, which a module image cannot hold.
+        let ext: [u8; 4] = match kind {
+            FileKind::Run => *b".KRN",
+            FileKind::Manifest => *b".KMN",
+            FileKind::Log => *b".KLG",
         };
-        for &b in ext {
+        for &b in &ext {
             out[i] = b;
             i += 1;
         }
@@ -388,6 +441,58 @@ impl FsRunStorage {
         Err(StorageError::IoFault)
     }
 
+    /// Read up to `out.len()` bytes at `offset` of the file at `path` (a
+    /// file outside the store's own layout, named as the FS provider
+    /// names it): the count read, 0 at its end; `NotFound` when there is
+    /// no such file. One open per call — for a one-off reader (an import),
+    /// not the store's own hot path.
+    pub fn read_path(
+        &self,
+        path: &[u8],
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize, StorageError> {
+        let Ok(at) = u32::try_from(offset) else {
+            self.last_errno.set(-27);
+            return Err(StorageError::IoFault);
+        };
+        let mut p = [0u8; 256];
+        let Some(dst) = p.get_mut(..path.len()) else {
+            return Err(StorageError::IoFault);
+        };
+        for (x, y) in dst.iter_mut().zip(path) {
+            *x = *y;
+        }
+        let sys = self.sys();
+        // SAFETY: `p` holds the path for the duration of the call.
+        let fd = unsafe { (sys.provider_call)(-1, FS_OPEN, p.as_mut_ptr(), path.len()) };
+        if fd < 0 {
+            self.last_errno.set(fd);
+            return Err(if open_says_missing(fd) {
+                StorageError::NotFound
+            } else {
+                StorageError::IoFault
+            });
+        }
+        let seek = at.to_le_bytes();
+        // SAFETY: `fd` from FS_OPEN; a 4-byte LE position; `out` is valid
+        // for writes of its length.
+        let n = unsafe {
+            let rc = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+            if rc < 0 {
+                rc
+            } else {
+                (sys.provider_call)(fd, FS_READ, out.as_mut_ptr(), out.len())
+            }
+        };
+        self.close_fd(fd);
+        if n < 0 {
+            self.last_errno.set(n);
+            return Err(StorageError::IoFault);
+        }
+        Ok(n as usize)
+    }
+
     fn drop_cache(&mut self) {
         if self.cache.fd >= 0 {
             let fd = self.cache.fd;
@@ -401,8 +506,8 @@ impl FsRunStorage {
     /// Open (kind, id) for appending, reusing the single-slot cache.
     /// The file must already exist (`create` is the only birth path).
     fn open_for_write(&mut self, kind: FileKind, id: u32) -> Result<(), StorageError> {
-        let kind_run = matches!(kind, FileKind::Run);
-        if self.cache.fd >= 0 && self.cache.kind_run == kind_run && self.cache.id == id {
+        let code = kind_code(kind);
+        if self.cache.fd >= 0 && self.cache.kind == code && self.cache.id == id {
             return Ok(());
         }
         self.drop_cache();
@@ -430,11 +535,21 @@ impl FsRunStorage {
         }
         self.cache = WriteCache {
             fd,
-            kind_run,
+            kind: code,
             id,
             len: u64::from(u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]])),
         };
         Ok(())
+    }
+}
+
+/// A file kind as the descriptor caches key it: runs, manifests and log
+/// segments share ids, so the kind is part of a file's identity.
+fn kind_code(kind: FileKind) -> u8 {
+    match kind {
+        FileKind::Run => 0,
+        FileKind::Manifest => 1,
+        FileKind::Log => 2,
     }
 }
 
@@ -460,7 +575,7 @@ impl RunStorage for FsRunStorage {
         }
         self.cache = WriteCache {
             fd,
-            kind_run: matches!(kind, FileKind::Run),
+            kind: kind_code(kind),
             id,
             len: 0,
         };
@@ -479,6 +594,11 @@ impl RunStorage for FsRunStorage {
     }
 
     fn append(&mut self, kind: FileKind, id: u32, data: &[u8]) -> Result<(), StorageError> {
+        // The end of THIS file: open it first, so an append that follows
+        // a write to another file (a log record during a flush) does not
+        // take that file's length for its own.
+        self.require_write_tier()?;
+        self.open_for_write(kind, id)?;
         let at = self.cache.len;
         self.write_seeked(kind, id, at, data)
     }
@@ -584,13 +704,13 @@ impl RunStorage for FsRunStorage {
             return Err(StorageError::IoFault);
         }
         let sys = self.sys();
-        let kind_run = matches!(kind, FileKind::Run);
+        let code = kind_code(kind);
         // Reuse an already-open descriptor if we hold one. This is the
         // whole point: the rig measured ~42 ms per read_at, essentially
         // all of it the FS_OPEN (a linear FAT32 directory scan that
         // grows with the run files), against a 4 KiB read.
         let mut cached = self.read_fds.get();
-        let hit = cached.lookup(kind_run, id);
+        let hit = cached.lookup(code, id);
         self.read_fds.set(cached);
         let (fd, from_cache) = match hit {
             Some(fd) => (fd, true),
@@ -644,7 +764,7 @@ impl RunStorage for FsRunStorage {
             // the close is explicit and the cache never exceeds its
             // budget.
             let mut c = self.read_fds.get();
-            let evicted = c.insert(kind_run, id, fd);
+            let evicted = c.insert(code, id, fd);
             self.read_fds.set(c);
             if let Some(old) = evicted {
                 self.close_fd(old);
@@ -658,8 +778,7 @@ impl RunStorage for FsRunStorage {
 
     fn delete(&mut self, kind: FileKind, id: u32) -> Result<(), StorageError> {
         self.require_write_tier()?;
-        let kind_run = matches!(kind, FileKind::Run);
-        if self.cache.fd >= 0 && self.cache.kind_run == kind_run && self.cache.id == id {
+        if self.cache.fd >= 0 && self.cache.kind == kind_code(kind) && self.cache.id == id {
             self.drop_cache();
         }
         // BEFORE the unlink, for two reasons: run ids are reused after
@@ -693,19 +812,7 @@ impl RunStorage for FsRunStorage {
         // Directory to scan: `kv` on linux layout, the FS root on
         // bare-metal FAT32.
         let mut dpath = [0u8; PATH_MAX];
-        let dlen = if self.root_path == 0 {
-            dpath[0] = b'k';
-            dpath[1] = b'v';
-            if self.store_id != 0 {
-                dpath[2] = b'0' + self.store_id;
-                3
-            } else {
-                2
-            }
-        } else {
-            dpath[0] = b'/';
-            1
-        };
+        let dlen = self.dir_path(&mut dpath);
         let sys = self.sys();
         // SAFETY: valid path buffer; OPENDIR returns a dir fd.
         let dir_fd = unsafe { (sys.provider_call)(-1, FS_OPENDIR, dpath.as_mut_ptr(), dlen) };
@@ -716,9 +823,10 @@ impl RunStorage for FsRunStorage {
             // rather than reporting healthy emptiness.
             return Err(StorageError::IoFault);
         }
-        let want_ext: &[u8; 3] = match kind {
-            FileKind::Run => b"KRN",
-            FileKind::Manifest => b"KMN",
+        let want_ext: [u8; 3] = match kind {
+            FileKind::Run => *b"KRN",
+            FileKind::Manifest => *b"KMN",
+            FileKind::Log => *b"KLG",
         };
         let mut count = 0usize;
         let mut overflow = false;
@@ -757,7 +865,7 @@ impl RunStorage for FsRunStorage {
                 if entry_type == 1 {
                     continue; // directory
                 }
-                if let Some(id) = parse_kv_name(name, want_ext) {
+                if let Some(id) = parse_kv_name(name, &want_ext) {
                     if count >= out.len() {
                         overflow = true;
                         break;

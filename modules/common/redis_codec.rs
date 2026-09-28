@@ -38,7 +38,7 @@ use types::{
     PUT_FLAG_KEEPTTL, PUT_FLAG_NX, PUT_FLAG_XX, REQ_LINEARIZABLE, REQ_SERIALIZABLE,
 };
 
-// ── Time-series (RFC database foundation §14.19, Phase 8) ────────────
+// ── Time-series ──────────────────────────────────────────────────────
 //
 // TS.ADD / TS.RANGE serve the time-series capability over the redis
 // wire (real clients: redis-cli and every RedisTimeSeries SDK speak
@@ -51,7 +51,7 @@ use types::{
 // asserts byte-identity against the models encoder, the same tripwire
 // discipline `fnv1a64` uses.
 //
-// §14.19's committed-input rule shows up on the wire: `TS.ADD key *`
+// The committed-input rule shows up on the wire: `TS.ADD key *`
 // (server-assigned time) REFUSES — a replica-sampled timestamp is
 // exactly what the contract forbids; the client states the time it
 // means.
@@ -553,8 +553,9 @@ pub fn build_op_body(recv: &[u8], cmd: &[u8], argv: &Argv, body: &mut [u8]) -> B
         let value = argv.arg(recv, 3);
         let Some(ts) = parse_u64(ts_arg) else {
             // '*' lands here too, deliberately: a server-assigned
-            // sample time is a replica-sampled timestamp, which
-            // §14.19 forbids. The client states the time it means.
+            // sample time is a replica-sampled timestamp, which the
+            // committed-input rule forbids. The client states the
+            // time it means.
             return Built::BadArgs(
                 b"ERR TS.ADD needs an explicit millisecond timestamp (committed input)",
             );
@@ -922,6 +923,13 @@ pub fn build_op_body(recv: &[u8], cmd: &[u8], argv: &Argv, body: &mut [u8]) -> B
 pub fn encode_kv_reply(send_buf: &mut [u8], send_len: &mut usize, result: u8, body: &[u8]) {
     let sb = send_buf;
     let sl = send_len;
+    // A command that cannot apply to a large value's stored form (APPEND,
+    // INCR, … over one). Outside the match: one more literal arm lowers it
+    // to a table of pointers, which a PIC module cannot relocate.
+    if result == types::KV_RESULT_MANIFEST {
+        let _ = enc_error(sb, sl, b"ERR the command does not apply to a large value");
+        return;
+    }
     match result {
         KV_RESULT_OK => {
             if body.is_empty() {
@@ -948,6 +956,9 @@ pub fn encode_kv_reply(send_buf: &mut [u8], send_len: &mut usize, result: u8, bo
         }
         KV_RESULT_QUOTA => {
             let _ = enc_error(sb, sl, b"BUSY tenant quota exceeded");
+        }
+        types::KV_RESULT_TOO_LARGE => {
+            let _ = enc_error(sb, sl, b"ERR value too large");
         }
         KV_RESULT_UNAUTH => {
             let _ = enc_error(sb, sl, b"NOAUTH Authentication required");

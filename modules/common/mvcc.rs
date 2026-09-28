@@ -1,19 +1,18 @@
-//! MVCC timestamp authority — RFC database-foundation §10.
+//! MVCC timestamp authority.
 //!
-//! Phase 2 slice 1: the contracts and the executable monotonicity rules
+//! The contracts and the executable monotonicity rules
 //! behind the replicated timestamp allocator. This file is contracts
 //! only — no ports, no I/O, no queueing. The PIC module that owns the
 //! ports is `modules/app/timestamp_allocator/`; it is a thin pump over
 //! the state machine defined here.
 //!
-//! §10 states the requirement the whole file exists to make executable:
-//!
-//! > The first implementation should provide a replicated timestamp
-//! > allocator … which leases monotonically ordered timestamp intervals
-//! > to transaction coordinators. Leases have upper bounds, identities,
-//! > and epochs. **After restart or leadership change, an allocator must
-//! > move beyond every previously issued interval before issuing more
-//! > timestamps.**
+//! The requirement the whole file exists to make executable: a
+//! replicated timestamp allocator
+//! leases monotonically ordered timestamp intervals
+//! to transaction coordinators. Leases have upper bounds, identities,
+//! and epochs. **After restart or leadership change, an allocator must
+//! move beyond every previously issued interval before issuing more
+//! timestamps.**
 //!
 //! Three rules encode that, and `validate_successor` enforces all three
 //! as one function:
@@ -34,7 +33,7 @@
 //!
 //! ## Durability before issuance
 //!
-//! The other half of §10 — and §21 invariant 3 — is that a timestamp may
+//! The other half of the authority's contract is that a timestamp may
 //! only be handed out after the high water covering it is *durably
 //! committed*. [`ReserveState`] is the state machine for that: it tracks
 //! a `committed_high_water` (established only from committed records)
@@ -61,9 +60,9 @@ pub const MVCC_LEASE_VERSION: u16 = 1;
 /// **Hybrid logical clocks are NOT enabled in v1, and physical time is
 /// not the serialization authority.**
 ///
-/// §10 permits a hybrid logical representation "later … provided clock
-/// uncertainty is bounded and the same monotonicity and recovery
-/// invariants are proven", and closes with the rule this constant
+/// A hybrid logical representation is permissible later, provided
+/// clock uncertainty is bounded and the same monotonicity and
+/// recovery invariants are proven — with the rule this constant
 /// exists to keep visible: *physical time must never silently become
 /// the serialization authority.*
 ///
@@ -131,8 +130,7 @@ pub const MSG_TS_LEASE_REQUEST: u8 = 0xE3;
 pub const MSG_TS_LEASE_GRANT: u8 = 0xE4;
 
 /// Allocator → coordinator: typed refusal. Every rejection is explicit;
-/// the allocator never answers a request by issuing something weaker
-/// (§21 invariant 14).
+/// the allocator never answers a request by issuing something weaker.
 ///
 /// Payload (`LEASE_REJECT_WIRE_LEN`, integers LE):
 ///
@@ -195,7 +193,7 @@ pub const LEASE_WIRE_LEN: usize = 40;
 
 // ── Timestamp lease record ────────────────────────────────────────────
 
-/// One replicated timestamp-allocator record (§10).
+/// One replicated timestamp-allocator record.
 ///
 /// Wire layout (`MVCC_LEASE_VERSION` 1, all integers LE):
 ///
@@ -393,7 +391,7 @@ pub fn decode_reject(src: &[u8]) -> Option<(u64, u8)> {
 
 // ── Typed errors ──────────────────────────────────────────────────────
 
-/// A §10 monotonicity violation found by [`validate_successor`]. Each
+/// A monotonicity violation found by [`validate_successor`]. Each
 /// variant names exactly one rule; a caller that sees any of them must
 /// fail closed — there is no repair, because the committed record is the
 /// only authority for what was already issued.
@@ -409,7 +407,7 @@ pub enum LeaseError {
     IntervalTooLarge { size: u64 },
     /// `next.interval_start < prev.interval_end`: the successor would
     /// re-issue timestamps the predecessor already covered. This is the
-    /// violation §10's restart/leadership rule exists to prevent.
+    /// violation the restart/leadership rule exists to prevent.
     IntervalRegression { prev_end: u64, next_start: u64 },
     /// `next.epoch < prev.epoch`: incarnations moved backwards.
     EpochRegression { prev_epoch: u32, next_epoch: u32 },
@@ -490,7 +488,8 @@ pub fn leases_overlap(a: &TimestampLease, b: &TimestampLease) -> bool {
     a.interval_start < b.interval_end && b.interval_start < a.interval_end
 }
 
-/// Enforce §10's core invariant on a `prev → next` succession.
+/// Enforce the allocator's core invariant on a `prev → next`
+/// succession.
 ///
 /// `prev` is the newest previously issued record — on restart, the
 /// highest-`interval_end` record recovered from the committed log, NOT
@@ -544,8 +543,9 @@ pub fn validate_successor(prev: &TimestampLease, next: &TimestampLease) -> Resul
     Ok(())
 }
 
-/// Build the successor of `prev` for `allocator_id`, applying the §10
-/// rules rather than merely checking them: the interval starts at
+/// Build the successor of `prev` for `allocator_id`, applying the
+/// succession rules rather than merely checking them: the interval
+/// starts at
 /// `prev`'s high water, and the epoch is bumped strictly when the
 /// allocator identity differs.
 ///
@@ -595,7 +595,7 @@ pub enum ReservePhase {
     AwaitingCommit = 2,
 }
 
-/// The durability-before-issuance state machine (§10, §21 invariant 3).
+/// The durability-before-issuance state machine.
 ///
 /// Two water marks, and the whole safety argument is the gap between
 /// them:
@@ -620,7 +620,7 @@ pub enum ReservePhase {
 /// to `committed_high_water` — the allocator inherits the high water but
 /// none of the reserve, so its first grant necessarily waits on a fresh,
 /// self-proposed, committed advance carrying its own strictly higher
-/// epoch. That is §10's "move beyond every previously issued interval"
+/// epoch. That is "move beyond every previously issued interval"
 /// expressed as arithmetic rather than as a check.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -688,7 +688,7 @@ impl ReserveState {
     ///   commits later it arrives here as another record and is folded
     ///   in the same way).
     ///
-    /// Fails closed with a [`LeaseError`] if the record breaks §10
+    /// Fails closed with a [`LeaseError`] if the record breaks
     /// succession against the newest record already observed. A caller
     /// that gets an error must drop the record and count it — it must
     /// NOT fall back to local state.
@@ -885,7 +885,7 @@ impl ReserveState {
     /// that discards lease records without carrying the high water in
     /// the snapshot would let a probe re-issue timestamps — the same
     /// hazard the replay-complete path has, gated today by the pinned
-    /// compaction floor (§18).
+    /// compaction floor.
     pub fn plan_bootstrap(&mut self, chunk: u64) -> Result<TimestampLease, IssueError> {
         if self.phase != ReservePhase::Unestablished {
             return Err(IssueError::BadRequest);

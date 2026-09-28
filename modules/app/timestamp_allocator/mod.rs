@@ -1,5 +1,4 @@
-//! timestamp_allocator — the replicated MVCC timestamp authority
-//! (RFC database foundation §10, Phase 2 slice 1).
+//! timestamp_allocator — the replicated MVCC timestamp authority.
 //!
 //! # Core invariant: durability before issuance
 //!
@@ -15,9 +14,10 @@
 //! lost to a leadership change before commit, the next allocator would
 //! recover a lower high water and re-issue the very same timestamps —
 //! two different writes at one MVCC timestamp, which is silent
-//! corruption of every snapshot read taken afterwards. §21 invariant 3
-//! (apply is deterministic from prior state plus committed command) and
-//! invariant 2 (nothing claims durability before the durable proof) are
+//! corruption of every snapshot read taken afterwards. Deterministic
+//! apply (from prior state plus committed command) and
+//! durability honesty (nothing claims durability before the durable
+//! proof) are
 //! the same rule seen from the two ends.
 //!
 //! So the request path is:
@@ -32,9 +32,9 @@
 //! ```
 //!
 //! and there is no fourth branch. A full hold queue is a typed
-//! `REJECT_QUEUE_FULL`, not a grant from thin air (§21 invariant 14:
+//! `REJECT_QUEUE_FULL`, not a grant from thin air —
 //! exhaustion produces bounded backpressure or typed failure, never a
-//! weaker consistency mode).
+//! weaker consistency mode.
 //!
 //! # Restart and leadership change
 //!
@@ -46,7 +46,7 @@
 //! (`issued_high_water` is snapped up to `committed_high_water`) and
 //! bumps this allocator's epoch strictly past every epoch it saw. Its
 //! first grant therefore cannot happen until its own, epoch-bumped
-//! advance has committed. That is §10's "move beyond every previously
+//! advance has committed. That is "move beyond every previously
 //! issued interval" made structural rather than checked.
 //!
 //! # Bounds
@@ -119,10 +119,11 @@ const EMIT_EVERY: u64 = 5000;
 ///
 /// Deliberately zero in v1: the only clock this module could read is a
 /// LOCAL one, and a locally sampled value written into a replicated
-/// record is exactly the non-determinism §21 invariant 3 forbids and
+/// record is exactly the non-determinism deterministic apply forbids
+/// and
 /// `mvcc::HYBRID_NOT_ENABLED` warns about. Lease expiry becomes real
 /// when it can be driven from the replicated tick source
-/// (`ttl_scheduler`'s `MSG_LEASE_TICK`) — a later Phase-2 slice. Until
+/// (`ttl_scheduler`'s `MSG_LEASE_TICK`) — a later slice. Until
 /// then a zero expiry means "no administrative deadline", and nothing in
 /// the ordering path ever reads the field anyway.
 const LEASE_EXPIRY_NONE: u64 = 0;
@@ -162,14 +163,14 @@ struct AllocState {
     /// Step counter driving the auto-grant/bootstrap cadence.
     auto_ctr: u32,
 
-    // ── Phase-14 counters (ids follow manifest `[observability] metrics`) ──
+    // ── Metric counters (ids follow manifest `[observability] metrics`) ──
     m_grants: u64,
     m_proposals: u64,
     m_holds: u64,
     m_rejects: u64,
     step_ctr: u64,
 
-    // ── the §10 state machine ──
+    // ── the reserve state machine ──
     reserve: ReserveState,
 
     // Bounded FIFO of held requests: `hold[head .. head+len)` modulo
@@ -242,7 +243,7 @@ impl AllocState {
 define_params! {
     AllocState;
 
-    // Allocator identity (§10: leases carry identities). Distinct per
+    // Allocator identity (leases carry identities). Distinct per
     // allocator instance; a change of identity in the committed record
     // is what a successor detects as a leadership change, so two live
     // allocators sharing an id would be indistinguishable in the log.
@@ -576,7 +577,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // whether the pump acted.
         auto_grant_tick(s, sys);
 
-        // Phase-14: emit module-scope counters on the metrics port at a
+        // Observability: emit module-scope counters on the metrics
+        // port at a
         // coarse cadence (no-op until wired). ids follow manifest order;
         // `epoch` and `high_water` are levels, not rates.
         s.step_ctr = s.step_ctr.wrapping_add(1);
@@ -643,7 +645,7 @@ unsafe fn pump_committed(s: &mut AllocState, sys: &SyscallTable) -> bool {
     let Some(rec) = TimestampLease::decode(&scratch[..LEASE_WIRE_LEN]) else {
         return true;
     };
-    // A record that breaks §10 succession is DROPPED, never repaired and
+    // A record that breaks succession is DROPPED, never repaired and
     // never worked around from local state: the committed log is the
     // only authority for what was already issued.
     let _ = s.reserve.observe_committed(&rec);

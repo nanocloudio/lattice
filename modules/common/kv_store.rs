@@ -12,6 +12,9 @@
     reason = "shared via #[path] into the PIC module and host tests; each consumer uses a subset"
 )]
 
+#[path = "kv_chunks.rs"]
+pub mod kv_chunks;
+
 #[path = "types.rs"]
 mod types;
 
@@ -28,17 +31,31 @@ mod txn;
 use disk_store::run_storage::RunStorage;
 use disk_store::state_store::{KvStateStore, Progress, StoreError};
 use disk_store::{DiskStore, BATCH_FORMAT_VERSION, BATCH_HDR_LEN, BATCH_MAGIC, RECORD_FIXED};
+use types::KV_OP_CHUNK_SWEEP;
 use types::{
-    KV_ARRAY_ELEMENT_NULL, KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_EXISTS,
-    KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_IDEMPOTENT_LOOKUP, KV_OP_INCR,
-    KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE, KV_OP_RANGE_SCAN, KV_OP_SCAN,
-    KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS, KV_OP_STRLEN, KV_OP_TXN,
-    KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE, KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED,
-    KV_RESULT_COMPACTED, KV_RESULT_IDEMPOTENT_LOOKUP, KV_RESULT_INTEGER, KV_RESULT_INTERNAL,
-    KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR,
-    KV_RESULT_TXN, KV_RESULT_TXN_PENDING, KV_RESULT_VERSIONS, KV_RESULT_WRONG_TYPE, PUT_FLAG_GET,
-    PUT_FLAG_KEEPTTL, PUT_FLAG_NX, PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER,
-    TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL, VERSION_KIND_DELETE, VERSION_KIND_PUT,
+    DELETE_META_FLAG_MANIFESTS, KV_OP_GET_CHUNK, KV_OP_PUT_CHUNK, KV_OP_PUT_MANIFEST,
+    KV_RESULT_BAD_CHUNK, KV_RESULT_MANIFEST, KV_RESULT_MISSING_CHUNK, RANGE_META_FLAG_MANIFESTS,
+    VERSIONS_FLAG_MANIFESTS,
+};
+use types::{KVS_MORE_LIMIT, KVS_MORE_PARTIAL};
+use types::{
+    KV_ARRAY_ELEMENT_NULL, KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_DELETE_META,
+    KV_OP_EXISTS, KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_IDEMPOTENT_LOOKUP,
+    KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE, KV_OP_RANGE_META,
+    KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS,
+    KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE,
+    KV_RESULT_ARRAY, KV_RESULT_CAS_FAILED, KV_RESULT_COMPACTED, KV_RESULT_FUTURE_REV,
+    KV_RESULT_IDEMPOTENT_LOOKUP, KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_KVS,
+    KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_QUOTA, KV_RESULT_RANGE,
+    KV_RESULT_SCAN_CURSOR, KV_RESULT_TXN, KV_RESULT_TXN_PENDING, KV_RESULT_VERSIONS,
+    KV_RESULT_WRONG_TYPE, PUT_FLAG2_MANIFESTS, PUT_FLAG_GET, PUT_FLAG_IGNORE_LEASE,
+    PUT_FLAG_IGNORE_VALUE, PUT_FLAG_KEEPTTL, PUT_FLAG_LEASE, PUT_FLAG_NX, PUT_FLAG_PREV_META,
+    PUT_FLAG_XX, TXN_CMP_MOD_EQUAL, TXN_CMP_MOD_GREATER, TXN_CMP_MOD_LESS, TXN_CMP_MOD_NOT_EQUAL,
+    VERSIONS_FLAG_META, VERSION_KIND_DELETE, VERSION_KIND_PUT,
+};
+use types::{
+    KV_OP_COMPACT, KV_OP_ETCD_TXN, KV_OP_HASH_KV, KV_OP_LEASE_KEYS, KV_OP_LEASE_REVOKE,
+    KV_RESULT_DUPLICATE, KV_RESULT_ETCD_TXN,
 };
 
 // ── Capacities ────────────────────────────────────────────────────────
@@ -47,7 +64,9 @@ use types::{
 /// the version on any layout change; `snapshot_decode` refuses bodies
 /// it doesn't recognise rather than mis-parsing them.
 pub const SNAPSHOT_MAGIC: u32 = 0x4C4B_5653;
-pub const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+/// Format 2 adds each record's flags; format 1 bodies still decode (no
+/// record in them is flagged).
+pub const SNAPSHOT_FORMAT_VERSION: u16 = 2;
 /// `[magic:4][format:2][flags:2][revision:8][count:4][rsvd:4][clock:8]`
 ///
 /// `clock` is the committed clock frontier — the state machine's `now`
@@ -58,20 +77,150 @@ pub const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 /// then re-age the survivors from zero.
 pub const SNAPSHOT_HDR_LEN: usize = 32;
 /// Per-record fixed prefix ahead of the key/value bytes:
-/// `[key_len:2][value_len:4][create_rev:8][mod_rev:8][version:8][lease:8][expiry:8]`
-pub const SNAPSHOT_REC_FIXED: usize = 46;
+/// `[key_len:2][value_len:4][create_rev:8][mod_rev:8][version:8][lease:8][expiry:8][flags:1]`
+pub const SNAPSHOT_REC_FIXED: usize = 47;
+/// Format 1's prefix: the same without `flags`.
+const SNAPSHOT_REC_FIXED_V1: usize = 46;
 
 pub const MAX_KEYS: usize = 1024;
-pub const MAX_KEY_LEN: usize = 256;
+/// Longest physical key: the 12-byte identity prefix, a keyspace, and the
+/// longest key a model writes — a document index entry at the document
+/// id bound (`IDENT_LEN + 4 + models::DOCUMENT_KEY_MAX_LEN`; a
+/// contract test holds the two together). A buffer capacity: what one
+/// replicated write carries is the consensus entry's bound.
+pub const MAX_KEY_LEN: usize = 2584;
 pub const MAX_VALUE_LEN: usize = 4096;
 
+/// Bytes of watch events one command may journal.
+pub const JOURNAL_BYTES: usize = 16384;
+use types::{JOURNAL_PREV, JOURNAL_PREV_MANIFEST};
+
+// ── Event journal ─────────────────────────────────────────────────────
+
+/// The watch events one command produced, in the order it produced
+/// them, as the store saw them: each key's metadata after the write and
+/// the version it replaced (etcd's `prev_kv`). The hosting worker frames
+/// `MSG_WATCH_EVENT`s from it. A provider journals only while its
+/// [`Materializer::journal`] answers one.
+///
+/// Entry: `[op:1][klen:2][key][vlen:2][value][create:8][version:8]
+/// [lease:8][prev:1]`, then when `prev` is not 0
+/// `[pvlen:2][pvalue][pcreate:8][pmod:8][pversion:8][please:8]` —
+/// [`JOURNAL_PREV_MANIFEST`] when the replaced value is a large value's
+/// manifest.
+/// `op` is `KV_OP_PUT` or `KV_OP_DELETE`; a `create` of 0 on a put means
+/// the write created the key (its create revision is the event's).
+#[repr(C)]
+pub struct EventJournal {
+    pub buf: [u8; JOURNAL_BYTES],
+    pub len: usize,
+    /// An event did not fit: the journal is incomplete for this command.
+    pub overflow: bool,
+}
+
+impl EventJournal {
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.overflow = false;
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one journal entry: every argument is one of its fields"
+    )]
+    fn push(
+        &mut self,
+        op: u8,
+        key: &[u8],
+        value: &[u8],
+        create: u64,
+        version: u64,
+        lease: u64,
+        prev: Option<(&[u8], &RecMeta)>,
+    ) {
+        let need =
+            1 + 2 + key.len() + 2 + value.len() + 25 + prev.map_or(0, |(v, _)| 2 + v.len() + 32);
+        let at = self.len;
+        if self.overflow
+            || key.len() > u16::MAX as usize
+            || value.len() > u16::MAX as usize
+            || at + need > JOURNAL_BYTES
+        {
+            self.overflow = true;
+            return;
+        }
+        let b = &mut self.buf[at..at + need];
+        let mut p = 0usize;
+        let mut put = |bytes: &[u8]| {
+            b[p..p + bytes.len()].copy_from_slice(bytes);
+            p += bytes.len();
+        };
+        put(&[op]);
+        put(&(key.len() as u16).to_le_bytes());
+        put(key);
+        put(&(value.len() as u16).to_le_bytes());
+        put(value);
+        put(&create.to_le_bytes());
+        put(&version.to_le_bytes());
+        put(&lease.to_le_bytes());
+        match prev {
+            Some((v, m)) => {
+                put(&[if m.flags & RECORD_MANIFEST != 0 {
+                    JOURNAL_PREV_MANIFEST
+                } else {
+                    JOURNAL_PREV
+                }]);
+                put(&(v.len() as u16).to_le_bytes());
+                put(v);
+                put(&m.create_revision.to_le_bytes());
+                put(&m.mod_revision.to_le_bytes());
+                put(&m.version.to_le_bytes());
+                put(&m.lease_id.to_le_bytes());
+            }
+            None => put(&[0]),
+        }
+        self.len = at + need;
+    }
+}
+
+/// Remove `key`, journaling the version it deletes when the provider
+/// journals.
+fn remove_noted<M: Materializer>(store: &mut M, key: &[u8], now_ms: u64) -> Option<bool> {
+    let mut prev = [0u8; MAX_VALUE_LEN];
+    let found = match store.get_live(key, now_ms, &mut prev) {
+        GetOutcome::Found { value_len, meta } => Some((value_len, meta)),
+        GetOutcome::Absent => None,
+        GetOutcome::TooBig | GetOutcome::Fault => return None,
+    };
+    let r = store.remove(key, now_ms);
+    if let (Some(true), Some((n, m))) = (r, found) {
+        // A deleted manifest releases its value's chunks.
+        if let Some(root) = manifest_root(&prev[..n], &m) {
+            if !release_root(store, &root, now_ms) {
+                return None;
+            }
+        }
+        if let Some(j) = store.journal() {
+            j.push(KV_OP_DELETE, key, &[], 0, 0, 0, Some((&prev[..n], &m)));
+        }
+    }
+    r
+}
+
 // ── Record ────────────────────────────────────────────────────────────
+
+/// Record flag: the value is a large value's manifest
+/// (`kv_chunks::Manifest`), written only by `KV_OP_PUT_MANIFEST` — never
+/// inferred from the bytes.
+pub const RECORD_MANIFEST: u8 = types::RECORD_FLAG_MANIFEST;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KvRecord {
     pub used: bool,
-    pub _pad: [u8; 3],
+    /// [`RECORD_MANIFEST`]: the value is a large value's manifest.
+    pub flags: u8,
+    pub _pad: [u8; 2],
     pub key_len: u16,
     pub value_len: u32,
     pub create_revision: u64,
@@ -90,7 +239,8 @@ impl KvRecord {
     pub const fn empty() -> Self {
         Self {
             used: false,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
             key_len: 0,
             value_len: 0,
             create_revision: 0,
@@ -124,9 +274,9 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-// ── Canonical key identity (RFC §23) ──────────────────────────────────
+// ── Canonical key identity ────────────────────────────────────────────
 //
-// "Tenant identity is part of the canonical key." The engine carries a
+// Tenant identity is part of the canonical key: the engine carries a
 // `(tenant, database, keyspace)` triple set per command by the worker
 // (`Materializer::set_key_identity`); both providers fold it into the
 // physical key so two tenants sharing a user key never collide. The
@@ -174,7 +324,7 @@ fn ident_successor(prefix: &[u8; IDENT_LEN]) -> Option<[u8; IDENT_LEN]> {
 pub struct KvStore {
     pub revision: u64,
     pub used_count: u32,
-    /// Canonical identity prefix (§23) for the command in flight, set
+    /// Canonical identity prefix for the command in flight, set
     /// per command by the worker. Zeroed = the historical single-tenant
     /// `(0, 0, 0)` layout. Not part of the snapshot: it is per-command
     /// state, re-established before every apply, never persisted.
@@ -183,6 +333,16 @@ pub struct KvStore {
     /// Same per-command discipline as `key_identity`: set before every
     /// apply from the committed command head, never persisted.
     pub pending_commit_ts: u64,
+    /// A write batch (etcd's Txn, one revision): 0 none, 1 open, 2 open
+    /// and its revision taken. Per-command state, never persisted.
+    pub batch: u8,
+    /// Whether this command journals its watch events into `events`.
+    /// Per-command state, never persisted.
+    pub journaling: bool,
+    pub events: EventJournal,
+    /// The revision a Compact retired history below. The memory provider
+    /// holds no history, so it only answers repeat and future compacts.
+    pub compact_rev: u64,
     pub records: [KvRecord; MAX_KEYS],
 }
 
@@ -195,6 +355,10 @@ impl KvStore {
         self.used_count = 0;
         self.key_identity = [0u8; IDENT_LEN];
         self.pending_commit_ts = 0;
+        self.batch = 0;
+        self.journaling = false;
+        self.events.clear();
+        self.compact_rev = 0;
         let mut i = 0;
         while i < MAX_KEYS {
             self.records[i] = KvRecord::empty();
@@ -250,7 +414,7 @@ impl KvStore {
     /// Look up a slot by USER key under the current identity — the
     /// composed-key counterpart of [`lookup_present`] for callers that
     /// hold a user key rather than the physical `[identity][user_key]`
-    /// the store now keys on (§23). With the default identity this is
+    /// the store keys on. With the default identity this is
     /// `[0; 12] ++ user_key`.
     pub fn user_lookup_present(&self, user_key: &[u8]) -> Option<usize> {
         let mut kbuf = [0u8; MAX_KEY_LEN];
@@ -267,17 +431,16 @@ impl KvStore {
         // returns `Err(start)` — an OCCUPIED slot. Writing there would
         // silently destroy an unrelated key AND inflate `used_count`
         // past `MAX_KEYS`. Every caller already treats `false` as
-        // `KV_RESULT_INTERNAL`, so a full store now rejects the write
+        // `KV_RESULT_INTERNAL`, so a full store rejects the write
         // instead of corrupting a live record.
         //
-        // Rig-observed 2026-07-27: writing 2500 distinct keys into the
-        // 1024-slot table left earlier keys silently absent while their
-        // SETs had all been acked OK.
+        // Without this check, writing 2500 distinct keys into the
+        // 1024-slot table leaves earlier keys silently absent while
+        // their SETs are all acked OK — observed live on the rig.
         if self.records[slot_idx].used {
             return false;
         }
-        self.revision = self.revision.wrapping_add(1);
-        let rev = self.revision;
+        let rev = self.advance_revision();
         let slot = &mut self.records[slot_idx];
         slot.used = true;
         slot.key_len = key.len() as u16;
@@ -287,6 +450,7 @@ impl KvStore {
         slot.version = 1;
         slot.lease_id = 0;
         slot.expiry_ms = 0;
+        slot.flags = 0;
         slot.commit_ts = self.pending_commit_ts;
         slot.key[..key.len()].copy_from_slice(key);
         slot.value[..value.len()].copy_from_slice(value);
@@ -294,12 +458,23 @@ impl KvStore {
         true
     }
 
+    /// The revision a write takes: a new one, or — inside a batch whose
+    /// revision is already taken — the batch's.
+    pub fn advance_revision(&mut self) -> u64 {
+        if self.batch != 2 {
+            self.revision = self.revision.wrapping_add(1);
+            if self.batch == 1 {
+                self.batch = 2;
+            }
+        }
+        self.revision
+    }
+
     pub fn update_value(&mut self, slot_idx: usize, value: &[u8]) -> bool {
         if value.len() > MAX_VALUE_LEN {
             return false;
         }
-        self.revision = self.revision.wrapping_add(1);
-        let rev = self.revision;
+        let rev = self.advance_revision();
         let ts = self.pending_commit_ts;
         let slot = &mut self.records[slot_idx];
         slot.value_len = value.len() as u32;
@@ -307,6 +482,9 @@ impl KvStore {
         slot.mod_revision = rev;
         slot.version = slot.version.saturating_add(1);
         slot.commit_ts = ts;
+        // A write states its value afresh: what it is (a manifest) is
+        // set by the op that wrote one, after it.
+        slot.flags = 0;
         true
     }
 
@@ -419,7 +597,7 @@ impl KvStore {
     }
 
     /// Serialise the live state into `out` as a state-machine snapshot
-    /// body (backlog §61). Only USED records are written, so the encoded
+    /// body. Only USED records are written, so the encoded
     /// size tracks live data rather than the fixed
     /// `MAX_KEYS * sizeof(KvRecord)` arena.
     ///
@@ -471,6 +649,7 @@ impl KvStore {
                 out[p + 22..p + 30].copy_from_slice(&r.version.to_le_bytes());
                 out[p + 30..p + 38].copy_from_slice(&r.lease_id.to_le_bytes());
                 out[p + 38..p + 46].copy_from_slice(&r.expiry_ms.to_le_bytes());
+                out[p + 46] = r.flags;
                 p += SNAPSHOT_REC_FIXED;
                 out[p..p + klen].copy_from_slice(&r.key[..klen]);
                 p += klen;
@@ -545,6 +724,7 @@ impl KvStore {
                     out[p + 22..p + 30].copy_from_slice(&r.version.to_le_bytes());
                     out[p + 30..p + 38].copy_from_slice(&r.lease_id.to_le_bytes());
                     out[p + 38..p + 46].copy_from_slice(&r.expiry_ms.to_le_bytes());
+                    out[p + 46] = r.flags;
                     p += SNAPSHOT_REC_FIXED;
                     out[p..p + klen].copy_from_slice(&r.key[..klen]);
                     p += klen;
@@ -568,7 +748,8 @@ impl KvStore {
 
     /// Restore state from a snapshot body produced by
     /// `snapshot_encode`. The store is cleared first, so this is a
-    /// REPLACE (the §2.1 "discard current state" semantic), not a merge.
+    /// REPLACE (clustor's app-snapshot contract discards current
+    /// state), not a merge.
     ///
     /// Records are re-inserted through the normal hash/probe path so the
     /// linear-probe invariants are rebuilt correctly rather than assumed
@@ -619,9 +800,14 @@ impl KvStore {
         }
         let magic = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
         let format = u16::from_le_bytes([src[4], src[5]]);
-        if magic != SNAPSHOT_MAGIC || format != SNAPSHOT_FORMAT_VERSION {
+        if magic != SNAPSHOT_MAGIC || !(1..=SNAPSHOT_FORMAT_VERSION).contains(&format) {
             return false;
         }
+        let fixed = if format == 1 {
+            SNAPSHOT_REC_FIXED_V1
+        } else {
+            SNAPSHOT_REC_FIXED
+        };
         let revision = u64::from_le_bytes([
             src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
         ]);
@@ -635,7 +821,7 @@ impl KvStore {
         let mut p = SNAPSHOT_HDR_LEN;
         let mut done = 0usize;
         while done < count {
-            if p + SNAPSHOT_REC_FIXED > src.len() {
+            if p + fixed > src.len() {
                 self.init();
                 return false;
             }
@@ -692,7 +878,8 @@ impl KvStore {
                 src[p + 44],
                 src[p + 45],
             ]);
-            p += SNAPSHOT_REC_FIXED;
+            let flags = if format == 1 { 0 } else { src[p + 46] };
+            p += fixed;
 
             if key_len > MAX_KEY_LEN || value_len > MAX_VALUE_LEN {
                 self.init();
@@ -737,6 +924,7 @@ impl KvStore {
             rec.version = version;
             rec.lease_id = lease_id;
             rec.expiry_ms = expiry_ms;
+            rec.flags = flags;
 
             p = val_end;
             done += 1;
@@ -825,7 +1013,7 @@ fn read_u8(body: &[u8], offset: &mut usize) -> Option<u8> {
 /// under which the expiry queue tracks the record, and the relative TTL
 /// the command carried (`0` = no expiry).
 ///
-/// `ident` is the command's canonical identity prefix (§23). The hash
+/// `ident` is the command's canonical identity prefix. The hash
 /// covers `ident ++ key`, exactly as the stored record's key does, for
 /// two reasons: two tenants writing the same user key must not
 /// register, cancel and reclaim each OTHER's entries, and the hash is
@@ -911,7 +1099,7 @@ fn format_decimal_i64(n: i64, out: &mut [u8]) -> usize {
 
 // ── Materializer: the physical provider beneath the interpreter ──────
 //
-// RFC database foundation §9/§30: ONE semantic engine (`apply_mat`
+// ONE semantic engine (`apply_mat`
 // below is the single command interpreter), with replaceable physical
 // materialization providers selected at graph construction. The
 // interpreter performs every materialization read/write through this
@@ -939,6 +1127,8 @@ pub struct RecMeta {
     /// per-partition apply order, the commit timestamp is the
     /// cluster-wide MVCC domain that survives topology changes.
     pub commit_ts: u64,
+    /// [`RECORD_MANIFEST`] when the value is a large value's manifest.
+    pub flags: u8,
 }
 
 /// Outcome of a live (expiry-filtered) point lookup.
@@ -968,7 +1158,7 @@ pub enum HistOutcome {
     Found { value_len: usize, meta: RecMeta },
     /// The provider does not retain that revision, so it CANNOT answer.
     /// Never downgrade this to `Absent` or to a latest read — that
-    /// would be a wrong answer to a historical question (§21 inv. 14).
+    /// would be a wrong answer to a historical question.
     Compacted,
     /// Value larger than the caller's buffer (caller fails closed).
     TooBig,
@@ -993,13 +1183,17 @@ pub enum HistOutcome {
 /// idempotence on the disk provider keys off exactly this
 /// per-materialized-write assignment (see `DiskMaterializer`).
 pub trait Materializer {
-    /// Bind the canonical identity `(tenant, database, keyspace)` (§23)
+    /// Bind the canonical identity `(tenant, database, keyspace)`
     /// for the command about to be applied. Every physical key this
     /// materializer reads or writes until the next call is scoped to it,
     /// so two tenants sharing a user key never collide. Default no-op
     /// keeps the historical single-tenant `(0, 0, 0)` behaviour for any
     /// provider that does not model identity.
     fn set_key_identity(&mut self, _tenant: u32, _database: u32, _keyspace: u32) {}
+    /// The identity bound by [`set_key_identity`](Self::set_key_identity).
+    fn key_identity(&self) -> (u32, u32, u32) {
+        (0, 0, 0)
+    }
     /// Bind the MVCC commit timestamp for the command about to be
     /// applied. Every version the materializer writes
     /// until the next call carries it. Same per-command discipline as
@@ -1007,11 +1201,21 @@ pub trait Materializer {
     /// resolve path re-binds it per staged op from the resolve record.
     /// Default no-op keeps timestamp-less providers valid.
     fn set_commit_ts(&mut self, _ts: u64) {}
+    /// The journal this command's watch events go to, when the host
+    /// keeps one ([`EventJournal`]). Default: none.
+    fn journal(&mut self) -> Option<&mut EventJournal> {
+        None
+    }
     /// Current engine revision (returned in `MSG_KV_APPLIED`).
     fn revision(&self) -> u64;
     /// Bump the engine revision without writing a record (the DELETE
     /// batch-end / FLUSH bump).
     fn bump_revision(&mut self);
+    /// Open a write batch: every write until [`end_batch`](Self::end_batch)
+    /// takes ONE revision (the first write's), as etcd's Txn commits.
+    fn begin_batch(&mut self);
+    /// Close the write batch.
+    fn end_batch(&mut self);
     /// Live point lookup: newest version, expired records reported
     /// `Absent` (the memory provider also lazily reclaims the slot —
     /// a physical, non-observable difference).
@@ -1026,6 +1230,25 @@ pub trait Materializer {
     fn update_existing(&mut self, key: &[u8], value: &[u8]) -> bool;
     /// Set the absolute expiry deadline without touching revisions.
     fn set_expiry(&mut self, key: &[u8], expiry_ms: u64) -> bool;
+    /// Set the lease a live record is attached to (0 = none) without
+    /// touching revisions; the put that carries it has already bumped them.
+    fn set_lease(&mut self, key: &[u8], lease_id: u64) -> bool;
+    /// Set a live record's flags ([`RECORD_MANIFEST`]) without touching
+    /// revisions; the write that carries them has already bumped them.
+    fn set_flags(&mut self, key: &[u8], flags: u8) -> bool;
+    /// Write one of the store's own bookkeeping records (large values'
+    /// chunks and their references) as part of the op in progress: at the
+    /// revision it takes (batch-aware — every such write of one op shares
+    /// it). One op never writes a bookkeeping key twice with different
+    /// kinds: a disk store holds one version per key and revision.
+    fn put_meta(&mut self, key: &[u8], value: &[u8]) -> bool;
+    /// Remove a bookkeeping record the same way.
+    fn remove_meta(&mut self, key: &[u8]) -> bool;
+    /// Is a write batch open ([`begin_batch`](Self::begin_batch))?
+    fn batch_open(&self) -> bool;
+    /// The revision the op in progress writes at: the batch's, once taken,
+    /// else the next.
+    fn op_revision(&self) -> u64;
     /// Remove a live record. Expiry-filtered: DELETE of an expired key
     /// reports `false` (the key is logically gone — Redis semantics —
     /// and the count must be a function of logical state, never of
@@ -1044,6 +1267,28 @@ pub trait Materializer {
     /// promised — and the same `(result_code, len)` shape, with a
     /// `KV_RESULT_RANGE` body.
     fn range_scan_op(&mut self, body: &[u8], out: &mut [u8], now_ms: u64) -> (u8, usize);
+    /// Walk the live keys of `[start, end)` (an empty `end` is unbounded
+    /// above) as of `at_rev` (0 = the current revision), calling
+    /// `f(user_key, value, meta)` for each until it returns `false`.
+    /// The order is the provider's ([`walk_sorted`](Self::walk_sorted)
+    /// says whether it is ascending key order). Returns `KV_RESULT_OK`,
+    /// or `KV_RESULT_COMPACTED` when `at_rev` is below what the provider
+    /// retains, or `KV_RESULT_INTERNAL` on a fault. The shared
+    /// [`KV_OP_RANGE_META`] op is built on it.
+    fn walk_live_meta<F: FnMut(&[u8], &[u8], &RecMeta) -> bool>(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        at_rev: u64,
+        now_ms: u64,
+        f: F,
+    ) -> u8;
+    /// Whether [`walk_live_meta`](Self::walk_live_meta) walks in
+    /// ascending key order (the disk provider's sorted runs do; the
+    /// memory provider's hash slots do not).
+    fn walk_sorted(&self) -> bool {
+        false
+    }
     /// The SCAN_VERSIONS op: every version in a span whose revision
     /// falls in `(from, to]`, tombstones included. Same
     /// `(result_code, len)` shape, with a `KV_RESULT_VERSIONS` body,
@@ -1079,7 +1324,7 @@ pub trait Materializer {
         usize::MAX
     }
 
-    // ── Historical (MVCC as-of) reads — RFC §10, §20 "snapshot" ──────
+    // ── Historical (MVCC as-of) reads ───────────────────────────────
     //
     // These are the two methods where the providers are allowed to
     // DIFFER in capability, and the only place the engine tolerates a
@@ -1092,7 +1337,7 @@ pub trait Materializer {
     /// Lowest MVCC revision this provider can still answer a read at.
     /// A request strictly below it is `Compacted`.
     ///
-    /// - Disk provider: the committed GC floor (§18) — everything above
+    /// - Disk provider: the committed GC floor — everything above
     ///   it is retained history.
     /// - Memory provider: its CURRENT revision. It materializes only
     ///   current values, so the only "history" it holds is the present.
@@ -1115,6 +1360,13 @@ pub trait Materializer {
     fn reclaim_floor(&self) -> u64 {
         0
     }
+
+    /// The revision a Compact ([`KV_OP_COMPACT`]) last retired history
+    /// below (0 = none).
+    fn compact_revision(&self) -> u64;
+
+    /// Retire history below `rev`: reads under it are refused from now.
+    fn set_compact_revision(&mut self, rev: u64);
 
     /// Point read of `key` as of `revision` (`0` = latest, and then
     /// byte-identical to [`get_live`](Self::get_live)). Expiry-filtered
@@ -1166,7 +1418,7 @@ pub fn apply(
     apply_mat(store, op, body, out_body, now_ms)
 }
 
-/// The read policy a command is served under (RFC §20, §8's
+/// The read policy a command is served under (the
 /// `RequestContext`). Only the two fields that change what a read
 /// SEES are carried; everything else in the context is the router's
 /// and the anchor's business, not the state machine's.
@@ -1242,7 +1494,7 @@ pub fn apply_mat<M: Materializer>(
 ///   question. This is the path etcd's `Range{revision > 0}` takes.
 /// - **The request context**: `Consistency::Snapshot` plus a non-zero
 ///   `read_timestamp` makes ordinary `GET`/`SCAN`/`RANGE` historical,
-///   which is how the native database surface (§8) expresses it
+///   which is how the native database surface expresses it
 ///   without a second op code per read.
 ///
 /// Both land on the same two provider methods, so there is exactly one
@@ -1273,8 +1525,19 @@ pub fn apply_mat_ctx<M: Materializer>(
     }
     match op {
         KV_OP_GET => apply_get(store, body, out_body, now_ms),
-        KV_OP_PUT => apply_put(store, body, out_body, now_ms),
-        KV_OP_DELETE => apply_delete(store, body, out_body, now_ms),
+        // Ops that may keep large values' references run as one batch:
+        // their bookkeeping takes the write's own revision.
+        KV_OP_PUT => batched(store, |s| apply_put(s, body, out_body, now_ms, false)),
+        KV_OP_PUT_MANIFEST => batched(store, |s| apply_put(s, body, out_body, now_ms, true)),
+        KV_OP_PUT_CHUNK | KV_OP_CHUNK_SWEEP if store.batch_open() => {
+            // A chunk op is an op of its own: inside another's batch it
+            // could write a key that op already wrote.
+            (KV_RESULT_INTERNAL, 0)
+        }
+        KV_OP_PUT_CHUNK => batched(store, |s| apply_put_chunk(s, body, out_body, now_ms)),
+        KV_OP_GET_CHUNK => apply_get_chunk(store, body, out_body, now_ms),
+        KV_OP_CHUNK_SWEEP => batched(store, |s| apply_chunk_sweep(s, body, out_body, now_ms)),
+        KV_OP_DELETE => batched(store, |s| apply_delete(s, body, out_body, now_ms)),
         KV_OP_INCR => apply_incr_or_decr(store, body, out_body, true, now_ms),
         KV_OP_DECR => apply_incr_or_decr(store, body, out_body, false, now_ms),
         KV_OP_APPEND => apply_append(store, body, out_body, now_ms),
@@ -1285,11 +1548,24 @@ pub fn apply_mat_ctx<M: Materializer>(
         KV_OP_MSET => apply_mset(store, body, out_body, now_ms),
         KV_OP_SCAN | KV_OP_RANGE => apply_scan(store, body, out_body, now_ms),
         KV_OP_RANGE_SCAN => store.range_scan_op(body, out_body, now_ms),
+        KV_OP_RANGE_META => apply_range_meta(store, body, out_body, now_ms),
+        KV_OP_DELETE_META => batched(store, |s| apply_delete_meta(s, body, out_body, now_ms)),
+        KV_OP_LEASE_REVOKE => batched(store, |s| apply_lease_keys(s, body, out_body, now_ms, true)),
+        KV_OP_COMPACT => apply_compact(store, body),
+        KV_OP_HASH_KV => apply_hash_kv(store, body, out_body, now_ms),
+        KV_OP_LEASE_KEYS => apply_lease_keys(store, body, out_body, now_ms, false),
+        KV_OP_ETCD_TXN => {
+            // One revision for the whole transaction, nested ones included.
+            store.begin_batch();
+            let r = apply_etcd_txn(store, body, out_body, now_ms, 0);
+            store.end_batch();
+            r
+        }
         KV_OP_SCAN_VERSIONS => store.scan_versions_op(body, out_body),
         KV_OP_SNAPSHOT_VERSIONS => store.snapshot_versions_op(body, out_body, now_ms),
         KV_OP_GET_AT => apply_get_at(store, body, out_body, now_ms),
         KV_OP_SCAN_AT => apply_scan_at(store, body, out_body, now_ms),
-        KV_OP_CAS => apply_cas(store, body, out_body, now_ms),
+        KV_OP_CAS => batched(store, |s| apply_cas(s, body, out_body, now_ms)),
         KV_OP_TXN => apply_txn(store, body, out_body, now_ms),
         KV_OP_TXN_PREPARE => apply_txn_prepare(store, body, out_body, now_ms),
         KV_OP_TXN_RESOLVE => apply_txn_resolve(store, body, out_body, now_ms),
@@ -1331,6 +1607,28 @@ impl Materializer for KvStore {
         self.key_identity = ident_bytes(tenant, database, keyspace);
     }
 
+    fn key_identity(&self) -> (u32, u32, u32) {
+        let b = &self.key_identity;
+        let rd = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        (rd(0), rd(4), rd(8))
+    }
+
+    fn journal(&mut self) -> Option<&mut EventJournal> {
+        if self.journaling {
+            Some(&mut self.events)
+        } else {
+            None
+        }
+    }
+
+    fn compact_revision(&self) -> u64 {
+        self.compact_rev
+    }
+
+    fn set_compact_revision(&mut self, rev: u64) {
+        self.compact_rev = rev;
+    }
+
     fn set_commit_ts(&mut self, ts: u64) {
         self.pending_commit_ts = ts;
     }
@@ -1340,7 +1638,15 @@ impl Materializer for KvStore {
     }
 
     fn bump_revision(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.advance_revision();
+    }
+
+    fn begin_batch(&mut self) {
+        self.batch = 1;
+    }
+
+    fn end_batch(&mut self) {
+        self.batch = 0;
     }
 
     fn get_live(&mut self, key: &[u8], now_ms: u64, val_out: &mut [u8]) -> GetOutcome {
@@ -1366,6 +1672,7 @@ impl Materializer for KvStore {
                 lease_id: r.lease_id,
                 expiry_ms: r.expiry_ms,
                 commit_ts: r.commit_ts,
+                flags: r.flags,
             },
         }
     }
@@ -1408,6 +1715,98 @@ impl Materializer for KvStore {
         }
     }
 
+    fn set_lease(&mut self, key: &[u8], lease_id: u64) -> bool {
+        let mut kbuf = [0u8; MAX_KEY_LEN];
+        let Some(key) = self.compose_key(key, &mut kbuf) else {
+            return false;
+        };
+        match self.lookup_present(key) {
+            Some(idx) => {
+                self.records[idx].lease_id = lease_id;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn set_flags(&mut self, key: &[u8], flags: u8) -> bool {
+        let mut kbuf = [0u8; MAX_KEY_LEN];
+        let Some(key) = self.compose_key(key, &mut kbuf) else {
+            return false;
+        };
+        match self.lookup_present(key) {
+            Some(idx) => {
+                self.records[idx].flags = flags;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn put_meta(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let mut kbuf = [0u8; MAX_KEY_LEN];
+        let Some(key) = self.compose_key(key, &mut kbuf) else {
+            return false;
+        };
+        if value.len() > MAX_VALUE_LEN {
+            return false;
+        }
+        let idx = match self.lookup(key) {
+            Ok(idx) => idx,
+            Err(slot) if !self.records[slot].used => {
+                let r = &mut self.records[slot];
+                r.used = true;
+                r.key_len = key.len() as u16;
+                r.key[..key.len()].copy_from_slice(key);
+                r.version = 0;
+                r.lease_id = 0;
+                r.expiry_ms = 0;
+                r.commit_ts = 0;
+                r.flags = 0;
+                r.create_revision = 0;
+                self.used_count += 1;
+                slot
+            }
+            Err(_) => return false,
+        };
+        let rev = self.advance_revision();
+        let r = &mut self.records[idx];
+        if r.create_revision == 0 {
+            r.create_revision = rev;
+        }
+        r.value_len = value.len() as u32;
+        r.value[..value.len()].copy_from_slice(value);
+        r.mod_revision = rev;
+        r.version = r.version.saturating_add(1);
+        true
+    }
+
+    fn remove_meta(&mut self, key: &[u8]) -> bool {
+        let mut kbuf = [0u8; MAX_KEY_LEN];
+        let Some(key) = self.compose_key(key, &mut kbuf) else {
+            return false;
+        };
+        match self.lookup_present(key) {
+            Some(idx) => {
+                self.advance_revision();
+                self.delete_at(idx)
+            }
+            None => true,
+        }
+    }
+
+    fn batch_open(&self) -> bool {
+        self.batch != 0
+    }
+
+    fn op_revision(&self) -> u64 {
+        if self.batch == 2 {
+            self.revision
+        } else {
+            self.revision.wrapping_add(1)
+        }
+    }
+
     fn remove(&mut self, key: &[u8], now_ms: u64) -> Option<bool> {
         let mut kbuf = [0u8; MAX_KEY_LEN];
         let Some(key) = self.compose_key(key, &mut kbuf) else {
@@ -1431,6 +1830,45 @@ impl Materializer for KvStore {
             return (KV_RESULT_INTERNAL, 0);
         };
         self.range_slots(&q, out, now_ms)
+    }
+
+    fn walk_live_meta<F: FnMut(&[u8], &[u8], &RecMeta) -> bool>(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        at_rev: u64,
+        now_ms: u64,
+        mut f: F,
+    ) -> u8 {
+        // Only the present is held: a past revision is compacted.
+        if at_rev != 0 && at_rev < self.revision {
+            return KV_RESULT_COMPACTED;
+        }
+        for idx in 0..MAX_KEYS {
+            let record = &self.records[idx];
+            if !record.used || is_expired(record, now_ms) {
+                continue;
+            }
+            let Some(key) = record.key_bytes().strip_prefix(&self.key_identity[..]) else {
+                continue;
+            };
+            if key < start || (!end.is_empty() && key >= end) {
+                continue;
+            }
+            let meta = RecMeta {
+                create_revision: record.create_revision,
+                mod_revision: record.mod_revision,
+                version: record.version,
+                lease_id: record.lease_id,
+                expiry_ms: record.expiry_ms,
+                commit_ts: record.commit_ts,
+                flags: record.flags,
+            };
+            if !f(key, record.value_bytes(), &meta) {
+                break;
+            }
+        }
+        KV_RESULT_OK
     }
 
     fn scan_versions_op(&mut self, body: &[u8], out: &mut [u8]) -> (u8, usize) {
@@ -1521,7 +1959,7 @@ impl Materializer for KvStore {
     }
 
     fn flush_all(&mut self) -> bool {
-        // §23: FLUSH clears THIS identity's keys only. Delete every slot
+        // FLUSH clears THIS identity's keys only. Delete every slot
         // whose stored key carries the current identity prefix; the
         // probe-chain compaction in `delete_at` keeps the table valid as
         // we go, so re-scan from the top after each removal.
@@ -1623,7 +2061,7 @@ impl KvStore {
             let record = &self.records[idx];
             if record.used && !is_expired(record, now_ms) {
                 let stored = record.key_bytes();
-                // §23: this walk visits every slot, so it must skip keys
+                // This walk visits every slot, so it must skip keys
                 // that are not this identity's and hand back the USER
                 // key (prefix stripped) — never another tenant's data,
                 // never the internal prefix.
@@ -1686,7 +2124,7 @@ impl KvStore {
         while idx < MAX_KEYS {
             let record = &self.records[idx];
             if record.used && !is_expired(record, now_ms) {
-                // §23: strip the identity prefix and compare in USER-key
+                // Strip the identity prefix and compare in USER-key
                 // space. A key under a different identity strips to
                 // `None` and is skipped — another tenant's row is not in
                 // any span this identity can name.
@@ -1743,7 +2181,7 @@ impl KvStore {
     }
 }
 
-// ── Disk materializer (ordered disk provider, RFC §9.5/§30) ──────────
+// ── Disk materializer (ordered disk provider) ────────────────────────
 
 /// Version of the disk record-metadata prefix layout below. Bump on
 /// ANY layout change — the prefix is persisted inside every disk
@@ -1754,7 +2192,7 @@ pub const DISK_META_FORMAT: u16 = 1;
 /// payload (little-endian):
 ///
 /// ```text
-/// [format:u16 = DISK_META_FORMAT][rsvd:u32 = 0]
+/// [format:u16 = DISK_META_FORMAT][flags:u8][rsvd:u8 × 3 = 0]
 /// [create_revision:u64][mod_revision:u64][version:u64]
 /// [lease_id:u64][expiry_ms:u64][commit_ts:u64]           (54 bytes)
 /// ```
@@ -1767,7 +2205,8 @@ pub const DISK_META_LEN: usize = 54;
 
 fn encode_disk_meta(out: &mut [u8], meta: &RecMeta) {
     out[0..2].copy_from_slice(&DISK_META_FORMAT.to_le_bytes());
-    out[2..6].copy_from_slice(&0u32.to_le_bytes());
+    out[2] = meta.flags;
+    out[3..6].copy_from_slice(&[0; 3]);
     out[6..14].copy_from_slice(&meta.create_revision.to_le_bytes());
     out[14..22].copy_from_slice(&meta.mod_revision.to_le_bytes());
     out[22..30].copy_from_slice(&meta.version.to_le_bytes());
@@ -1785,7 +2224,8 @@ fn decode_disk_meta(src: &[u8]) -> Option<RecMeta> {
     if format != DISK_META_FORMAT {
         return None;
     }
-    off += 6; // format + rsvd
+    let flags = src[2];
+    off += 6; // format, flags, rsvd
     let rd = |o: &mut usize| {
         let mut b = [0u8; 8];
         b.copy_from_slice(&src[*o..*o + 8]);
@@ -1799,6 +2239,7 @@ fn decode_disk_meta(src: &[u8]) -> Option<RecMeta> {
         lease_id: rd(&mut off),
         expiry_ms: rd(&mut off),
         commit_ts: rd(&mut off),
+        flags,
     })
 }
 
@@ -1846,7 +2287,7 @@ const DISK_COMPACT_STEP_CAP: u32 = 512;
 /// quarantines/recovers — an error is never downgraded to an
 /// empty/absent result.
 ///
-/// ## Replay idempotence across the recovery boundary (RFC §4.3/§9.4)
+/// ## Replay idempotence across the recovery boundary
 ///
 /// After `recover()` the materialization already reflects every write
 /// with an assigned revision `<= replay_floor` (the recovered
@@ -1863,8 +2304,8 @@ const DISK_COMPACT_STEP_CAP: u32 = 512;
 ///   control flow — INCR arithmetic, NX/XX, CAS witnesses, TXN
 ///   branches — deterministic). Requires history retention at or
 ///   below the replay window: the compaction floor must not have
-///   advanced past un-replayed history (§18 ties floor advancement to
-///   durable snapshot coverage; Phase-1 never advances it).
+///   advanced past un-replayed history (the GC-floor contract ties
+///   floor advancement to durable snapshot coverage).
 /// - **Writes below the floor are suppressed** (`ts < replay_floor`):
 ///   the flush order guarantees every distinct-revision write below
 ///   the recovered high-water is already durable (flush persists the
@@ -1921,12 +2362,18 @@ pub struct DiskMaterializer<'a, S: RunStorage> {
     /// reply must name that ceiling, not whatever has landed since. `0`
     /// = no override (report the engine revision).
     pub reply_revision: u64,
-    /// Canonical identity `(tenant, database, keyspace)` (§23) for the
+    /// Canonical identity `(tenant, database, keyspace)` for the
     /// command in flight. Fed straight to `internal_key::encode`, so
     /// every physical key this materializer writes and every scan bound
     /// it builds is scoped to it. Default `(0, 0, 0)` is the historical
     /// single-tenant layout.
     pub key_identity: (u32, u32, u32),
+    /// A write batch (etcd's Txn): 0 none, 1 open, 2 open and its revision
+    /// taken.
+    pub batch: u8,
+    /// Where this command's watch events are journaled, when the host
+    /// keeps a journal.
+    pub events: Option<&'a mut EventJournal>,
 }
 
 impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
@@ -1944,6 +2391,24 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
             reply_revision: 0,
             key_identity: (0, 0, 0),
             pending_commit_ts: 0,
+            batch: 0,
+            events: None,
+        }
+    }
+
+    /// The revision a write takes (see `KvStore::advance_revision`): a new
+    /// one, or inside a batch whose revision is taken, the batch's.
+    fn batch_ts(&self) -> u64 {
+        if self.batch == 2 {
+            self.revision
+        } else {
+            self.revision.wrapping_add(1)
+        }
+    }
+
+    fn batch_taken(&mut self) {
+        if self.batch == 1 {
+            self.batch = 2;
         }
     }
 
@@ -2001,8 +2466,14 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
         match self.store.flush() {
             Ok(()) => true,
             Err(StoreError::Backpressure) => {
-                let floor = self.store.state.compaction_floor;
-                let mut cursor = 0u64;
+                // The run set is full: merge. A compaction already under
+                // way (maintenance's, at a committed floor) is the one
+                // driven to its end — one at another floor would abort it.
+                let (floor, mut cursor) = self
+                    .store
+                    .state
+                    .compaction_in_flight()
+                    .unwrap_or((self.store.state.compaction_floor, 0));
                 let mut steps = 0u32;
                 loop {
                     match self.store.compact(floor, cursor) {
@@ -2225,6 +2696,22 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         self.key_identity = (tenant, database, keyspace);
     }
 
+    fn key_identity(&self) -> (u32, u32, u32) {
+        self.key_identity
+    }
+
+    fn journal(&mut self) -> Option<&mut EventJournal> {
+        self.events.as_deref_mut()
+    }
+
+    fn compact_revision(&self) -> u64 {
+        self.store.state.compact_revision
+    }
+
+    fn set_compact_revision(&mut self, rev: u64) {
+        self.store.state.compact_revision = rev;
+    }
+
     fn set_commit_ts(&mut self, ts: u64) {
         self.pending_commit_ts = ts;
     }
@@ -2234,7 +2721,18 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
     }
 
     fn bump_revision(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        if self.batch != 2 {
+            self.revision = self.revision.wrapping_add(1);
+            self.batch_taken();
+        }
+    }
+
+    fn begin_batch(&mut self) {
+        self.batch = 1;
+    }
+
+    fn end_batch(&mut self) {
+        self.batch = 0;
     }
 
     fn get_live(&mut self, key: &[u8], now_ms: u64, val_out: &mut [u8]) -> GetOutcome {
@@ -2266,7 +2764,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         if key.len() > MAX_KEY_LEN || value.len() > MAX_VALUE_LEN {
             return false; // mirror the memory provider's capacity gate
         }
-        let ts = self.revision.wrapping_add(1);
+        let ts = self.batch_ts();
         let meta = RecMeta {
             create_revision: ts,
             mod_revision: ts,
@@ -2274,6 +2772,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             lease_id: 0,
             expiry_ms: 0,
             commit_ts: self.pending_commit_ts,
+            flags: 0,
         };
         let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
         encode_disk_meta(&mut payload, &meta);
@@ -2287,6 +2786,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             return false;
         }
         self.revision = ts;
+        self.batch_taken();
         true
     }
 
@@ -2299,7 +2799,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             ReadLatest::Found(_, meta) => meta,
             _ => return false, // caller observed it live; fail closed
         };
-        let ts = self.revision.wrapping_add(1);
+        let ts = self.batch_ts();
         let meta = RecMeta {
             create_revision: old.create_revision,
             mod_revision: ts,
@@ -2307,6 +2807,8 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             lease_id: old.lease_id,
             expiry_ms: old.expiry_ms,
             commit_ts: self.pending_commit_ts,
+            // A write states its value afresh (see `update_value`).
+            flags: 0,
         };
         encode_disk_meta(&mut payload, &meta);
         payload[DISK_META_LEN..DISK_META_LEN + value.len()].copy_from_slice(value);
@@ -2319,6 +2821,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             return false;
         }
         self.revision = ts;
+        self.batch_taken();
         true
     }
 
@@ -2339,6 +2842,90 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         self.put_version(key, meta.mod_revision, ValueKind::Value, &payload[..n])
     }
 
+    fn set_lease(&mut self, key: &[u8], lease_id: u64) -> bool {
+        let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
+        let (n, meta) = match self.read_latest(key, &mut payload) {
+            ReadLatest::Found(n, meta) => (n, meta),
+            _ => return false,
+        };
+        if meta.lease_id == lease_id {
+            return true;
+        }
+        // The same version rewritten, as `set_expiry` does; the lease
+        // sits at meta offsets 30..38.
+        payload[30..38].copy_from_slice(&lease_id.to_le_bytes());
+        self.put_version(key, meta.mod_revision, ValueKind::Value, &payload[..n])
+    }
+
+    fn set_flags(&mut self, key: &[u8], flags: u8) -> bool {
+        let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
+        let (n, meta) = match self.read_latest(key, &mut payload) {
+            ReadLatest::Found(n, meta) => (n, meta),
+            _ => return false,
+        };
+        if meta.flags == flags {
+            return true;
+        }
+        // The same version rewritten; the flags sit at meta offset 2.
+        payload[2] = flags;
+        self.put_version(key, meta.mod_revision, ValueKind::Value, &payload[..n])
+    }
+
+    fn put_meta(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if key.len() > MAX_KEY_LEN || value.len() > MAX_VALUE_LEN {
+            return false;
+        }
+        let ts = self.batch_ts();
+        let meta = RecMeta {
+            create_revision: ts,
+            mod_revision: ts,
+            version: 1,
+            lease_id: 0,
+            expiry_ms: 0,
+            commit_ts: 0,
+            flags: 0,
+        };
+        let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
+        encode_disk_meta(&mut payload, &meta);
+        payload[DISK_META_LEN..DISK_META_LEN + value.len()].copy_from_slice(value);
+        if !self.put_version(
+            key,
+            ts,
+            ValueKind::Value,
+            &payload[..DISK_META_LEN + value.len()],
+        ) {
+            return false;
+        }
+        self.revision = ts;
+        self.batch_taken();
+        true
+    }
+
+    fn remove_meta(&mut self, key: &[u8]) -> bool {
+        let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
+        match self.read_latest(key, &mut payload) {
+            ReadLatest::Absent => true,
+            ReadLatest::Fault => false,
+            ReadLatest::Found(..) => {
+                let ts = self.batch_ts();
+                if !self.put_version(key, ts, ValueKind::PointTombstone, &[]) {
+                    return false;
+                }
+                self.revision = ts;
+                self.batch_taken();
+                true
+            }
+        }
+    }
+
+    fn batch_open(&self) -> bool {
+        self.batch != 0
+    }
+
+    fn op_revision(&self) -> u64 {
+        self.batch_ts()
+    }
+
     fn remove(&mut self, key: &[u8], now_ms: u64) -> Option<bool> {
         let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
         match self.read_latest(key, &mut payload) {
@@ -2357,7 +2944,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 // one version kind with no meta prefix to hold it. An
                 // untimestamped delete stays empty, byte-identical to
                 // the historical layout.
-                let ts = self.revision.wrapping_add(1);
+                let ts = self.batch_ts();
                 let cts = self.pending_commit_ts;
                 let payload_bytes = cts.to_le_bytes();
                 let tomb: &[u8] = if cts != 0 { &payload_bytes } else { &[] };
@@ -2388,6 +2975,106 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         self.range_from(self.read_revision(), empty, &q, out, now_ms)
     }
 
+    fn walk_live_meta<F: FnMut(&[u8], &[u8], &RecMeta) -> bool>(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        at_rev: u64,
+        now_ms: u64,
+        mut f: F,
+    ) -> u8 {
+        if self.in_replay() && self.revision == 0 {
+            return KV_RESULT_OK;
+        }
+        let at = if at_rev == 0 {
+            self.read_revision()
+        } else {
+            at_rev
+        };
+        let (it, id, ik) = self.key_identity;
+        let (_, ident_hi) = self.ident_span();
+        let mut startbuf = [0u8; disk_store::MAX_ENCODED_KEY];
+        let mut endbuf = [0u8; disk_store::MAX_ENCODED_KEY];
+        let Some(slen) = internal_key::encode_prefix(&mut startbuf, it, id, ik, start) else {
+            return KV_RESULT_INTERNAL;
+        };
+        // An empty `end` is unbounded above WITHIN this identity (see
+        // `range_from`).
+        let elen = if end.is_empty() {
+            match ident_hi {
+                Some(hi) => {
+                    endbuf[..IDENT_LEN].copy_from_slice(&hi);
+                    IDENT_LEN
+                }
+                None => 0,
+            }
+        } else {
+            match internal_key::encode_prefix(&mut endbuf, it, id, ik, end) {
+                Some(n) => n,
+                None => return KV_RESULT_INTERNAL,
+            }
+        };
+        let span = disk_store::state_store::KeySpan {
+            start: &startbuf[..slen],
+            end: &endbuf[..elen],
+        };
+        let mut resume = 0u64;
+        let mut sbuf = [0u8; DISK_SCAN_BUF];
+        loop {
+            let p = match self.store.scan_at(span, at, resume, 64, &mut sbuf) {
+                Ok(p) => p,
+                Err(disk_store::state_store::StoreError::Compacted) => return KV_RESULT_COMPACTED,
+                Err(_) => {
+                    self.fault = true;
+                    return KV_RESULT_INTERNAL;
+                }
+            };
+            let mut at_off = 0usize;
+            for _ in 0..p.entries {
+                let klen = u16::from_le_bytes([sbuf[at_off], sbuf[at_off + 1]]) as usize;
+                let vlen = u32::from_le_bytes([
+                    sbuf[at_off + 2],
+                    sbuf[at_off + 3],
+                    sbuf[at_off + 4],
+                    sbuf[at_off + 5],
+                ]) as usize;
+                at_off += 6;
+                let key = &sbuf[at_off..at_off + klen];
+                let val = &sbuf[at_off + klen..at_off + klen + vlen];
+                at_off += klen + vlen;
+                resume += 1;
+                let mut ubuf = [0u8; MAX_KEY_LEN];
+                let Some(dec) = internal_key::decode(key, &mut ubuf) else {
+                    self.fault = true;
+                    return KV_RESULT_INTERNAL;
+                };
+                let Some(meta) = decode_disk_meta(val) else {
+                    self.fault = true;
+                    return KV_RESULT_INTERNAL;
+                };
+                if meta.expiry_ms != 0 && now_ms >= meta.expiry_ms {
+                    continue;
+                }
+                if !f(&ubuf[..dec.user_key_len], &val[DISK_META_LEN..], &meta) {
+                    return KV_RESULT_OK;
+                }
+            }
+            match p.progress {
+                Progress::Done => return KV_RESULT_OK,
+                Progress::InProgress { .. } => {
+                    if p.entries == 0 {
+                        self.fault = true;
+                        return KV_RESULT_INTERNAL;
+                    }
+                }
+            }
+        }
+    }
+
+    fn walk_sorted(&self) -> bool {
+        true
+    }
+
     fn scan_versions_op(&mut self, body: &[u8], out: &mut [u8]) -> (u8, usize) {
         let Some(w) = parse_scan_versions_body(body) else {
             return (KV_RESULT_INTERNAL, 0);
@@ -2404,7 +3091,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         };
         // An empty end is unbounded WITHIN this identity, capped at the
         // next identity's prefix so the walk cannot cross into another
-        // tenant (§23). If there is no successor (all-`0xFF`) it stays
+        // tenant. If there is no successor (all-`0xFF`) it stays
         // unbounded, which for a real identity never arises.
         let elen = if w.end.is_empty() {
             match ident_hi {
@@ -2434,10 +3121,11 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         // resolves to the ceiling it was opened with. The pin is memo-
         // scoped, so a caller that will retry or page past the walk's
         // completion must name the ceiling explicitly; it is reported
-        // as the reply's revision for exactly that.
+        // as the reply's revision for exactly that. A first page opens
+        // a new window at "now" unless it is its own paused re-drive.
         let hi = if w.to != 0 {
             w.to
-        } else if let Some(pinned) = self.store.state.scan_window_ceiling(span, w.from) {
+        } else if let Some(pinned) = self.store.state.scan_window_ceiling(span, w.from, w.cursor) {
             pinned
         } else if self.in_replay() {
             self.revision
@@ -2445,6 +3133,13 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             self.store.state.highest_revision
         };
         self.reply_revision = hi;
+        let page_key = disk_store::ScanPageKey {
+            from: w.from,
+            hi,
+            ordinal: w.cursor,
+            limit: w.limit,
+            shape: w.flags,
+        };
 
         let mut out_off = 10usize;
         let mut emitted: u16 = 0;
@@ -2458,7 +3153,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         if let Some((parked, n, complete, next_cursor)) =
             self.store
                 .state
-                .scan_page_take(span, w.from, hi, w.cursor, &mut out[10..])
+                .scan_page_take(span, &page_key, &mut out[10..])
         {
             if complete {
                 out[0..8].copy_from_slice(&next_cursor.to_le_bytes());
@@ -2547,7 +3242,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 // and dropping it would make a resumed stream disagree
                 // with the continuous one that delivered it live.
                 let is_tomb = dec.kind == internal_key::ValueKind::PointTombstone;
-                let (kind, commit_ts, uval) = if is_tomb {
+                let (kind, commit_ts, uval, rec_meta) = if is_tomb {
                     // A timestamped tombstone carries its commit
                     // timestamp as an 8-byte payload;
                     // the emitted delete version has no user value
@@ -2559,10 +3254,15 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                     } else {
                         0
                     };
-                    (VERSION_KIND_DELETE, cts, &[][..])
+                    (VERSION_KIND_DELETE, cts, &[][..], None)
                 } else {
                     match decode_disk_meta(val) {
-                        Some(meta) => (VERSION_KIND_PUT, meta.commit_ts, &val[DISK_META_LEN..]),
+                        Some(meta) => (
+                            VERSION_KIND_PUT,
+                            meta.commit_ts,
+                            &val[DISK_META_LEN..],
+                            Some(meta),
+                        ),
                         None => {
                             self.fault = true;
                             return (KV_RESULT_INTERNAL, 0);
@@ -2570,7 +3270,19 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                     }
                 };
                 let ulen = dec.user_key_len;
-                let need = 8 + 8 + 1 + 2 + ulen + 4 + uval.len();
+                // With META, a put's entry grows by its 24-byte metadata:
+                // well inside a put's transcode slack (raw − entry ≥ 60).
+                let meta_len = if w.meta && rec_meta.is_some() { 24 } else { 0 };
+                let rec_flags = rec_meta.map_or(0, |m| m.flags);
+                if rec_flags & RECORD_MANIFEST != 0 && !w.manifests {
+                    // A manifest's bytes are not its value: a reader that
+                    // does not read manifests is refused. The record was
+                    // pulled, so the walk's position is forgotten.
+                    self.store.state.scan_reset();
+                    return (KV_RESULT_MANIFEST, 0);
+                }
+                let flags_len = usize::from(w.manifests);
+                let need = 8 + 8 + 1 + 2 + ulen + 4 + uval.len() + meta_len + flags_len;
                 if out_off + need > cap {
                     // Only reachable for a page that cannot hold even
                     // one record (a caller buffer smaller than the
@@ -2594,6 +3306,16 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 out_off += 4;
                 out[out_off..out_off + uval.len()].copy_from_slice(uval);
                 out_off += uval.len();
+                if let (true, Some(m)) = (meta_len != 0, rec_meta) {
+                    for v in [m.create_revision, m.version, m.lease_id] {
+                        out[out_off..out_off + 8].copy_from_slice(&v.to_le_bytes());
+                        out_off += 8;
+                    }
+                }
+                if w.manifests {
+                    out[out_off] = rec_flags;
+                    out_off += 1;
+                }
                 emitted += 1;
                 if emitted >= w.limit {
                     break 'outer;
@@ -2608,9 +3330,13 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                     // re-drives the same command next step, the parked
                     // prefix is taken back above, and the provider
                     // continues from where it stood.
-                    self.store
-                        .state
-                        .scan_page_park(w.cursor, emitted, &out[10..out_off], false, 0);
+                    self.store.state.scan_page_park(
+                        &page_key,
+                        emitted,
+                        &out[10..out_off],
+                        false,
+                        0,
+                    );
                     return (KV_RESULT_PAUSED, 0);
                 }
                 Progress::InProgress { .. } => {
@@ -2626,7 +3352,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         out[8..10].copy_from_slice(&emitted.to_le_bytes());
         self.store
             .state
-            .scan_page_park(w.cursor, emitted, &out[10..out_off], true, new_cursor);
+            .scan_page_park(&page_key, emitted, &out[10..out_off], true, new_cursor);
         (KV_RESULT_VERSIONS, out_off)
     }
 
@@ -2784,7 +3510,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         let cts_bytes = cts.to_le_bytes();
         let tomb: &[u8] = if cts != 0 { &cts_bytes } else { &[] };
         if revn > 0 {
-            // §23: FLUSH clears THIS identity's keys, not the whole
+            // FLUSH clears THIS identity's keys, not the whole
             // store — a tenant's flush must not tombstone another's.
             let (ident_lo, ident_hi) = self.ident_span();
             let hibuf = ident_hi.unwrap_or([0u8; IDENT_LEN]);
@@ -2851,7 +3577,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
     }
 
     /// The disk provider retains every version above the committed GC
-    /// floor it was last handed (§18 — the floor is trusted, never
+    /// floor it was last handed (the floor is trusted, never
     /// computed here).
     fn read_horizon(&self) -> u64 {
         self.store.state.compaction_floor
@@ -3044,6 +3770,7 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
                 out[p + 22..p + 30].copy_from_slice(&meta.version.to_le_bytes());
                 out[p + 30..p + 38].copy_from_slice(&meta.lease_id.to_le_bytes());
                 out[p + 38..p + 46].copy_from_slice(&meta.expiry_ms.to_le_bytes());
+                out[p + 46] = meta.flags;
                 p += SNAPSHOT_REC_FIXED;
                 out[p..p + 4].copy_from_slice(&dec.tenant.to_be_bytes());
                 out[p + 4..p + 8].copy_from_slice(&dec.database.to_be_bytes());
@@ -3098,7 +3825,7 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         // the memory provider's slot cursor is.
         let mut resume = cursor;
         let mut done = force_empty;
-        // §23: the full SCAN is bounded to this identity's span, not the
+        // The full SCAN is bounded to this identity's span, not the
         // whole store — otherwise a Redis SCAN would walk every tenant.
         let (ident_lo, ident_hi) = self.ident_span();
         let hibuf = ident_hi.unwrap_or([0u8; IDENT_LEN]);
@@ -3212,7 +3939,7 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         };
         // An empty `end` is unbounded above WITHIN this identity, capped
         // at the next identity's prefix so the scan cannot cross into
-        // another tenant (§23) — NOT the encoding of the empty key,
+        // another tenant — NOT the encoding of the empty key,
         // which would be a bound below every real key and yield nothing.
         let elen = if end.is_empty() {
             match ident_hi {
@@ -3380,6 +4107,7 @@ fn parse_scan_versions_body(body: &[u8]) -> Option<VersionWindow<'_>> {
     let to = read_u64(body, &mut off)?;
     let cursor = read_u64(body, &mut off)?;
     let limit = read_u16(body, &mut off)?;
+    let flags = read_u8(body, &mut off).unwrap_or(0);
     Some(VersionWindow {
         start,
         end,
@@ -3387,6 +4115,9 @@ fn parse_scan_versions_body(body: &[u8]) -> Option<VersionWindow<'_>> {
         to,
         cursor,
         limit,
+        meta: flags & VERSIONS_FLAG_META != 0,
+        manifests: flags & VERSIONS_FLAG_MANIFESTS != 0,
+        flags,
     })
 }
 
@@ -3401,6 +4132,13 @@ struct VersionWindow<'a> {
     to: u64,
     cursor: u64,
     limit: u16,
+    /// PUT entries carry their metadata ([`VERSIONS_FLAG_META`]).
+    meta: bool,
+    /// Every entry ends with its record's flags
+    /// ([`VERSIONS_FLAG_MANIFESTS`]); without it a manifest is refused.
+    manifests: bool,
+    /// The request's flags byte: its entries' shape.
+    flags: u8,
 }
 
 /// Resolve a window's upper bound: `0` means "up to now", matching the
@@ -3413,6 +4151,291 @@ fn normalize_to(to: u64, current: u64) -> u64 {
     } else {
         to
     }
+}
+
+/// A parsed [`KV_OP_RANGE_META`] body.
+struct RangeMetaQ<'a> {
+    start: &'a [u8],
+    end: &'a [u8],
+    at_rev: u64,
+    limit: u32,
+    flags: u8,
+    target: u8,
+    order: u8,
+    min_mod: u64,
+    max_mod: u64,
+    min_create: u64,
+    max_create: u64,
+}
+
+fn parse_range_meta_body(body: &[u8]) -> Option<RangeMetaQ<'_>> {
+    let mut off = 0usize;
+    let start = read_key(body, &mut off)?;
+    let end = read_key(body, &mut off)?;
+    let at_rev = read_u64(body, &mut off)?;
+    let limit = u32::from_le_bytes(body.get(off..off + 4)?.try_into().ok()?);
+    off += 4;
+    let flags = read_u8(body, &mut off)?;
+    let target = read_u8(body, &mut off)?;
+    let order = read_u8(body, &mut off)?;
+    Some(RangeMetaQ {
+        start,
+        end,
+        at_rev,
+        limit,
+        flags,
+        target,
+        order,
+        min_mod: read_u64(body, &mut off)?,
+        max_mod: read_u64(body, &mut off)?,
+        min_create: read_u64(body, &mut off)?,
+        max_create: read_u64(body, &mut off)?,
+    })
+}
+
+/// The order a [`KV_OP_RANGE_META`] sorts by: `target` first (0 key,
+/// 1 version, 2 create, 3 mod, 4 value), then the key.
+fn range_meta_cmp(
+    target: u8,
+    a: (&[u8], &[u8], &RecMeta),
+    b: (&[u8], &[u8], &RecMeta),
+) -> core::cmp::Ordering {
+    let primary = match target {
+        1 => a.2.version.cmp(&b.2.version),
+        2 => a.2.create_revision.cmp(&b.2.create_revision),
+        3 => a.2.mod_revision.cmp(&b.2.mod_revision),
+        4 => a.1.cmp(b.1),
+        _ => core::cmp::Ordering::Equal,
+    };
+    primary.then(a.0.cmp(b.0))
+}
+
+/// One [`KV_RESULT_KVS`] entry at `out[*at..]`; false when it does not fit.
+fn range_meta_put(
+    out: &mut [u8],
+    at: &mut usize,
+    key: &[u8],
+    val: &[u8],
+    meta: &RecMeta,
+    keys_only: bool,
+) -> bool {
+    range_meta_put_as(out, at, key, val, meta, keys_only, false)
+}
+
+/// [`range_meta_put`], with the record's flags after the entry when the
+/// reader asked for them (it reads manifests).
+fn range_meta_put_as(
+    out: &mut [u8],
+    at: &mut usize,
+    key: &[u8],
+    val: &[u8],
+    meta: &RecMeta,
+    keys_only: bool,
+    with_flags: bool,
+) -> bool {
+    let val = if keys_only { &[][..] } else { val };
+    let need = 2 + key.len() + 4 + val.len() + 32 + usize::from(with_flags);
+    if *at + need > out.len() {
+        return false;
+    }
+    let mut p = *at;
+    out[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    p += 2;
+    out[p..p + key.len()].copy_from_slice(key);
+    p += key.len();
+    out[p..p + 4].copy_from_slice(&(val.len() as u32).to_le_bytes());
+    p += 4;
+    out[p..p + val.len()].copy_from_slice(val);
+    p += val.len();
+    for v in [
+        meta.create_revision,
+        meta.mod_revision,
+        meta.version,
+        meta.lease_id,
+    ] {
+        out[p..p + 8].copy_from_slice(&v.to_le_bytes());
+        p += 8;
+    }
+    if with_flags {
+        out[p] = meta.flags;
+        p += 1;
+    }
+    *at = p;
+    true
+}
+
+/// [`KV_OP_RANGE_META`]: count every match, then emit them in the asked
+/// order — one streaming pass when the provider already walks in it (the
+/// disk provider, ascending keys), else by repeated selection (each pass
+/// finds the next entry after the last one emitted; cheap over the
+/// memory provider's table, and bounded on any provider by the answer's
+/// buffer).
+fn apply_range_meta<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let Some(q) = parse_range_meta_body(body) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    if out.len() < 11 {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    if q.at_rev != 0 && q.at_rev > store.revision() {
+        return (KV_RESULT_FUTURE_REV, 0);
+    }
+    // etcd's spans: no end = the one key; `\0` = every key from start.
+    let mut succ = [0u8; MAX_KEY_LEN + 1];
+    let (start, end): (&[u8], &[u8]) = if q.end.is_empty() {
+        let n = q.start.len();
+        if n >= succ.len() {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+        succ[..n].copy_from_slice(q.start);
+        succ[n] = 0;
+        (q.start, &succ[..n + 1])
+    } else if q.end == [0] {
+        (q.start, &[])
+    } else {
+        (q.start, q.end)
+    };
+    let passes = |m: &RecMeta| {
+        (q.min_mod == 0 || m.mod_revision >= q.min_mod)
+            && (q.max_mod == 0 || m.mod_revision <= q.max_mod)
+            && (q.min_create == 0 || m.create_revision >= q.min_create)
+            && (q.max_create == 0 || m.create_revision <= q.max_create)
+    };
+    let mut total = 0u64;
+    let r = store.walk_live_meta(start, end, q.at_rev, now_ms, |_, _, m| {
+        if passes(m) {
+            total += 1;
+        }
+        true
+    });
+    if r != KV_RESULT_OK {
+        return (r, 0);
+    }
+    let keys_only = q.flags & 1 != 0;
+    let count_only = q.flags & 2 != 0;
+    // A reader that reads manifests gets each entry's flags; one that
+    // does not is refused a manifest's bytes (keys and counts are fine).
+    let manifests = q.flags & RANGE_META_FLAG_MANIFESTS != 0;
+    let mut refused = false;
+    let limit = if q.limit == 0 {
+        u64::MAX
+    } else {
+        u64::from(q.limit)
+    };
+    let mut at = 11usize;
+    let mut emitted = 0u64;
+    let desc = q.order == 2;
+    if !count_only && q.target == 0 && !desc && store.walk_sorted() {
+        let r = store.walk_live_meta(start, end, q.at_rev, now_ms, |k, v, m| {
+            if !passes(m) {
+                return true;
+            }
+            if m.flags & RECORD_MANIFEST != 0 && !manifests && !keys_only {
+                refused = true;
+                return false;
+            }
+            if emitted >= limit || !range_meta_put_as(out, &mut at, k, v, m, keys_only, manifests) {
+                return false;
+            }
+            emitted += 1;
+            true
+        });
+        if r != KV_RESULT_OK {
+            return (r, 0);
+        }
+    } else if !count_only {
+        let mut last_key = [0u8; MAX_KEY_LEN];
+        let mut last_val = [0u8; MAX_VALUE_LEN];
+        let mut last: Option<(usize, usize, RecMeta)> = None;
+        let mut best_key = [0u8; MAX_KEY_LEN];
+        let mut best_val = [0u8; MAX_VALUE_LEN];
+        while emitted < limit {
+            let mut best: Option<(usize, usize, RecMeta)> = None;
+            let r = store.walk_live_meta(start, end, q.at_rev, now_ms, |k, v, m| {
+                if !passes(m) || k.len() > MAX_KEY_LEN || v.len() > MAX_VALUE_LEN {
+                    return true;
+                }
+                // Refused as above; and a large value's bytes are not its
+                // value, so it cannot be sorted by them.
+                if m.flags & RECORD_MANIFEST != 0 && ((!manifests && !keys_only) || q.target == 4) {
+                    refused = true;
+                    return false;
+                }
+                let e = (k, v, m);
+                let fwd = |o: core::cmp::Ordering| if desc { o.reverse() } else { o };
+                if let Some((kl, vl, lm)) = last {
+                    let after = fwd(range_meta_cmp(
+                        q.target,
+                        e,
+                        (&last_key[..kl], &last_val[..vl], &lm),
+                    ));
+                    if after != core::cmp::Ordering::Greater {
+                        return true;
+                    }
+                }
+                let better = match best {
+                    None => true,
+                    Some((kl, vl, bm)) => {
+                        fwd(range_meta_cmp(
+                            q.target,
+                            e,
+                            (&best_key[..kl], &best_val[..vl], &bm),
+                        )) == core::cmp::Ordering::Less
+                    }
+                };
+                if better {
+                    best_key[..k.len()].copy_from_slice(k);
+                    best_val[..v.len()].copy_from_slice(v);
+                    best = Some((k.len(), v.len(), *m));
+                }
+                true
+            });
+            if r != KV_RESULT_OK {
+                return (r, 0);
+            }
+            let Some((kl, vl, bm)) = best else {
+                break;
+            };
+            if refused {
+                break;
+            }
+            if !range_meta_put_as(
+                out,
+                &mut at,
+                &best_key[..kl],
+                &best_val[..vl],
+                &bm,
+                keys_only,
+                manifests,
+            ) {
+                break;
+            }
+            emitted += 1;
+            last_key[..kl].copy_from_slice(&best_key[..kl]);
+            last_val[..vl].copy_from_slice(&best_val[..vl]);
+            last = Some((kl, vl, bm));
+        }
+    }
+    if refused {
+        return (KV_RESULT_MANIFEST, 0);
+    }
+    // Cut by the limit, or by the answer's space before the limit.
+    let more = if count_only || emitted >= total {
+        0
+    } else if emitted < total.min(limit) {
+        KVS_MORE_PARTIAL
+    } else {
+        KVS_MORE_LIMIT
+    };
+    out[0..8].copy_from_slice(&total.to_le_bytes());
+    out[8] = more;
+    out[9..11].copy_from_slice(&(emitted as u16).to_le_bytes());
+    (KV_RESULT_KVS, at)
 }
 
 fn apply_get<M: Materializer>(
@@ -3435,12 +4458,19 @@ fn apply_get<M: Materializer>(
     let mut scratch = [0u8; MAX_VALUE_LEN];
     match store.get_live(key, now_ms, &mut scratch) {
         GetOutcome::Absent => (KV_RESULT_NOT_FOUND, 0),
-        GetOutcome::Found { value_len: n, .. } => {
+        GetOutcome::Found { value_len: n, meta } => {
             if n > out.len() {
                 return (KV_RESULT_INTERNAL, 0);
             }
             out[..n].copy_from_slice(&scratch[..n]);
-            (KV_RESULT_OK, n)
+            // A manifest is answered as one: the reader fetches its
+            // chunks, and a reader that does not is not misled.
+            let code = if meta.flags & RECORD_MANIFEST != 0 {
+                KV_RESULT_MANIFEST
+            } else {
+                KV_RESULT_OK
+            };
+            (code, n)
         }
         GetOutcome::TooBig | GetOutcome::Fault => (KV_RESULT_INTERNAL, 0),
     }
@@ -3478,12 +4508,17 @@ fn apply_get_revision<M: Materializer>(
     let mut scratch = [0u8; MAX_VALUE_LEN];
     match store.get_as_of(key, revision, now_ms, &mut scratch) {
         HistOutcome::Absent => (KV_RESULT_NOT_FOUND, 0),
-        HistOutcome::Found { value_len: n, .. } => {
+        HistOutcome::Found { value_len: n, meta } => {
             if n > out.len() {
                 return (KV_RESULT_INTERNAL, 0);
             }
             out[..n].copy_from_slice(&scratch[..n]);
-            (KV_RESULT_OK, n)
+            let code = if meta.flags & RECORD_MANIFEST != 0 {
+                KV_RESULT_MANIFEST
+            } else {
+                KV_RESULT_OK
+            };
+            (code, n)
         }
         // The whole point of the slice: an honest refusal, never a
         // wrong value and never a bare NOT_FOUND (which a client would
@@ -3509,11 +4544,15 @@ fn apply_scan_at<M: Materializer>(
     store.scan_as_of(revision, cursor, limit, out, now_ms)
 }
 
+/// KV_OP_PUT, and (`manifest`) KV_OP_PUT_MANIFEST: the same write, of a
+/// value that is a large value's manifest — checked, its root chunk
+/// required, and the record flagged.
 fn apply_put<M: Materializer>(
     store: &mut M,
     body: &[u8],
     out: &mut [u8],
     now_ms: u64,
+    manifest: bool,
 ) -> (u8, usize) {
     let mut off = 0;
     let Some(key) = read_key(body, &mut off) else {
@@ -3526,6 +4565,18 @@ fn apply_put<M: Materializer>(
         return (KV_RESULT_INTERNAL, 0);
     };
     let ttl_ms = read_u64(body, &mut off).unwrap_or(0);
+    let lease = if flags & PUT_FLAG_LEASE != 0 {
+        let Some(l) = read_u64(body, &mut off) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        Some(l)
+    } else {
+        None
+    };
+    let reads_manifests = read_u8(body, &mut off).unwrap_or(0) & PUT_FLAG2_MANIFESTS != 0;
+    let prev_meta = flags & PUT_FLAG_PREV_META != 0;
+    let ignore_value = flags & PUT_FLAG_IGNORE_VALUE != 0;
+    let ignore_lease = flags & PUT_FLAG_IGNORE_LEASE != 0;
 
     let nx = (flags & PUT_FLAG_NX) != 0;
     let xx = (flags & PUT_FLAG_XX) != 0;
@@ -3546,6 +4597,25 @@ fn apply_put<M: Materializer>(
         GetOutcome::TooBig | GetOutcome::Fault => return (KV_RESULT_INTERNAL, 0),
     };
     let exists = existing.is_some();
+    let was_manifest = existing.is_some_and(|(_, m)| m.flags & RECORD_MANIFEST != 0);
+    // A manifest's bytes are never handed back as a value, unless the
+    // reader reads manifests.
+    if was_manifest && (get || prev_meta) && !reads_manifests {
+        return (KV_RESULT_MANIFEST, 0);
+    }
+    if manifest {
+        let Some(m) = kv_chunks::Manifest::parse(value) else {
+            return (KV_RESULT_BAD_CHUNK, 0);
+        };
+        if ignore_value {
+            return (KV_RESULT_BAD_CHUNK, 0);
+        }
+        match chunk_stored(store, &m.root, now_ms) {
+            Some(true) => {}
+            Some(false) => return (KV_RESULT_MISSING_CHUNK, 0),
+            None => return (KV_RESULT_INTERNAL, 0),
+        }
+    }
 
     if nx && exists {
         return (KV_RESULT_CAS_FAILED, 0);
@@ -3553,6 +4623,43 @@ fn apply_put<M: Materializer>(
     if xx && !exists {
         return (KV_RESULT_CAS_FAILED, 0);
     }
+    // etcd's ignore_value / ignore_lease need something to keep.
+    if (ignore_value || ignore_lease) && !exists {
+        return (KV_RESULT_NOT_FOUND, 0);
+    }
+    // The previous KeyValue (etcd's prev_kv): `[present:u8]` + an entry.
+    let mut prev_meta_len = 0usize;
+    if prev_meta {
+        if out.is_empty() {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+        out[0] = u8::from(exists);
+        prev_meta_len = 1;
+        if let Some((n, m)) = existing {
+            let mut at = 1usize;
+            if !range_meta_put_as(
+                out,
+                &mut at,
+                key_slice,
+                &prev[..n],
+                &m,
+                false,
+                reads_manifests,
+            ) {
+                return (KV_RESULT_INTERNAL, 0);
+            }
+            prev_meta_len = at;
+        }
+    }
+    // ignore_value: the stored value is written again (a new version).
+    let mut kept = [0u8; MAX_VALUE_LEN];
+    let value: &[u8] = match existing {
+        Some((n, _)) if ignore_value => {
+            kept[..n].copy_from_slice(&prev[..n]);
+            &kept[..n]
+        }
+        _ => value,
+    };
 
     let prev_value_bytes: Option<usize> = if get && exists {
         let n = existing.map(|(n, _)| n).unwrap_or(0);
@@ -3589,11 +4696,606 @@ fn apply_put<M: Materializer>(
     if !store.set_expiry(key_slice, new_expiry) {
         return (KV_RESULT_INTERNAL, 0);
     }
+    // The lease the key carries now: the put's, or (ignore_lease) the
+    // one it had. A put without the lease flag leaves it as it was.
+    let new_lease = if ignore_lease {
+        existing.map(|(_, m)| m.lease_id)
+    } else {
+        lease
+    };
+    if let Some(l) = new_lease {
+        if !store.set_lease(key_slice, l) {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+    }
+    // What the record is now: a manifest when this write put one, or
+    // kept one's value (ignore_value).
+    if (manifest || (ignore_value && was_manifest)) && !store.set_flags(key_slice, RECORD_MANIFEST)
+    {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    // References: the new manifest holds its root; the one it replaced
+    // (unless the value was kept) releases its own.
+    if manifest {
+        let Some(m) = kv_chunks::Manifest::parse(value) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        if !incref_chunk(store, &m.root, now_ms) {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+    }
+    if let Some((n, m)) = existing.filter(|_| !ignore_value) {
+        if let Some(root) = manifest_root(&prev[..n], &m) {
+            if !release_root(store, &root, now_ms) {
+                return (KV_RESULT_INTERNAL, 0);
+            }
+        }
+    }
+    if let Some(j) = store.journal() {
+        let (create, version) = existing.map_or((0, 1), |(_, m)| {
+            (m.create_revision, m.version.saturating_add(1))
+        });
+        let lease_now = new_lease.or(existing.map(|(_, m)| m.lease_id)).unwrap_or(0);
+        let prev_kv = existing.map(|(n, m)| (&prev[..n], m));
+        // A manifest's event says so: its value is the manifest, which a
+        // watcher resolves (or refuses), never renders as the value.
+        j.push(
+            if manifest {
+                KV_OP_PUT_MANIFEST
+            } else {
+                KV_OP_PUT
+            },
+            key_slice,
+            value,
+            create,
+            version,
+            lease_now,
+            prev_kv.as_ref().map(|(v, m)| (*v, m)),
+        );
+    }
+    if prev_meta {
+        return (KV_RESULT_OK, prev_meta_len);
+    }
 
     match prev_value_bytes {
+        // The previous value was a manifest, which this reader reads.
+        Some(n) if was_manifest => (KV_RESULT_MANIFEST, n),
         Some(n) => (KV_RESULT_OK, n),
         None => (KV_RESULT_OK, 0),
     }
+}
+
+// ── Large values: chunks ──────────────────────────────────────────────
+
+/// Run `f` with the store bound to the command's tenant and database in
+/// the chunk keyspace `ks`, then restore the command's identity.
+fn in_chunk_space<M: Materializer, R>(store: &mut M, ks: u32, f: impl FnOnce(&mut M) -> R) -> R {
+    let (t, d, k) = store.key_identity();
+    store.set_key_identity(t, d, ks);
+    let r = f(store);
+    store.set_key_identity(t, d, k);
+    r
+}
+
+/// Is the chunk `hash` stored? `None` on a provider fault.
+fn chunk_stored<M: Materializer>(
+    store: &mut M,
+    hash: &kv_chunks::Hash,
+    now_ms: u64,
+) -> Option<bool> {
+    in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
+        let mut b = [0u8; kv_chunks::CHUNK_MAX];
+        match s.get_live(kv_chunks::hash_key(hash), now_ms, &mut b) {
+            GetOutcome::Found { .. } => Some(true),
+            GetOutcome::Absent => Some(false),
+            GetOutcome::TooBig | GetOutcome::Fault => None,
+        }
+    })
+}
+
+/// The root a manifest record names, when it is one.
+fn manifest_root(value: &[u8], meta: &RecMeta) -> Option<kv_chunks::Hash> {
+    if meta.flags & RECORD_MANIFEST == 0 {
+        return None;
+    }
+    kv_chunks::Manifest::parse(value).map(|m| m.root)
+}
+
+/// The revision bookkeeping is stamped with: the op's own.
+fn chunk_rev<M: Materializer>(store: &M) -> u64 {
+    store.op_revision()
+}
+
+/// The most memtable entries a write op can add, from its body alone —
+/// what a disk store must have free before the op is admitted, so the op
+/// never meets a full memtable part-way (its earlier writes applied, the
+/// rest refused). `None`: not bounded by its body (a sweep, a range
+/// delete, a lease revoke); such an op is admitted only while no flush
+/// holds the memtable, when making room is a synchronous flush.
+///
+/// Each count is every version write the op's apply path makes (an
+/// overwrite of a version the op already wrote adds nothing):
+/// - `PUT` / `PUT_MANIFEST`: the value, its root's reference and queue
+///   entry, and the released root of the value it replaced.
+/// - `DELETE`: per key, its tombstone and a released root.
+/// - `PUT_CHUNK`: the chunk, its reference count and its queue entry;
+///   a node also takes a reference on each child — the count and the
+///   queue entry it leaves ([`kv_chunks::FANOUT`] children at most).
+/// - `TXN`: the larger of its two branches.
+pub fn write_bound(op: u8, body: &[u8]) -> Option<usize> {
+    const PUT_BOUND: usize = 8;
+    match op {
+        KV_OP_PUT | KV_OP_PUT_MANIFEST => Some(PUT_BOUND),
+        KV_OP_DELETE => {
+            let n = body.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+            Some(2 + 4 * usize::from(n))
+        }
+        KV_OP_PUT_CHUNK => {
+            let len = body
+                .get(32..34)
+                .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))?;
+            let node = body.get(34) == Some(&kv_chunks::KIND_NODE);
+            let children = if node {
+                len.saturating_sub(1) / kv_chunks::HASH_LEN
+            } else {
+                0
+            };
+            Some(3 + 2 * children)
+        }
+        KV_OP_TXN => txn_write_bound(body),
+        _ => None,
+    }
+}
+
+/// [`write_bound`] of a `KV_OP_TXN` body (layout: `apply_txn`).
+fn txn_write_bound(body: &[u8]) -> Option<usize> {
+    let mut off = 0usize;
+    let cmps = read_u16(body, &mut off)?;
+    for _ in 0..cmps {
+        read_u8(body, &mut off)?;
+        read_key(body, &mut off)?;
+        read_u64(body, &mut off)?;
+    }
+    let mut branch = || -> Option<usize> {
+        let n = read_u16(body, &mut off)?;
+        let mut sum = 0usize;
+        for _ in 0..n {
+            let op = read_u8(body, &mut off)?;
+            let len = usize::from(read_u16(body, &mut off)?);
+            let inner = body.get(off..off.checked_add(len)?)?;
+            off += len;
+            sum = sum.checked_add(write_bound(op, inner)?)?;
+        }
+        Some(sum)
+    };
+    let then = branch()?;
+    let other = branch()?;
+    Some(then.max(other))
+}
+
+/// Run `f` as one op in one revision: inside the batch already open, or
+/// in its own.
+fn batched<M: Materializer, R>(store: &mut M, f: impl FnOnce(&mut M) -> R) -> R {
+    if store.batch_open() {
+        return f(store);
+    }
+    store.begin_batch();
+    let r = f(store);
+    store.end_batch();
+    r
+}
+
+/// A chunk's `(references, since)`; `Ok(None)` when it has no record,
+/// `Err` on a provider fault.
+fn chunk_refs<M: Materializer>(
+    store: &mut M,
+    hash: &kv_chunks::Hash,
+    now_ms: u64,
+) -> Result<Option<(u64, u64)>, ()> {
+    in_chunk_space(store, kv_chunks::KS_CHUNK_REF, |s| {
+        let mut b = [0u8; kv_chunks::REF_LEN];
+        match s.get_live(kv_chunks::hash_key(hash), now_ms, &mut b) {
+            GetOutcome::Found { value_len, .. } => {
+                kv_chunks::decode_ref(&b[..value_len]).map(Some).ok_or(())
+            }
+            GetOutcome::Absent => Ok(None),
+            _ => Err(()),
+        }
+    })
+}
+
+fn set_chunk_refs<M: Materializer>(
+    store: &mut M,
+    hash: &kv_chunks::Hash,
+    refs: u64,
+    since: u64,
+) -> bool {
+    let r = kv_chunks::encode_ref(refs, since);
+    in_chunk_space(store, kv_chunks::KS_CHUNK_REF, |s| {
+        s.put_meta(kv_chunks::hash_key(hash), &r)
+    })
+}
+
+/// Queue the current identity's `hash` at `rev` in a chunk queue
+/// (`KS_CHUNK_RETIRE` or `KS_CHUNK_ZERO`, both store-wide), or take it
+/// out. An unreferenced chunk is queued with the committed clock, which
+/// its grace runs from.
+fn chunk_queue<M: Materializer>(
+    store: &mut M,
+    ks: u32,
+    rev: u64,
+    hash: &kv_chunks::Hash,
+    on: bool,
+    now_ms: u64,
+) -> bool {
+    let (t, d, k) = store.key_identity();
+    let key = kv_chunks::queued_key_of(rev, t, d, hash);
+    let stamp = now_ms.to_le_bytes();
+    let value: &[u8] = if ks == kv_chunks::KS_CHUNK_ZERO {
+        &stamp
+    } else {
+        &[]
+    };
+    store.set_key_identity(kv_chunks::QUEUE_TENANT, kv_chunks::QUEUE_DATABASE, ks);
+    let ok = if on {
+        store.put_meta(&key, value)
+    } else {
+        store.remove_meta(&key)
+    };
+    store.set_key_identity(t, d, k);
+    ok
+}
+
+/// Run `f` as the identity `(tenant, database)` a queue entry names.
+fn as_identity<M: Materializer, R>(
+    store: &mut M,
+    tenant: u32,
+    database: u32,
+    f: impl FnOnce(&mut M) -> R,
+) -> R {
+    let (t, d, k) = store.key_identity();
+    store.set_key_identity(tenant, database, k);
+    let r = f(store);
+    store.set_key_identity(t, d, k);
+    r
+}
+
+/// One more reference to a stored chunk (a record's root, a node's
+/// child): out of the unreferenced queue when it was there.
+fn incref_chunk<M: Materializer>(store: &mut M, hash: &kv_chunks::Hash, now_ms: u64) -> bool {
+    let rev = chunk_rev(store);
+    match chunk_refs(store, hash, now_ms) {
+        Ok(Some((0, since))) => {
+            chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, since, hash, false, now_ms)
+                && set_chunk_refs(store, hash, 1, rev)
+        }
+        Ok(Some((refs, _))) => set_chunk_refs(store, hash, refs + 1, rev),
+        _ => false,
+    }
+}
+
+/// One reference fewer: a chunk left with none waits in the unreferenced
+/// queue for the floor to pass this revision.
+fn decref_chunk<M: Materializer>(store: &mut M, hash: &kv_chunks::Hash, now_ms: u64) -> bool {
+    let rev = chunk_rev(store);
+    match chunk_refs(store, hash, now_ms) {
+        Ok(Some((refs, _))) if refs > 0 => {
+            set_chunk_refs(store, hash, refs - 1, rev)
+                && (refs > 1
+                    || chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, rev, hash, true, now_ms))
+        }
+        _ => false,
+    }
+}
+
+/// A manifest a write superseded or deleted: its root's reference goes
+/// once the committed floor passes the superseding revision (history may
+/// read the old manifest until then) — queued at the superseding write's
+/// own revision (the op's).
+fn release_root<M: Materializer>(store: &mut M, root: &kv_chunks::Hash, now_ms: u64) -> bool {
+    let rev = store.op_revision();
+    chunk_queue(store, kv_chunks::KS_CHUNK_RETIRE, rev, root, true, now_ms)
+}
+
+/// KV_OP_PUT_CHUNK: `[hash:32][len:u16][chunk]`.
+fn apply_put_chunk<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    _out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let (Some(hash), Some(len)) = (
+        body.get(..kv_chunks::HASH_LEN)
+            .and_then(|h| <kv_chunks::Hash>::try_from(h).ok()),
+        body.get(32..34)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize),
+    ) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let Some(chunk) = body.get(34..34 + len).filter(|_| body.len() == 34 + len) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let Some((kind, payload)) = kv_chunks::parse_chunk(chunk) else {
+        return (KV_RESULT_BAD_CHUNK, 0);
+    };
+    if kv_chunks::sha256(chunk) != hash {
+        return (KV_RESULT_BAD_CHUNK, 0);
+    }
+    let rev = chunk_rev(store);
+    match chunk_refs(store, &hash, now_ms) {
+        // Content-addressed: the same bytes, already here. One nothing
+        // references yet starts its wait afresh, so a producer about to
+        // name it is not raced by the sweep.
+        Ok(Some((0, since))) => {
+            let ok = chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, since, &hash, false, now_ms)
+                && set_chunk_refs(store, &hash, 0, rev)
+                && chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, rev, &hash, true, now_ms);
+            return if ok {
+                (KV_RESULT_OK, 0)
+            } else {
+                (KV_RESULT_INTERNAL, 0)
+            };
+        }
+        Ok(Some(_)) => return (KV_RESULT_OK, 0),
+        Ok(None) => {}
+        Err(()) => return (KV_RESULT_INTERNAL, 0),
+    }
+    // A node is accepted only over its whole subtree: every child it
+    // names is stored, so a stored root is a whole value.
+    if kind == kv_chunks::KIND_NODE {
+        for child in kv_chunks::children(payload) {
+            match chunk_stored(store, &child, now_ms) {
+                Some(true) => {}
+                Some(false) => return (KV_RESULT_MISSING_CHUNK, 0),
+                None => return (KV_RESULT_INTERNAL, 0),
+            }
+        }
+    }
+    let stored = in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
+        s.put_meta(kv_chunks::hash_key(&hash), chunk)
+    });
+    let ok = stored
+        && set_chunk_refs(store, &hash, 0, rev)
+        && chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, rev, &hash, true, now_ms)
+        && (kind != kv_chunks::KIND_NODE
+            || kv_chunks::children(payload).all(|c| incref_chunk(store, &c, now_ms)));
+    if !ok {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    (KV_RESULT_OK, 0)
+}
+
+/// Most queue entries one sweep takes.
+pub const SWEEP_BUDGET_MAX: usize = 64;
+
+/// A due-list of queue entries.
+type Due = [kv_chunks::Queued; SWEEP_BUDGET_MAX];
+
+const NO_ENTRY: kv_chunks::Queued = kv_chunks::Queued {
+    rev: 0,
+    tenant: 0,
+    database: 0,
+    hash: [0; kv_chunks::HASH_LEN],
+};
+
+/// Which entries of a chunk queue a walk takes.
+#[derive(Clone, Copy)]
+struct DueAt {
+    /// Queued at or below the floor…
+    floor: u64,
+    /// …by an earlier op than this one (an op never writes a key it
+    /// wrote already)…
+    before: u64,
+    /// …and, for an unreferenced chunk, queued on the committed clock
+    /// before this.
+    queued_before_ms: u64,
+}
+
+/// The entries of the chunk queue `ks` due by `due` (every entry, with
+/// `None`), at most `left`, into `got`: how many. `None` on a provider
+/// fault. A sorted walk stops at the first entry not due: the queue
+/// sorts by revision, and the committed clock never runs backwards
+/// along the log, so nothing after it is due either.
+fn due_entries<M: Materializer>(
+    store: &mut M,
+    ks: u32,
+    due: Option<DueAt>,
+    left: usize,
+    got: &mut Due,
+) -> Option<usize> {
+    let mut n = 0usize;
+    let sorted = store.walk_sorted();
+    let (t, d, k) = store.key_identity();
+    store.set_key_identity(kv_chunks::QUEUE_TENANT, kv_chunks::QUEUE_DATABASE, ks);
+    let r = store.walk_live_meta(&[], &[], 0, 0, |key, value, _| {
+        if n >= left {
+            return false;
+        }
+        let Some(q) = kv_chunks::queued_key(key) else {
+            return true;
+        };
+        let taken = due.is_none_or(|d| {
+            q.rev <= d.floor
+                && q.rev < d.before
+                && (ks != kv_chunks::KS_CHUNK_ZERO
+                    || <[u8; kv_chunks::ZERO_VALUE_LEN]>::try_from(value)
+                        .is_ok_and(|b| u64::from_le_bytes(b) < d.queued_before_ms))
+        });
+        if taken {
+            if let Some(g) = got.get_mut(n) {
+                *g = q;
+            }
+            n += 1;
+        } else if sorted {
+            return false;
+        }
+        n < left
+    });
+    store.set_key_identity(t, d, k);
+    (r == KV_RESULT_OK).then_some(n)
+}
+
+/// A sweep's body length.
+pub const SWEEP_BODY_LEN: usize = 8 + 8 + 2;
+
+/// The sweep's answer: entries are due at its floor now (another sweep
+/// takes them).
+pub const SWEEP_MORE: u8 = 0x01;
+/// The sweep's answer: entries wait in the queues (for the floor, or for
+/// their grace).
+pub const SWEEP_WAITING: u8 = 0x02;
+
+/// KV_OP_CHUNK_SWEEP: `[floor:u64][queued_before_ms:u64][budget:u16]`,
+/// store-wide. Releases due at or below the floor drop their references;
+/// chunks unreferenced since at or below it, and queued on the committed
+/// clock before `queued_before_ms`, go (a node's children lose a
+/// reference each and start their own wait). Answered `KV_RESULT_OK` with
+/// `[flags:u8]`: [`SWEEP_MORE`], [`SWEEP_WAITING`].
+///
+/// Both bounds travel in the committed command, so every replica sweeps
+/// alike; its proposer names only a floor that committed, and a clock
+/// bound its graph's grace allows.
+fn apply_chunk_sweep<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let u64_at = |at: usize| {
+        body.get(at..at + 8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_le_bytes)
+    };
+    let (Some(floor), Some(queued_before_ms), Some(budget)) = (
+        u64_at(0),
+        u64_at(8),
+        body.get(16..18)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize),
+    ) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    if body.len() != SWEEP_BODY_LEN {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    let mut left = budget.min(SWEEP_BUDGET_MAX);
+    let due = DueAt {
+        floor,
+        before: store.op_revision(),
+        queued_before_ms,
+    };
+    let mut got: Due = [NO_ENTRY; SWEEP_BUDGET_MAX];
+    // Releases: a superseded manifest's root loses its reference.
+    let Some(n) = due_entries(store, kv_chunks::KS_CHUNK_RETIRE, Some(due), left, &mut got) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    for q in &got[..n] {
+        let ok = as_identity(store, q.tenant, q.database, |s| {
+            chunk_queue(s, kv_chunks::KS_CHUNK_RETIRE, q.rev, &q.hash, false, now_ms)
+                && decref_chunk(s, &q.hash, now_ms)
+        });
+        if !ok {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+    }
+    left -= n;
+    // Unreferenced chunks: gone, a node's children released.
+    let Some(n) = due_entries(store, kv_chunks::KS_CHUNK_ZERO, Some(due), left, &mut got) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    for q in &got[..n] {
+        if !as_identity(store, q.tenant, q.database, |s| {
+            remove_chunk(s, q.rev, &q.hash, now_ms)
+        }) {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+    }
+    // What is left: due now (this pass's own queueing included — a later
+    // revision may take it), or waiting.
+    let mut probe: Due = [NO_ENTRY; SWEEP_BUDGET_MAX];
+    let mut any = |store: &mut M, ks: u32, due: Option<DueAt>| {
+        due_entries(store, ks, due, 1, &mut probe).map(|n| n > 0)
+    };
+    let later = Some(DueAt {
+        before: u64::MAX,
+        ..due
+    });
+    let (Some(r_due), Some(z_due), Some(r_any), Some(z_any)) = (
+        any(store, kv_chunks::KS_CHUNK_RETIRE, later),
+        any(store, kv_chunks::KS_CHUNK_ZERO, later),
+        any(store, kv_chunks::KS_CHUNK_RETIRE, None),
+        any(store, kv_chunks::KS_CHUNK_ZERO, None),
+    ) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let Some(o) = out.first_mut() else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    *o = if r_due || z_due { SWEEP_MORE } else { 0 }
+        | if r_any || z_any { SWEEP_WAITING } else { 0 };
+    (KV_RESULT_OK, 1)
+}
+
+/// An unreferenced chunk, queued at `since`, goes: its record and
+/// references, and a node's reference on each child.
+fn remove_chunk<M: Materializer>(
+    store: &mut M,
+    since: u64,
+    h: &kv_chunks::Hash,
+    now_ms: u64,
+) -> bool {
+    let mut chunk = [0u8; kv_chunks::CHUNK_MAX];
+    let len = in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
+        match s.get_live(kv_chunks::hash_key(h), now_ms, &mut chunk) {
+            GetOutcome::Found { value_len, .. } => Some(value_len),
+            _ => None,
+        }
+    });
+    let Some(len) = len else {
+        return false;
+    };
+    let ok = chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, since, h, false, now_ms)
+        && in_chunk_space(store, kv_chunks::KS_CHUNK_REF, |s| {
+            s.remove_meta(kv_chunks::hash_key(h))
+        })
+        && in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
+            s.remove_meta(kv_chunks::hash_key(h))
+        });
+    if !ok {
+        return false;
+    }
+    match kv_chunks::parse_chunk(&chunk[..len]) {
+        Some((kv_chunks::KIND_NODE, payload)) => {
+            kv_chunks::children(payload).all(|c| decref_chunk(store, &c, now_ms))
+        }
+        _ => true,
+    }
+}
+
+/// KV_OP_GET_CHUNK: `[hash:32]`.
+fn apply_get_chunk<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let Some(hash) = body
+        .get(..kv_chunks::HASH_LEN)
+        .filter(|_| body.len() == kv_chunks::HASH_LEN)
+        .and_then(|h| <kv_chunks::Hash>::try_from(h).ok())
+    else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
+        let mut b = [0u8; kv_chunks::CHUNK_MAX];
+        match s.get_live(kv_chunks::hash_key(&hash), now_ms, &mut b) {
+            GetOutcome::Found { value_len: n, .. } if n <= out.len() => {
+                out[..n].copy_from_slice(&b[..n]);
+                (KV_RESULT_OK, n)
+            }
+            GetOutcome::Absent => (KV_RESULT_NOT_FOUND, 0),
+            _ => (KV_RESULT_INTERNAL, 0),
+        }
+    })
 }
 
 fn apply_cas<M: Materializer>(
@@ -3622,13 +5324,19 @@ fn apply_cas<M: Materializer>(
     // witness check sees a fresh world.
     let mut scratch = [0u8; MAX_VALUE_LEN];
     match store.get_live(key_slice, now_ms, &mut scratch) {
-        GetOutcome::Found { meta, .. } => {
+        GetOutcome::Found { meta, value_len } => {
             // Existing record: witness must equal the current mod_revision.
             if meta.mod_revision != witness {
                 return (KV_RESULT_CAS_FAILED, 0);
             }
+            let old_root = manifest_root(&scratch[..value_len], &meta);
             if !store.update_existing(key_slice, value) {
                 return (KV_RESULT_INTERNAL, 0);
+            }
+            if let Some(root) = old_root {
+                if !release_root(store, &root, now_ms) {
+                    return (KV_RESULT_INTERNAL, 0);
+                }
             }
             // CAS doesn't carry an expiry field — preserve the prior deadline.
             if !store.set_expiry(key_slice, meta.expiry_ms) {
@@ -3837,6 +5545,679 @@ fn apply_txn<M: Materializer>(
     (KV_RESULT_TXN, out_off)
 }
 
+/// etcd's span rules: no `end` = the one key (`[key, key‖0)`), `\0` =
+/// unbounded above, else `[start, end)`. The successor is built in `succ`.
+fn etcd_span<'a>(
+    start: &'a [u8],
+    end: &'a [u8],
+    succ: &'a mut [u8; MAX_KEY_LEN + 1],
+) -> Option<(&'a [u8], &'a [u8])> {
+    if end.is_empty() {
+        let n = start.len();
+        if n >= succ.len() {
+            return None;
+        }
+        succ[..n].copy_from_slice(start);
+        succ[n] = 0;
+        Some((start, &succ[..n + 1]))
+    } else if end == [0] {
+        Some((start, &[]))
+    } else {
+        Some((start, end))
+    }
+}
+
+/// [`KV_OP_DELETE_META`]: gather the span's live keys (and, with prev_kv,
+/// values) into the answer, then delete them all and bump the revision
+/// once — one revision for the whole range, as etcd's DeleteRange.
+/// A KVS entry at `out[e..]` (`[klen:2][key][vlen:4][value][meta:32]`,
+/// then `[flags:1]` when `marked`): its key and where it ends.
+fn kvs_entry_at(out: &[u8], e: usize, marked: bool) -> Option<(&[u8], usize)> {
+    let kl = u16::from_le_bytes([*out.get(e)?, *out.get(e + 1)?]) as usize;
+    let key = out.get(e + 2..e + 2 + kl)?;
+    let vl = u32::from_le_bytes(out.get(e + 2 + kl..e + 6 + kl)?.try_into().ok()?) as usize;
+    let end = e + 6 + kl + vl + 32 + usize::from(marked);
+    out.get(..end)?;
+    Some((key, end))
+}
+
+/// Order the `n` KVS entries in `out[from..to]` by key, in place: each
+/// place takes the least of the entries after it, rotated into it.
+/// `false` when the entries are not the shape they claim.
+fn sort_kvs_entries(out: &mut [u8], from: usize, to: usize, n: usize, marked: bool) -> bool {
+    let mut p = from;
+    for _ in 0..n {
+        // The least entry from `p` on.
+        let (mut best, mut best_end) = (p, 0usize);
+        let mut e = p;
+        while e < to {
+            let Some((key, end)) = kvs_entry_at(out, e, marked) else {
+                return false;
+            };
+            let less =
+                best_end == 0 || kvs_entry_at(out, best, marked).is_some_and(|(bk, _)| key < bk);
+            if less {
+                best = e;
+                best_end = end;
+            }
+            e = end;
+        }
+        if best_end == 0 {
+            return false;
+        }
+        // Rotate it to the front of what is left (three reversals: no
+        // panic path, unlike `rotate_right`).
+        let k = best_end - best;
+        let Some(span) = out.get_mut(p..best_end) else {
+            return false;
+        };
+        span.reverse();
+        match span.split_at_mut_checked(k) {
+            Some((head, tail)) => {
+                head.reverse();
+                tail.reverse();
+            }
+            None => return false,
+        }
+        p += k;
+    }
+    p == to
+}
+
+fn apply_delete_meta<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let mut off = 0usize;
+    let (Some(start), Some(end), Some(flags)) = (
+        read_key(body, &mut off),
+        read_key(body, &mut off),
+        read_u8(body, &mut off),
+    ) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let prev_kv = flags & 1 != 0;
+    // As RANGE_META: previous values that are manifests only for a
+    // reader that reads them.
+    let manifests = flags & DELETE_META_FLAG_MANIFESTS != 0;
+    let mut refused = false;
+    let mut succ = [0u8; MAX_KEY_LEN + 1];
+    let Some((start, end)) = etcd_span(start, end, &mut succ) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    if out.len() < 11 {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    let mut at = 11usize;
+    let mut n = 0u64;
+    let mut full = false;
+    let r = store.walk_live_meta(start, end, 0, now_ms, |k, v, m| {
+        if prev_kv && !manifests && m.flags & RECORD_MANIFEST != 0 {
+            refused = true;
+            return false;
+        }
+        if range_meta_put_as(out, &mut at, k, v, m, !prev_kv, manifests) {
+            n += 1;
+            true
+        } else {
+            full = true;
+            false
+        }
+    });
+    if r != KV_RESULT_OK {
+        return (r, 0);
+    }
+    if refused {
+        // Nothing deleted: the gather comes first.
+        return (KV_RESULT_MANIFEST, 0);
+    }
+    if full || n > u64::from(u16::MAX) {
+        return (KV_RESULT_QUOTA, 0);
+    }
+    // In key order, as etcd answers (and so its watchers see the deletes),
+    // whatever order the provider walked in.
+    if !store.walk_sorted() && !sort_kvs_entries(out, 11, at, n as usize, manifests) {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    // Delete what was gathered: the keys are read back from the answer.
+    let mut p = 11usize;
+    let mut deleted = 0u64;
+    for _ in 0..n {
+        let klen = u16::from_le_bytes([out[p], out[p + 1]]) as usize;
+        let mut key = [0u8; MAX_KEY_LEN];
+        key[..klen].copy_from_slice(&out[p + 2..p + 2 + klen]);
+        let vlen_at = p + 2 + klen;
+        let vlen = u32::from_le_bytes([
+            out[vlen_at],
+            out[vlen_at + 1],
+            out[vlen_at + 2],
+            out[vlen_at + 3],
+        ]) as usize;
+        p = vlen_at + 4 + vlen + 32 + usize::from(manifests);
+        match remove_noted(store, &key[..klen], now_ms) {
+            Some(true) => deleted += 1,
+            Some(false) => {}
+            None => return (KV_RESULT_INTERNAL, 0),
+        }
+    }
+    if deleted > 0 {
+        store.bump_revision();
+    }
+    out[0..8].copy_from_slice(&deleted.to_le_bytes());
+    // The KVS `more` byte carries the prev_kv flag here: whether the
+    // entries' values are the deleted values (the answer says what it is).
+    out[8] = u8::from(prev_kv);
+    out[9..11].copy_from_slice(&(n as u16).to_le_bytes());
+    (KV_RESULT_KVS, at)
+}
+
+/// [`KV_OP_LEASE_REVOKE`] (`delete`) / [`KV_OP_LEASE_KEYS`]: the live keys
+/// attached to a lease, gathered into the answer as far as it holds them
+/// (`more` = 1 when some did not fit) and, for a revoke, deleted at one
+/// revision.
+fn apply_lease_keys<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+    delete: bool,
+) -> (u8, usize) {
+    let mut off = 0usize;
+    let Some(lease) = read_u64(body, &mut off) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    if lease == 0 || out.len() < 11 {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    if !delete {
+        // A listing pages in key order from its cursor.
+        let after = read_key(body, &mut off).unwrap_or(&[]);
+        return lease_keys_page(store, lease, after, out, now_ms);
+    }
+    let mut at = 11usize;
+    let mut n = 0u64;
+    let mut more = false;
+    let r = store.walk_live_meta(&[], &[], 0, now_ms, |k, v, m| {
+        if m.lease_id != lease {
+            return true;
+        }
+        if n < u64::from(u16::MAX) && range_meta_put(out, &mut at, k, v, m, true) {
+            n += 1;
+            true
+        } else {
+            more = true;
+            false
+        }
+    });
+    if r != KV_RESULT_OK {
+        return (r, 0);
+    }
+    let mut deleted = 0u64;
+    if delete {
+        let mut p = 11usize;
+        for _ in 0..n {
+            let klen = u16::from_le_bytes([out[p], out[p + 1]]) as usize;
+            let mut key = [0u8; MAX_KEY_LEN];
+            key[..klen].copy_from_slice(&out[p + 2..p + 2 + klen]);
+            // Key-only entries: no value bytes follow the length.
+            p += 2 + klen + 4 + 32;
+            match remove_noted(store, &key[..klen], now_ms) {
+                Some(true) => deleted += 1,
+                Some(false) => {}
+                None => return (KV_RESULT_INTERNAL, 0),
+            }
+        }
+        if deleted > 0 {
+            store.bump_revision();
+        }
+    }
+    out[0..8].copy_from_slice(&(if delete { deleted } else { n }).to_le_bytes());
+    out[8] = u8::from(more);
+    out[9..11].copy_from_slice(&(n as u16).to_le_bytes());
+    (KV_RESULT_KVS, at)
+}
+
+/// [`KV_OP_COMPACT`]: etcd's Compact, refused as etcd refuses it — a
+/// revision already compacted, or one the store has not reached.
+fn apply_compact<M: Materializer>(store: &mut M, body: &[u8]) -> (u8, usize) {
+    let mut off = 0usize;
+    let Some(rev) = read_u64(body, &mut off) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    if rev <= store.compact_revision() {
+        return (KV_RESULT_COMPACTED, 0);
+    }
+    if rev > store.revision() {
+        return (KV_RESULT_FUTURE_REV, 0);
+    }
+    store.set_compact_revision(rev);
+    (KV_RESULT_OK, 0)
+}
+
+/// [`KV_OP_HASH_KV`]: an order-free digest of the live keys at a
+/// revision (each entry hashed alone, the hashes summed), and their size.
+fn apply_hash_kv<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let mut off = 0usize;
+    let Some(rev) = read_u64(body, &mut off) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    if rev > store.revision() {
+        return (KV_RESULT_FUTURE_REV, 0);
+    }
+    if rev != 0 && rev < store.compact_revision() {
+        return (KV_RESULT_COMPACTED, 0);
+    }
+    if out.len() < 36 {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    let (mut sum, mut bytes, mut keys) = (0u64, 0u64, 0u64);
+    let r = store.walk_live_meta(&[], &[], rev, now_ms, |k, v, m| {
+        let mut h = fnv1a64(k) ^ fnv1a64(v).rotate_left(17);
+        for x in [m.create_revision, m.mod_revision, m.version, m.lease_id] {
+            h = (h ^ x).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        sum = sum.wrapping_add(h);
+        bytes += (k.len() + v.len()) as u64;
+        keys += 1;
+        true
+    });
+    if r != KV_RESULT_OK {
+        return (r, 0);
+    }
+    let hash = (sum ^ (sum >> 32)) as u32;
+    let hash_rev = if rev == 0 { store.revision() } else { rev };
+    out[0..4].copy_from_slice(&hash.to_le_bytes());
+    out[4..12].copy_from_slice(&store.compact_revision().to_le_bytes());
+    out[12..20].copy_from_slice(&hash_rev.to_le_bytes());
+    out[20..28].copy_from_slice(&bytes.to_le_bytes());
+    out[28..36].copy_from_slice(&keys.to_le_bytes());
+    (KV_RESULT_OK, 36)
+}
+
+/// One page of [`KV_OP_LEASE_KEYS`]: the lease's keys after `after`, in
+/// ascending key order, as many as the answer holds (`more` = 1 when
+/// keys remain: the caller asks again from the last key it got). A
+/// provider that walks in key order is read once; one that does not
+/// (the memory provider's hash slots) is walked once per key, taking
+/// the least key past the last each time.
+fn lease_keys_page<M: Materializer>(
+    store: &mut M,
+    lease: u64,
+    after: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    let mut at = 11usize;
+    let mut n = 0u64;
+    let mut more = false;
+    let mut last = [0u8; MAX_KEY_LEN];
+    let mut last_len = after.len().min(MAX_KEY_LEN);
+    last[..last_len].copy_from_slice(&after[..last_len]);
+    let mut started = !after.is_empty();
+    let meta_of = |lease_id: u64| RecMeta {
+        create_revision: 0,
+        mod_revision: 0,
+        version: 0,
+        lease_id,
+        expiry_ms: 0,
+        commit_ts: 0,
+        flags: 0,
+    };
+    if store.walk_sorted() {
+        let r = store.walk_live_meta(&[], &[], 0, now_ms, |k, _v, m| {
+            if m.lease_id != lease || (started && k <= &last[..last_len]) {
+                return true;
+            }
+            if n < u64::from(u16::MAX)
+                && range_meta_put(out, &mut at, k, &[], &meta_of(lease), true)
+            {
+                n += 1;
+                true
+            } else {
+                more = true;
+                false
+            }
+        });
+        if r != KV_RESULT_OK {
+            return (r, 0);
+        }
+    } else {
+        loop {
+            let mut best = [0u8; MAX_KEY_LEN];
+            let mut best_len = 0usize;
+            let mut found = false;
+            let r = store.walk_live_meta(&[], &[], 0, now_ms, |k, _v, m| {
+                if m.lease_id != lease
+                    || k.len() > MAX_KEY_LEN
+                    || (started && k <= &last[..last_len])
+                    || (found && k >= &best[..best_len])
+                {
+                    return true;
+                }
+                best[..k.len()].copy_from_slice(k);
+                best_len = k.len();
+                found = true;
+                true
+            });
+            if r != KV_RESULT_OK {
+                return (r, 0);
+            }
+            if !found {
+                break;
+            }
+            if n >= u64::from(u16::MAX)
+                || !range_meta_put(out, &mut at, &best[..best_len], &[], &meta_of(lease), true)
+            {
+                more = true;
+                break;
+            }
+            n += 1;
+            last[..best_len].copy_from_slice(&best[..best_len]);
+            last_len = best_len;
+            started = true;
+        }
+    }
+    out[0..8].copy_from_slice(&n.to_le_bytes());
+    out[8] = u8::from(more);
+    out[9..11].copy_from_slice(&(n as u16).to_le_bytes());
+    (KV_RESULT_KVS, at)
+}
+
+/// One compare of a [`KV_OP_ETCD_TXN`] body, parsed.
+struct EtcdCmp<'a> {
+    target: u8,
+    result: u8,
+    key: &'a [u8],
+    end: &'a [u8],
+    operand: u64,
+    value: &'a [u8],
+}
+
+fn parse_etcd_cmp<'a>(body: &'a [u8], off: &mut usize) -> Option<EtcdCmp<'a>> {
+    let target = read_u8(body, off)?;
+    let result = read_u8(body, off)?;
+    let key = read_key(body, off)?;
+    let end = read_key(body, off)?;
+    let operand = read_u64(body, off)?;
+    let vlen = u32::from_le_bytes(body.get(*off..*off + 4)?.try_into().ok()?) as usize;
+    *off += 4;
+    let value = body.get(*off..*off + vlen)?;
+    *off += vlen;
+    Some(EtcdCmp {
+        target,
+        result,
+        key,
+        end,
+        operand,
+        value,
+    })
+}
+
+/// Whether one key (its value and metadata, or `None` when absent)
+/// satisfies `c`: an absent key is all zeros and fails any value compare.
+fn etcd_cmp_one(c: &EtcdCmp<'_>, kv: Option<(&[u8], &RecMeta)>) -> bool {
+    use core::cmp::Ordering;
+    let ord = match (c.target, kv) {
+        (3, None) => return false,
+        (3, Some((v, _))) => v.cmp(c.value),
+        (t, kv) => {
+            let actual = match (t, kv.map(|(_, m)| *m)) {
+                (_, None) => 0,
+                (0, Some(m)) => m.version,
+                (1, Some(m)) => m.create_revision,
+                (2, Some(m)) => m.mod_revision,
+                (_, Some(m)) => m.lease_id,
+            };
+            actual.cmp(&c.operand)
+        }
+    };
+    match c.result {
+        0 => ord == Ordering::Equal,
+        1 => ord == Ordering::Greater,
+        2 => ord == Ordering::Less,
+        _ => ord != Ordering::Equal,
+    }
+}
+
+/// Whether compare `c` holds over its key or range (every key must; no
+/// key compares as one absent key). `None` on a store fault.
+fn etcd_cmp_holds<M: Materializer>(store: &mut M, c: &EtcdCmp<'_>, now_ms: u64) -> Option<bool> {
+    let mut succ = [0u8; MAX_KEY_LEN + 1];
+    let (start, end) = etcd_span(c.key, c.end, &mut succ)?;
+    let mut seen = false;
+    let mut all = true;
+    // A value compare against a large value reads its chunks, which the
+    // walk cannot while it holds the store: the walk stops at one, the
+    // compare reads it, and the walk resumes after its key.
+    let mut from = [0u8; MAX_KEY_LEN + 1];
+    let mut from_len = start.len();
+    from[..from_len].copy_from_slice(start);
+    loop {
+        let mut large: Option<(kv_chunks::Manifest, usize, [u8; MAX_KEY_LEN])> = None;
+        let r = store.walk_live_meta(&from[..from_len], end, 0, now_ms, |k, v, m| {
+            seen = true;
+            if c.target == 3 && m.flags & RECORD_MANIFEST != 0 {
+                let mut kb = [0u8; MAX_KEY_LEN];
+                kb[..k.len()].copy_from_slice(k);
+                large = kv_chunks::Manifest::parse(v).map(|mf| (mf, k.len(), kb));
+                if large.is_none() {
+                    all = false;
+                }
+                return false;
+            }
+            if !etcd_cmp_one(c, Some((v, m))) {
+                all = false;
+                return false;
+            }
+            true
+        });
+        if r != KV_RESULT_OK {
+            return None;
+        }
+        let Some((mf, kl, kb)) = large else {
+            break;
+        };
+        let ord = cmp_large_value(store, &mf, c.value, now_ms)?;
+        if !etcd_result_holds(c.result, ord) {
+            all = false;
+            break;
+        }
+        // Resume just after the large value's key.
+        from[..kl].copy_from_slice(&kb[..kl]);
+        from[kl] = 0;
+        from_len = kl + 1;
+    }
+    Some(if seen { all } else { etcd_cmp_one(c, None) })
+}
+
+/// Does an etcd compare `result` accept `ord` (the key's against the
+/// operand)?
+fn etcd_result_holds(result: u8, ord: core::cmp::Ordering) -> bool {
+    use core::cmp::Ordering;
+    match result {
+        0 => ord == Ordering::Equal,
+        1 => ord == Ordering::Greater,
+        2 => ord == Ordering::Less,
+        _ => ord != Ordering::Equal,
+    }
+}
+
+/// A large value against `operand`, byte-wise, reading only the leading
+/// chunks a difference (or the operand's end) needs. `None` on a
+/// provider fault or a tree that does not read back.
+fn cmp_large_value<M: Materializer>(
+    store: &mut M,
+    m: &kv_chunks::Manifest,
+    operand: &[u8],
+    now_ms: u64,
+) -> Option<core::cmp::Ordering> {
+    use core::cmp::Ordering;
+    let mut r = kv_chunks::Reader::new(*m);
+    let mut at = 0usize;
+    let mut chunk = [0u8; kv_chunks::CHUNK_MAX];
+    while let Some(h) = r.want() {
+        let n = in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
+            match s.get_live(kv_chunks::hash_key(&h), now_ms, &mut chunk) {
+                GetOutcome::Found { value_len, .. } => Some(value_len),
+                _ => None,
+            }
+        })?;
+        if let kv_chunks::Step::Data(d) = r.take(&chunk[..n])? {
+            let rest = operand.get(at..).unwrap_or(&[]);
+            let k = d.len().min(rest.len());
+            match d[..k].cmp(&rest[..k]) {
+                Ordering::Equal => {}
+                o => return Some(o),
+            }
+            if rest.len() <= d.len() {
+                // The operand ended within (or exactly at the end of)
+                // this chunk; the value is longer than it.
+                return Some(
+                    if (at + d.len()) as u64 == m.total && rest.len() == d.len() {
+                        Ordering::Equal
+                    } else {
+                        Ordering::Greater
+                    },
+                );
+            }
+            at += d.len();
+        }
+    }
+    // The value ended before the operand did.
+    Some(Ordering::Less)
+}
+
+/// The key a Txn write op writes (a Put's, or a single-key DeleteRange's).
+fn etcd_op_key(kind: u8, body: &[u8]) -> Option<&[u8]> {
+    let mut off = 0usize;
+    match kind {
+        types::ETCD_OP_PUT | types::ETCD_OP_PUT_MANIFEST => read_key(body, &mut off),
+        3 => {
+            let key = read_key(body, &mut off)?;
+            let end = read_key(body, &mut off)?;
+            end.is_empty().then_some(key)
+        }
+        _ => None,
+    }
+}
+
+/// `[kind:u8][len:u32 LE]` of the op at `ops[p..]`.
+fn etcd_op_head(ops: &[u8], p: usize) -> Option<(u8, usize)> {
+    let h = ops.get(p..p + 5)?;
+    Some((h[0], u32::from_le_bytes([h[1], h[2], h[3], h[4]]) as usize))
+}
+
+/// [`KV_OP_ETCD_TXN`]: evaluate the compares, then apply the chosen
+/// branch's ops in order, each answering into the reply (a Range after a
+/// Put sees it, as in etcd).
+fn apply_etcd_txn<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+    depth: u8,
+) -> (u8, usize) {
+    if usize::from(depth) > types::ETCD_TXN_DEPTH_MAX || out.len() < 2 {
+        return (KV_RESULT_INTERNAL, 0);
+    }
+    let mut off = 0usize;
+    let Some(ncmp) = read_u8(body, &mut off) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let mut succeeded = true;
+    for _ in 0..ncmp {
+        let Some(c) = parse_etcd_cmp(body, &mut off) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        if succeeded {
+            match etcd_cmp_holds(store, &c, now_ms) {
+                Some(h) => succeeded = h,
+                None => return (KV_RESULT_INTERNAL, 0),
+            }
+        }
+    }
+    // The branches: `then`, then `else`; the chosen one is `[from, to)`.
+    let mut branches = [(0usize, 0usize, 0u8); 2];
+    for b in &mut branches {
+        let Some(n) = read_u8(body, &mut off) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        let from = off;
+        for _ in 0..n {
+            let Some((_, len)) = etcd_op_head(body, off) else {
+                return (KV_RESULT_INTERNAL, 0);
+            };
+            off += 5 + len;
+            if off > body.len() {
+                return (KV_RESULT_INTERNAL, 0);
+            }
+        }
+        *b = (from, off, n);
+    }
+    let (from, to, n) = branches[if succeeded { 0 } else { 1 }];
+    let ops = &body[from..to];
+    // etcd refuses a branch that writes one key twice, before applying.
+    let mut p = 0usize;
+    for i in 0..n {
+        let Some((kind, len)) = etcd_op_head(ops, p) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        let key = etcd_op_key(kind, &ops[p + 5..p + 5 + len]);
+        let mut q = p + 5 + len;
+        if let Some(k) = key {
+            for _ in i + 1..n {
+                let Some((k2, l2)) = etcd_op_head(ops, q) else {
+                    return (KV_RESULT_INTERNAL, 0);
+                };
+                if etcd_op_key(k2, &ops[q + 5..q + 5 + l2]) == Some(k) {
+                    return (KV_RESULT_DUPLICATE, 0);
+                }
+                q += 5 + l2;
+            }
+        }
+        p += 5 + len;
+    }
+    out[0] = u8::from(succeeded);
+    out[1] = n;
+    let mut at = 2usize;
+    let mut p = 0usize;
+    for _ in 0..n {
+        let Some((kind, len)) = etcd_op_head(ops, p) else {
+            return (KV_RESULT_INTERNAL, 0);
+        };
+        let op_body = &ops[p + 5..p + 5 + len];
+        p += 5 + len;
+        if at + 6 > out.len() {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+        let sub = &mut out[at + 6..];
+        let (r, rn) = match kind {
+            1 => apply_range_meta(store, op_body, sub, now_ms),
+            types::ETCD_OP_PUT => apply_put(store, op_body, sub, now_ms, false),
+            types::ETCD_OP_PUT_MANIFEST => apply_put(store, op_body, sub, now_ms, true),
+            3 => apply_delete_meta(store, op_body, sub, now_ms),
+            4 => apply_etcd_txn(store, op_body, sub, now_ms, depth + 1),
+            _ => (KV_RESULT_INTERNAL, 0),
+        };
+        if !matches!(r, KV_RESULT_OK | KV_RESULT_KVS | KV_RESULT_ETCD_TXN) {
+            // An op the store refused ends the transaction with its reason.
+            return (r, 0);
+        }
+        out[at] = kind;
+        out[at + 1] = r;
+        out[at + 2..at + 6].copy_from_slice(&(rn as u32).to_le_bytes());
+        at += 6 + rn;
+    }
+    (KV_RESULT_ETCD_TXN, at)
+}
+
 fn apply_delete<M: Materializer>(
     store: &mut M,
     body: &[u8],
@@ -3853,7 +6234,7 @@ fn apply_delete<M: Materializer>(
         let Some(key) = read_key(body, &mut off) else {
             return (KV_RESULT_INTERNAL, 0);
         };
-        match store.remove(key, now_ms) {
+        match remove_noted(store, key, now_ms) {
             Some(true) => deleted += 1,
             Some(false) => {}
             None => return (KV_RESULT_INTERNAL, 0),
@@ -3970,6 +6351,10 @@ fn apply_concat<M: Materializer>(
     // APPEND/PREPEND start fresh rather than extending a stale value.
     let mut scratch = [0u8; MAX_VALUE_LEN];
     let new_len: usize = match store.get_live(key_slice, now_ms, &mut scratch) {
+        // A large value is not extended byte-wise in place.
+        GetOutcome::Found { meta, .. } if meta.flags & RECORD_MANIFEST != 0 => {
+            return (KV_RESULT_MANIFEST, 0);
+        }
         GetOutcome::Found {
             value_len: existing_len,
             ..
@@ -4044,6 +6429,13 @@ fn apply_strlen<M: Materializer>(
     };
     let mut scratch = [0u8; MAX_VALUE_LEN];
     let len: i64 = match store.get_live(key, now_ms, &mut scratch) {
+        // A large value's length is its manifest's total.
+        GetOutcome::Found { value_len, meta } if meta.flags & RECORD_MANIFEST != 0 => {
+            match kv_chunks::Manifest::parse(&scratch[..value_len]) {
+                Some(m) => m.total as i64,
+                None => return (KV_RESULT_INTERNAL, 0),
+            }
+        }
         GetOutcome::Found { value_len, .. } => value_len as i64,
         GetOutcome::Absent => 0,
         GetOutcome::TooBig | GetOutcome::Fault => return (KV_RESULT_INTERNAL, 0),
@@ -4071,14 +6463,29 @@ fn apply_mget<M: Materializer>(
     let mut out_off = 0;
     out[out_off..out_off + 2].copy_from_slice(&count.to_le_bytes());
     out_off += 2;
+    // The flags byte after the keys: a reader that reads manifests.
+    let mut end = off;
+    for _ in 0..count {
+        if read_key(body, &mut end).is_none() {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+    }
+    let marked = body
+        .get(end)
+        .is_some_and(|f| f & types::MGET_FLAG_MANIFESTS != 0);
     let mut scratch = [0u8; MAX_VALUE_LEN];
     let mut i = 0;
     while i < count {
         let Some(key) = read_key(body, &mut off) else {
             return (KV_RESULT_INTERNAL, 0);
         };
-        match store.get_live(key, now_ms, &mut scratch) {
-            GetOutcome::Found { value_len: n, .. } => {
+        let flags = match store.get_live(key, now_ms, &mut scratch) {
+            // Unmarked, a manifest refuses the whole op rather than being
+            // answered as its bytes.
+            GetOutcome::Found { meta, .. } if meta.flags & RECORD_MANIFEST != 0 && !marked => {
+                return (KV_RESULT_MANIFEST, 0);
+            }
+            GetOutcome::Found { value_len: n, meta } => {
                 if out_off + 4 + n > out.len() {
                     return (KV_RESULT_INTERNAL, 0);
                 }
@@ -4086,6 +6493,7 @@ fn apply_mget<M: Materializer>(
                 out_off += 4;
                 out[out_off..out_off + n].copy_from_slice(&scratch[..n]);
                 out_off += n;
+                meta.flags & RECORD_MANIFEST
             }
             GetOutcome::Absent => {
                 if out_off + 4 > out.len() {
@@ -4093,8 +6501,16 @@ fn apply_mget<M: Materializer>(
                 }
                 out[out_off..out_off + 4].copy_from_slice(&KV_ARRAY_ELEMENT_NULL.to_le_bytes());
                 out_off += 4;
+                0
             }
             GetOutcome::TooBig | GetOutcome::Fault => return (KV_RESULT_INTERNAL, 0),
+        };
+        if marked {
+            let Some(o) = out.get_mut(out_off) else {
+                return (KV_RESULT_INTERNAL, 0);
+            };
+            *o = flags;
+            out_off += 1;
         }
         i += 1;
     }
@@ -4111,6 +6527,39 @@ fn apply_mset<M: Materializer>(
     let Some(count) = read_u16(body, &mut off) else {
         return (KV_RESULT_INTERNAL, 0);
     };
+    // The marks after the pairs: which values are manifests. Each is
+    // checked — its root stored — before any pair is written.
+    let pairs_at = off;
+    let mut end = off;
+    for _ in 0..count {
+        if read_key(body, &mut end).is_none() || read_value(body, &mut end).is_none() {
+            return (KV_RESULT_INTERNAL, 0);
+        }
+    }
+    let marks = match body.get(end..) {
+        Some([]) => None,
+        Some(m) if m.len() == usize::from(count) => Some(m),
+        _ => return (KV_RESULT_INTERNAL, 0),
+    };
+    let marked = |i: u16| marks.is_some_and(|m| m.get(usize::from(i)) == Some(&1));
+    if marks.is_some() {
+        let mut p = pairs_at;
+        for i in 0..count {
+            let (_, Some(value)) = (read_key(body, &mut p), read_value(body, &mut p)) else {
+                return (KV_RESULT_INTERNAL, 0);
+            };
+            if marked(i) {
+                let Some(m) = kv_chunks::Manifest::parse(value) else {
+                    return (KV_RESULT_BAD_CHUNK, 0);
+                };
+                match chunk_stored(store, &m.root, now_ms) {
+                    Some(true) => {}
+                    Some(false) => return (KV_RESULT_MISSING_CHUNK, 0),
+                    None => return (KV_RESULT_INTERNAL, 0),
+                }
+            }
+        }
+    }
     let mut scratch = [0u8; MAX_VALUE_LEN];
     let mut i = 0;
     while i < count {
@@ -4120,21 +6569,39 @@ fn apply_mset<M: Materializer>(
         let Some(value) = read_value(body, &mut off) else {
             return (KV_RESULT_INTERNAL, 0);
         };
+        let manifest = if marked(i) {
+            kv_chunks::Manifest::parse(value)
+        } else {
+            None
+        };
         let mut key_copy = [0u8; MAX_KEY_LEN];
         let kn = key.len().min(MAX_KEY_LEN);
         key_copy[..kn].copy_from_slice(&key[..kn]);
         let key_slice = &key_copy[..kn];
 
-        let exists = match store.get_live(key_slice, now_ms, &mut scratch) {
-            GetOutcome::Found { .. } => true,
-            GetOutcome::Absent => false,
+        let (exists, old_root) = match store.get_live(key_slice, now_ms, &mut scratch) {
+            GetOutcome::Found { value_len, meta } => {
+                (true, manifest_root(&scratch[..value_len], &meta))
+            }
+            GetOutcome::Absent => (false, None),
             GetOutcome::TooBig | GetOutcome::Fault => return (KV_RESULT_INTERNAL, 0),
         };
-        if exists {
-            if !store.update_existing(key_slice, value) {
-                return (KV_RESULT_INTERNAL, 0);
-            }
-        } else if !store.insert_new(key_slice, value) {
+        // Each key its own revision, as before; a released manifest's
+        // bookkeeping in the key's.
+        let ok = batched(store, |s| {
+            let wrote = if exists {
+                s.update_existing(key_slice, value)
+            } else {
+                s.insert_new(key_slice, value)
+            };
+            // A manifest holds its root; the one replaced releases its own.
+            wrote
+                && manifest.is_none_or(|m| {
+                    s.set_flags(key_slice, RECORD_MANIFEST) && incref_chunk(s, &m.root, now_ms)
+                })
+                && old_root.is_none_or(|root| release_root(s, &root, now_ms))
+        });
+        if !ok {
             return (KV_RESULT_INTERNAL, 0);
         }
         // MSET clears TTL — Redis semantics.
@@ -4234,7 +6701,8 @@ pub struct TxnOp<'a> {
     pub body: &'a [u8],
 }
 
-/// Build a `KV_OP_TXN` body. See `modules/common/types.rs §KV_OP_TXN`.
+/// Build a `KV_OP_TXN` body. See `KV_OP_TXN` in
+/// `modules/common/types.rs`.
 pub fn body_put_txn(
     out: &mut [u8],
     cmps: &[TxnCmp<'_>],
@@ -4461,7 +6929,7 @@ pub fn read_result_array(body: &[u8]) -> Option<alloc::vec::Vec<Option<alloc::ve
 #[cfg(test)]
 extern crate alloc;
 
-// ── Cross-range transactions (§13, Phase 5) ────────────────────────────
+// ── Cross-range transactions ───────────────────────────────────────────
 //
 // Two-phase commit built entirely out of ordinary replicated records, so
 // that both state-store providers get it identically and every existing
@@ -4569,14 +7037,14 @@ fn intent_on<M: Materializer>(store: &mut M, key: &[u8], now_ms: u64) -> Option<
     let vlen = read_intent(store, key, now_ms, &mut buf)?;
     let rec = txn::IntentRecord::decode(buf.get(..txn::INTENT_WIRE_LEN)?)?;
 
-    // HELPING (§13.2 step 8). Before reporting the key undecided, try
+    // HELPING. Before reporting the key undecided, try
     // to decide it here. If the home record happens to live in this
     // partition — which is every transaction whose home range is the
     // one being read, and the common case for a reader that arrives
     // after the coordinator died — the authority is a local lookup
     // away, and `resolve_intent` turns it into an answer.
     //
-    // This is helping in the narrow sense the RFC means: the reader
+    // This is helping in the narrow sense: the reader
     // does not DECIDE anything. It reads the record that already
     // decided, and applies it. A record that is still Pending or
     // Staging, or that is not here at all, leaves the intent exactly
@@ -4900,7 +7368,7 @@ fn apply_txn_resolve<M: Materializer>(
 }
 
 /// `KV_OP_TXN_RECORD`: write or advance the home transaction record,
-/// refusing any status move §13.2's lattice forbids.
+/// refusing any status move the status lattice forbids.
 fn apply_txn_record<M: Materializer>(
     store: &mut M,
     body: &[u8],
@@ -4952,7 +7420,7 @@ fn apply_txn_record<M: Materializer>(
     (KV_RESULT_OK, 0)
 }
 
-// ── Exactly-once execution under a caller identity (§14, Phase 9) ─────
+// ── Exactly-once execution under a caller identity ────────────────────
 
 /// Keyspace holding idempotency records, keyed by the caller's identity.
 pub const KS_IDEMPOTENCY: u32 = 0x800A_0001;
@@ -5031,7 +7499,7 @@ fn apply_idempotent<M: Materializer>(
 }
 
 /// `KV_OP_IDEMPOTENT_LOOKUP`: read an idempotency identity WITHOUT running
-/// anything. The rediscovery route §21 owes — a caller that lost its reply
+/// anything. The rediscovery route — a caller that lost its reply
 /// but kept its intent asks whether the mutation committed, and is told
 /// `Committed`/`DidNotHappen`/`Indeterminate` rather than made to re-submit
 /// the whole op to find out. Purely read-only; writes no record.

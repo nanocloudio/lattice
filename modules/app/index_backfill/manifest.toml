@@ -3,7 +3,7 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Online index backfill worker (RFC database foundation §26 Phase 6).
+# Online index backfill worker.
 #
 # Polls the catalog for indexes at SchemaPhase::Backfilling, walks the
 # table's existing rows in bounded pages, writes their index entries

@@ -60,6 +60,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/types.rs"]
 mod types;
 
+#[path = "../../common/kv_large.rs"]
+mod kv_large;
+
 #[path = "../../common/wire.rs"]
 mod wire;
 
@@ -230,10 +233,12 @@ const SLOT_FREE: u16 = 0xFFFF;
 /// completion (the common case) costs O(1) per reply and no arena.
 const RO_DEPTH: usize = 256;
 
-/// Per-slot arena for stashed out-of-order reply bytes (entries that
-/// arrived before the reorder head). Sized for a couple of max replies;
-/// overflow fails the conn closed.
-const RO_ARENA: usize = 8192;
+/// Per-slot arena for stashed reply bytes: entries that arrived before
+/// the reorder head, and ready ones waiting for room in `send_buf`. Holds
+/// every large-value answer that can complete out of order (one per
+/// session, each up to a whole reply) and room for the rest; an answer
+/// that still finds no room is answered BUSY (retryable) in its place.
+const RO_ARENA: usize = RLG_SESSIONS * SEND_BUF_SIZE + 8192;
 
 #[derive(Clone, Copy)]
 struct RoEntry {
@@ -439,7 +444,14 @@ impl Slot {
             return true;
         };
         if !self.ro_stash(idx, reply) {
-            return false;
+            // No room for the answer: its command answered BUSY instead,
+            // which the arena always takes unless full to the byte.
+            self.ro_failed = false;
+            // (A literal here, not a `const` slice: that would be an
+            // absolute pointer a PIC module cannot relocate.)
+            if !self.ro_stash(idx, b"-BUSY reply backlog full, retry\r\n") {
+                return false;
+            }
         }
         self.ro_drain();
         true
@@ -475,14 +487,14 @@ impl Slot {
             }
             let off = self.ro[head].off as usize;
             let len = self.ro[head].len as usize;
-            // Append to send_buf (bounded — drop on overflow keeps the
-            // wire well-formed; the client sees a truncated pipeline and
-            // reconnects, same failure mode as any send_buf overflow).
-            if self.send_len + len <= SEND_BUF_SIZE {
-                self.send_buf[self.send_len..self.send_len + len]
-                    .copy_from_slice(&self.ro_arena[off..off + len]);
-                self.send_len += len;
+            // Into send_buf when it has room; else the reply waits for
+            // the next flush (never dropped: the client counts replies).
+            if self.send_len + len > SEND_BUF_SIZE {
+                break;
             }
+            self.send_buf[self.send_len..self.send_len + len]
+                .copy_from_slice(&self.ro_arena[off..off + len]);
+            self.send_len += len;
             self.ro[head] = RoEntry::empty();
             self.ro_head = ((head + 1) % RO_DEPTH) as u16;
             self.ro_count -= 1;
@@ -503,19 +515,37 @@ impl Slot {
     /// entries so drained bytes are reclaimed even under a conn that
     /// never fully quiesces. O(RO_DEPTH × reply) and bounded.
     fn ro_compact(&mut self) {
-        let mut scratch = [0u8; RO_ARENA];
+        // In place, lowest offset first: each entry moves down, never over
+        // one not yet moved (no arena-sized copy on the stack).
+        let mut moved = [false; RO_DEPTH];
         let mut used = 0usize;
-        for step in 0..self.ro_count as usize {
-            let idx = (self.ro_head as usize + step) % RO_DEPTH;
-            if self.ro[idx].ready {
-                let off = self.ro[idx].off as usize;
-                let len = self.ro[idx].len as usize;
-                scratch[used..used + len].copy_from_slice(&self.ro_arena[off..off + len]);
-                self.ro[idx].off = used as u16;
-                used += len;
+        loop {
+            let mut best: Option<usize> = None;
+            for step in 0..self.ro_count as usize {
+                let idx = (self.ro_head as usize + step) % RO_DEPTH;
+                let e = &self.ro[idx];
+                if e.ready && !moved[idx] && best.is_none_or(|b| e.off < self.ro[b].off) {
+                    best = Some(idx);
+                }
             }
+            let Some(idx) = best else {
+                break;
+            };
+            let off = self.ro[idx].off as usize;
+            let len = self.ro[idx].len as usize;
+            // Forward, byte by byte (`used` <= `off`): `copy_within`'s
+            // panic message is a table a PIC module cannot relocate.
+            for k in 0..len {
+                if let Some(&b) = self.ro_arena.get(off + k) {
+                    if let Some(d) = self.ro_arena.get_mut(used + k) {
+                        *d = b;
+                    }
+                }
+            }
+            self.ro[idx].off = used as u16;
+            moved[idx] = true;
+            used += len;
         }
-        self.ro_arena[..used].copy_from_slice(&scratch[..used]);
         self.ro_used = used as u16;
     }
 }
@@ -643,7 +673,75 @@ struct AnchorState {
 
     slots: [Slot; MAX_CONNS],
     scratch: [u8; SCRATCH_BUF_SIZE],
+    /// Commands carried through the large-value layer, one envelope for
+    /// their exchanges, and a reply waiting for a session.
+    lg: [RLgSlot; RLG_SESSIONS],
+    lg_env: [u8; 3 + wire::KV_REQUEST_PAYLOAD_MAX],
+    /// Answers holding a large value that found every session busy, in
+    /// order (`[head, tail)`), each `[slot:1][conn:2][ro_corr:8][op:1]
+    /// [result:1][len:2][body]`.
+    park: [u8; PARK_BYTES],
+    park_head: usize,
+    park_tail: usize,
+    /// Requests `kv_out` had no room for, in order (`[head, tail)`):
+    /// every request goes behind them, so a large value's chunks and its
+    /// write reach the store in the order the connection sent them.
+    outq: [u8; OUTQ_BYTES],
+    outq_head: usize,
+    outq_tail: usize,
+    /// Cuts a large value into its chunks, as the command is sent.
+    uploader: kv_large::Uploader,
 }
+
+// ── Large values ──────────────────────────────────────────────────────
+
+/// Answers holding a large value expanded at once (GET, MGET, GETSET);
+/// one that finds every session busy is parked.
+const RLG_SESSIONS: usize = 4;
+/// Requests waiting for room on `kv_out`, in bytes: a burst of large
+/// values' chunks.
+const OUTQ_BYTES: usize = 65536;
+/// A command's op body, as `forward_to_router` builds it.
+const RLG_BODY: usize = SCRATCH_BUF_SIZE - 64;
+/// The body marked, and each exchange sent.
+const RLG_WORK: usize = kv_large::mark_room(RLG_BODY);
+/// An answer's body, expanded: what one RESP reply carries.
+const RLG_OUT: usize = SEND_BUF_SIZE;
+/// A session's exchange waiting for room on `kv_out`.
+const LG_UNSENT: u64 = 1;
+/// The conn byte of chunk exchanges: no slot index is this. Content is
+/// immutable, so they take no connection's order and no read fence.
+const LG_CHUNK_CONN: u8 = u8::MAX;
+/// A session that has not finished in this long is abandoned; its reply
+/// is an error.
+const LG_STALL_MS: u64 = 30_000;
+
+struct RLgSlot {
+    session: kv_large::Session,
+    /// The exchange in flight; [`LG_UNSENT`] waiting; 0 = free.
+    corr: u64,
+    slot_idx: usize,
+    conn_id: u16,
+    /// The reorder-ring entry the answer fills.
+    ro_corr: u64,
+    tenant: u32,
+    consistency: u8,
+    since_ms: u64,
+    unsent_op: u8,
+    unsent_len: usize,
+    req_len: usize,
+    req: [u8; RLG_BODY],
+    work: [u8; RLG_WORK],
+    send: [u8; RLG_WORK],
+    out: [u8; RLG_OUT],
+}
+
+/// Answers waiting for a session, in bytes. Replies keep flowing while
+/// they wait (the sessions' own fetches come back on the same channel).
+const PARK_BYTES: usize = 32768;
+/// A parked answer's head: slot, connection, reorder entry, op, result,
+/// body length.
+const PARK_HEAD: usize = 1 + 2 + 8 + 1 + 1 + 2;
 
 impl AnchorState {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -687,6 +785,14 @@ impl AnchorState {
             self.slots[i] = Slot::free();
             i += 1;
         }
+        for l in self.lg.iter_mut() {
+            l.corr = 0;
+            l.session.reset();
+        }
+        self.park_head = 0;
+        self.park_tail = 0;
+        self.outq_head = 0;
+        self.outq_tail = 0;
     }
 
     fn alloc_slot(&mut self, conn_id: u16) -> Option<usize> {
@@ -1700,10 +1806,42 @@ fn forward_to_router(
     };
 
     let corr = anchor.next_corr();
+    // A value too large for one write: its chunks go first, in order, and
+    // the command after them (rewritten to name its manifest).
+    let (op, body_len) = if kv_large::carries_large(op, &body[..body_len]) {
+        match upload_chunks(anchor, slot_idx, op, &mut body, body_len) {
+            Some(r) => r,
+            None => {
+                let s = &mut anchor.slots[slot_idx];
+                let _ = enc_error(
+                    &mut s.send_buf,
+                    &mut s.send_len,
+                    b"BUSY router backpressured",
+                );
+                return Dispatch::Handled;
+            }
+        }
+    } else {
+        (op, body_len)
+    };
     let tenant = anchor.slots[slot_idx].tenant;
 
     // Envelope head: [corr:8][proto:1][tenant:4][conn:1][cons:1][op:1][body_len:2] = 18
     let head_len = 8 + 1 + 4 + 1 + 1 + 1 + 2;
+    // A read that may meet a large value goes marked (an MGET; a SET that
+    // answers the value it replaced): the answer says which values are
+    // manifests, never refusing the whole command.
+    let (body_len, marked) = {
+        let at = 3 + head_len;
+        match anchor
+            .scratch
+            .get_mut(at..)
+            .and_then(|o| kv_large::mark_read(op, &body[..body_len], o))
+        {
+            Some(n) => (n, true),
+            None => (body_len, false),
+        }
+    };
     let payload_len = head_len + body_len;
     if payload_len > u16::MAX as usize {
         let s = &mut anchor.slots[slot_idx];
@@ -1741,15 +1879,17 @@ fn forward_to_router(
     scratch[p] = (body_len & 0xFF) as u8;
     scratch[p + 1] = ((body_len >> 8) & 0xFF) as u8;
     p += 2;
-    scratch[p..p + body_len].copy_from_slice(&body[..body_len]);
+    if !marked {
+        scratch[p..p + body_len].copy_from_slice(&body[..body_len]);
+    }
 
     let sys = anchor.syscalls;
     let kv_out = anchor.kv_out;
     if sys.is_null() {
         return Dispatch::Fatal;
     }
-    let written = unsafe { ((*sys).channel_write)(kv_out, anchor.scratch.as_mut_ptr(), total) };
-    if written != total as i32 {
+    let _ = kv_out;
+    if !kv_write(anchor, Frame::Scratch(total)) {
         let s = &mut anchor.slots[slot_idx];
         let _ = enc_error(
             &mut s.send_buf,
@@ -1832,11 +1972,45 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
         return false;
     }
 
+    // An exchange of a command carried through the large-value layer.
+    if corr != 0 {
+        if let Some(i) = anchor.lg.iter().position(|l| l.corr == corr) {
+            lg_reply(anchor, i, result, body_off, body_len);
+            return true;
+        }
+    }
+
     // The head's conn byte is the SLOT INDEX this anchor stamped on
     // the request (the router echoes it). Validate occupancy — a slot
     // freed while a reply was in flight must not resurrect.
     let slot_idx = conn_id as usize;
     if slot_idx >= MAX_CONNS || anchor.slots[slot_idx].conn_id == SLOT_FREE {
+        return true;
+    }
+
+    // A marked answer (an MGET's; a manifest for a value): unmarked here,
+    // or — holding a large value — expanded through a session.
+    let marked_op = match result {
+        types::KV_RESULT_ARRAY => Some(types::KV_OP_MGET),
+        types::KV_RESULT_MANIFEST if body_len > 0 => Some(types::KV_OP_GET),
+        _ => None,
+    };
+    if let Some(op) = marked_op {
+        let mut out = [0u8; RLG_OUT];
+        let plain = kv_large::unmark(
+            op,
+            &[],
+            result,
+            &anchor.scratch[body_off..body_off + body_len],
+            &mut out,
+        );
+        match plain {
+            Ok(Some((r, n))) => {
+                ro_answer(anchor, slot_idx, corr, r, &out[..n]);
+            }
+            Ok(None) => lg_expand(anchor, slot_idx, corr, op, result, body_off, body_len),
+            Err(_) => ro_answer(anchor, slot_idx, corr, types::KV_RESULT_INTERNAL, &[]),
+        }
         return true;
     }
 
@@ -1865,6 +2039,390 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
         slot.phase = SlotPhase::Closing;
     }
     true
+}
+
+/// Answer the command whose reorder entry is `corr` on `slot_idx`.
+fn ro_answer(anchor: &mut AnchorState, slot_idx: usize, corr: u64, result: u8, body: &[u8]) {
+    let mut reply = [0u8; SEND_BUF_SIZE];
+    let mut reply_len = 0usize;
+    redis_codec::encode_kv_reply(&mut reply, &mut reply_len, result, body);
+    let slot = &mut anchor.slots[slot_idx];
+    if !slot.ro_fill(corr, &reply[..reply_len]) {
+        slot.phase = SlotPhase::Closing;
+    }
+}
+
+/// A request frame to write to `kv_out`: in `scratch`, or in `lg_env`.
+enum Frame {
+    Scratch(usize),
+    Lg(usize),
+}
+
+/// Write a request to `kv_out` behind any already waiting; with no room
+/// it waits in `outq`. `false`: not even `outq` has room.
+fn kv_write(anchor: &mut AnchorState, frame: Frame) -> bool {
+    flush_outq(anchor);
+    let AnchorState {
+        scratch,
+        lg_env,
+        outq,
+        outq_head,
+        outq_tail,
+        syscalls,
+        kv_out,
+        ..
+    } = &mut *anchor;
+    let bytes: &mut [u8] = match frame {
+        Frame::Scratch(n) => &mut scratch[..n],
+        Frame::Lg(n) => &mut lg_env[..n],
+    };
+    if *outq_head == *outq_tail && !syscalls.is_null() && *kv_out >= 0 {
+        let n = bytes.len();
+        if unsafe { ((**syscalls).channel_write)(*kv_out, bytes.as_mut_ptr(), n) } == n as i32 {
+            return true;
+        }
+    }
+    // Behind the others: compact first when the tail has run out.
+    if *outq_tail + bytes.len() > OUTQ_BYTES && *outq_head > 0 {
+        outq.copy_within(*outq_head..*outq_tail, 0);
+        *outq_tail -= *outq_head;
+        *outq_head = 0;
+    }
+    match outq.get_mut(*outq_tail..*outq_tail + bytes.len()) {
+        Some(d) => {
+            d.copy_from_slice(bytes);
+            *outq_tail += bytes.len();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Write waiting requests, in order, while `kv_out` takes them.
+fn flush_outq(anchor: &mut AnchorState) {
+    let (sys, kv_out) = (anchor.syscalls, anchor.kv_out);
+    if sys.is_null() || kv_out < 0 {
+        return;
+    }
+    while anchor.outq_head < anchor.outq_tail {
+        let h = anchor.outq_head;
+        // [msg][len:2][payload]
+        let len = 3 + u16::from_le_bytes([anchor.outq[h + 1], anchor.outq[h + 2]]) as usize;
+        let n = unsafe { ((*sys).channel_write)(kv_out, anchor.outq[h..].as_mut_ptr(), len) };
+        if n != len as i32 {
+            return;
+        }
+        anchor.outq_head += len;
+    }
+    anchor.outq_head = 0;
+    anchor.outq_tail = 0;
+}
+
+/// Send a large value's chunks (the command's op body in `body[..len]`),
+/// then rewrite the body to name its manifest: `(op, length)`. `None`
+/// when `kv_out` and `outq` together had no room — the command is not
+/// sent (chunks already sent are unreferenced, and reclaimed).
+fn upload_chunks(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    op: u8,
+    body: &mut [u8],
+    len: usize,
+) -> Option<(u8, usize)> {
+    const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
+    let tenant = anchor.slots[slot_idx].tenant;
+    if !anchor.uploader.start(op, &body[..len]).ok()? {
+        return Some((op, len));
+    }
+    let mut chunk = [0u8; kv_large::CHUNK_REQUEST_MAX];
+    while let Some(n) = anchor.uploader.next_chunk(&body[..len], &mut chunk).ok()? {
+        // The chunk's reply is not awaited: the command after it, on the
+        // same ordered path, is refused if the chunk did not land.
+        let corr = anchor.next_corr();
+        let payload = REQ_HEAD + n;
+        let total = 3 + payload;
+        let e = &mut anchor.lg_env;
+        e[0] = MSG_KV_REQUEST;
+        e[1..3].copy_from_slice(&(payload as u16).to_le_bytes());
+        e[3..11].copy_from_slice(&corr.to_le_bytes());
+        e[11] = PROTO_REDIS;
+        e[12..16].copy_from_slice(&tenant.to_le_bytes());
+        e[16] = LG_CHUNK_CONN;
+        e[17] = types::REQ_SERIALIZABLE;
+        e[18] = kv_large::UPLOAD_OP;
+        e[19..21].copy_from_slice(&(n as u16).to_le_bytes());
+        e[21..total].copy_from_slice(&chunk[..n]);
+        if !kv_write(anchor, Frame::Lg(total)) {
+            return None;
+        }
+    }
+    let mut rewritten = [0u8; RLG_BODY];
+    let (op, n) = anchor.uploader.rewrite(&body[..len], &mut rewritten).ok()?;
+    body.get_mut(..n)?.copy_from_slice(&rewritten[..n]);
+    Some((op, n))
+}
+
+/// `lg_expand`'s `off` for an answer replayed from the park (in
+/// `scratch[0..]`): it takes a free session even with others parked.
+const PARK_REPLAY: usize = usize::MAX;
+
+/// Park an answer (at `scratch[off..off + len]`) until a session frees.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parked answer: each argument is one of its head fields"
+)]
+fn park(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    conn_id: u16,
+    ro_corr: u64,
+    op: u8,
+    result: u8,
+    off: usize,
+    len: usize,
+) -> bool {
+    let need = PARK_HEAD + len;
+    let AnchorState {
+        park,
+        park_head,
+        park_tail,
+        scratch,
+        ..
+    } = &mut *anchor;
+    if *park_tail + need > PARK_BYTES && *park_head > 0 {
+        park.copy_within(*park_head..*park_tail, 0);
+        *park_tail -= *park_head;
+        *park_head = 0;
+    }
+    let (Some(d), Some(body)) = (
+        park.get_mut(*park_tail..*park_tail + need),
+        scratch.get(off..off + len),
+    ) else {
+        return false;
+    };
+    d[0] = slot_idx as u8;
+    d[1..3].copy_from_slice(&conn_id.to_le_bytes());
+    d[3..11].copy_from_slice(&ro_corr.to_le_bytes());
+    d[11] = op;
+    d[12] = result;
+    d[13..15].copy_from_slice(&(len as u16).to_le_bytes());
+    d[PARK_HEAD..].copy_from_slice(body);
+    *park_tail += need;
+    true
+}
+
+/// Expand an answer holding a large value (at `scratch[off..off + len]`)
+/// through a session; with none free, park it.
+fn lg_expand(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    ro_corr: u64,
+    op: u8,
+    result: u8,
+    off: usize,
+    len: usize,
+) {
+    let conn_id = anchor.slots[slot_idx].conn_id;
+    // Behind answers already waiting, or with no session free: parked.
+    let free = anchor.lg.iter().position(|l| l.corr == 0);
+    let Some(i) = free.filter(|_| anchor.park_head == anchor.park_tail || off == PARK_REPLAY)
+    else {
+        if !park(anchor, slot_idx, conn_id, ro_corr, op, result, off, len) {
+            let mut reply = [0u8; 64];
+            let mut n = 0usize;
+            let _ = enc_error(&mut reply, &mut n, b"BUSY large values backlogged, retry");
+            if !anchor.slots[slot_idx].ro_fill(ro_corr, &reply[..n]) {
+                anchor.slots[slot_idx].phase = SlotPhase::Closing;
+            }
+        }
+        return;
+    };
+    let off = if off == PARK_REPLAY { 0 } else { off };
+    let now = unsafe { dev_millis(&*anchor.syscalls) };
+    let tenant = anchor.slots[slot_idx].tenant;
+    let act = {
+        let AnchorState { lg, scratch, .. } = &mut *anchor;
+        let l = &mut lg[i];
+        l.slot_idx = slot_idx;
+        l.conn_id = conn_id;
+        l.ro_corr = ro_corr;
+        l.tenant = tenant;
+        l.consistency = types::REQ_SERIALIZABLE;
+        l.since_ms = now;
+        l.req_len = 0;
+        l.corr = LG_UNSENT;
+        let reply = scratch.get(off..off + len).unwrap_or(&[]);
+        let RLgSlot {
+            session, send, out, ..
+        } = l;
+        session.expand(op, &[], result, reply, send, out)
+    };
+    lg_act(anchor, i, act, None);
+}
+
+/// Carry out what session `i` asks: its next exchange, or its answer.
+/// `as_is`: the reply that ended it, at `scratch[off..off + len]`.
+fn lg_act(
+    anchor: &mut AnchorState,
+    i: usize,
+    act: Result<kv_large::Act, kv_large::LargeError>,
+    as_is: Option<(u8, usize, usize)>,
+) {
+    match act {
+        Ok(kv_large::Act::Send(op, n)) => lg_send(anchor, i, op, n),
+        Ok(kv_large::Act::Done(result, n)) => {
+            let mut out = [0u8; RLG_OUT];
+            let n = n.min(RLG_OUT);
+            out[..n].copy_from_slice(&anchor.lg[i].out[..n]);
+            lg_finish(anchor, i, result, &out[..n]);
+        }
+        Ok(kv_large::Act::AsIs) => {
+            let Some((result, off, len)) = as_is else {
+                lg_finish(anchor, i, types::KV_RESULT_INTERNAL, &[]);
+                return;
+            };
+            let mut out = [0u8; RLG_OUT];
+            let n = len.min(RLG_OUT);
+            out[..n].copy_from_slice(&anchor.scratch[off..off + n]);
+            lg_finish(anchor, i, result, &out[..n]);
+        }
+        Err(kv_large::LargeError::Overflow) => {
+            lg_finish(anchor, i, types::KV_RESULT_TOO_LARGE, &[])
+        }
+        Err(_) => lg_finish(anchor, i, types::KV_RESULT_INTERNAL, &[]),
+    }
+}
+
+/// Send session `i`'s exchange (`op`, its `send[..n]`); with no room on
+/// `kv_out` it waits for [`lg_step`].
+fn lg_send(anchor: &mut AnchorState, i: usize, op: u8, n: usize) {
+    const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
+    let corr = anchor.next_corr();
+    let chunk = op == kv_large::UPLOAD_OP || op == kv_large::FETCH_OP;
+    let (conn, consistency) = if chunk {
+        (LG_CHUNK_CONN, types::REQ_SERIALIZABLE)
+    } else {
+        (anchor.lg[i].slot_idx as u8, anchor.lg[i].consistency)
+    };
+    let payload = REQ_HEAD + n;
+    let total = 3 + payload;
+    let tenant = anchor.lg[i].tenant;
+    let sent = {
+        let AnchorState { lg, lg_env, .. } = &mut *anchor;
+        match (lg[i].send.get(..n), total <= lg_env.len()) {
+            (Some(body), true) => {
+                lg_env[0] = MSG_KV_REQUEST;
+                lg_env[1..3].copy_from_slice(&(payload as u16).to_le_bytes());
+                lg_env[3..11].copy_from_slice(&corr.to_le_bytes());
+                lg_env[11] = PROTO_REDIS;
+                lg_env[12..16].copy_from_slice(&tenant.to_le_bytes());
+                lg_env[16] = conn;
+                lg_env[17] = consistency;
+                lg_env[18] = op;
+                lg_env[19..21].copy_from_slice(&(n as u16).to_le_bytes());
+                lg_env[21..total].copy_from_slice(body);
+                true
+            }
+            _ => false,
+        }
+    };
+    if !sent {
+        lg_finish(anchor, i, types::KV_RESULT_TOO_LARGE, &[]);
+        return;
+    }
+    let written = kv_write(anchor, Frame::Lg(total));
+    let l = &mut anchor.lg[i];
+    if written {
+        l.corr = corr;
+    } else {
+        l.corr = LG_UNSENT;
+        l.unsent_op = op;
+        l.unsent_len = n;
+    }
+}
+
+/// A reply to session `i`'s exchange, at `scratch[off..off + len]`.
+fn lg_reply(anchor: &mut AnchorState, i: usize, result: u8, off: usize, len: usize) {
+    let act = {
+        let AnchorState { lg, scratch, .. } = &mut *anchor;
+        let body = scratch.get(off..off + len).unwrap_or(&[]);
+        let RLgSlot {
+            session,
+            req,
+            req_len,
+            work,
+            send,
+            out,
+            ..
+        } = &mut lg[i];
+        session.reply(&req[..*req_len], work, result, body, send, out)
+    };
+    lg_act(anchor, i, act, Some((result, off, len)));
+}
+
+/// Answer session `i`'s command and free the session. A connection gone
+/// meanwhile is answered by no one.
+fn lg_finish(anchor: &mut AnchorState, i: usize, result: u8, body: &[u8]) {
+    let (slot_idx, conn_id, ro_corr) = (
+        anchor.lg[i].slot_idx,
+        anchor.lg[i].conn_id,
+        anchor.lg[i].ro_corr,
+    );
+    anchor.lg[i].corr = 0;
+    anchor.lg[i].session.reset();
+    if anchor.slots[slot_idx].conn_id == conn_id {
+        ro_answer(anchor, slot_idx, ro_corr, result, body);
+    }
+}
+
+/// Each step: resend exchanges that found no room, abandon ones that
+/// never came back, give a freed session to a parked answer, then to a
+/// connection waiting for one.
+fn lg_step(anchor: &mut AnchorState) {
+    flush_outq(anchor);
+    if anchor.lg.iter().any(|l| l.corr != 0) {
+        let now = unsafe { dev_millis(&*anchor.syscalls) };
+        for i in 0..RLG_SESSIONS {
+            let l = &anchor.lg[i];
+            if l.corr == 0 {
+                continue;
+            }
+            if now.saturating_sub(l.since_ms) > LG_STALL_MS {
+                lg_finish(anchor, i, types::KV_RESULT_INTERNAL, &[]);
+            } else if l.corr == LG_UNSENT {
+                let (op, n) = (l.unsent_op, l.unsent_len);
+                lg_send(anchor, i, op, n);
+            }
+        }
+    }
+    // Parked answers, in order, into the sessions free.
+    while anchor.park_head < anchor.park_tail && anchor.lg.iter().any(|l| l.corr == 0) {
+        let h = anchor.park_head;
+        let p = &anchor.park[h..];
+        let slot_idx = p[0] as usize;
+        let conn_id = u16::from_le_bytes([p[1], p[2]]);
+        let ro_corr = u64::from_le_bytes(p[3..11].try_into().unwrap_or([0; 8]));
+        let (op, result) = (p[11], p[12]);
+        let len = u16::from_le_bytes([p[13], p[14]]) as usize;
+        anchor.park_head += PARK_HEAD + len;
+        if anchor.slots[slot_idx].conn_id != conn_id {
+            continue;
+        }
+        // Through the scratch the reply path reads answers from.
+        let AnchorState { park, scratch, .. } = &mut *anchor;
+        let (Some(dst), Some(src)) = (
+            scratch.get_mut(..len),
+            park.get(h + PARK_HEAD..h + PARK_HEAD + len),
+        ) else {
+            continue;
+        };
+        dst.copy_from_slice(src);
+        lg_expand(anchor, slot_idx, ro_corr, op, result, PARK_REPLAY, len);
+    }
+    if anchor.park_head == anchor.park_tail {
+        anchor.park_head = 0;
+        anchor.park_tail = 0;
+    }
 }
 
 // ── NET-side handling ─────────────────────────────────────────────────
@@ -2168,15 +2726,23 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
             i += 1;
             continue;
         }
-        if send_len > 0 {
+        // Send, then release replies waiting for room, while each round
+        // sends something.
+        let mut rounds = 0;
+        while anchor.slots[i].send_len > 0 && rounds < 4 {
+            let send_len = anchor.slots[i].send_len;
             // Copy out so net_send_data_pic can use anchor.scratch
             // without aliasing slot.send_buf.
             let mut tmp = [0u8; SEND_BUF_SIZE];
             tmp[..send_len].copy_from_slice(&anchor.slots[i].send_buf[..send_len]);
-            if net_send_data_pic(anchor, conn_id, &tmp[..send_len]) {
-                anchor.slots[i].send_len = 0;
+            if !net_send_data_pic(anchor, conn_id, &tmp[..send_len]) {
+                break;
             }
+            anchor.slots[i].send_len = 0;
+            anchor.slots[i].ro_drain();
+            rounds += 1;
         }
+        let _ = send_len;
         if phase == SlotPhase::Closing && anchor.slots[i].send_len == 0 {
             let _ = net_send_close_pic(anchor, conn_id);
             anchor.free_slot(i);
@@ -2288,6 +2854,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let m_ps1 = poll_pubsub_worker(anchor, 1);
         let m_rel = poll_relocate_in(anchor);
         ps_step(anchor);
+        lg_step(anchor);
         let m_ps = m_ps0 || m_ps1 || m_rel;
         ro_stall_sweep(anchor);
         flush_slots(anchor);
@@ -2332,7 +2899,9 @@ unsafe fn ro_stall_sweep(anchor: &mut AnchorState) {
         if slot.conn_id == SLOT_FREE || slot.phase == SlotPhase::Closing {
             continue;
         }
-        if slot.ro_count == 0 {
+        // Nothing pending, or a ready head waiting only for the network
+        // to take its bytes: not a stall.
+        if slot.ro_count == 0 || slot.ro[slot.ro_head as usize].ready {
             slot.ro_stall = 0;
             continue;
         }

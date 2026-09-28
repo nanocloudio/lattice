@@ -1,39 +1,40 @@
-//! Database-operation contracts — RFC database foundation §14.4, §15,
-//! §17.2, §18, §23.
+//! Database-operation contracts.
 //!
-//! Phase 6 slice 1: the four record families and rule sets that every
-//! Phase-6 worker (index maintainer, change-feed publisher, backup
-//! coordinator, compaction coordinator) composes over. This file is
-//! contracts only — no ports, no I/O, no clocks, no module. It stands
-//! in the same relationship to the Phase-6 modules that `txn.rs` does
-//! to the transaction coordinator and `range_lifecycle.rs` does to the
-//! range supervisor.
+//! The four record families and rule sets that every
+//! database-operation worker (index maintainer, change-feed publisher,
+//! backup coordinator, compaction coordinator) composes over. This
+//! file is contracts only — no ports, no I/O, no clocks, no module. It
+//! stands in the same relationship to those workers' modules that
+//! `txn.rs` does to the transaction coordinator and
+//! `range_lifecycle.rs` does to the range supervisor.
 //!
-//! ## 1. Secondary index encoding (§14, §14.4)
+//! ## 1. Secondary index encoding
 //!
-//! > Secondary indexes are ordinary ordered keyspaces with an encoding
-//! > such as `index_key | primary_key -> stored index payload`.
+//! Secondary indexes are ordinary ordered keyspaces with an encoding
+//! such as `index_key | primary_key -> stored index payload`.
 //!
 //! The whole point of putting the primary key *inside* the index key is
 //! that a prefix scan of one index value yields that value's primary
 //! keys, in primary-key order, with no secondary filter. That only
 //! works if the index-value component is **prefix-unambiguous**: index
-//! value `"a"` must not sweep up entries for `"ab"`. §9.1 already
-//! solved that problem for user keys, so this file reuses the exact
+//! value `"a"` must not sweep up entries for `"ab"`. The key-escape
+//! discipline already solves that problem for user keys, so this file
+//! reuses the exact
 //! same escape discipline ([`internal_key::KEY_ESCAPE`] /
 //! [`internal_key::KEY_TERMINATOR`]) one level down, inside the user
 //! key, and then hands the result to `internal_key` as an ordinary user
 //! key. See [`index_prefix_for`] for the layout and the bleed proof.
 //!
-//! Unique indexes get [`UniqueOwnership`]: the "intent or ownership
-//! record that detects conflicting primary keys" §14 asks for.
-//! Derived indexes get [`IndexFreshness`], which makes §21 invariant 19
+//! Unique indexes get [`UniqueOwnership`]: the intent-or-ownership
+//! record that detects conflicting primary keys.
+//! Derived indexes get [`IndexFreshness`], which makes the
+//! index-freshness rule
 //! executable — an index cannot claim a freshness or exactness it has
 //! not reached.
 //!
-//! ## 2. Change-feed cursors (§15)
+//! ## 2. Change-feed cursors
 //!
-//! [`FeedCursor`] carries exactly §15's resume-token field list:
+//! [`FeedCursor`] carries exactly the resume-token field list:
 //! database, partition-map identity, range identity **and generation**,
 //! timestamp/revision, and format version.
 //!
@@ -45,7 +46,7 @@
 //!   has no way to detect that. Losing the feed loudly is strictly
 //!   better than a gap it cannot see.
 //! - A cursor whose range generation changed is
-//!   [`Resumability::NeedsRefresh`], because §15's split/merge topology
+//!   [`Resumability::NeedsRefresh`], because a split/merge topology
 //!   transition replaces **one cursor with a cursor set**.
 //!   [`successor_cursors`] computes that replacement — the children of
 //!   a split tile the parent's key span exactly, and the survivor of a
@@ -53,10 +54,11 @@
 //!   transition "without gaps or duplicates beyond its declared
 //!   delivery contract".
 //!
-//! ## 3. Backup manifest and state machine (§17.2)
+//! ## 3. Backup manifest and state machine
 //!
-//! [`BackupManifest`] is §17.1's manifest shape adapted from one range
-//! to a whole database, and [`BackupPhase`] is §17.2's numbered list
+//! [`BackupManifest`] is the per-range snapshot-manifest shape adapted
+//! to a whole database, and [`BackupPhase`] is the backup procedure's
+//! numbered steps
 //! made into a lattice. The two rules the machine exists to enforce:
 //!
 //! - **Step 5**: a backup becomes `complete` **only** when every
@@ -72,16 +74,17 @@
 //!   explicitly aborted one — see [`BackupManifest::recovery`] — and
 //!   never a released protected timestamp with an incomplete backup.
 //!
-//! Restore ([`validate_restore`]) enforces §17.2's closing sentence:
+//! Restore ([`validate_restore`]) enforces the closing rule:
 //! every artifact is validated before publication, and a live
 //! incarnation is never overwritten in place.
 //!
-//! ## 4. Retention claims (§18)
+//! ## 4. Retention claims
 //!
-//! [`effective_floor`] is the pure claim arithmetic §18 describes: the
+//! [`effective_floor`] is the GC-floor contract's pure claim
+//! arithmetic: the
 //! effective floor is bounded by the **oldest** requirement across
-//! every claim source, and "missing or stale claim sources block unsafe
-//! advancement". That last clause is §21 invariant 13 and it is why
+//! every claim source, and missing or stale claim sources block unsafe
+//! advancement. That last clause is why
 //! this function returns `Result`: an unreported source is not "no
 //! claims", it is *unknown*, and unknown blocks.
 //!
@@ -119,13 +122,13 @@ pub use range_lifecycle::{
     SplitPhase, TargetPlacement, MAX_KEY_BOUND_LEN, MAX_RANGES, MAX_REPLICAS,
 };
 
-/// Logical MVCC timestamp (§10). A plain `u64` everywhere in the
-/// contracts; named here because the §18 arithmetic reads better in
-/// terms of it.
+/// Logical MVCC timestamp. A plain `u64` everywhere in the
+/// contracts; named here because the retention-floor arithmetic reads
+/// better in terms of it.
 pub type Timestamp = u64;
 
 // ══════════════════════════════════════════════════════════════════════
-// 1. Secondary index encoding (§14, §14.4)
+// 1. Secondary index encoding
 // ══════════════════════════════════════════════════════════════════════
 
 /// Version of the index-key composite layout. Bump on ANY layout
@@ -147,8 +150,8 @@ pub const MAX_PRIMARY_KEY_LEN: usize = MAX_KEY_BOUND_LEN;
 
 /// Width of the index identifier inside the composite key, bytes.
 /// A fixed-width big-endian `u32`, so it is trivially order-preserving
-/// and prefix-unambiguous — the same reasoning §9.1 applies to the
-/// tenant/database/keyspace triple.
+/// and prefix-unambiguous — the same reasoning the internal-key
+/// encoding applies to the tenant/database/keyspace triple.
 pub const INDEX_ID_LEN: usize = 4;
 
 /// Worst-case length of the composite *user key* handed to
@@ -270,7 +273,7 @@ fn build_composite(
     term_into(out, n)
 }
 
-/// One secondary-index entry, in the §14 form
+/// One secondary-index entry, in the form
 /// `index_key | primary_key -> payload`.
 ///
 /// The record itself is never serialized as a blob: it *is* a key, and
@@ -281,7 +284,7 @@ fn build_composite(
 pub struct IndexEntry {
     pub tenant: u32,
     pub database: u32,
-    /// The reserved `relational/index/...` keyspace (§14.4). Index
+    /// The reserved `relational/index/...` keyspace. Index
     /// entries live in their own keyspace, not the table's.
     pub keyspace: u32,
     /// Catalog-assigned index identity.
@@ -292,7 +295,7 @@ pub struct IndexEntry {
     primary_key_len: u16,
     /// MVCC timestamp of the index mutation. The primary row and its
     /// synchronous index entries share one transaction, so they share
-    /// one commit timestamp (§14).
+    /// one commit timestamp.
     pub mvcc_timestamp: Timestamp,
     pub value_kind: ValueKind,
 }
@@ -316,7 +319,7 @@ impl IndexEntry {
     /// row and could never be dereferenced.
     #[allow(
         clippy::too_many_arguments,
-        reason = "contract constructor mirrors the §14 record shape one-to-one"
+        reason = "contract constructor mirrors the index record shape one-to-one"
     )]
     pub fn new(
         tenant: u32,
@@ -481,7 +484,7 @@ pub fn decode_index_entry(
 /// escaped payload except as the first byte of `0x00 0xFF`, and the
 /// terminator `0x00 0x01` sorts strictly below it, so an index value
 /// is a byte prefix of another value's encoding only when the two
-/// values are equal. This is §9.1's prefix-ambiguity rule applied one
+/// values are equal. This is the key prefix-ambiguity rule applied one
 /// level down, and it is why the composite escapes its components
 /// rather than length-prefixing them (a length prefix would sort short
 /// values before long ones by *length*, breaking the ordered scan the
@@ -634,10 +637,10 @@ pub fn index_user_key_primary(body: &[u8], pk_out: &mut [u8]) -> Option<(u32, us
     None // ran out before the closing terminator
 }
 
-// ── Unique-index ownership (§14) ──────────────────────────────────────
+// ── Unique-index ownership ────────────────────────────────────────────
 
-/// The §14 "intent or ownership record that detects conflicting primary
-/// keys" for a unique index.
+/// The intent-or-ownership record that detects conflicting primary
+/// keys for a unique index.
 ///
 /// One record per `(index_id, index_value)`. The primary key it names
 /// is the value's owner; any other primary key attempting to claim the
@@ -662,8 +665,7 @@ pub struct UniqueOwnership {
     owning_primary_key_len: u16,
     /// The transaction epoch that installed this ownership. A claim
     /// presented at an older epoch is a delayed message from a
-    /// superseded attempt and cannot mutate current state (§21
-    /// invariant 6).
+    /// superseded attempt and cannot mutate current state.
     pub txn_epoch: u64,
 }
 
@@ -805,8 +807,8 @@ pub enum UniqueOutcome {
     /// No record exists for this slot: the candidate may take it.
     Vacant,
     /// The stored record already names this primary key. Re-asserting
-    /// ownership is idempotent — §21 invariant 17's "every remote
-    /// mutation is idempotently identifiable" applies to index
+    /// ownership is idempotent — the rule that every remote
+    /// mutation is idempotently identifiable applies to index
     /// maintenance too.
     OwnedBySelf,
     /// A different primary key owns the value. The candidate
@@ -816,7 +818,7 @@ pub enum UniqueOutcome {
     Conflict,
     /// The candidate presents an epoch older than the stored record: a
     /// delayed message from a superseded attempt. Refused rather than
-    /// applied (§21 invariant 6).
+    /// applied.
     StaleEpoch { current: u64, presented: u64 },
     /// The two records describe different `(index_id, index_value)`
     /// slots. The caller compared the wrong pair; there is no safe
@@ -824,7 +826,7 @@ pub enum UniqueOutcome {
     SlotMismatch,
 }
 
-/// The §14 unique-index conflict check.
+/// The unique-index conflict check.
 ///
 /// Ordering of the clauses is the contract: slot identity first (a
 /// mismatched comparison is a caller bug and must not read as
@@ -855,18 +857,18 @@ pub fn check_unique_ownership(
     }
 }
 
-// ── Index freshness (§14, §21 invariant 19) ───────────────────────────
+// ── Index freshness ───────────────────────────────────────────────────
 
 /// How exact an index's contents are relative to its source.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexExactness {
     /// Maintained inside the writing transaction: exact at every
-    /// committed timestamp of the source (§14).
+    /// committed timestamp of the source.
     Synchronous = 1,
     /// Maintained asynchronously: exact only up to
     /// [`IndexFreshness::source_timestamp`], and it must advertise its
-    /// lag (§14).
+    /// lag.
     Derived = 2,
 }
 
@@ -880,9 +882,9 @@ impl IndexExactness {
     }
 }
 
-/// §21 invariant 19 as a record: "every derived index reports its
-/// source revision/timestamp and generation; it cannot silently claim
-/// freshness or exactness it has not achieved."
+/// The index-freshness rule as a record: every derived index reports
+/// its source revision/timestamp and generation; it cannot silently
+/// claim freshness or exactness it has not achieved.
 ///
 /// Wire layout ([`INDEX_FRESHNESS_VERSION`] 1, integers LE):
 ///
@@ -900,14 +902,14 @@ pub struct IndexFreshness {
     pub source_revision: u64,
     /// MVCC timestamp the index is exact as of.
     pub source_timestamp: Timestamp,
-    /// Descriptor generation the index was built against (§11.3): an
+    /// Descriptor generation the index was built against: an
     /// index built before a topology change cannot answer for the
     /// span after it.
     pub range_generation: u32,
     pub exactness: IndexExactness,
     /// Advertised lag, milliseconds. Observability only — decisions use
-    /// `source_timestamp` (§21 invariant 3 forbids local time from
-    /// affecting logical outcome).
+    /// `source_timestamp` (local time must never affect a logical
+    /// outcome).
     pub lag_ms: u64,
 }
 
@@ -961,8 +963,8 @@ pub enum FreshnessError {
     /// The index was built against a different descriptor generation.
     GenerationMismatch { current: u32, index: u32 },
     /// The index has not consumed the source through the required
-    /// timestamp. §14: "asynchronous derived indexes ... cannot satisfy
-    /// a freshness contract they have not reached."
+    /// timestamp. Asynchronous derived indexes cannot satisfy
+    /// a freshness contract they have not reached.
     BehindRequiredTimestamp {
         required: Timestamp,
         reached: Timestamp,
@@ -970,7 +972,7 @@ pub enum FreshnessError {
     /// A synchronous index advertising nonzero lag is self-
     /// contradictory: synchronous maintenance happens inside the
     /// writing transaction, so there is nothing to lag behind. Refused
-    /// rather than believed (§21 invariant 19).
+    /// rather than believed.
     SynchronousClaimsLag { lag_ms: u64 },
 }
 
@@ -1001,7 +1003,7 @@ pub fn index_satisfies_freshness(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 2. Change-feed cursors (§15)
+// 2. Change-feed cursors
 // ══════════════════════════════════════════════════════════════════════
 
 /// Version of the [`FeedCursor`] resume-token wire encoding. Bump on
@@ -1009,19 +1011,20 @@ pub fn index_satisfies_freshness(
 pub const FEED_CURSOR_VERSION: u16 = 1;
 
 /// Version of the change-feed **event** stream format the cursor was
-/// issued against. Carried inside the token (§15's "format version")
+/// issued against. Carried inside the token
 /// and separate from [`FEED_CURSOR_VERSION`]: the token layout and the
 /// event layout evolve independently, and a consumer holding a token
 /// for an event format this build no longer emits cannot be resumed.
 pub const FEED_EVENT_FORMAT_VERSION: u16 = 1;
 
 /// Maximum successors one topology transition can produce. Two,
-/// because a split produces two children and no §12 operation produces
+/// because a split produces two children and no lifecycle operation
+/// produces
 /// more. This is a format bound; widening it (an N-way split) is a
 /// version bump.
 pub const MAX_SUCCESSOR_CURSORS: usize = 2;
 
-/// A change-feed resume token (§15).
+/// A change-feed resume token.
 ///
 /// > A resume token includes database, partition-map identity, range
 /// > identity and generation, timestamp/revision, and format version.
@@ -1037,10 +1040,11 @@ pub const MAX_SUCCESSOR_CURSORS: usize = 2;
 /// ```
 ///
 /// `revision` is the range's apply-order position and `timestamp` is
-/// the MVCC timestamp of the last delivered event: §15 orders per-range
-/// events "by MVCC timestamp and range apply order", so a resume point
+/// the MVCC timestamp of the last delivered event: per-range events
+/// are ordered by MVCC timestamp and range apply order, so a resume
+/// point
 /// needs both. Retention decisions use `timestamp`, because the MVCC
-/// GC floor is a timestamp (§18).
+/// GC floor is a timestamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeedCursor {
     pub database_id: u32,
@@ -1125,7 +1129,7 @@ impl FeedCursor {
 /// from the same timestamp/revision, so no event is skipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshReason {
-    /// §15's topology transition: the range generation moved, so this
+    /// A topology transition: the range generation moved, so this
     /// one cursor is replaced by a cursor SET.
     RangeGenerationChanged { current: u32, cursor: u32 },
     /// The descriptor exists but is no longer serving — the range was
@@ -1140,7 +1144,7 @@ pub enum RefreshReason {
 /// that is a gap the consumer cannot detect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedFailure {
-    /// §18: the history this cursor needs has been reclaimed. The
+    /// The history this cursor needs has been reclaimed. The
     /// single most important fail-closed rule in this section.
     BelowRetentionFloor { floor: Timestamp, cursor: Timestamp },
     /// The token was issued against an event format this build no
@@ -1168,7 +1172,7 @@ pub enum Resumability {
     Unrecoverable(FeedFailure),
 }
 
-/// Classify a resume attempt (§15, §18).
+/// Classify a resume attempt.
 ///
 /// `retention_floor` is the MVCC GC safe timestamp for the cursor's
 /// range: history strictly below it may already have been reclaimed.
@@ -1254,7 +1258,7 @@ impl SuccessorCursor {
 }
 
 /// The bounded set of cursors that replaces one cursor across a
-/// topology transition (§15).
+/// topology transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorSet {
     count: usize,
@@ -1291,7 +1295,7 @@ impl CursorSet {
     /// Do the successors tile a single contiguous span with no gap and
     /// no overlap, and does that span contain `[start, end)`?
     ///
-    /// This is the executable form of §15's "without gaps or
+    /// This is the executable form of "without gaps or
     /// duplicates": a gap would mean events for some key are delivered
     /// to no successor, and an overlap would mean they are delivered to
     /// two. [`successor_cursors`] refuses to return a set that fails
@@ -1302,7 +1306,8 @@ impl CursorSet {
         }
         let items = self.items();
         // Contiguity: each successor starts exactly where the previous
-        // one ended. Bounds are the half-open USER-key bounds of §11.
+        // one ended. Bounds are the partition map's half-open
+        // USER-key bounds.
         for i in 1..items.len() {
             let prev = &items[i - 1].descriptor;
             let cur = &items[i].descriptor;
@@ -1338,21 +1343,22 @@ pub enum FeedError {
     CursorNotAffected,
     /// The merge target named by the operation is not in the map.
     MergeTargetNotInMap,
-    /// The operation is not a legal §12 operation over this map. The
+    /// The operation is not a legal lifecycle operation over this
+    /// map. The
     /// wrapped error comes from `range_lifecycle`'s locked validators.
     Lifecycle(LifecycleError),
     /// The successor set could not be constructed within
     /// [`MAX_SUCCESSOR_CURSORS`].
     SuccessorCapacity,
     /// The computed successors do not cover the cursor's span with no
-    /// gap and no overlap. Refused rather than returned (§15).
+    /// gap and no overlap. Refused rather than returned.
     SuccessorSpanIncomplete,
     /// A successor descriptor could not be constructed (an oversized
     /// bound or a bad replica set inherited from the source).
     SuccessorMalformed,
 }
 
-/// The cursor set that replaces `cursor` when `op` publishes (§15).
+/// The cursor set that replaces `cursor` when `op` publishes.
 ///
 /// - **Split**: the one cursor becomes **two**, one per child, each
 ///   positioned at the parent's `revision`/`timestamp` and carrying the
@@ -1366,15 +1372,15 @@ pub enum FeedError {
 ///   of the split case: two cursors collapse to one, and the consumer
 ///   deduplicates the overlap according to its declared delivery
 ///   contract.
-/// - **Relocate**: §12.3 changes replicas, not bounds, so the cursor is
+/// - **Relocate**: it changes replicas, not bounds, so the cursor is
 ///   replaced by **one** cursor on the same range at the new generation
 ///   and binding. The span is unchanged.
 ///
 /// The replacement cursors deliberately keep the parent's `revision`
 /// and `timestamp`. That is what makes the crossing gapless: the
 /// consumer resumes each successor at exactly the point it stopped, and
-/// re-delivery of events at that boundary is the "duplicates within its
-/// declared delivery contract" §15 permits.
+/// re-delivery of events at that boundary is the duplicates-within-
+/// the-declared-delivery-contract case the feed permits.
 ///
 /// `map` is the **pre-operation** published map. It is read, never
 /// copied — building the post-operation map is `range_lifecycle`'s job
@@ -1525,7 +1531,7 @@ fn successor(cursor: &FeedCursor, descriptor: RangeDescriptor) -> SuccessorCurso
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 3. Backup manifest and state machine (§17.2, §23)
+// 3. Backup manifest and state machine
 // ══════════════════════════════════════════════════════════════════════
 
 /// Version of the [`BackupManifest`] wire encoding. Bump on ANY layout
@@ -1546,7 +1552,7 @@ pub const BACKUP_ARTIFACT_FORMAT_VERSION: u16 = 1;
 /// [`BACKUP_MANIFEST_MAX_WIRE_LEN`].
 pub const MAX_BACKUP_RANGES: usize = range_lifecycle::MAX_RANGES;
 
-/// Digest width, bytes. SHA-256, matching §17.1's `sha256:` manifest
+/// Digest width, bytes. SHA-256, matching the manifest's `sha256:`
 /// fields.
 pub const DIGEST_LEN: usize = 32;
 
@@ -1554,9 +1560,9 @@ pub const DIGEST_LEN: usize = 32;
 /// carrying it has not been exported, whatever its state byte claims.
 pub const DIGEST_ABSENT: [u8; DIGEST_LEN] = [0; DIGEST_LEN];
 
-/// §23: "encryption at rest is applied below the engine with key
+/// Encryption at rest is applied below the engine with key
 /// identity in manifests; rotation is an observable, resumable
-/// operation."
+/// operation.
 ///
 /// The manifest records which key wrapped the artifacts, at which
 /// version, under which rotation epoch — so a restore can prove the
@@ -1572,7 +1578,7 @@ pub struct EncryptionKeyIdentity {
     /// next version.
     pub key_version: u32,
     /// Rotation epoch the artifacts were written under. Observability
-    /// and fencing (§21 invariant 11).
+    /// and fencing.
     pub rotation_epoch: u32,
 }
 
@@ -1591,8 +1597,8 @@ impl EncryptionKeyIdentity {
     }
 }
 
-/// §23 key-rotation phases. Rotation is "observable and resumable", so
-/// it is a durable lattice like every other Phase-6 operation.
+/// Key-rotation phases. Rotation is observable and resumable, so
+/// it is a durable lattice like every other database operation.
 ///
 /// ```text
 /// Announced     new key version minted and published to the fleet
@@ -1660,11 +1666,11 @@ pub fn rotation_transition(from: RotationPhase, to: RotationPhase) -> Result<(),
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RangeExportState {
-    /// Discovered in the descriptor set (§17.2 step 2) but not yet
+    /// Discovered in the descriptor set (backup step 2) but not yet
     /// exported. Digest and size are meaningless in this state.
     Required = 1,
     /// Exported at the protected timestamp with a recorded digest and
-    /// byte size (§17.2 steps 3-4).
+    /// byte size (backup steps 3-4).
     Exported = 2,
 }
 
@@ -1678,8 +1684,8 @@ impl RangeExportState {
     }
 }
 
-/// One range's entry in a backup manifest — §17.1's `files:` list
-/// lifted to database granularity.
+/// One range's entry in a backup manifest — the snapshot manifest's
+/// `files:` list lifted to database granularity.
 ///
 /// Wire layout (integers LE):
 /// `[range_id:16][range_generation:u32][state:u8][digest:32][byte_size:u64]`
@@ -1707,15 +1713,15 @@ impl RangeBackupEntry {
     };
 
     /// A range entry counts as present only when it is `Exported`
-    /// **and** carries a non-absent digest. §17.2 step 5 says "every
-    /// required range **and digest**"; a state byte alone is not
+    /// **and** carries a non-absent digest. Completeness means every
+    /// required range **and digest**; a state byte alone is not
     /// evidence.
     pub fn is_present(&self) -> bool {
         self.state == RangeExportState::Exported && self.digest != DIGEST_ABSENT
     }
 }
 
-/// §17.2's numbered steps as a phase lattice.
+/// The backup procedure's numbered steps as a phase lattice.
 ///
 /// ```text
 /// ProtectedTimestampAcquired  1. protected timestamp acquired
@@ -1787,14 +1793,16 @@ pub enum BackupError {
     /// A transition outside the legal lattice, including any
     /// transition out of a terminal phase.
     IllegalTransition { from: BackupPhase, to: BackupPhase },
-    /// §17.2 step 5: completeness was claimed while some range is still
+    /// Backup step 5: completeness was claimed while some range is
+    /// still
     /// `Required` or carries an absent digest. `index` names the first
     /// offender.
     RangeNotPresent { index: usize },
     /// A backup with no ranges cannot be complete — an empty descriptor
     /// set means discovery never ran.
     NoRangesDiscovered,
-    /// §17.2 step 6: protection release was attempted before the final
+    /// Backup step 6: protection release was attempted before the
+    /// final
     /// manifest was durable and without an explicit abort.
     ProtectionReleasedEarly { phase: BackupPhase },
     /// A manifest whose `complete` flag disagrees with its phase or its
@@ -1809,7 +1817,7 @@ pub enum BackupError {
     RangeNotDiscovered,
     /// An export was recorded with the reserved absent digest.
     DigestAbsent,
-    /// An illegal §23 key-rotation transition.
+    /// An illegal key-rotation transition.
     IllegalRotationTransition {
         from: RotationPhase,
         to: RotationPhase,
@@ -1829,8 +1837,8 @@ pub enum BackupRecovery {
     Finished,
 }
 
-/// The durable record of one database backup (§17.2), shaped after
-/// §17.1's per-range snapshot manifest.
+/// The durable record of one database backup, shaped after
+/// the per-range snapshot manifest.
 ///
 /// Wire layout ([`BACKUP_MANIFEST_VERSION`] 1, all integers LE):
 ///
@@ -1852,7 +1860,7 @@ pub enum BackupRecovery {
 /// [`check_invariants`](BackupManifest::check_invariants), so a
 /// manifest that survived a crash mid-write and *claims* completeness
 /// without its digests cannot be read back as a valid manifest. That
-/// is the durable half of §17.2 step 5.
+/// is the durable half of backup step 5.
 ///
 /// Not `Copy`: at [`MAX_BACKUP_RANGES`] = 64 entries the record is
 /// several kilobytes, and an implicit copy on every use would be a
@@ -1862,16 +1870,16 @@ pub struct BackupManifest {
     /// Globally unique backup identity. All-zero is rejected.
     pub backup_id: [u8; 16],
     pub database_id: u32,
-    /// §17.2 step 1: the timestamp protection is held at. Every range
+    /// Backup step 1: the timestamp protection is held at. Every range
     /// is exported at exactly this timestamp.
     pub protected_timestamp: Timestamp,
-    /// §17.2 step 2: the metadata revision at which the complete
+    /// Backup step 2: the metadata revision at which the complete
     /// descriptor set was discovered. A restore that cannot reproduce
     /// this revision is restoring a different descriptor set.
     pub metadata_revision: u64,
     /// Format of the exported artifacts (not of this manifest).
     pub artifact_format_version: u16,
-    /// §23: which key wrapped the artifacts.
+    /// Which key wrapped the artifacts.
     pub key: EncryptionKeyIdentity,
     phase: BackupPhase,
     complete: bool,
@@ -1901,7 +1909,7 @@ impl BackupManifest {
         entries: [RangeBackupEntry::EMPTY; MAX_BACKUP_RANGES],
     };
 
-    /// §17.2 step 1: begin a backup by recording the protected
+    /// Backup step 1: begin a backup by recording the protected
     /// timestamp it holds. Fails closed on a null backup id.
     pub fn begin(
         backup_id: [u8; 16],
@@ -1924,7 +1932,7 @@ impl BackupManifest {
         self.phase
     }
 
-    /// §17.2 step 5's flag. Never settable by a caller: it is a
+    /// Backup step 5's flag. Never settable by a caller: it is a
     /// consequence of reaching [`BackupPhase::AllRangesPresent`].
     pub fn is_complete(&self) -> bool {
         self.complete
@@ -1934,7 +1942,7 @@ impl BackupManifest {
         &self.entries[..self.entry_count as usize]
     }
 
-    /// §17.2 step 2: record one discovered range. Refuses duplicates
+    /// Backup step 2: record one discovered range. Refuses duplicates
     /// and refuses once the manifest is past discovery — the
     /// descriptor set is fixed at one metadata revision, so it cannot
     /// grow after export starts.
@@ -1966,7 +1974,7 @@ impl BackupManifest {
         Ok(())
     }
 
-    /// §17.2 steps 3-4: record one range's export. Refuses a reserved
+    /// Backup steps 3-4: record one range's export. Refuses a reserved
     /// absent digest and refuses a range that was never discovered.
     pub fn record_export(
         &mut self,
@@ -1993,7 +2001,7 @@ impl BackupManifest {
         Ok(())
     }
 
-    /// Index of the first entry that is not present (§17.2 step 5).
+    /// Index of the first entry that is not present (backup step 5).
     pub fn first_missing(&self) -> Option<usize> {
         self.entries().iter().position(|e| !e.is_present())
     }
@@ -2002,7 +2010,7 @@ impl BackupManifest {
         self.entries().iter().position(|e| &e.range_id == range_id)
     }
 
-    /// Drive the §17.2 machine.
+    /// Drive the backup machine.
     ///
     /// Legal edges, and the guards that are the point of the whole
     /// section:
@@ -2012,7 +2020,7 @@ impl BackupManifest {
     /// DescriptorSetDiscovered    → RangesExporting
     /// RangesExporting            → AllRangesPresent          (EVERY range present — sets `complete`)
     /// AllRangesPresent           → ManifestDurable
-    /// ManifestDurable            → ProtectionReleased        (§17.2 step 6)
+    /// ManifestDurable            → ProtectionReleased        (step 6)
     /// {1,2,3,4,5}                → Aborted                   (step 6's explicit alternative)
     /// ```
     ///
@@ -2061,7 +2069,7 @@ impl BackupManifest {
                 }
             }
             BackupPhase::AllRangesPresent => {
-                // §17.2 step 5, the whole rule in three lines.
+                // Backup step 5, the whole rule in three lines.
                 if self.entry_count == 0 {
                     return Err(BackupError::NoRangesDiscovered);
                 }
@@ -2076,7 +2084,7 @@ impl BackupManifest {
         Ok(())
     }
 
-    /// §17.2 step 6 as a predicate: protection may be released only
+    /// Backup step 6 as a predicate: protection may be released only
     /// after the final manifest is durable, or after an explicit abort.
     pub fn may_release_protection(&self) -> bool {
         matches!(
@@ -2128,7 +2136,7 @@ impl BackupManifest {
     /// 2. a phase that implies completeness must carry `complete`;
     /// 3. a phase that does not imply completeness must not carry it.
     ///
-    /// Rule 1 is the durable form of §17.2 step 5. Rules 2 and 3 make
+    /// Rule 1 is the durable form of backup step 5. Rules 2 and 3 make
     /// the flag and the phase inseparable, so a torn write cannot
     /// produce a manifest that reads as complete.
     pub fn check_invariants(&self) -> Result<(), BackupError> {
@@ -2292,11 +2300,11 @@ impl BackupManifest {
     }
 }
 
-// ── Restore (§17.2) ───────────────────────────────────────────────────
+// ── Restore ───────────────────────────────────────────────────────────
 
 /// One artifact the restore target has fetched and authenticated
-/// **before** publication (§17.2: "validates all artifacts before
-/// publication").
+/// **before** publication (all artifacts are validated before
+/// publication).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedArtifact {
     pub range_id: [u8; 16],
@@ -2322,7 +2330,7 @@ pub struct RestoreTarget {
     /// The key the target currently holds.
     pub key: EncryptionKeyIdentity,
     /// Oldest key version in the lineage whose material is still
-    /// retained. §23's rotation is resumable and observable, so a
+    /// retained. Rotation is resumable and observable, so a
     /// restore under a retired key version must fail closed rather
     /// than discover it cannot decrypt after publication.
     pub oldest_retained_key_version: u32,
@@ -2392,7 +2400,7 @@ impl RestoreTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestoreError {
     /// The manifest does not claim completeness. An incomplete backup
-    /// is not a restorable artifact set (§17.2 step 5).
+    /// is not a restorable artifact set (backup step 5).
     ManifestNotComplete { phase: BackupPhase },
     /// The manifest names ranges but claims none, or vice versa.
     EmptyManifest,
@@ -2403,13 +2411,13 @@ pub enum RestoreError {
     /// The manifest was wrapped under a different key lineage.
     KeyLineageMismatch,
     /// The manifest's key version is outside the target's retained
-    /// window: the material needed to unwrap it is gone (§23).
+    /// window: the material needed to unwrap it is gone.
     KeyVersionRetired {
         manifest: u32,
         oldest_retained: u32,
         current: u32,
     },
-    /// §17.2: restore "never overwrites a live incarnation in place".
+    /// Restore never overwrites a live incarnation in place.
     /// `index` names the manifest entry whose range is live in the
     /// target.
     LiveIncarnationPresent { index: usize },
@@ -2424,7 +2432,7 @@ pub enum RestoreError {
     DigestAbsent { index: usize },
 }
 
-/// §17.2's restore preconditions, all of them, fail-closed.
+/// The restore preconditions, all of them, fail-closed.
 ///
 /// > Restore creates new range incarnations and validates all artifacts
 /// > before publication. It never overwrites a live incarnation in
@@ -2491,19 +2499,19 @@ pub fn validate_restore(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 4. Retention claims (§18, §21 invariant 13)
+// 4. Retention claims
 // ══════════════════════════════════════════════════════════════════════
 
 /// Version of the [`RetentionClaim`] wire encoding. Bump on ANY layout
 /// change; decoders fail closed on an unknown version.
 pub const RETENTION_CLAIM_VERSION: u16 = 1;
 
-/// Maximum claims considered in one floor computation. Bounded because
-/// §21 invariant 14 forbids unbounded allocation; a coordinator with
+/// Maximum claims considered in one floor computation. Bounded
+/// because unbounded allocation is forbidden; a coordinator with
 /// more claims than this must aggregate per source before calling.
 pub const MAX_RETENTION_CLAIMS: usize = 64;
 
-/// Number of distinct claim sources — §18's bullet list, one per line.
+/// Number of distinct claim sources — one per source kind below.
 pub const CLAIM_SOURCE_COUNT: usize = 8;
 
 /// An expiry of zero means "never expires". A legal hold with a wall-
@@ -2511,7 +2519,7 @@ pub const CLAIM_SOURCE_COUNT: usize = 8;
 /// common case, and zero is the encoding of it.
 pub const NEVER_EXPIRES: u64 = 0;
 
-/// §18's claim sources, in the order the RFC lists them.
+/// The claim sources, in their canonical order.
 ///
 /// Discriminants start at 1 so a zeroed buffer never decodes as a
 /// source.
@@ -2568,8 +2576,8 @@ impl ClaimSource {
     }
 }
 
-/// One retention claim (§18): "the compaction coordinator collects
-/// signed/source-fenced claims".
+/// One retention claim: the compaction coordinator collects
+/// signed, source-fenced claims.
 ///
 /// Wire layout ([`RETENTION_CLAIM_VERSION`] 1, all integers LE):
 ///
@@ -2586,7 +2594,7 @@ impl ClaimSource {
 /// `expires_unix_ms` is wall time and is the ONLY wall-clock input in
 /// this file. It is never read from a local clock here: `now` is a
 /// parameter of [`effective_floor`], so the arithmetic is deterministic
-/// and replayable (§21 invariant 3).
+/// and replayable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionClaim {
     /// Unique claim identity. All-zero is rejected.
@@ -2601,8 +2609,8 @@ pub struct RetentionClaim {
     /// Wall-clock expiry, or [`NEVER_EXPIRES`].
     pub expires_unix_ms: u64,
     /// The source's fence/epoch at the time the claim was issued
-    /// (§21 invariant 11: "a storage fence is valid only with the
-    /// correct source identity and epoch").
+    /// (a storage fence is valid only with the
+    /// correct source identity and epoch).
     pub source_epoch: u64,
 }
 
@@ -2698,7 +2706,7 @@ impl SourceState {
     };
 }
 
-/// The per-source collection state §18's coordinator assembles before
+/// The per-source collection state the coordinator assembles before
 /// computing a candidate floor.
 ///
 /// Not persisted — it is the coordinator's in-flight view — so it has
@@ -2743,12 +2751,12 @@ impl Default for SourceRegistry {
     }
 }
 
-/// Every way the floor computation refuses to advance. §18: "missing or
-/// stale claim sources block unsafe advancement" — so each of these is
+/// Every way the floor computation refuses to advance. Missing or
+/// stale claim sources block unsafe advancement — so each of these is
 /// a refusal, never a smaller floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloorError {
-    /// A required source did not report. §21 invariant 13.
+    /// A required source did not report. Silence blocks.
     SourceMissing { source: ClaimSource },
     /// A source reported at an epoch other than its current one: its
     /// claim set may predate a fence and cannot be trusted.
@@ -2762,7 +2770,7 @@ pub enum FloorError {
     /// bound anything.
     ClaimFromUnreportedSource { index: usize, source: ClaimSource },
     /// A claim carries an epoch other than its source's current one:
-    /// an unfenced claim (§21 invariant 11).
+    /// an unfenced claim.
     ClaimEpochStale {
         index: usize,
         source: ClaimSource,
@@ -2771,12 +2779,12 @@ pub enum FloorError {
     },
     /// A claim with a null identity — a zeroed buffer read as a claim.
     ClaimIdentityNull { index: usize },
-    /// More claims than [`MAX_RETENTION_CLAIMS`] (§21 invariant 14:
+    /// More claims than [`MAX_RETENTION_CLAIMS`] (a
     /// bounded refusal, not unbounded work).
     TooManyClaims { count: usize },
 }
 
-/// §18's floor arithmetic: **the effective floor is bounded by the
+/// The floor arithmetic: **the effective floor is bounded by the
 /// oldest requirement.**
 ///
 /// ```text
@@ -2798,9 +2806,9 @@ pub enum FloorError {
 /// physical reclamation that follows it.
 ///
 /// The returned floor is `<= candidate` and `<=` every live claim's
-/// protected timestamp, which is the executable form of §21 invariant
-/// 13 ("watch and backup retention cannot be advanced past an active
-/// protected claim").
+/// protected timestamp, which is the executable form of the rule
+/// that watch and backup retention cannot be advanced past an active
+/// protected claim.
 pub fn effective_floor(
     claims: &[RetentionClaim],
     registry: &SourceRegistry,
@@ -2813,7 +2821,7 @@ pub fn effective_floor(
         });
     }
     // Guard 1 and 2: source coverage and source freshness. Checked in
-    // §18's listed order so a refusal is reproducible.
+    // the sources' canonical order so a refusal is reproducible.
     for source in ClaimSource::ALL {
         let s = registry.state(source);
         if s.required && !s.reported {

@@ -1,9 +1,8 @@
-//! pg_edge_anchor — PostgreSQL v3 wire connector (RFC database
-//! foundation §14.3).
+//! pg_edge_anchor — PostgreSQL v3 wire connector.
 //!
 //! ## What this module owns
 //!
-//! Exactly what §14.3 assigns a connector: the wire handshake,
+//! Exactly a connector's concerns: the wire handshake,
 //! authentication negotiation, the simple query flow, session variables,
 //! the dialect surface, error mapping, and RESULT ENCODING. Everything
 //! about how PostgreSQL specifically spells things lives here.
@@ -11,8 +10,9 @@
 //! ## What it must not own
 //!
 //! Parsing, binding, catalogs of record, table formats, transaction
-//! management, persistence. §14.3 forbids connector-specific versions of
-//! all of those, and the reason is concrete rather than architectural
+//! management, persistence. Connector-specific versions of
+//! all of those are forbidden, and the reason is concrete rather than
+//! architectural
 //! tidiness: if this module parsed SQL, it and the MySQL connector would
 //! eventually disagree about what `INSERT INTO t VALUES (1)` means for a
 //! two-column table, and nothing would surface the disagreement until
@@ -36,7 +36,8 @@
 //! ignored. A driver that sends them is using a prepared statement with
 //! parameters, and the executor has no parameter binding: pretending to
 //! prepare and then executing something else would be the silent
-//! approximation §14.3 forbids. `psql` uses the simple query path for
+//! forbidden silent approximation. `psql` uses the simple query path
+//! for
 //! typed input, so the interactive path works; a parameterised driver
 //! gets a clear "feature not supported" instead of a wrong answer.
 
@@ -508,7 +509,7 @@ fn feed_ready(anchor: &mut AnchorState, idx: usize) -> usize {
         // half-implemented: a driver sending these is using parameters,
         // and the executor has no parameter binding. Pretending to
         // prepare and then executing something else is exactly the
-        // silent approximation §14.3 forbids.
+        // forbidden silent approximation.
         pg::F_PARSE | pg::F_BIND | pg::F_DESCRIBE | pg::F_EXECUTE | pg::F_CLOSE => {
             send_error(anchor, idx, sql_exec::ERR_UNSUPPORTED);
         }

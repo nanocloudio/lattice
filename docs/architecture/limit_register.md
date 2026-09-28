@@ -15,17 +15,33 @@ Every checkable row's `Symbol` must exist in its `Source` as a `const` whose
 value matches `Value`. `—` marks a derived or typed constant which still
 requires review but is not checked by the simple integer-value guard.
 
+## Profiles
+
+A module built two ways declares some bounds per build; a machine-checked row
+for such a constant names the build it describes. `bounded` is a module's
+default build, every buffer inline in its state; `big` is the variant of
+`document_executor_big`, whose whole-document buffers are one heap arena sized
+at load. A row with no profile holds for every build.
+
+```limit-register-profiles
+bounded | not(feature = "big")
+big     | feature = "big"
+```
+
 ## Core state and storage
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
 | In-memory keys per store | Capacity | `MAX_KEYS` | modules/common/kv_store.rs | 1024 | Rejects a new key; updates to existing keys remain possible. This bounds both raw-memory mode and each replicated memory-state worker. |
-| In-memory physical-key slot | Shape | `MAX_KEY_LEN` | modules/common/kv_store.rs | 256 | The store prepends a 12-byte tenant/database/keyspace identity, so the effective user-key ceiling is 244 bytes. A longer composed key is rejected. |
+| Document id key | Semantic | `MAX_DOCUMENT_ID_KEY` | modules/common/models.rs | 1024 | A policy: MongoDB's historical index-key limit; Kubernetes' longest object id (namespace + name) is about a third of it. A longer id is refused before a key is built. |
+| In-memory physical-key slot | Shape | `MAX_KEY_LEN` | modules/common/kv_store.rs | 2584 | Derived: the 12-byte identity, a keyspace, and the longest model key (a document index entry at `MAX_DOCUMENT_ID_KEY`, worst-case escaped); a contract test holds it to the derivation. A longer composed key is rejected; what one replicated write carries is the consensus entry's bound. |
 | In-memory value bytes | Shape | `MAX_VALUE_LEN` | modules/common/kv_store.rs | 4096 | Rejects the operation. |
 | State-worker scratch | Capacity | `SCRATCH_BUF_SIZE` | modules/app/kv_state_worker/mod.rs | 8192 | Rejects an over-budget frame or memory snapshot export; the WAL remains authoritative. |
 | App-snapshot body | Shape | `SNAPSHOT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as 8164 bytes (`SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`); this binds before Clustor's 16384-byte snapshot body. |
+| Worker answer body | Shape | `RESULT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as `SCRATCH_BUF_SIZE` less the `MSG_KV_APPLIED` envelope (8151 bytes): the store answers into exactly what can be sent, so no answer is ever built that would go unsent. |
 | Snapshot chunk | Pacing | `SNAPSHOT_CHUNK_MAX` | modules/app/kv_state_worker/mod.rs | 4096 | Streams another chunk; does not cap total disk-state size. |
-| Encoded disk key | Shape | `MAX_ENCODED_KEY` | modules/common/disk_store.rs | 544 | Rejects keys whose escaped/on-disk representation cannot fit. |
+| Disk provider user key | Shape | `MAX_USER_KEY` | modules/common/disk_store.rs | 2584 | Equal to `kv_store::MAX_KEY_LEN` (a contract test holds them together). |
+| Encoded disk key | Shape | `MAX_ENCODED_KEY` | modules/common/disk_store.rs | — | Derived: `internal_key::encoded_max_len(MAX_USER_KEY)`. Rejects keys whose escaped/on-disk representation cannot fit. |
 | Disk value record | Shape | `MAX_VALUE_LEN` | modules/common/disk_store.rs | — | Derived as 4150 bytes to include metadata around the 4096-byte public value. |
 | Memtable entries | Capacity | `MEMTABLE_MAX_ENTRIES` | modules/common/disk_store.rs | 512 | Backpressures mutation while flush catches up. |
 | Memtable flush watermark | Pacing | `MEMTABLE_FLUSH_WATERMARK` | modules/common/disk_store.rs | 384 | Starts flush early; not a refusal ceiling. |
@@ -34,11 +50,14 @@ requires review but is not checked by the simple integer-value guard.
 | Parked version-scan page | Capacity | `SCAN_PAGE_MAX` | modules/common/disk_store.rs | 8192 | The reply prefix kept across a pause. The engine caps every page at this budget, so a park can never be refused; the cap therefore bounds one command's reply, not a refusal path. |
 | Version-scan entry shrink | Shape | `VERSIONS_TRANSCODE_SLACK` | modules/common/kv_store.rs | 6 | The least a reply entry is smaller than its raw record; the engine sizes each store request by it, so a record the store hands over always fits the page (an overflow record is stashed against the held ordinal, so the cursor never runs ahead of the caller). |
 | Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held; the request times out upstream and is re-issued. Only `KV_OP_SCAN_VERSIONS` pauses, and its frame is bounded well under this. |
+| Command-log answer room | Shape | `CLOG_OUT_MAX` | modules/app/kv_state_worker/mod.rs | 65536 | The largest answer room an op is applied with (a store-provider call's); a logged op replays with the room it first had, capped here. |
+| Imported host-log record | Shape | `IMPORT_RECORD_MAX` | modules/app/kv_state_worker/mod.rs | 3149824 | One record of a fluxor host `store.log` being imported (`kv_state_worker_store`): the largest object (3 MiB) and its key. A larger record stops the import and quarantines the store rather than skip it. |
 | Immutable runs | Capacity | `MAX_RUNS` | modules/common/disk_store.rs | 16 | Backpressures until compaction frees a run slot. |
 | Manifest files | Capacity | `MAX_MANIFEST_FILES` | modules/common/disk_store.rs | 8 | Bounds retained manifest generations; rotation/reclamation must keep pace. |
-| Runs returned by listing | Capacity | `MAX_LISTED_RUNS` | modules/common/disk_store.rs | 64 | Rejects/flags an inventory that cannot be represented; never silently truncates authoritative run state. |
+| Runs returned by listing | Capacity | `MAX_LISTED_RUNS` | modules/common/disk_store.rs | 1024 | Rejects/flags an inventory that cannot be represented; never silently truncates authoritative run state. Sized for the orphans a crash can leave of undrained retirements (recovery deletes them only if it can list them); 4 KB of stack, once, at recovery. |
 | Open run descriptors | Capacity | `SLOTS` | modules/common/fd_cache.rs | 5 | Evicts the least-recently-used descriptor; data remains on disk. This can dominate cold-read latency. |
-| Filesystem store path | Shape | `PATH_MAX` | modules/common/fs_run_storage.rs | 17 | Bounds the internally encoded store/run path; deployments must stay within the store-id/path scheme. |
+| Filesystem store path | Shape | `PATH_MAX` | modules/common/fs_run_storage.rs | 145 | Bounds the internally encoded store/run path: a named store directory (`DIR_MAX`), `/`, and an 8.3 name. |
+| Named store directory | Shape | `DIR_MAX` | modules/common/fs_run_storage.rs | 128 | A worker's `store_dir`; a longer one refuses construction. |
 | Replica command | Shape | `MAX_COMMAND_BYTES` | modules/common/replica_facade.rs | 4096 | Rejects a larger command locally, although Clustor's 2048-byte WAL entry binds first on the current replicated graph. |
 | Replica response | Shape | `MAX_RESPONSE_BYTES` | modules/common/replica_facade.rs | 4096 | Rejects an oversized response rather than truncating it. |
 | Replica watch event | Shape | `MAX_WATCH_EVENT_BYTES` | modules/common/replica_facade.rs | 4096 | Rejects an oversized event rather than truncating it. |
@@ -60,6 +79,8 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 | Partition ports on one request router | Topology | `MAX_PARTITION_PORTS` | modules/app/kv_request_router/mod.rs | 2 | Map load refuses any binding to port 2 or above. With `partition_fanout` enabled, keyed traffic for partitions beyond 0 shares one tagged port and `partition_demux` fans it out, so the keyed-path ceiling becomes the demux's; targeted lifecycle operations still address the direct ports and keep this bound. |
 | Local partitions behind one demux | Topology | `MAX_LOCAL_PARTITIONS` | modules/app/partition_demux/mod.rs | 8 | A frame tagged at or above the configured partition count is dropped and counted; its port is not wired. |
 | Concurrent routed requests | Capacity | `MAX_INFLIGHT` | modules/app/kv_request_router/mod.rs | 256 | Rejects busy; caller retries. |
+| Commands waiting for a worker | Capacity | `KV_STASH_SLOTS` | modules/app/kv_request_router/mod.rs | 4 | A command the worker's channel has no room for waits, in order; while any waits no new request is taken, so backpressure reaches the anchors. Past it (internal re-dispatch only) the op is refused busy, never dropped silently. |
+| Waiting command frame | Shape | `KV_STASH_FRAME` | modules/app/kv_request_router/mod.rs | — | Derived: the largest command the router builds and a partition tag. |
 | Linearizable-read slots | Semantic | `LIN_READ_SLOTS` | modules/app/kv_request_router/mod.rs | 32 | Current code falls back to the snapshot path when full. That silently weakens a requested guarantee and should be changed to backpressure or explicit failure before claiming strict linearizability under load. |
 | Linearizable-read response bytes | Shape | `LIN_READ_BUF` | modules/app/kv_request_router/mod.rs | 300 | Oversize read state cannot use the linearizable fast path. |
 | Held migration operations | Capacity | `HOLD_SLOTS` | modules/app/kv_request_router/mod.rs | 48 | Rejects busy when migration hold space is exhausted. |
@@ -96,6 +117,13 @@ must expose any overrides and keep them consistent at every participant.
 | Leases | Capacity | `MAX_LEASES` | modules/app/lease_manager/mod.rs | 256 | Rejects lease creation. |
 | TTL scheduling queue | Capacity | `QUEUE_CAP` | modules/app/ttl_scheduler/mod.rs | 1024 | Rejects/backpressures another scheduled expiry; callers must not accept a lease whose expiry cannot be represented. |
 | Pending watch plans | Capacity | `MAX_PENDING_PLANS` | modules/app/watch_fanout/mod.rs | 16 | Backpressures/defer fan-out planning. |
+| Replay window bytes | Capacity | `WINDOW_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | A backfill larger than this cannot be sent in revision order: refused as compacted (the client relists), never sent out of order or cut. |
+| Replay window frames | Capacity | `WINDOW_FRAMES` | modules/app/watch_fanout/mod.rs | 256 | As `WINDOW_BYTES`. |
+| Replay replaced-version bytes | Capacity | `PREV_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | The versions a backfill's events replaced that lie below its window; past it the backfill is refused as compacted (the client relists), never sent without its prev_kv. |
+| Watch event | Shape | `WATCH_EVENT_MAX` | modules/common/wire.rs | 8704 | The largest MSG_WATCH_EVENT payload (a key, a 4 KiB value and the 4 KiB value it replaced, with metadata); every stage of the watch path holds one. |
+| Replicated proposal body | Shape | `CONSENSUS_PROPOSAL_BODY_MAX` | modules/common/wire.rs | 2040 | One clustor log entry body less the gateway's correlation tag; a larger replicated write is refused as too large in each protocol's own words (etcd "request is too large", memcached "SERVER_ERROR object too large for cache"). |
+| Channel frame payload | Shape | `FRAME_PAYLOAD_MAX` | modules/common/wire.rs | 8189 | One channel frame (the SDK's CHANNEL_BUFFER_SIZE, a cross-core slot) less the envelope header; a message past it crosses as MSG_PART parts. |
+| Message part bytes | Shape | `PART_BYTES_MAX` | modules/common/wire.rs | — | Derived: one frame less a part's head; a logical message's size is its receiver's policy, not this. |
 | Retention consumers | Capacity | `MAX_SOURCES` | modules/common/compaction_floor.rs | 4 | Cannot track another independent retention source safely. |
 | Retention key/partition groups | Capacity | `MAX_KPG` | modules/common/compaction_floor.rs | 32 | Refuses/holds floor advancement rather than compacting required history. |
 | Retention claims | Capacity | `MAX_RETENTION_CLAIMS` | modules/common/db_ops.rs | 64 | Rejects another claim. |
@@ -105,7 +133,15 @@ must expose any overrides and keep them consistent at every participant.
 | Backup page buffer | Capacity | `PAGE_BUF` | modules/app/backup_coordinator/mod.rs | 3584 | Splits/defer pages; a single unrepresentable item fails explicitly. |
 | Unacknowledged CDC batches | Capacity | `UNACKED_CAP` | modules/common/cdc_feed.rs | 16 | Backpressures the feed until acknowledgement. |
 | CDC key | Shape | `KEY_MAX` | modules/common/cdc_feed.rs | 256 | Rejects malformed/oversized events. |
-| CDC wire key | Shape | `CDC_MAX_KEY_LEN` | modules/common/cdc_wire.rs | 256 | Encoder/decoder reject rather than truncate. |
+| CDC wire key | Shape | `CDC_MAX_KEY_LEN` | modules/common/cdc_wire.rs | 2584 | Any key the store holds; encoder/decoder reject rather than truncate. |
+| Chunk | Shape | `CHUNK_MAX` | modules/common/kv_chunks.rs | 1970 | Derived (a contract test holds it): the largest payload one replicated `KV_OP_PUT_CHUNK` carries — the 2040-byte proposal body less the entry tag, the 35-byte command head and the op's hash and length. Nothing that travels is larger. |
+| Large values per request | Shape | `MAX_LARGE_PER_REQUEST` | modules/common/kv_large.rs | 64 | A TXN with more large values is refused before any chunk is sent; one document insert batch is at most `doc_exec::MAX_INSERT_DOCS` (64). |
+| Chunk request | Shape | `CHUNK_REQUEST_MAX` | modules/common/kv_large.rs | — | Derived: a chunk behind its hash and length. |
+| Large values per answer | Shape | `MAX_LARGE_PER_REPLY` | modules/common/kv_large.rs | 64 | Values one answer expands, each reserved at its place before it is fetched; a page holding more is cut (partial), any other answer is refused too large. |
+| etcd Txn nesting | Semantic | `ETCD_TXN_DEPTH_MAX` | modules/common/types.rs | 4 | Txns nested below the outermost; the store and the large-value layer refuse deeper ones alike. |
+| Chunk sweep budget | Shape | `SWEEP_BUDGET_MAX` | modules/common/kv_store.rs | 64 | Queue entries one replicated sweep takes, so one command's apply stays bounded; the proposer sweeps again while more are due. |
+| Data chunk | Shape | `DATA_MAX` | modules/common/kv_chunks.rs | — | Derived: `CHUNK_MAX` less the chunk's kind byte; a value within it is stored inline. |
+| Chunk tree depth | Semantic | `MAX_DEPTH` | modules/common/kv_chunks.rs | 9 | Node levels any u64 total needs at 61-way fanout; a producer and a reader hold one node per level. Value size itself is each protocol's declared object policy, not this. |
 | CDC wire value | Shape | `CDC_MAX_VALUE_LEN` | modules/common/cdc_wire.rs | 4096 | Encoder/decoder reject rather than truncate. |
 
 ## Native and protocol surfaces
@@ -130,14 +166,37 @@ must expose any overrides and keep them consistent at every participant.
 | Memcached command tokens | Shape | `MAX_TOKENS` | modules/common/memcached_codec.rs | 32 | Rejects a command with more tokens. |
 | etcd connections | Capacity | `MAX_CONNS` | modules/app/etcd_edge_anchor/mod.rs | 64 | Drops/refuses excess accepts. |
 | etcd streams per connection | Capacity | `MAX_STREAMS_PER_CONN` | modules/app/etcd_edge_anchor/mod.rs | 8 | Refuses another stream. |
-| etcd stream body | Shape | `STREAM_BODY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 2048 | Rejects an oversized body. |
+| etcd stream body | Shape | `STREAM_BODY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 4608 | A larger request is refused as etcd refuses one ("request is too large"); the connection stays up. |
+| etcd watches per stream | Capacity | `WATCHES_PER_STREAM` | modules/app/etcd_edge_anchor/mod.rs | 8 | Refuses another watch on the stream (created and canceled at once). |
+| ended leases awaiting key deletion | Capacity | `LEASE_END_QUEUE` | modules/app/etcd_edge_anchor/mod.rs | 32 | Leaves further `MSG_LEASE_REVOKE`s queued on the channel until a deletion completes. |
+| etcd alarms held at once | Capacity | `ALARMS_MAX` | modules/app/etcd_edge_anchor/mod.rs | 4 | A further ACTIVATE is answered but not held. |
+| etcd response message | Capacity | `RESP_OUT_MAX` | modules/app/etcd_edge_anchor/mod.rs | 16000 | One encoded gRPC response in one DATA frame; the store's answer (at most 8 KiB) always fits. |
+| etcd auth tokens held | Capacity | `TOKENS_MAX` | modules/app/etcd_edge_anchor/mod.rs | 64 | A new token replaces the one nearest to lapsing. |
+| etcd auth token length | Shape | `TOKEN_MAX` | modules/app/etcd_edge_anchor/mod.rs | 32 | A longer `token`/`authorization` value cannot be one of ours: the request is answered as an invalid token. |
+| etcd auth change staged | Capacity | `AUTH_CHANGES_MAX` | modules/app/etcd_edge_anchor/mod.rs | 3072 | An auth change touching more records is refused (ResourceExhausted). |
+| etcd users | Capacity | `USERS_MAX` | modules/common/etcd_auth.rs | 32 | UserAdd past it is refused (ResourceExhausted). |
+| etcd roles | Capacity | `ROLES_MAX` | modules/common/etcd_auth.rs | 32 | RoleAdd past it is refused (ResourceExhausted). |
+| etcd roles per user | Capacity | `USER_ROLES_MAX` | modules/common/etcd_auth.rs | 8 | UserGrantRole past it is refused (ResourceExhausted). |
+| etcd permissions per role | Capacity | `PERMS_MAX` | modules/common/etcd_auth.rs | 8 | RoleGrantPermission past it is refused (ResourceExhausted). |
+| etcd permission key | Shape | `PERM_KEY_MAX` | modules/common/etcd_auth.rs | 128 | A longer key or range end is refused (InvalidArgument). |
+| etcd user/role name | Shape | `NAME_MAX` | modules/common/etcd_auth.rs | 64 | A longer name is refused. |
+| KV reply / watch frame envelope (etcd anchor) | Capacity | `REPLY_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 8832 | Carries the worker's largest answer (8192 bytes) behind the router's head and fence tail, or the largest watch frame (`WATCH_EVENT_MAX` behind its watch id). |
+| KV reply envelope (router) | Capacity | `REPLY_BUF_SIZE` | modules/app/kv_request_router/mod.rs | 8320 | The answer path's buffer; commands stay bounded by `SCRATCH_BUF_SIZE`. |
+| anchor-internal KV op body | Capacity | `BODY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 4000 | An internal op (lease keys, a snapshot page, an auth change's Txn) whose body exceeds it is not sent; the request answers Unavailable. |
+| watch-event journal bytes per command | Capacity | `JOURNAL_BYTES` | modules/common/kv_store.rs | 16384 | The command's events fall back to the command-derived form, without metadata or `prev_kv`. |
+| etcd stored key | Shape | `STORE_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 2572 | Any key the store holds (its physical key less the identity; a contract test holds them together): copied whole, never clipped. |
+| etcd large-value requests at once | Capacity | `LG_SESSIONS` | modules/app/etcd_edge_anchor/mod.rs | 8 | Requests carried through the large-value layer together (an upload, an expansion, a Txn that reads); one that finds all busy waits in its stream and is sent when one frees. |
+| etcd watch event value | Shape | `WATCH_VALUE_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived: a large value (and the value it replaced) fetched for a watch event, two of them and a key fitting one encoded response; a larger one cancels the watch with the reason, never a clipped value. |
+| etcd watch key + range | Shape | `WATCH_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 96 | Refuses the watch (created and canceled), never watches a cut key; mirrors `watch_hub::WATCH_KEY_MAX`. |
 | PostgreSQL connections | Capacity | `MAX_CONNS` | modules/app/pg_edge_anchor/mod.rs | 16 | Drops/refuses excess accepts. |
 | MySQL connections | Capacity | `MAX_CONNS` | modules/app/mysql_edge_anchor/mod.rs | 16 | Drops/refuses excess accepts. |
 | MySQL result columns | Shape | `MAX_COLS` | modules/app/mysql_edge_anchor/mod.rs | 32 | Rejects a wider result. |
 | Document connections | Capacity | `MAX_CONNS` | modules/app/doc_edge_anchor/mod.rs | 8 | Drops/refuses excess accepts. |
 | Document collection/name | Shape | `NAME_MAX` | modules/app/doc_edge_anchor/mod.rs | 64 | Rejects longer names. |
-| Document id | Shape | `ID_MAX` | modules/app/doc_edge_anchor/mod.rs | — | Derived as 129 bytes. |
-| Document composite key | Shape | `KEY_MAX` | modules/app/doc_edge_anchor/mod.rs | 512 | Rejects an oversized encoded key. |
+| Mongo reply | Shape | `SEND_BUF` | modules/app/doc_edge_anchor/mod.rs | 24576 | The largest reply and a slot's unsent bytes; a slot that overflows is closed. |
+| Mongo open cursors | Capacity | `MAX_CURSORS` | modules/app/doc_edge_anchor/mod.rs | 4 | A find past them answers its first batch and no cursor. |
+| Mongo batch documents | Pacing | `BATCH_DOCS` | modules/app/doc_edge_anchor/mod.rs | 101 | The default batch; `getMore` continues. |
+| BSON expansion of a tree | Semantic | `BSON_EXPANSION` | modules/app/doc_edge_anchor/mod.rs | 6 | Sizes the document budget a list asks for, so a batch always renders whole. |
 | Document/BSON message | Shape | `MAX_BSON` | modules/common/doc_server_codec.rs | 4096 | Rejects a larger document payload. |
 | Wide-column connections | Capacity | `MAX_CONNS` | modules/app/wide_edge_anchor/mod.rs | 8 | Drops/refuses excess accepts. |
 | Wide-column result rows | Shape | `MAX_RESULT_ROWS` | modules/app/wide_edge_anchor/mod.rs | 16 | Returns `result exceeds one batch`; it does not silently truncate, but paging beyond this batch is not yet provided here. |
@@ -192,6 +251,59 @@ anchor 16384/20480 bytes.
 | Graph vertex id | Shape | `MAX_VERTEX_ID_LEN` | modules/common/models.rs | 32 | Rejects a longer id. |
 | Synchronous graph indexes | Shape | `MAX_GRAPH_SYNC_INDEXES` | modules/common/models.rs | 4 | Rejects/defer additional index maintenance. |
 | Search term bytes | Shape | `MAX_TERM_LEN` | modules/common/models.rs | 48 | Rejects a longer term. |
+| Document tree depth | Shape | `MAX_DEPTH` | modules/common/doc_tree.rs | 32 | Rejects a document (or edit result) nesting deeper. |
+| Document path segments | Shape | `MAX_PATH_SEGMENTS` | modules/common/doc_tree.rs | 32 | Rejects a longer path. |
+| Document identifier value | Shape | `MAX_IDENTIFIER_LEN` | modules/common/doc_tree.rs | 48 | Rejects a longer identifier value (`MAX_MODEL_ID_LEN`). |
+| Decimal literal | Shape | `MAX_DECIMAL_TEXT` | modules/common/doc_tree.rs | 64 | Rejects a longer decimal literal. |
+| Decimal exponent | Shape | `MAX_DECIMAL_EXPONENT` | modules/common/doc_tree.rs | 9999 | Rejects a literal stating a larger exponent. |
+| Collection name | Shape | `MAX_NAME_LEN` | modules/common/doc_catalog.rs | 64 | Rejects a longer name. |
+| Paths per index | Shape | `MAX_INDEX_PATHS` | modules/common/doc_catalog.rs | 8 | Refuses the index. |
+| Index entry values | Shape | `MAX_INDEX_VALUES` | modules/common/doc_ops.rs | 256 | A document whose values do not fit its entry is refused as not indexable (`models::MAX_DOC_INDEX_VALUE_LEN`). |
+| Number key digits | Semantic | `MAX_KEY_DIGITS` | modules/common/doc_tree.rs | 64 | Longer exact expansions (binary64 only) are marked, not rounded: the key stays exact. |
+| Field element spelling | Shape | `ELEMENT_TEXT` | modules/common/doc_render.rs | 1024 | One field-set element spelled for a dialect (a keyed element's key as JSON, a set element's value); past it the spelling answers Overflow. Kubernetes' longest key value is a 253-byte name. |
+| Mongo dropIndexes names | Capacity | `DROP_NAMES` | modules/app/doc_edge_anchor/mod.rs | 16 | `*` drops at most this many per command. |
+| Collection descriptor | Shape | `MAX_DESCRIPTOR_LEN` | modules/common/doc_catalog.rs | 2048 | Rejects a larger descriptor. |
+| Document request | Shape | `DOC_REQUEST_MAX` | modules/common/doc_exec.rs | 8189 | One channel frame (8192, also a cross-core slot) less the envelope header: nothing larger crosses an edge. Refuses the request as malformed. |
+| Document response | Shape | `DOC_RESPONSE_MAX` | modules/common/doc_exec.rs | 8189 | One frame, as a request. A list answers what fits and a continuation; one document past it answers too-large. |
+| Writer (manager) name | Shape | `MAX_MANAGER_LEN` | modules/common/doc_exec.rs | 128 | Refuses the request as malformed. |
+| Scope label | Shape | `MAX_SCOPE_LEN` | modules/common/doc_exec.rs | 64 | Refuses the request as malformed; an ownership entry holds it in a byte-length (Kubernetes subresources are short names). |
+| Documents per insert | Shape | `MAX_INSERT_DOCS` | modules/common/doc_exec.rs | 64 | Refuses the request as malformed. |
+| Filter nesting | Shape | `MAX_FILTER_DEPTH` | modules/common/doc_exec.rs | 16 | Refuses the filter as malformed. |
+| Filter nodes | Shape | `MAX_FILTER_NODES` | modules/common/doc_exec.rs | 128 | Refuses the filter as malformed. |
+| Mutations per update | Shape | `MAX_MUTATIONS` | modules/common/doc_exec.rs | 32 | Refuses the request as malformed. |
+| Projection paths | Shape | `MAX_PROJECTION_PATHS` | modules/common/doc_exec.rs | 32 | Refuses the projection as malformed. |
+| Continuation key | Shape | `MAX_CONTINUE_KEY` | modules/common/doc_exec.rs | 256 | The executor cannot mint a longer one (keys are shorter); a longer one is refused. |
+| Document executor queue | Capacity | `QUEUE_DEPTH` | modules/app/document_executor/mod.rs | 4 | Answers busy. |
+| Document record | Shape | `MAX_RECORD` | modules/app/document_executor/mod.rs | — | Derived: what one answer carries whole (`RESPONSE_MAX` less framing and a stamped revision); a larger document answers too-large. A record over one data chunk is stored as a chunk tree. |
+| Document request | Shape | `REQUEST_MAX` | modules/app/document_executor/mod.rs | — | Derived: one channel frame (`DOC_REQUEST_MAX`); in the big build (`document_executor_big`) `MAX_DOCUMENT` and 64 KiB of framing, arriving as `wire::MSG_PART` parts. A larger request answers too-large from its first part. |
+| Document answer | Shape | `RESPONSE_MAX` | modules/app/document_executor/mod.rs | — | Derived as `REQUEST_MAX`, from `DOC_RESPONSE_MAX`; an answer past one frame leaves as parts. |
+| Big-build document policy | Shape | `MAX_DOCUMENT` | modules/app/document_executor/mod.rs | 1572864 | The Kubernetes object bound (etcd's 1.5 MiB), decided for the big build; its buffers are one heap arena sized from it at load. |
+| Document id value | Shape | `ID_VALUE_MAX` | modules/app/document_executor/mod.rs | — | Derived: an id value is at most its key (`MAX_DOCUMENT_ID_KEY`) plus 4 bytes of framing per component (each at least 3 key bytes) and an array head, so three times the key bound. |
+| Document KV key | Shape | `KEY_MAX` | modules/app/document_executor/mod.rs | — | Derived as the keyspace prefix and `DOCUMENT_KEY_MAX_LEN` (the longer of a data key and an index entry key); a longer id or shard value is refused before a key is built. |
+| Document edit buffer | Shape | `DOC_BUF` | modules/app/document_executor/mod.rs | 16384 | An edit whose result does not fit answers too-large. The big build's is `MAX_RECORD` and 64 KiB of slack. |
+| Document scan page | Pacing | `SCAN_PAGE` | modules/app/document_executor/mod.rs | 16 | Lists, filtered updates and drops read further pages. |
+| Watch candidates | Semantic | `WATCH_CANDIDATES` | modules/app/document_executor/mod.rs | 256 | A watch answers at most the changes of this many versions (whole revisions), and says more remain. |
+| Watch scan page | Pacing | `WATCH_PAGE` | modules/app/document_executor/mod.rs | 64 | A watch pass reads further pages. |
+| Document-wire sessions | Capacity | `MAX_CONNS` | modules/app/doc_wire_anchor/mod.rs | 8 | Refuses excess accepts. |
+| Document-wire request frame | Shape | `RECV_BUF` | modules/app/doc_wire_anchor/mod.rs | — | Derived as one `DOC_REQUEST_MAX` frame and the net frame that completes it; the anchor stops reading the network while a session lacks room for one more. A longer request streams to the executor as parts. |
+| Document-wire frame | Shape | `WIRE_FRAME_MAX` | modules/app/doc_wire_anchor/mod.rs | 16777216 | MongoDB's message bound: the largest frame the wire streams; the executor refuses what its build does not take. A longer length prefix closes the session. |
+| JSON document message | Shape | `JSON_MAX` | modules/app/doc_json_dialect/mod.rs | — | Derived: one channel frame; in the big build (`doc_json_dialect_big`) `MAX_DOCUMENT` and 64 KiB of the rest of the message, crossing as `wire::MSG_PART` parts. A longer request answers too-large from its first part. |
+| JSON dialect document policy | Shape | `MAX_DOCUMENT` | modules/app/doc_json_dialect/mod.rs | 1572864 | The big build's: the executor big twin's bound (the decided Kubernetes object bound). |
+| JSON dialect schema | Shape | `DOC_SCHEMA_MAX` | modules/app/doc_json_dialect/mod.rs | 4096 | A longer `schema` param: every request is refused (invalid) rather than served by half a schema. |
+| JSON dialect list keys | Shape | `PATCH_KEYS_MAX` | modules/app/doc_json_dialect/mod.rs | 1024 | A longer `patch_keys` param: refused as the schema is. |
+| JSON dialect id paths | Shape | `ID_PATHS_MAX` | modules/app/doc_json_dialect/mod.rs | 1024 | The `id_paths` param: the default paths and the collections that read theirs elsewhere (Kubernetes' cluster-scoped kinds, by name alone). Longer: refused as the schema is. |
+| JSON dialect revision path | Shape | `RV_PATH_MAX` | modules/app/doc_json_dialect/mod.rs | 64 | A longer `rv_path` param: refused as the schema is. |
+| JSON dialect compound id | Shape | `MAX_ID_PATHS` | modules/app/doc_json_dialect/mod.rs | 4 | An id read from more paths: every write refused (invalid). |
+| JSON dialect table columns | Shape | `TABLE_MAX` | modules/app/doc_json_dialect/mod.rs | 4096 | A longer `table` param: refused as the schema is. |
+| JSON dialect continuation | Shape | `CONTINUE_MAX` | modules/app/doc_json_dialect/mod.rs | 1024 | A longer continuation (as the executor stated it) is refused as malformed. |
+| JSON dialect followed watches | Capacity | `MAX_SESSIONS` | modules/app/doc_json_dialect/mod.rs | 16 | A further `J_FLAG_FOLLOW` is answered busy. |
+| JSON dialect followed request | Shape | `SESSION_REQ_MAX` | modules/app/doc_json_dialect/mod.rs | 1024 | A longer followed watch request is answered too-large. |
+| Document-wire answers queued | Capacity | `SEND_BUF` | modules/app/doc_wire_anchor/mod.rs | — | Derived as one `DOC_RESPONSE_MAX` frame; a client that does not read its answers is closed. |
+| Document-wire net chunk | Pacing | `NET_CHUNK` | modules/app/doc_wire_anchor/mod.rs | — | Derived: the net contract's `MAX_CMD_DATA`, and no more than one channel frame holds beside the connection id (`wire::FRAME_PAYLOAD_MAX` − 2); answers leave in chunks of this size. |
+| Lost compare-and-set retries | Semantic | `MAX_CAS_RETRIES` | modules/app/document_executor/mod.rs | 3 | Answers conflict; the client retries. |
+| Followed watches | Capacity | `MAX_FOLLOWS` | modules/app/document_executor/mod.rs | 16 | A further `FLAG_FOLLOW` is answered busy; a pull watch still serves. |
+| Followed watch request | Shape | `FOLLOW_REQ_MAX` | modules/app/document_executor/mod.rs | 1024 | A longer watch request cannot be followed: answered too-large. |
+| KV request payload | Shape | `KV_REQUEST_PAYLOAD_MAX` | modules/common/wire.rs | 4160 | The router carries no larger request; an executor refuses a transaction past it (a document insert batch is one) as too-large. |
 
 The SQL surface is useful but is not yet SQLite-equivalent. Loam can compose a
 single-node embedded profile around Lattice's relational primitives, but today
@@ -314,7 +426,7 @@ checked.
 | Max Wire Version | Shape | `MAX_WIRE_VERSION` | modules/common/doc_server_codec.rs | — | The highest Mongo wire protocol version the codec advertises and accepts. |
 | Password Max | Shape | `PASSWORD_MAX` | modules/app/mysql_edge_anchor/mod.rs | 64 | Rejects an input longer than this bound. |
 | Password Max | Shape | `PASSWORD_MAX` | modules/app/pg_edge_anchor/mod.rs | 64 | Rejects an input longer than this bound. |
-| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 20489 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_client/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
@@ -328,8 +440,8 @@ checked.
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/ttl_scheduler/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_fanout/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_fanout/mod.rs | 8832 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 32768 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
@@ -404,12 +516,15 @@ into two registers.
 
 ```limit-register
 MAX_KEYS | modules/common/kv_store.rs | 1024
-MAX_KEY_LEN | modules/common/kv_store.rs | 256
+MAX_DOCUMENT_ID_KEY | modules/common/models.rs | 1024
+MAX_KEY_LEN | modules/common/kv_store.rs | 2584
 MAX_VALUE_LEN | modules/common/kv_store.rs | 4096
 SCRATCH_BUF_SIZE | modules/app/kv_state_worker/mod.rs | 8192
 SNAPSHOT_BODY_MAX | modules/app/kv_state_worker/mod.rs | -
+RESULT_BODY_MAX | modules/app/kv_state_worker/mod.rs | -
 SNAPSHOT_CHUNK_MAX | modules/app/kv_state_worker/mod.rs | 4096
-MAX_ENCODED_KEY | modules/common/disk_store.rs | 544
+MAX_USER_KEY | modules/common/disk_store.rs | 2584
+MAX_ENCODED_KEY | modules/common/disk_store.rs | -
 MAX_VALUE_LEN | modules/common/disk_store.rs | -
 MEMTABLE_MAX_ENTRIES | modules/common/disk_store.rs | 512
 MEMTABLE_FLUSH_WATERMARK | modules/common/disk_store.rs | 384
@@ -418,11 +533,14 @@ SCAN_STEP_RECORDS | modules/common/disk_store.rs | -
 SCAN_PAGE_MAX | modules/common/disk_store.rs | 8192
 VERSIONS_TRANSCODE_SLACK | modules/common/kv_store.rs | 6
 HELD_FRAME_MAX | modules/app/kv_state_worker/mod.rs | 1024
+CLOG_OUT_MAX | modules/app/kv_state_worker/mod.rs | 65536
+IMPORT_RECORD_MAX | modules/app/kv_state_worker/mod.rs | 3149824
 MAX_RUNS | modules/common/disk_store.rs | 16
 MAX_MANIFEST_FILES | modules/common/disk_store.rs | 8
-MAX_LISTED_RUNS | modules/common/disk_store.rs | 64
+MAX_LISTED_RUNS | modules/common/disk_store.rs | 1024
 SLOTS | modules/common/fd_cache.rs | 5
-PATH_MAX | modules/common/fs_run_storage.rs | 17
+PATH_MAX | modules/common/fs_run_storage.rs | 145
+DIR_MAX | modules/common/fs_run_storage.rs | 128
 MAX_COMMAND_BYTES | modules/common/replica_facade.rs | 4096
 MAX_RESPONSE_BYTES | modules/common/replica_facade.rs | 4096
 MAX_WATCH_EVENT_BYTES | modules/common/replica_facade.rs | 4096
@@ -433,6 +551,8 @@ MAX_RANGES | modules/common/partition_map.rs | 64
 MAX_PARTITION_PORTS | modules/app/kv_request_router/mod.rs | 2
 MAX_LOCAL_PARTITIONS | modules/app/partition_demux/mod.rs | 8
 MAX_INFLIGHT | modules/app/kv_request_router/mod.rs | 256
+KV_STASH_SLOTS | modules/app/kv_request_router/mod.rs | 4
+KV_STASH_FRAME | modules/app/kv_request_router/mod.rs | -
 LIN_READ_SLOTS | modules/app/kv_request_router/mod.rs | 32
 LIN_READ_BUF | modules/app/kv_request_router/mod.rs | 300
 HOLD_SLOTS | modules/app/kv_request_router/mod.rs | 48
@@ -458,6 +578,13 @@ WATCH_KEY_MAX | modules/common/watch_hub.rs | 96
 MAX_LEASES | modules/app/lease_manager/mod.rs | 256
 QUEUE_CAP | modules/app/ttl_scheduler/mod.rs | 1024
 MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 16
+WINDOW_BYTES | modules/app/watch_fanout/mod.rs | 65536
+PREV_BYTES | modules/app/watch_fanout/mod.rs | 65536
+WATCH_EVENT_MAX | modules/common/wire.rs | 8704
+FRAME_PAYLOAD_MAX | modules/common/wire.rs | 8189
+PART_BYTES_MAX | modules/common/wire.rs | -
+CONSENSUS_PROPOSAL_BODY_MAX | modules/common/wire.rs | 2040
+WINDOW_FRAMES | modules/app/watch_fanout/mod.rs | 256
 MAX_SOURCES | modules/common/compaction_floor.rs | 4
 MAX_KPG | modules/common/compaction_floor.rs | 32
 MAX_RETENTION_CLAIMS | modules/common/db_ops.rs | 64
@@ -467,7 +594,15 @@ KEY_MAX | modules/app/backup_coordinator/mod.rs | 128
 PAGE_BUF | modules/app/backup_coordinator/mod.rs | 3584
 UNACKED_CAP | modules/common/cdc_feed.rs | 16
 KEY_MAX | modules/common/cdc_feed.rs | 256
-CDC_MAX_KEY_LEN | modules/common/cdc_wire.rs | 256
+CDC_MAX_KEY_LEN | modules/common/cdc_wire.rs | 2584
+CHUNK_MAX | modules/common/kv_chunks.rs | 1970
+DATA_MAX | modules/common/kv_chunks.rs | -
+MAX_LARGE_PER_REQUEST | modules/common/kv_large.rs | 64
+CHUNK_REQUEST_MAX | modules/common/kv_large.rs | -
+MAX_LARGE_PER_REPLY | modules/common/kv_large.rs | 64
+ETCD_TXN_DEPTH_MAX | modules/common/types.rs | 4
+SWEEP_BUDGET_MAX | modules/common/kv_store.rs | 64
+MAX_DEPTH | modules/common/kv_chunks.rs | 9
 CDC_MAX_VALUE_LEN | modules/common/cdc_wire.rs | 4096
 DATA_FRAME_MAX_PAYLOAD | modules/common/data_surface.rs | 8192
 MAX_PUSHDOWN_KEY_LEN | modules/common/data_surface.rs | 64
@@ -487,14 +622,37 @@ MAX_INFLIGHT | modules/app/memcached_datagram_anchor/mod.rs | 512
 MAX_TOKENS | modules/common/memcached_codec.rs | 32
 MAX_CONNS | modules/app/etcd_edge_anchor/mod.rs | 64
 MAX_STREAMS_PER_CONN | modules/app/etcd_edge_anchor/mod.rs | 8
-STREAM_BODY_MAX | modules/app/etcd_edge_anchor/mod.rs | 2048
+STREAM_BODY_MAX | modules/app/etcd_edge_anchor/mod.rs | 4608
+WATCHES_PER_STREAM | modules/app/etcd_edge_anchor/mod.rs | 8
+LEASE_END_QUEUE | modules/app/etcd_edge_anchor/mod.rs | 32
+ALARMS_MAX | modules/app/etcd_edge_anchor/mod.rs | 4
+RESP_OUT_MAX | modules/app/etcd_edge_anchor/mod.rs | 16000
+TOKENS_MAX | modules/app/etcd_edge_anchor/mod.rs | 64
+TOKEN_MAX | modules/app/etcd_edge_anchor/mod.rs | 32
+AUTH_CHANGES_MAX | modules/app/etcd_edge_anchor/mod.rs | 3072
+USERS_MAX | modules/common/etcd_auth.rs | 32
+ROLES_MAX | modules/common/etcd_auth.rs | 32
+USER_ROLES_MAX | modules/common/etcd_auth.rs | 8
+PERMS_MAX | modules/common/etcd_auth.rs | 8
+PERM_KEY_MAX | modules/common/etcd_auth.rs | 128
+NAME_MAX | modules/common/etcd_auth.rs | 64
+REPLY_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 8832
+REPLY_BUF_SIZE | modules/app/kv_request_router/mod.rs | 8320
+BODY_MAX | modules/app/etcd_edge_anchor/mod.rs | 4000
+JOURNAL_BYTES | modules/common/kv_store.rs | 16384
+STORE_KEY_MAX | modules/app/etcd_edge_anchor/mod.rs | 2572
+LG_SESSIONS | modules/app/etcd_edge_anchor/mod.rs | 8
+WATCH_VALUE_MAX | modules/app/etcd_edge_anchor/mod.rs | -
+WATCH_KEY_MAX | modules/app/etcd_edge_anchor/mod.rs | 96
 MAX_CONNS | modules/app/pg_edge_anchor/mod.rs | 16
 MAX_CONNS | modules/app/mysql_edge_anchor/mod.rs | 16
 MAX_COLS | modules/app/mysql_edge_anchor/mod.rs | 32
 MAX_CONNS | modules/app/doc_edge_anchor/mod.rs | 8
 NAME_MAX | modules/app/doc_edge_anchor/mod.rs | 64
-ID_MAX | modules/app/doc_edge_anchor/mod.rs | -
-KEY_MAX | modules/app/doc_edge_anchor/mod.rs | 512
+SEND_BUF | modules/app/doc_edge_anchor/mod.rs | 24576
+MAX_CURSORS | modules/app/doc_edge_anchor/mod.rs | 4
+BATCH_DOCS | modules/app/doc_edge_anchor/mod.rs | 101
+BSON_EXPANSION | modules/app/doc_edge_anchor/mod.rs | 6
 MAX_BSON | modules/common/doc_server_codec.rs | 4096
 MAX_CONNS | modules/app/wide_edge_anchor/mod.rs | 8
 MAX_RESULT_ROWS | modules/app/wide_edge_anchor/mod.rs | 16
@@ -563,7 +721,7 @@ MAX_SPLIT_KEY_LEN | modules/common/range_lifecycle.rs | -
 MAX_WIRE_VERSION | modules/common/doc_server_codec.rs | -
 PASSWORD_MAX | modules/app/mysql_edge_anchor/mod.rs | 64
 PASSWORD_MAX | modules/app/pg_edge_anchor/mod.rs | 64
-RECV_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 4096
+RECV_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 20489
 RECV_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
 RECV_BUF_SIZE | modules/app/lattice_data_client/mod.rs | -
 RECV_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
@@ -577,8 +735,8 @@ SCRATCH_BUF_SIZE | modules/app/lease_manager/mod.rs | 4096
 SCRATCH_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | -
 SCRATCH_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | -
 SCRATCH_BUF_SIZE | modules/app/ttl_scheduler/mod.rs | 4096
-SCRATCH_BUF_SIZE | modules/app/watch_fanout/mod.rs | 4096
-SEND_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 4096
+SCRATCH_BUF_SIZE | modules/app/watch_fanout/mod.rs | 8832
+SEND_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 32768
 SEND_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
 SEND_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
 SEND_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | 4096
@@ -621,4 +779,70 @@ RO_STALL_LIMIT | modules/app/redis_edge_anchor/mod.rs | -
 TTL_RESUME_BUDGET | modules/app/kv_state_worker/mod.rs | 32
 WEDGE_BUDGET | modules/common/cdc_feed.rs | -
 MAX_PLACEMENT_REPLICAS | modules/common/data_surface.rs | -
+MAX_DEPTH | modules/common/doc_tree.rs | 32
+MAX_PATH_SEGMENTS | modules/common/doc_tree.rs | 32
+MAX_IDENTIFIER_LEN | modules/common/doc_tree.rs | 48
+MAX_DECIMAL_TEXT | modules/common/doc_tree.rs | 64
+MAX_DECIMAL_EXPONENT | modules/common/doc_tree.rs | 9999
+MAX_NAME_LEN | modules/common/doc_catalog.rs | 64
+MAX_INDEX_PATHS | modules/common/doc_catalog.rs | 8
+MAX_INDEX_VALUES | modules/common/doc_ops.rs | 256
+MAX_KEY_DIGITS | modules/common/doc_tree.rs | 64
+ELEMENT_TEXT | modules/common/doc_render.rs | 1024
+DROP_NAMES | modules/app/doc_edge_anchor/mod.rs | 16
+MAX_DESCRIPTOR_LEN | modules/common/doc_catalog.rs | 2048
+DOC_REQUEST_MAX | modules/common/doc_exec.rs | 8189
+DOC_RESPONSE_MAX | modules/common/doc_exec.rs | 8189
+MAX_MANAGER_LEN | modules/common/doc_exec.rs | 128
+MAX_SCOPE_LEN | modules/common/doc_exec.rs | 64
+MAX_INSERT_DOCS | modules/common/doc_exec.rs | 64
+MAX_FILTER_DEPTH | modules/common/doc_exec.rs | 16
+MAX_FILTER_NODES | modules/common/doc_exec.rs | 128
+MAX_MUTATIONS | modules/common/doc_exec.rs | 32
+MAX_PROJECTION_PATHS | modules/common/doc_exec.rs | 32
+MAX_CONTINUE_KEY | modules/common/doc_exec.rs | 256
+QUEUE_DEPTH | modules/app/document_executor/mod.rs | 4
+MAX_RECORD | modules/app/document_executor/mod.rs | -
+REQUEST_MAX | modules/app/document_executor/mod.rs | -
+RESPONSE_MAX | modules/app/document_executor/mod.rs | -
+MAX_DOCUMENT | modules/app/document_executor/mod.rs | 1572864
+ID_VALUE_MAX | modules/app/document_executor/mod.rs | -
+DOC_BUF | modules/app/document_executor/mod.rs | 16384 | bounded
+DOC_BUF | modules/app/document_executor/mod.rs | MAX_RECORD + 65536 | big
+KEY_MAX | modules/app/document_executor/mod.rs | -
+SCAN_PAGE | modules/app/document_executor/mod.rs | 16
+MAX_CAS_RETRIES | modules/app/document_executor/mod.rs | 3
+MAX_FOLLOWS | modules/app/document_executor/mod.rs | 16
+FOLLOW_REQ_MAX | modules/app/document_executor/mod.rs | 1024
+WATCH_CANDIDATES | modules/app/document_executor/mod.rs | 256
+WATCH_PAGE | modules/app/document_executor/mod.rs | 64
+MAX_CONNS | modules/app/doc_wire_anchor/mod.rs | 8
+RECV_BUF | modules/app/doc_wire_anchor/mod.rs | -
+WIRE_FRAME_MAX | modules/app/doc_wire_anchor/mod.rs | 16777216
+JSON_MAX | modules/app/doc_json_dialect/mod.rs | -
+MAX_DOCUMENT | modules/app/doc_json_dialect/mod.rs | 1572864
+DOC_SCHEMA_MAX | modules/app/doc_json_dialect/mod.rs | 4096
+PATCH_KEYS_MAX | modules/app/doc_json_dialect/mod.rs | 1024
+ID_PATHS_MAX | modules/app/doc_json_dialect/mod.rs | 1024
+RV_PATH_MAX | modules/app/doc_json_dialect/mod.rs | 64
+MAX_ID_PATHS | modules/app/doc_json_dialect/mod.rs | 4
+TABLE_MAX | modules/app/doc_json_dialect/mod.rs | 4096
+CONTINUE_MAX | modules/app/doc_json_dialect/mod.rs | 1024
+MAX_SESSIONS | modules/app/doc_json_dialect/mod.rs | 16
+SESSION_REQ_MAX | modules/app/doc_json_dialect/mod.rs | 1024
+SEND_BUF | modules/app/doc_wire_anchor/mod.rs | -
+NET_CHUNK | modules/app/doc_wire_anchor/mod.rs | -
+KV_REQUEST_PAYLOAD_MAX | modules/common/wire.rs | 4160
+```
+
+## Exempt names
+
+Constants whose names read like ceilings but are not bounds: the gate's
+reverse scan skips them.
+
+```limit-register-exempt
+FIELD_LIMIT | modules/common/doc_exec.rs | a request field tag (the list limit a caller states), not a bound
+NUM_MAX | modules/common/doc_exec.rs | a mutation sub-operation (take the maximum), not a bound
+P_WATCH_SIZE | modules/app/document_executor/mod.rs | a phase (the watch's sizing pass), not a bound
+KVS_MORE_LIMIT | modules/common/types.rs | an answer's `more` code (matches lie past the request's limit), not a bound
 ```

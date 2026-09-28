@@ -29,7 +29,7 @@ name = "http_out"
 direction = "output"
 content_type = "OctetStream"
 
-# This module's OWN module-scope operational counters (Phase 14), kept
+# This module's OWN module-scope operational counters, kept
 # separate from the app-metric rollups it aggregates on telemetry_out.
 # Output index 2 (telemetry_out, http_out, metrics). No-op when unwired.
 [[ports]]
@@ -37,7 +37,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────
 # Declaration order IS the id contract (id N = the Nth name).
 [observability]
 metrics = ["deltas_in", "snapshots_out"]

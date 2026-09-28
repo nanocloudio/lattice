@@ -1,5 +1,4 @@
-//! SQL execution wire and key composition (RFC database foundation
-//! §14.4, §14.5).
+//! SQL execution wire and key composition.
 //!
 //! Dual-target facade shared by `relational_executor` and both
 //! connectors. Three concerns, all of them boundary definitions rather
@@ -34,7 +33,7 @@
 //!
 //! ## Why result rows are typed, not text
 //!
-//! §14.3 gives each connector its own "result encoding", and the two
+//! Each connector owns its own result encoding, and the two
 //! genuinely differ: PostgreSQL renders a boolean as `t`/`f`, MySQL as
 //! `1`/`0`. If the executor produced text, one of those renderings would
 //! have to win and the other connector would be re-parsing text to fix
@@ -121,7 +120,7 @@ pub const DIALECT_MYSQL: u8 = 1;
 /// protocol's completion notice — `CommandComplete("INSERT 0 3")` for
 /// PostgreSQL, an OK packet with an affected-rows count for MySQL. The
 /// executor does not build either string, because those strings are
-/// exactly the "result encoding" §14.3 gives the connector.
+/// exactly the result encoding the connector owns.
 pub const TAG_EMPTY: u8 = 0;
 pub const TAG_CREATE_TABLE: u8 = 1;
 pub const TAG_DROP_TABLE: u8 = 2;

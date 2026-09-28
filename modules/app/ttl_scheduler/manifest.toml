@@ -86,7 +86,7 @@ content_type = "OctetStream"
 #                     (replicated graphs); 0 emits the bare envelope
 #                     (graphs with no consensus).
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ──────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.

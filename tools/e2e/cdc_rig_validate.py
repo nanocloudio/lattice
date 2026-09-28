@@ -206,7 +206,7 @@ def main():
         print("FAIL: commit_ts not monotone in apply order")
         return 9
     if not resolved:
-        print("FAIL: no resolved watermarks (§7)")
+        print("FAIL: no resolved watermarks")
         return 10
     top_resolved = max(struct.unpack("<Q", e["value"])[0] for e in resolved if len(e["value"]) == 8)
     if top_resolved < max(ts):

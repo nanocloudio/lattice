@@ -3,7 +3,7 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Wide-column CQL connector (RFC database foundation §14.17, Phase 8).
+# Wide-column CQL connector.
 # A real CQL client connects on 9042; rows decompose into CELLS under
 # KS_WIDE_TABLE (one canonical KV key per column + a row marker), a
 # statement's cells commit as ONE KV transaction, and the logical cell
@@ -17,12 +17,12 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "kv_in"

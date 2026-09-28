@@ -551,9 +551,12 @@ the KV path (`kv_request_router`, `kv_state_worker`,
 `lattice_apply_bridge`, `adapter_metrics`); the rest is the clustor
 substrate palette (`peer_router`, `gateway`, `consensus`,
 `durability`, `admission`, `control_plane`, `operations`). Other
-protocol anchors (Memcached, etcd, SQL, document, wide-column,
-models) are enabled the same way the Redis anchor is: add the module
-and wire its `kv_out`/`kv_in` pair to a router ingress port. The
+protocol anchors (Memcached, etcd, wide-column, models) are enabled
+the same way the Redis anchor is: add the module and wire its
+`kv_out`/`kv_in` pair to a router ingress port. The SQL and document
+fronts are dialects over an executor (`relational_executor`,
+`document_executor`), and the executor takes the router's compute
+ingress (`internal_sql_in`/`compute_out`). The
 write path and read semantics are described in the
 [specification](../architecture/specification.md).
 

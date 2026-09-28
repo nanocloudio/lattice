@@ -1,38 +1,34 @@
-//! Cross-range transaction contracts — RFC database foundation §13.
+//! Cross-range transaction contracts.
 //!
-//! Phase 5 slice 1: the durable record shapes and the *decision rules*
+//! The durable record shapes and the *decision rules*
 //! for cross-range serializable transactions. This file is contracts
 //! only — no ports, no I/O, no routing, no module. The transaction
 //! coordinator module is a later slice; it will be a thin pump over the
 //! functions defined here, in the same relationship `timestamp_allocator`
 //! has to `mvcc.rs`.
 //!
-//! §13.2 fixes the shape of the protocol, and two sentences of it are
-//! the whole reason this file exists:
-//!
-//! > Replicate the final participant proof and `COMMITTED` state in the
-//! > home range. **Treat that home transaction record as the decision
-//! > authority.** … Readers that encounter an intent consult, push, or
-//! > help resolve the authoritative transaction record.
-//!
-//! and
-//!
-//! > If the client cannot learn the result before deadline, the response
-//! > must say that delivery is indeterminate, not that the transaction
-//! > necessarily failed.
+//! The protocol's shape is fixed, and two of its rules are
+//! the whole reason this file exists. First: replicate the final
+//! participant proof and `COMMITTED` state in the
+//! home range, and **treat that home transaction record as the
+//! decision authority** — readers that encounter an intent consult,
+//! push, or help resolve the authoritative transaction record.
+//! Second: if the client cannot learn the result before deadline, the
+//! response must say that delivery is indeterminate, not that the
+//! transaction necessarily failed.
 //!
 //! Those become [`resolve_intent`] and [`retry_class_for`] respectively.
 //!
 //! ## What is authoritative, and what is only a hint
 //!
 //! - The [`TransactionRecord`] in the **home range** is the sole
-//!   authority for the outcome (§21 invariant 9). Nothing else decides:
+//!   authority for the outcome. Nothing else decides:
 //!   not the client's disconnect, not a participant's local view, not
 //!   the presence or absence of an intent, not elapsed wall time.
 //! - An [`IntentRecord`] in a participant range is a *provisional* value
 //!   plus a **pointer to that authority**. It carries `home_range_id` for
 //!   exactly one purpose: a reader that trips over an intent must know
-//!   where to go and ask (§13.2 step 8).
+//!   where to go and ask.
 //! - An intent whose identity does not match the record it was resolved
 //!   against never produces a value. It produces a typed error
 //!   ([`IntentResolution::WrongTransaction`] /
@@ -40,8 +36,8 @@
 //!
 //! ## The one thing that must never happen
 //!
-//! §21 invariant 10 — *intents needed by an undecided transaction cannot
-//! be compacted or lost* — has a reader-side twin that this file makes
+//! The rule that *intents needed by an undecided transaction cannot
+//! be compacted or lost* has a reader-side twin that this file makes
 //! executable: **an undecided intent must never resolve to "absent".**
 //! Resolving `PENDING`/`STAGING` to absent silently loses a write that
 //! may still commit, and no later step can detect it. So
@@ -52,7 +48,7 @@
 //! ## Timestamps are leased, never invented
 //!
 //! `read_timestamp` and `provisional_commit_timestamp` are logical MVCC
-//! timestamps (§10) that must come from a `mvcc::TimestampLease` held by
+//! timestamps that must come from a `mvcc::TimestampLease` held by
 //! the coordinator. A coordinator that invents a timestamp breaks
 //! serializability in a way no downstream check can catch, so
 //! [`timestamps_leased`] is provided to assert the pairing explicitly
@@ -97,7 +93,7 @@ pub const TXN_RECORD_TAG: u16 = 0x5852; // "RX"
 /// rather than decoding into plausible garbage.
 pub const INTENT_RECORD_TAG: u16 = 0x5849; // "IX"
 
-/// Hard ceiling on participants in one cross-range transaction (§13.4).
+/// Hard ceiling on participants in one cross-range transaction.
 ///
 /// This is a *format* bound, not a policy knob: it fixes the record's
 /// maximum encoded size, so it can only change with a version bump.
@@ -119,7 +115,7 @@ pub const INTENT_WIRE_LEN: usize = 49;
 
 // ── Status ────────────────────────────────────────────────────────────
 
-/// Cross-range transaction status (§13.2). The status byte in the home
+/// Cross-range transaction status. The status byte in the home
 /// record IS the outcome; there is no other place to look.
 ///
 /// Discriminants start at 1 so a zeroed buffer never decodes as a valid
@@ -154,7 +150,7 @@ impl TxnStatus {
 
     /// Terminal states are durable decisions. Nothing — not a stale
     /// retry, not a recovered coordinator, not an expiry sweep — may
-    /// move a transaction out of one (§21 invariant 9).
+    /// move a transaction out of one.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Committed | Self::Aborted)
     }
@@ -205,8 +201,8 @@ impl IntentKind {
 
 // ── Typed errors ──────────────────────────────────────────────────────
 
-/// Every way a transaction contract check can refuse (§13.4: "exceeding
-/// a bound returns a typed error before silent resource expansion").
+/// Every way a transaction contract check can refuse. Exceeding
+/// a bound returns a typed error before silent resource expansion.
 ///
 /// There is deliberately no catch-all variant: a caller must be able to
 /// name what it refused, and a new refusal must be a visible addition
@@ -221,7 +217,8 @@ pub enum TxnError {
     NotStaging { status: TxnStatus },
     /// The record names no participants. A cross-range transaction with
     /// an empty participant set has nothing to prove and must not be
-    /// committed through this path (§13.1 is the single-range path).
+    /// committed through this path (single-range commit is its own
+    /// path).
     NoParticipants,
     /// More participants than the format or the configured limit allows.
     TooManyParticipants { count: u32, limit: u32 },
@@ -232,8 +229,8 @@ pub enum TxnError {
     ParticipantNotPrepared { index: u8 },
     /// A participant range's descriptor generation moved after prepare:
     /// the range split, merged, or relocated under the transaction, so
-    /// the prepared proof no longer describes the range being committed
-    /// (§13.3, §21 invariant 6).
+    /// the prepared proof no longer describes the range being
+    /// committed.
     ParticipantGenerationChanged {
         index: u8,
         prepared: u32,
@@ -257,7 +254,7 @@ pub enum TxnError {
     /// would commit before its own snapshot.
     CommitTimestampRegression { read: u64, commit: u64 },
     /// A timestamp is zero, or outside the lease it claims to come
-    /// from. Timestamps are leased (§10), never invented.
+    /// from. Timestamps are leased, never invented.
     UnleasedTimestamp { timestamp: u64 },
     /// The transaction id is zero. Zero is reserved for "not
     /// transactional" (`db_context::RequestContext::transaction_id`).
@@ -270,35 +267,35 @@ pub enum TxnError {
     },
     /// Declared lifetime (begin → expiry) exceeds the configured bound.
     LifetimeExceeded { lifetime_ms: u64, limit_ms: u64 },
-    /// §13.4 key-count bound.
+    /// Key-count bound.
     TooManyKeys { keys: u32, limit: u32 },
-    /// §13.4 byte-volume bound.
+    /// Byte-volume bound.
     TooManyBytes { bytes: u32, limit: u32 },
-    /// §13.4 read-span bound.
+    /// Read-span bound.
     TooManyReadSpans { spans: u32, limit: u32 },
-    /// §13.4 concurrent-intents-per-range bound.
+    /// Concurrent-intents-per-range bound.
     TooManyIntents { intents: u32, limit: u32 },
-    /// §13.4 retry-count bound.
+    /// Retry-count bound.
     TooManyRetries { retries: u32, limit: u32 },
-    /// §13.4 priority-push bound. Exhausting it is how victim selection
+    /// Priority-push bound. Exhausting it is how victim selection
     /// terminates instead of pushing forever.
     TooManyPriorityPushes { pushes: u32, limit: u32 },
 }
 
 // ── Participant ───────────────────────────────────────────────────────
 
-/// One participant range of a cross-range transaction (§13.2).
+/// One participant range of a cross-range transaction.
 ///
 /// Wire layout (`PARTICIPANT_WIRE_LEN` = 21, integers LE):
 ///
 /// ```text
-/// [range_id:16]        // 0..16   logical range identity (§11.3)
+/// [range_id:16]        // 0..16   logical range identity
 /// [generation:u32]     // 16..20  descriptor generation at prepare
 /// [prepared:u8]        // 20      0 = not prepared, 1 = prepared
 /// ```
 ///
 /// `generation` is captured when the participant prepares and is the
-/// fence that makes §13.3's "range splits and relocations preserve
+/// fence that makes "range splits and relocations preserve
 /// transaction routing through descriptor generations" executable: if
 /// the live descriptor generation no longer matches, the prepared proof
 /// describes a range that no longer exists in that shape and the commit
@@ -341,8 +338,7 @@ pub struct ObservedParticipant {
 
 // ── Transaction record ────────────────────────────────────────────────
 
-/// The authoritative home-range transaction record (§13.2, §21
-/// invariant 9).
+/// The authoritative home-range transaction record.
 ///
 /// Wire layout (`TXN_RECORD_VERSION` 1, all integers LE):
 ///
@@ -371,16 +367,16 @@ pub struct ObservedParticipant {
 ///   same reason `range_id` is: it is a logical identity that must not
 ///   collide across coordinators, restarts, or clusters, and it is the
 ///   idempotency identity a retrying client uses to *discover* the
-///   durable decision (§13.2, §21 invariant 17).
+///   durable decision.
 /// - `home_range_id`: which range holds this record. Copied into every
 ///   intent so a reader can find the authority.
-/// - `read_timestamp`: the snapshot every read was taken at (§10).
+/// - `read_timestamp`: the snapshot every read was taken at.
 /// - `provisional_commit_timestamp`: the timestamp the writes become
 ///   visible at. "Provisional" until `status == Committed`; after that
 ///   it is the commit timestamp, full stop, and it may be *later* than
-///   the read timestamp because §13.2 step 5 can push it forward to
-///   preserve serializability.
-/// - `priority`: contention/victim-selection rank (§13.4). Higher wins
+///   the read timestamp because the commit step can push it forward
+///   to preserve serializability.
+/// - `priority`: contention/victim-selection rank. Higher wins
 ///   a push; carried in the record so victim selection is decided from
 ///   replicated state, not from a local guess.
 /// - `epoch`: the transaction's incarnation. Bumped when a coordinator
@@ -392,8 +388,8 @@ pub struct ObservedParticipant {
 ///   they bound how long an abandoned transaction can hold intents
 ///   before a reaper may *replicate* an abort. They take part in NO
 ///   ordering or visibility decision. Expiry does not abort anything by
-///   itself; only a replicated `Aborted` status does (§21 invariant 12:
-///   expiry is a replicated decision, not a local-clock side effect).
+///   itself; only a replicated `Aborted` status does — expiry is a
+///   replicated decision, not a local-clock side effect.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransactionRecord {
@@ -613,8 +609,8 @@ impl TransactionRecord {
 
 // ── Intent record ─────────────────────────────────────────────────────
 
-/// The provisional value replicated into a participant range (§13.2
-/// step 3), stored under `internal_key::ValueKind::Intent`.
+/// The provisional value replicated into a participant range at
+/// prepare, stored under `internal_key::ValueKind::Intent`.
 ///
 /// Wire layout (`INTENT_RECORD_VERSION` 1, all integers LE):
 ///
@@ -633,7 +629,7 @@ impl TransactionRecord {
 /// header rather than by moving bytes.
 ///
 /// `home_range_id` is duplicated from the transaction record on purpose.
-/// It is the reader's only route to the authority (§13.2 step 8): a
+/// It is the reader's only route to the authority: a
 /// reader that finds an intent in a range knows nothing about the
 /// transaction except what this record tells it, and "go ask the home
 /// range" is unusable without knowing which range that is.
@@ -721,8 +717,7 @@ impl IntentRecord {
 // ── Intent resolution (the reader's rule) ─────────────────────────────
 
 /// What a reader that encountered an intent may conclude, having
-/// consulted the home transaction record (§13.2 step 8, §21 invariants
-/// 9 and 10).
+/// consulted the home transaction record.
 ///
 /// The five answers are exhaustive and none of them is "absent" except
 /// [`IntentResolution::Abort`]. That is the point: an undecided
@@ -733,7 +728,7 @@ impl IntentRecord {
 pub enum IntentResolution {
     /// The transaction committed. The value is visible at this
     /// timestamp — the home record's commit timestamp, which may be
-    /// LATER than the intent's provisional timestamp (§13.2 step 5).
+    /// LATER than the intent's provisional timestamp.
     Commit(u64),
     /// The transaction aborted. The intent is not a value and never
     /// was; the key reads as whatever it was before the intent.
@@ -760,7 +755,8 @@ impl IntentResolution {
     }
 
     /// The key reads as absent-because-of-this-intent. True for `Abort`
-    /// and for NOTHING else — see §21 invariant 10 in the module docs.
+    /// and for NOTHING else — see the undecided-intent rule in the
+    /// module docs.
     pub const fn is_absent(self) -> bool {
         matches!(self, Self::Abort)
     }
@@ -780,7 +776,7 @@ impl IntentResolution {
     }
 }
 
-/// The reader's rule (§13.2 step 8): resolve `intent` against the
+/// The reader's rule: resolve `intent` against the
 /// **home** transaction record it names.
 ///
 /// `record` MUST be the record read from `intent.home_range_id`. The
@@ -826,8 +822,8 @@ pub fn resolve_intent(intent: &IntentRecord, record: &TransactionRecord) -> Inte
 
 // ── Status lattice ────────────────────────────────────────────────────
 
-/// The legal status lattice (§13.2), and the executable form of §21
-/// invariant 9's consequence: **a committed transaction can never be
+/// The legal status lattice, and the executable form of the decision
+/// authority's consequence: **a committed transaction can never be
 /// un-committed.**
 ///
 /// Legal transitions, and only these:
@@ -855,7 +851,8 @@ pub fn resolve_intent(intent: &IntentRecord, record: &TransactionRecord) -> Inte
 ///
 /// The `X → X` self-transitions are legal because replicated records
 /// are redelivered: a re-proposed identical status is a no-op, not a
-/// violation, and §21 invariant 17 requires remote mutations to stay
+/// violation, and the discoverability rule requires remote mutations
+/// to stay
 /// idempotently identifiable. A self-transition changes nothing, so it
 /// does not weaken terminality.
 pub fn validate_status_transition(from: TxnStatus, to: TxnStatus) -> Result<(), TxnError> {
@@ -879,7 +876,7 @@ pub fn validate_status_transition(from: TxnStatus, to: TxnStatus) -> Result<(), 
 
 // ── Commit preconditions ──────────────────────────────────────────────
 
-/// May this record move to `Committed` (§13.2 steps 4–6)?
+/// May this record move to `Committed`?
 ///
 /// Every precondition below is checked independently and reports its own
 /// typed error, so a refusal names the reason rather than a generic
@@ -890,7 +887,7 @@ pub fn validate_status_transition(from: TxnStatus, to: TxnStatus) -> Result<(), 
 /// 3. no range appears twice;
 /// 4. every participant reported prepared;
 /// 5. every participant was observed, and its descriptor generation is
-///    unchanged since prepare (§13.3: a split/merge/relocation under the
+///    unchanged since prepare (a split/merge/relocation under the
 ///    transaction invalidates the proof);
 /// 6. every participant's intents were written at this record's epoch;
 /// 7. both timestamps are non-zero (leased) and
@@ -904,8 +901,8 @@ pub fn validate_status_transition(from: TxnStatus, to: TxnStatus) -> Result<(), 
 /// cannot invent them.
 ///
 /// `now_unix_ms` is used ONLY for the expiry check, and expiry here means
-/// "refuse to commit", never "abort". An abort is a replicated decision
-/// (§21 invariant 12); this function never produces one.
+/// "refuse to commit", never "abort". An abort is a replicated
+/// decision; this function never produces one.
 pub fn may_commit(
     record: &TransactionRecord,
     observed: &[ObservedParticipant],
@@ -976,7 +973,7 @@ pub fn may_commit(
     Ok(())
 }
 
-/// Assert that a record's timestamps really came from leases (§10).
+/// Assert that a record's timestamps really came from leases.
 ///
 /// A coordinator holds one or more `TimestampLease`s and cuts its read
 /// and commit timestamps from them. This checks the pairing explicitly:
@@ -985,7 +982,7 @@ pub fn may_commit(
 /// is cut above a committed high water — is always refused.
 ///
 /// The two leases may be the same lease; a transaction whose commit
-/// timestamp was pushed forward (§13.2 step 5) will typically present a
+/// timestamp was pushed forward will typically present a
 /// later one.
 pub fn timestamps_leased(
     record: &TransactionRecord,
@@ -1014,7 +1011,7 @@ pub fn timestamps_leased(
 // ── Outcome classification ────────────────────────────────────────────
 
 /// How a cross-range transaction ended, from the coordinator's point of
-/// view, at the moment it must answer the client (§13.2, §22).
+/// view, at the moment it must answer the client.
 ///
 /// The distinction that carries the most weight is between
 /// [`TxnOutcome::DeadlineNoDecision`] and
@@ -1025,11 +1022,11 @@ pub fn timestamps_leased(
 ///   `DeadlineExpired` is the honest answer.
 /// - `OutcomeUnknown` — intents were replicated, a commit may or may not
 ///   have been recorded, and the coordinator cannot learn which before
-///   the deadline. §13.2: *"the response must say that delivery is
-///   indeterminate, not that the transaction necessarily failed."* This
+///   the deadline. The response must say that delivery is
+///   indeterminate, not that the transaction necessarily failed. This
 ///   maps to [`RetryClass::IndeterminateDelivery`], whose contract is
-///   that the outcome remains discoverable through the transaction id
-///   (§21 invariant 17).
+///   that the outcome remains discoverable through the transaction
+///   id.
 ///
 /// Collapsing the second into the first is the specific bug this enum
 /// exists to prevent: a client told "failed" retries a transaction that
@@ -1043,7 +1040,7 @@ pub enum TxnOutcome {
     /// Lost a write-write conflict or a priority push.
     Conflict,
     /// The read set could not be refreshed at a later timestamp
-    /// (§13.2 step 5).
+    /// during the commit push.
     ReadRefreshFailed,
     /// The transaction's own expiry lapsed and it was reaped.
     Expired,
@@ -1059,10 +1056,10 @@ pub enum TxnOutcome {
     /// The decision may exist but could not be learned before the
     /// deadline. NOT a failure.
     OutcomeUnknown,
-    /// A §13.4 bound was exceeded, or the request was malformed.
+    /// A transaction bound was exceeded, or the request was malformed.
     BoundExceeded,
     /// Serializable execution was required and this composition cannot
-    /// provide it (§13.3: snapshot isolation must not be labelled
+    /// provide it (snapshot isolation must not be labelled
     /// serializable).
     Unsupported,
 }
@@ -1091,12 +1088,11 @@ pub const fn retry_class_for(outcome: TxnOutcome) -> Option<RetryClass> {
     }
 }
 
-// ── Bounds (§13.4) ────────────────────────────────────────────────────
+// ── Bounds ────────────────────────────────────────────────────────────
 
-/// Configurable transaction bounds (§13.4). Exceeding any of them
+/// Configurable transaction bounds. Exceeding any of them
 /// returns a typed [`TxnError`] *before* the resource is allocated —
-/// never a silent expansion, and never a downgrade to a weaker mode
-/// (§21 invariant 14).
+/// never a silent expansion, and never a downgrade to a weaker mode.
 ///
 /// Defaults are deliberately conservative: they are sized so one
 /// transaction cannot dominate a range's apply budget or intent space on
@@ -1110,8 +1106,8 @@ pub struct TxnLimits {
     pub max_keys: u32,
     /// Maximum total byte volume of one transaction's writes.
     pub max_bytes: u32,
-    /// Maximum bounded read spans recorded for conflict validation
-    /// (§13.3). Each span costs memory in the timestamp cache.
+    /// Maximum bounded read spans recorded for conflict validation.
+    /// Each span costs memory in the timestamp cache.
     pub max_read_spans: u32,
     /// Maximum participant ranges. Must be `<= MAX_PARTICIPANTS`, which
     /// is the format bound.
@@ -1127,8 +1123,8 @@ pub struct TxnLimits {
     /// Maximum client retries of one transaction identity.
     pub max_retries: u32,
     /// Maximum priority pushes before victim selection must terminate
-    /// (§13.4: "ensure eventual victim selection … avoid unbounded wait
-    /// queues").
+    /// (ensure eventual victim selection; avoid unbounded wait
+    /// queues).
     pub max_priority_pushes: u32,
 }
 
@@ -1188,7 +1184,8 @@ pub struct TxnUsage {
     pub priority_pushes: u32,
 }
 
-/// Enforce the §13.4 bounds. Each limit is checked in isolation and
+/// Enforce the transaction bounds. Each limit is checked in isolation
+/// and
 /// returns its own typed error, so a refusal is diagnosable and a test
 /// can violate exactly one thing at a time.
 ///
@@ -1200,7 +1197,8 @@ pub struct TxnUsage {
 /// began_unix_ms`, so an over-long transaction is refused when it is
 /// created rather than when it eventually overruns. An `expiry_unix_ms`
 /// of 0 means "no declared expiry", which the lifetime bound refuses:
-/// an unbounded transaction is exactly what §13.4 exists to prevent.
+/// an unbounded transaction is exactly what the bounds exist to
+/// prevent.
 pub fn bounds_check(
     record: &TransactionRecord,
     usage: &TxnUsage,
@@ -1270,15 +1268,15 @@ pub fn bounds_check(
 
 /// Has the transaction's administrative expiry lapsed? A true answer
 /// licenses a reaper to *propose* an abort; it is never itself an
-/// outcome (§21 invariant 12). `expiry_unix_ms == 0` means no declared
+/// outcome. `expiry_unix_ms == 0` means no declared
 /// expiry and never expires.
 pub fn is_expired(record: &TransactionRecord, now_unix_ms: u64) -> bool {
     record.expiry_unix_ms != 0 && now_unix_ms >= record.expiry_unix_ms
 }
 
-// ── Idempotency records (§14, Phase 9) ────────────────────────────────
+// ── Idempotency records ───────────────────────────────────────────────
 //
-// Moved here from `data_surface.rs`, which re-exports them. An
+// `data_surface.rs` re-exports these rather than defining them. An
 // idempotency record IS the durable identity of a committed mutation,
 // so it belongs with the transaction contracts — and the engine needs
 // it without mounting data_surface, whose own dependency tree (db_ops,
@@ -1342,7 +1340,7 @@ pub enum IdempotencyLookup {
     DidNotHappen,
     /// No record, and the identity is at or below the retention floor.
     /// The record may have existed and been reclaimed, so absence
-    /// proves NOTHING. §21 invariant 17 requires the outcome remain
+    /// proves NOTHING. The outcome must remain
     /// discoverable; once it is not, the honest answer is that it is
     /// unknown — never the cheerful "did not happen" that would invite
     /// a duplicate retry of a mutation that already committed.

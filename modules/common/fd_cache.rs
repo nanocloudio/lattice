@@ -77,7 +77,8 @@ pub const EMPTY_FD: i32 = -1;
 #[derive(Clone, Copy)]
 pub struct FdSlot {
     pub fd: i32,
-    pub kind_run: bool,
+    /// The file's kind, as its storage numbers it (run, manifest, log).
+    pub kind: u8,
     pub id: u32,
     /// LRU stamp; larger is more recent.
     pub used: u32,
@@ -87,7 +88,7 @@ impl FdSlot {
     pub const fn empty() -> Self {
         Self {
             fd: EMPTY_FD,
-            kind_run: false,
+            kind: 0,
             id: 0,
             used: 0,
         }
@@ -118,11 +119,11 @@ impl FdCache {
 
     /// A cached descriptor for this file, if present. Refreshes its LRU
     /// stamp.
-    pub fn lookup(&mut self, kind_run: bool, id: u32) -> Option<i32> {
+    pub fn lookup(&mut self, kind: u8, id: u32) -> Option<i32> {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         for s in &mut self.slots {
-            if s.fd >= 0 && s.kind_run == kind_run && s.id == id {
+            if s.fd >= 0 && s.kind == kind && s.id == id {
                 s.used = tick;
                 return Some(s.fd);
             }
@@ -137,7 +138,7 @@ impl FdCache {
     /// Never holds more than `SLOTS` descriptors: a full cache evicts
     /// its own least-recently-used entry rather than opening beyond its
     /// budget.
-    pub fn insert(&mut self, kind_run: bool, id: u32, fd: i32) -> Option<i32> {
+    pub fn insert(&mut self, kind: u8, id: u32, fd: i32) -> Option<i32> {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         // An existing entry for the same file is replaced, not
@@ -145,7 +146,7 @@ impl FdCache {
         // aliasing this cache must not create.
         let mut victim = usize::MAX;
         for (i, s) in self.slots.iter().enumerate() {
-            if s.fd >= 0 && s.kind_run == kind_run && s.id == id {
+            if s.fd >= 0 && s.kind == kind && s.id == id {
                 victim = i;
                 break;
             }
@@ -171,7 +172,7 @@ impl FdCache {
         let evicted = self.slots[victim].fd;
         self.slots[victim] = FdSlot {
             fd,
-            kind_run,
+            kind,
             id,
             used: tick,
         };
@@ -184,9 +185,9 @@ impl FdCache {
 
     /// Forget this file, returning its descriptor for the caller to
     /// close. Call before ANY operation that changes what the id names.
-    pub fn drop_entry(&mut self, kind_run: bool, id: u32) -> Option<i32> {
+    pub fn drop_entry(&mut self, kind: u8, id: u32) -> Option<i32> {
         for s in &mut self.slots {
-            if s.fd >= 0 && s.kind_run == kind_run && s.id == id {
+            if s.fd >= 0 && s.kind == kind && s.id == id {
                 let fd = s.fd;
                 *s = FdSlot::empty();
                 return Some(fd);

@@ -1,0 +1,41 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# The document model's canonical wire over TCP: each frame is
+# [len:u32 LE][MSG_DOC_REQUEST payload] in, [len:u32 LE][MSG_DOC_RESPONSE
+# payload] out (modules/common/doc_exec.rs). No dialect: a client states
+# canonical operations and reads canonical answers — tools, tests, and
+# graphs that speak the document wire themselves. No authentication:
+# bind it where only trusted peers reach.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+
+# MSG_DOC_RESPONSE from document_executor.
+[[ports]]
+name = "exec_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+
+# MSG_DOC_REQUEST to document_executor.
+[[ports]]
+name = "exec_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["sessions", "requests", "answers", "refused"]

@@ -17,7 +17,7 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # Local envelopes to ship: ship mode = the source worker's
 # snapshot_export stream; receive mode = the target worker's
@@ -31,7 +31,7 @@ content_type = "OctetStream"
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 # Reassembled envelopes from the peer: ship mode = acks to the split
 # driver's ack_in; receive mode = the chunk stream to the target

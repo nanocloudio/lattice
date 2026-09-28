@@ -5,7 +5,9 @@
 //!
 //! Lattice MSG_* constants live in the 0xC0..=0xEF range to avoid
 //! colliding with Clustor's (0x01..=0x6F) and Quantum's (0x90..=0xBF)
-//! ranges. See ~/Development/nanocloudio/standards/wire-registry.md once
+//! ranges, and continue in 0xF0..=0xFF now that range is full (0xC9 was
+//! its last free id; no contract in fluxor, clustor or quantum names a
+//! message in 0xF0..=0xFF). See ~/Development/nanocloudio/standards/wire-registry.md once
 //! the registry stabilises.
 //!
 //! ## Stability — DRAFT
@@ -46,6 +48,13 @@ pub const ENVELOPE_HDR: usize = 3;
 /// Payload: `[corr_id:u64 LE][protocol:u8][tenant_id:u32 LE]
 ///           [conn_id:u8][consistency:u8][op:u8][body_len:u16 LE][body…]`
 pub const MSG_KV_REQUEST: u8 = 0xC0;
+
+/// Largest `MSG_KV_REQUEST` payload the router accepts (its ingress
+/// scratch): a 4 KiB body and the head. A larger one is not carried —
+/// a caller that builds requests (an executor composing a transaction)
+/// refuses too-large before sending rather than wait on an answer that
+/// cannot come. 4160 = a 4096-byte body and 64 bytes of head.
+pub const KV_REQUEST_PAYLOAD_MAX: usize = 4160;
 
 /// Router → anchor. The router preserves `corr_id` from the request
 /// verbatim and stamps `conn_id` back in so the anchor can look up the
@@ -157,6 +166,29 @@ pub const MSG_SQL_REQUEST: u8 = 0xC4;
 /// originating slot without a lookup, exactly as on the KV path.
 pub const MSG_SQL_RESPONSE: u8 = 0xC5;
 
+/// Dialect → document executor: one canonical document operation.
+/// Payload: `[corr_id:u64 LE][dialect:u8][tenant_id:u32 LE][conn_id:u8]
+///           [op:u8][flags:u8]` then `{[field:u8][len:u32 LE][body]}…`.
+/// See `modules/common/doc_exec.rs` for the codec.
+pub const MSG_DOC_REQUEST: u8 = 0xC9;
+
+/// Document executor → dialect: the outcome, the documents, and a
+/// continuation when the answer is partial.
+/// Payload: `[corr_id:u64 LE][conn_id:u8][outcome:u8][flags:u8]
+///           [revision:u64 LE]` then `{[field:u8][len:u32 LE][body]}…`.
+pub const MSG_DOC_RESPONSE: u8 = 0xF0;
+
+/// JSON document client (Chronicle's store adapters) → `doc_json_dialect`:
+/// a canonical document operation stated in JSON text, with the view and
+/// table it is read through. The head and field framing are
+/// [`MSG_DOC_REQUEST`]'s; see `modules/common/doc_json.rs` for the fields.
+pub const MSG_JSON_DOC_REQUEST: u8 = 0xF2;
+
+/// `doc_json_dialect` → JSON document client: the outcome and the answer
+/// rendered as JSON text by the collection's schema. The head and field
+/// framing are [`MSG_DOC_RESPONSE`]'s.
+pub const MSG_JSON_DOC_RESPONSE: u8 = 0xF3;
+
 /// relational_executor → txn_coordinator: submit a cross-range write set
 /// for two-phase commit. The executor reaches this after the router
 /// refuses its single-range `KV_OP_TXN` with `KV_RESULT_CROSS_RANGE`. The
@@ -233,9 +265,23 @@ pub const MSG_WATCH_CTRL: u8 = 0xC8;
 pub const WATCH_CTRL_DEFINE: u8 = 0;
 pub const WATCH_CTRL_PROGRESS: u8 = 3;
 
+/// The largest `MSG_WATCH_EVENT` payload: a key (≤ 256 bytes), a value
+/// and the value it replaced (≤ 4096 bytes each), and the metadata tail.
+/// Every stage of the watch path — the worker's emit, watch_registry,
+/// watch_fanout, the anchor's read — holds one this large, so no event
+/// the store can produce is dropped for its size.
+pub const WATCH_EVENT_MAX: usize = 8704;
+
 /// kv_state_worker → registry / fanout: durable mutation event for fanout.
 /// Payload: `[kpg_id:u16 LE][revision:u64 LE][op:u8]
 ///           [key_len:u16 LE][key…][value_len:u16 LE][value…]`
+/// `op` `KV_OP_PUT_MANIFEST`: a put whose value is a large value's
+/// manifest (`kv_chunks.rs`) — a watcher resolves it, or refuses the
+/// watch, and never renders the manifest as the value. A metadata tail
+/// may follow: `[create:8][version:8][lease:8][prev:1]` and, when `prev`
+/// is not 0, `[pvlen:2][pvalue][pcreate:8][pmod:8][pversion:8]
+/// [please:8]` — `prev` 2 when the replaced value is itself a manifest
+/// (`types::JOURNAL_PREV_MANIFEST`), resolved the same way.
 pub const MSG_WATCH_EVENT: u8 = 0xCA;
 
 /// Fanout → anchor: framed watch response ready for client delivery.
@@ -299,7 +345,9 @@ pub const MSG_LEASE_CTRL: u8 = 0xD0;
 /// read as expiry).
 /// Payload: `[session_id:16][epoch:4 LE][lease_id:u64 LE][status:u8]
 ///           [ttl_ms:u32 LE][granted_at_ms:u64 LE]
-///           [keepalive_deadline_ms:u64 LE]`
+///           [keepalive_deadline_ms:u64 LE][now_ms:u64 LE]` — `now_ms` is
+/// the manager's clock, so a reader can turn the deadline into a
+/// remaining TTL.
 pub const MSG_LEASE_STATE: u8 = 0xD1;
 pub const LEASE_STATE_OK: u8 = 0;
 pub const LEASE_STATE_GONE: u8 = 1;
@@ -316,9 +364,9 @@ pub const LEASE_STATE_GONE: u8 = 1;
 /// message samples a local timer for a TTL decision.
 pub const MSG_LEASE_TICK: u8 = 0xD2;
 
-/// Manager → kv_state_worker: lease-attached key revoke.
-/// Payload: `[lease_id:u64 LE][kpg_id:u16 LE]
-///           [key_len:u16 LE][key…]`
+/// Manager → etcd anchor: a lease ended, revoked or expired. The
+/// anchor deletes the keys attached to it (`KV_OP_LEASE_REVOKE`).
+/// Payload: `[lease_id:u64 LE][reserved:4]`
 pub const MSG_LEASE_REVOKE: u8 = 0xD3;
 
 /// Substrate `control_plane` → placement-aware app modules
@@ -464,7 +512,18 @@ pub const TS_LEASE_GRANT_WIRE_LEN: usize = 48;
 // a failover-capable client needs.
 pub const MSG_CLIENT_REJECT: u8 = 0x15;
 pub const CLIENT_REJECT_NOT_LEADER: u8 = 0x02;
+/// The proposal is larger than one log entry carries (clustor's
+/// `CLIENT_REJECT_TOO_LARGE`): no retry can succeed.
+pub const CLIENT_REJECT_TOO_LARGE: u8 = 0x06;
 pub const CLIENT_REJECT_BODY_LEN: usize = 10;
+
+/// The largest proposal body the replicated path carries: one clustor
+/// WAL entry body (`wal_frame::MAX_ENTRY_BODY`, 2048) less the gateway's
+/// correlation tag (`wire::TAGGED_PROPOSAL_HDR`, 8). A lattice proposal
+/// is `[LATTICE_ENTRY_TAG][command]`; a larger one is refused as too
+/// large before it is proposed. Held equal to clustor's contract by
+/// `tests/contract_clustor_limits.rs`.
+pub const CONSENSUS_PROPOSAL_BODY_MAX: usize = 2040;
 
 /// Leading byte of every lattice-replicated Raft entry body.
 ///
@@ -941,6 +1000,183 @@ impl FenceTail {
             catalog_generation: u64::from_le_bytes(src[21..29].try_into().ok()?),
             commit_frontier: u64::from_le_bytes(src[29..37].try_into().ok()?),
         })
+    }
+}
+
+// ── Message parts ──────────────────────────────────────────────────────
+//
+// A logical message larger than one channel frame (a document past a
+// frame, its answer) crosses an edge as parts: `MSG_PART` frames, each
+// `[stream:u32][offset:u32][total:u32][msg_type:u8][bytes]`, sent in
+// order and whole — a sender finishes one message's parts before it
+// starts another's on the same channel — and reassembled by the receiver
+// into a buffer its policy sizes. A message that fits one frame is sent
+// as itself, never as parts.
+
+/// A part of a logical message larger than one frame.
+pub const MSG_PART: u8 = 0xF1;
+/// One channel frame's payload: the SDK's `CHANNEL_BUFFER_SIZE` (8192)
+/// less the envelope header.
+pub const FRAME_PAYLOAD_MAX: usize = 8189;
+/// A part's head: stream, offset, total, the message's own type.
+pub const PART_HEAD: usize = 4 + 4 + 4 + 1;
+/// The message bytes one part carries at most.
+pub const PART_BYTES_MAX: usize = FRAME_PAYLOAD_MAX - PART_HEAD;
+
+/// Cuts one message into its parts.
+#[derive(Clone, Copy, Debug)]
+pub struct PartWriter {
+    stream: u32,
+    msg_type: u8,
+    total: usize,
+    sent: usize,
+}
+
+impl PartWriter {
+    /// For `total` bytes of a `msg_type` message, as stream `stream`.
+    pub const fn new(stream: u32, msg_type: u8, total: usize) -> Self {
+        PartWriter {
+            stream,
+            msg_type,
+            total,
+            sent: 0,
+        }
+    }
+
+    /// Every part written?
+    pub fn done(&self) -> bool {
+        self.sent >= self.total
+    }
+
+    /// The next part of `msg` as a whole `MSG_PART` envelope into `out`
+    /// (room for `3 + FRAME_PAYLOAD_MAX`): its length, `None` when every
+    /// part is out or `out`/`msg` are short. Call [`PartWriter::sent`]
+    /// once it is written.
+    pub fn frame(&self, msg: &[u8], out: &mut [u8]) -> Option<usize> {
+        if self.done() || msg.len() != self.total || u32::try_from(self.total).is_err() {
+            return None;
+        }
+        let n = (self.total - self.sent).min(PART_BYTES_MAX);
+        let payload = PART_HEAD + n;
+        let bytes = msg.get(self.sent..self.sent + n)?;
+        let o = out.get_mut(..ENVELOPE_HDR + payload)?;
+        if !write_envelope_hdr(o, MSG_PART, payload) {
+            return None;
+        }
+        let head = o.get_mut(ENVELOPE_HDR..ENVELOPE_HDR + PART_HEAD)?;
+        head.get_mut(0..4)?
+            .copy_from_slice(&self.stream.to_le_bytes());
+        head.get_mut(4..8)?
+            .copy_from_slice(&(self.sent as u32).to_le_bytes());
+        head.get_mut(8..12)?
+            .copy_from_slice(&(self.total as u32).to_le_bytes());
+        *head.get_mut(12)? = self.msg_type;
+        // Zip, not copy_from_slice: no length-mismatch panic path in PIC.
+        for (d, b) in o.get_mut(ENVELOPE_HDR + PART_HEAD..)?.iter_mut().zip(bytes) {
+            *d = *b;
+        }
+        Some(ENVELOPE_HDR + payload)
+    }
+
+    /// The part [`PartWriter::frame`] built was written.
+    pub fn sent(&mut self) {
+        self.sent = (self.sent + PART_BYTES_MAX).min(self.total);
+    }
+}
+
+/// Why a part was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartError {
+    /// Not a part's shape.
+    Malformed,
+    /// The message is larger than the receiver's buffer.
+    TooLarge,
+    /// A part out of order, or of another stream mid-message: the message
+    /// in progress is abandoned.
+    OutOfOrder,
+}
+
+/// Reassembles one message at a time from its parts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reassembly {
+    stream: u32,
+    msg_type: u8,
+    total: usize,
+    got: usize,
+    active: bool,
+}
+
+impl Reassembly {
+    pub const fn new() -> Self {
+        Reassembly {
+            stream: 0,
+            msg_type: 0,
+            total: 0,
+            got: 0,
+            active: false,
+        }
+    }
+
+    /// Is a message part-way in?
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Abandon the message in progress.
+    pub fn reset(&mut self) {
+        self.active = false;
+    }
+
+    /// Take one `MSG_PART` payload into `buf`: `Ok(Some((msg_type,
+    /// total)))` when the message is whole in `buf[..total]`, `Ok(None)`
+    /// while parts remain. A part that does not continue the message in
+    /// progress abandons it (a new message's first part starts over).
+    pub fn take(&mut self, part: &[u8], buf: &mut [u8]) -> Result<Option<(u8, usize)>, PartError> {
+        use PartError::*;
+        let rd = |at: usize| -> Option<usize> {
+            Some(u32::from_le_bytes(part.get(at..at + 4)?.try_into().ok()?) as usize)
+        };
+        let (Some(stream), Some(offset), Some(total), Some(&msg_type)) =
+            (rd(0), rd(4), rd(8), part.get(12))
+        else {
+            return Err(Malformed);
+        };
+        let bytes = part.get(PART_HEAD..).ok_or(Malformed)?;
+        let stream = stream as u32;
+        if offset == 0 {
+            // A message's first part: whatever was in progress is gone.
+            self.active = true;
+            self.stream = stream;
+            self.msg_type = msg_type;
+            self.total = total;
+            self.got = 0;
+        } else if !self.active
+            || stream != self.stream
+            || offset != self.got
+            || total != self.total
+            || msg_type != self.msg_type
+        {
+            self.active = false;
+            return Err(OutOfOrder);
+        }
+        if total > buf.len() {
+            self.active = false;
+            return Err(TooLarge);
+        }
+        let end = offset + bytes.len();
+        let Some(dst) = buf.get_mut(offset..end).filter(|_| end <= total) else {
+            self.active = false;
+            return Err(Malformed);
+        };
+        for (d, b) in dst.iter_mut().zip(bytes) {
+            *d = *b;
+        }
+        self.got = end;
+        if self.got == self.total {
+            self.active = false;
+            return Ok(Some((self.msg_type, self.total)));
+        }
+        Ok(None)
     }
 }
 

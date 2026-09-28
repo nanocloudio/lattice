@@ -83,29 +83,29 @@ pub const PROTO_MEMCACHED_UDP: u8 = 0x04;
 /// connection behind it.
 pub const PROTO_INTERNAL_WATCH: u8 = 0x05;
 pub const PROTO_INTERNAL_SQL: u8 = 0x06;
-/// The range supervisor (Phase 4). The ONLY caller whose requests may
+/// The range supervisor. The ONLY caller whose requests may
 /// carry [`KV_OP_TARGETED`] — explicit partition addressing is a
 /// lifecycle-bootstrap tool, not a client capability.
 pub const PROTO_INTERNAL_LIFECYCLE: u8 = 0x07;
-/// The Phase 6 index-backfill worker. Future database-operations
+/// The index-backfill worker. Future database-operations
 /// workers (resolved feeds, backup) get their OWN values — one caller
 /// per protocol byte, or replies fan to the wrong module.
 pub const PROTO_INTERNAL_JOB: u8 = 0x08;
-/// The `lattice.data` anchor (Phase 9): compute that lives in ANOTHER
+/// The `lattice.data` anchor: compute that lives in ANOTHER
 /// graph, admitted here through the internal data surface.
 ///
 /// Unlike the internal callers above, this one shares its reply port
 /// with [`PROTO_INTERNAL_SQL`] — the router's outputs are at fluxor's
 /// 16-port cap. That sharing is not a compromise: `PROTO_INTERNAL_SQL`
 /// is compute placed IN this graph and `PROTO_INTERNAL_DATA` is the
-/// same compute placed remotely, and §30 compares those two placements
+/// same compute placed remotely, and the two placements are compared
 /// precisely because a deployment picks one. The router refuses at init
 /// if both ingresses are wired, so the shared port always has exactly
 /// one owner.
 pub const PROTO_INTERNAL_DATA: u8 = 0x09;
 pub const PROTO_UNKNOWN: u8 = 0xFF;
 
-// ── Continuity classes (protocol RFC vocabulary) ───────────────────────
+// ── Continuity classes ─────────────────────────────────────────────────
 
 pub const CONTINUITY_DRAIN_ONLY: u8 = 0x01;
 pub const CONTINUITY_EDGE_ANCHORED: u8 = 0x02;
@@ -126,20 +126,32 @@ pub const KV_OP_APPEND: u8 = 0x09;
 pub const KV_OP_EXISTS: u8 = 0x0A;
 pub const KV_OP_SCAN: u8 = 0x0B;
 pub const KV_OP_FLUSH: u8 = 0x0C;
+/// Body `[count:u16]{[klen:u16][key]}` then an optional `[flags:u8]`;
+/// answered [`KV_RESULT_ARRAY`] `[count:u16]{[len:u32][value]}` (`len`
+/// [`KV_ARRAY_ELEMENT_NULL`] for a missing key). With
+/// [`MGET_FLAG_MANIFESTS`] every element ends `[flags:u8]`
+/// ([`RECORD_FLAG_MANIFEST`]: the value is a manifest); without it a
+/// manifest refuses the whole op [`KV_RESULT_MANIFEST`].
 pub const KV_OP_MGET: u8 = 0x0D;
+/// [`KV_OP_MGET`] flag: the reader reads manifests.
+pub const MGET_FLAG_MANIFESTS: u8 = 0x01;
+/// Body `[count:u16]{[klen:u16][key][vlen:u32][value]}` then optional
+/// `[marks: count bytes]`: a mark of 1 says that pair's value is a large
+/// value's manifest (written as `KV_OP_PUT_MANIFEST` writes one). Every
+/// marked pair is checked before any is written.
 pub const KV_OP_MSET: u8 = 0x0E;
 pub const KV_OP_STRLEN: u8 = 0x0F;
 pub const KV_OP_PREPEND: u8 = 0x10;
-/// Historical point read at an explicit MVCC revision (RFC §10/§20
-/// "snapshot": serve at the supplied MVCC timestamp). Phase-2 slice B.
+/// Historical point read at an explicit MVCC revision (snapshot
+/// semantics: serve at the supplied MVCC timestamp).
 pub const KV_OP_GET_AT: u8 = 0x11;
-/// Historical ordered scan at an explicit MVCC revision (RFC §10
-/// "stable scans at one timestamp"). Phase-2 slice B.
+/// Historical ordered scan at an explicit MVCC revision: a stable
+/// scan at one timestamp.
 pub const KV_OP_SCAN_AT: u8 = 0x12;
 /// Half-open range scan `[start, end)` returning key AND value pairs
-/// in one walk (RFC §14.4 — a relational table read is a scan of the
-/// table's primary-key prefix, and it needs the row bytes, not just
-/// the keys). Phase-7.
+/// in one walk (a relational table read is a scan of the table's
+/// primary-key prefix, and it needs the row bytes, not just the
+/// keys).
 ///
 /// Body: `[start_len:u16 LE][start…][end_len:u16 LE][end…]`
 ///       `[cursor:u64 LE][limit:u16 LE]`
@@ -158,10 +170,11 @@ pub const KV_OP_SCAN_AT: u8 = 0x12;
 pub const KV_OP_RANGE_SCAN: u8 = 0x13;
 /// Every VERSION in `[start, end)` whose revision falls in the
 /// half-open-below window `(from, to]` — the watch-resume backfill
-/// (RFC §15). Phase-2 slice C.
+/// read.
 ///
 /// Body: `[start_len:u16 LE][start…][end_len:u16 LE][end…]`
 ///       `[from_rev:u64 LE][to_rev:u64 LE][cursor:u64 LE][limit:u16 LE]`
+///       optionally `[flags:u8]` ([`VERSIONS_FLAG_META`]).
 ///
 /// Distinct from `KV_OP_SCAN_AT` in the question it asks. `SCAN_AT`
 /// asks what the database LOOKED LIKE at one revision and returns one
@@ -175,7 +188,26 @@ pub const KV_OP_RANGE_SCAN: u8 = 0x13;
 /// window is genuinely gone, and serving the surviving tail would be a
 /// silently partial history the caller could not detect.
 pub const KV_OP_SCAN_VERSIONS: u8 = 0x14;
-/// Explicit partition addressing (Phase 4 lifecycle bootstrap only).
+/// [`KV_OP_SCAN_VERSIONS`] flag: each PUT entry is followed by the
+/// version's own metadata, `[create_revision:u64][version:u64][lease:u64]`
+/// (all LE) — what an etcd watch event's KeyValue carries. A DELETE entry
+/// carries none (a deleted key has none). Callers that do not set it get
+/// the entries unchanged.
+pub const VERSIONS_FLAG_META: u8 = 0x01;
+/// [`KV_OP_SCAN_VERSIONS`] flag: the reader reads large values'
+/// manifests — every entry ends `[flags:u8]` (after any metadata),
+/// `RECORD_MANIFEST` marking one. Without it a manifest version is
+/// refused `KV_RESULT_MANIFEST`.
+pub const VERSIONS_FLAG_MANIFESTS: u8 = 0x02;
+// Large values (`kv_chunks.rs`): a manifest record is explicit state, and
+// the reads a protocol makes of its own keys know it — GET / GET_AT
+// answer `KV_RESULT_MANIFEST`, RANGE_META / DELETE_META / SCAN_VERSIONS
+// mark or refuse it, STRLEN answers the value's length, APPEND / PREPEND
+// / MGET refuse it, and etcd's value compare reads its chunks. The raw
+// walks (SCAN, RANGE_SCAN, SCAN_AT, SNAPSHOT_VERSIONS and the snapshots)
+// carry every record as it is stored, a manifest as its 44 bytes — as
+// they carry any model's internal encoding.
+/// Explicit partition addressing (lifecycle bootstrap only).
 ///
 /// Body: `[partition_id:u16 LE][inner_op:u8][inner_body…]`
 ///
@@ -191,7 +223,7 @@ pub const KV_OP_SCAN_VERSIONS: u8 = 0x14;
 /// in two.
 pub const KV_OP_TARGETED: u8 = 0x15;
 
-// ── Cross-range transactions (§13, Phase 5) ────────────────────────────
+// ── Cross-range transactions ───────────────────────────────────────────
 //
 // Three ops turn a single-range `KV_OP_TXN` into a two-phase one across
 // participants. They exist as separate ops rather than as flags on
@@ -243,7 +275,7 @@ pub const KV_OP_TXN_RESOLVE: u8 = 0x17;
 ///
 /// Body: an encoded `TransactionRecord`.
 ///
-/// The op refuses any status move the §13.2 lattice forbids, in
+/// The op refuses any status move the status lattice forbids, in
 /// particular `Committed → Aborted`: a stale coordinator retry, an
 /// expiry sweeper working from an old read, and a recovered participant
 /// replaying an abort must all bounce off this. Replies
@@ -253,8 +285,8 @@ pub const KV_OP_TXN_RESOLVE: u8 = 0x17;
 /// which is what a helping reader does.
 pub const KV_OP_TXN_RECORD: u8 = 0x18;
 
-/// Execute an inner op EXACTLY ONCE under a caller-supplied identity
-/// (§14, Phase 9).
+/// Execute an inner op EXACTLY ONCE under a caller-supplied
+/// identity.
 ///
 /// Body: `[idempotency_key:u64 LE][inner_op:u8][inner_body…]`
 ///
@@ -278,7 +310,7 @@ pub const KV_OP_TXN_RECORD: u8 = 0x18;
 pub const KV_OP_IDEMPOTENT: u8 = 0x19;
 
 /// Live-rows snapshot scan WITH per-row commit metadata
-/// — the backfill read (§8): every live (winning, non-tombstone,
+/// — the backfill read: every live (winning, non-tombstone,
 /// unexpired) row in `[start, end)` as of `at_rev` (`0` = latest),
 /// each with the `mod_revision` and MVCC `commit_ts` of the version
 /// that produced it, so a backfilled event's identity is stable if the
@@ -294,7 +326,7 @@ pub const KV_OP_IDEMPOTENT: u8 = 0x19;
 pub const KV_OP_SNAPSHOT_VERSIONS: u8 = 0x1A;
 
 /// Pure rediscovery lookup of an idempotency identity — the wire form of
-/// the `ViaIdempotencyIdentity` resolution route (§21). It reads the
+/// the `ViaIdempotencyIdentity` resolution route. It reads the
 /// identity record WITHOUT running any inner op: where [`KV_OP_IDEMPOTENT`]
 /// re-submits the whole mutation to find out whether it already happened,
 /// this asks the question directly, which is what a client that lost its
@@ -310,6 +342,160 @@ pub const KV_OP_SNAPSHOT_VERSIONS: u8 = 0x1A;
 /// `txn::IdempotencyLookup` body. Read-only: it never writes a record, so
 /// it is safe to route off the consensus path.
 pub const KV_OP_IDEMPOTENT_LOOKUP: u8 = 0x1B;
+/// etcd's Range: the live keys of a span, WITH their metadata, ordered,
+/// limited and counted as `etcdserverpb.RangeRequest` asks.
+///
+/// Body: `[start_len:u16 LE][start…][end_len:u16 LE][end…]`
+///       `[at_rev:u64 LE][limit:u32 LE][flags:u8]`
+///       `[sort_target:u8][sort_order:u8]`
+///       `[min_mod:u64 LE][max_mod:u64 LE][min_create:u64 LE][max_create:u64 LE]`
+///
+/// - `end` empty: the single key `start`; `end` = `\0`: every key from
+///   `start` on; else `[start, end)`.
+/// - `at_rev` 0 = the current revision; below what the provider retains
+///   is `KV_RESULT_COMPACTED`, above the store's revision
+///   `KV_RESULT_FUTURE_REV`.
+/// - `limit` 0 = no limit. `flags`: 1 keys_only, 2 count_only,
+///   [`RANGE_META_FLAG_MANIFESTS`] the reader reads large values' manifests
+///   (each entry then ends `[flags:u8]`, `RECORD_MANIFEST` marking one);
+///   without it a manifest's value is refused `KV_RESULT_MANIFEST`.
+/// - `sort_target` 0 key, 1 version, 2 create, 3 mod, 4 value;
+///   `sort_order` 0 none (key ascending), 1 ascend, 2 descend — applied
+///   BEFORE the limit, as etcd does.
+/// - The four revision bounds filter (0 = unbounded); they are applied
+///   before the limit and the count.
+///
+/// Answered with [`KV_RESULT_KVS`]. Unlike `KV_OP_RANGE_SCAN` the order
+/// is promised: whatever order the provider walks in, entries come back
+/// in the requested one.
+pub const KV_OP_RANGE_META: u8 = 0x1C;
+/// [`KV_OP_RANGE_META`] flag: the reader reads manifests.
+pub const RANGE_META_FLAG_MANIFESTS: u8 = 0x04;
+/// [`KV_OP_DELETE_META`] flag: the reader reads manifests among the
+/// previous values (entries end `[flags:u8]`).
+pub const DELETE_META_FLAG_MANIFESTS: u8 = 0x02;
+/// etcd's DeleteRange: delete every live key of a span at ONE revision,
+/// atomically, and answer what was deleted.
+///
+/// Body: `[start_len:u16 LE][start…][end_len:u16 LE][end…][flags:u8]`
+/// with [`KV_OP_RANGE_META`]'s span rules; `flags` 1 = prev_kv (answer the
+/// deleted values too).
+///
+/// Answered [`KV_RESULT_KVS`]: `total` = how many were deleted, the
+/// `more` byte = the prev_kv flag, then one entry per deleted key (its
+/// value only with prev_kv; its metadata always). A span whose deleted keys do not fit the answer is refused
+/// `KV_RESULT_QUOTA` and deletes nothing — never a partial delete.
+pub const KV_OP_DELETE_META: u8 = 0x1D;
+/// etcd's Txn: compares over keys or ranges, then one branch of ops, all
+/// applied at ONE revision.
+///
+/// Body: `[cmp_count:u8]` then per compare
+/// `[target:u8][result:u8][key_len:u16][key][end_len:u16][end]`
+/// `[operand:u64 LE][value_len:u32 LE][value]` — target 0 version, 1
+/// create, 2 mod, 3 value, 4 lease; result 0 EQUAL, 1 GREATER, 2 LESS,
+/// 3 NOT_EQUAL; `end` as [`KV_OP_RANGE_META`]'s. Then `[then_count:u8]`
+/// ops and `[else_count:u8]` ops, each `[kind:u8][len:u32 LE][body]` —
+/// kind 1 Range (a `KV_OP_RANGE_META` body), 2 Put (`KV_OP_PUT`), 3
+/// DeleteRange (`KV_OP_DELETE_META`), 4 Txn (this body, nested), 5 Put of
+/// a manifest (`KV_OP_PUT_MANIFEST`); see `ETCD_OP_*`.
+///
+/// A missing key (or an empty range) compares as zero for version,
+/// create, mod and lease, and never satisfies a value compare — as etcd.
+/// Two writes of one key in the chosen branch are refused
+/// `KV_RESULT_DUPLICATE` before anything is applied.
+///
+/// Answered [`KV_RESULT_ETCD_TXN`].
+pub const KV_OP_ETCD_TXN: u8 = 0x1E;
+/// [`KV_OP_ETCD_TXN`] op kinds: a Range (a `KV_OP_RANGE_META` body), a
+/// Put (`KV_OP_PUT`), a DeleteRange (`KV_OP_DELETE_META`), a nested Txn,
+/// and a Put of a large value's manifest (`KV_OP_PUT_MANIFEST`).
+pub const ETCD_OP_RANGE: u8 = 1;
+pub const ETCD_OP_PUT: u8 = 2;
+pub const ETCD_OP_DELETE: u8 = 3;
+pub const ETCD_OP_TXN: u8 = 4;
+pub const ETCD_OP_PUT_MANIFEST: u8 = 5;
+/// Nesting a [`KV_OP_ETCD_TXN`] may reach below the outermost.
+pub const ETCD_TXN_DEPTH_MAX: usize = 4;
+/// An answer entry's flags byte (a reader that reads manifests gets one):
+/// the value is a large value's manifest.
+pub const RECORD_FLAG_MANIFEST: u8 = 0x01;
+/// A watch event's (and the store's event journal's) `prev` byte: the
+/// replaced version is present, its value inline …
+pub const JOURNAL_PREV: u8 = 1;
+/// … or present, its value a large value's manifest.
+pub const JOURNAL_PREV_MANIFEST: u8 = 2;
+/// A lease revoked or expired: delete every live key attached to it, at
+/// ONE revision. Body `[lease:u64 LE]`. Answered [`KV_RESULT_KVS`] as
+/// [`KV_OP_DELETE_META`] answers (deleted count, `more` = 1 when keys
+/// remain that did not fit this answer — the caller repeats the op until
+/// `more` is 0).
+pub const KV_OP_LEASE_REVOKE: u8 = 0x1F;
+/// The live keys attached to a lease (etcd's LeaseTimeToLive `keys`, and
+/// the permission check of a revoke under auth). Body `[lease:u64 LE]`,
+/// optionally `[after_len:u16 LE][after…]`: a cursor. Answered
+/// [`KV_RESULT_KVS`] with key-only entries in ascending key order after
+/// the cursor (`more` = 1 when keys remain; ask again from the last).
+pub const KV_OP_LEASE_KEYS: u8 = 0x20;
+/// etcd's Compact: retire history below a revision. Body
+/// `[revision:u64 LE]`. Answered `KV_RESULT_OK`, or
+/// `KV_RESULT_COMPACTED` when the revision is at or below one already
+/// compacted, or `KV_RESULT_FUTURE_REV` when it is ahead of the store.
+/// Reads below it are refused from then on; the physical reclamation
+/// follows as the provider's maintenance.
+pub const KV_OP_COMPACT: u8 = 0x21;
+/// etcd's HashKV (and the sizes its Status reports): a digest of the live
+/// keys as of a revision. Body `[revision:u64 LE]` (0 = the current one).
+/// Answered `KV_RESULT_OK` with `[hash:u32][compact_revision:u64]
+/// [hash_revision:u64][bytes:u64][keys:u64]`, all LE — `bytes` the keys'
+/// and values' total size. The digest is a function of the keys' content
+/// and metadata alone, never of the provider's layout or walk order, so
+/// two stores holding the same state agree on it.
+pub const KV_OP_HASH_KV: u8 = 0x22;
+/// Store one chunk of a large value (`kv_chunks.rs`). Body
+/// `[hash:32][len:u16][chunk]`. The worker checks the chunk's SHA-256
+/// against `hash` (`KV_RESULT_BAD_CHUNK`) and its shape, and accepts a
+/// node chunk only when every child it names is stored
+/// (`KV_RESULT_MISSING_CHUNK`); a chunk already stored is accepted as it
+/// is. A write like any other: it takes a revision (a chunk already
+/// referenced takes none). Not inside another op's batch. Answered
+/// `KV_RESULT_OK`.
+pub const KV_OP_PUT_CHUNK: u8 = 0x23;
+/// Read one chunk. Body `[hash:32]`. Answered `KV_RESULT_OK` with the
+/// chunk, or `KV_RESULT_NOT_FOUND`.
+pub const KV_OP_GET_CHUNK: u8 = 0x24;
+/// Release chunks the committed compaction floor no longer needs: a
+/// replicated maintenance command (see `kv_chunks.rs`). Body
+/// `[floor:u64][budget:u16]` (at most `kv_store::SWEEP_BUDGET_MAX`
+/// entries). Takes a revision when it releases anything. Answered
+/// `KV_RESULT_OK` with `[more:u8]`: whether anything due remains — the
+/// proposer sweeps again until it is 0.
+pub const KV_OP_CHUNK_SWEEP: u8 = 0x25;
+/// PUT a large value's manifest (`kv_chunks::Manifest`): a `KV_OP_PUT`
+/// body whose value is a manifest. Refused `KV_RESULT_MISSING_CHUNK`
+/// unless its root chunk is stored (a stored root is a whole value), and
+/// `KV_RESULT_BAD_CHUNK` when the value is not a manifest. The record is
+/// flagged: readers that do not ask for manifests are refused, never
+/// handed its bytes as a value. Also a TXN sub-op.
+pub const KV_OP_PUT_MANIFEST: u8 = 0x26;
+/// A [`KV_OP_TXN`] as its writer stages it, before the large-value layer
+/// (`kv_large.rs`) uploads its values: the same body, but each branch op
+/// framed `[op:u8][len:u32][body]`, so a `PUT` may carry a value past what
+/// a wire op's `u16` frames. It never goes on the wire: the layer's
+/// `Uploader` takes it and rewrites it into the `KV_OP_TXN` that is sent
+/// (each large value its manifest). A worker refuses it as an unknown op.
+pub const KV_OP_TXN_STAGED: u8 = 0x27;
+/// A replica's registration as an origin of provider writes (`origin.rs`):
+/// body `[nonce:u64 LE]`, `corr_id` naming the replica. Applied, it gives
+/// the replica its next incarnation. Proposed only by a replicated store
+/// provider; the router refuses it from a client, and nobody is answered.
+pub const KV_OP_ORIGIN_REGISTER: u8 = 0x28;
+/// A store provider's write, applied once by its origin's record
+/// (`origin.rs`): a [`KV_OP_TXN`] body, `corr_id` its `(replica,
+/// incarnation, seq)`. Proposed and answered as `KV_OP_ORIGIN_REGISTER`.
+pub const KV_OP_ORIGIN_WRITE: u8 = 0x29;
+/// A chunk of a store provider's large value: a [`KV_OP_PUT_CHUNK`] body.
+/// Proposed and answered as `KV_OP_ORIGIN_REGISTER`.
+pub const KV_OP_ORIGIN_CHUNK: u8 = 0x2A;
 
 // ── KV op-specific body shapes ─────────────────────────────────────────
 //
@@ -361,8 +547,8 @@ pub const KV_OP_IDEMPOTENT_LOOKUP: u8 = 0x1B;
 //   KV_OP_GET_AT
 //     [revision:u64 LE][key_len:u16 LE][key…]
 //     Historical point read: the value of `key` as of MVCC revision
-//     `revision` (§10 "latest and historical point reads", §20
-//     "snapshot: serve at the supplied MVCC timestamp"). `revision`
+//     `revision` (snapshot semantics: serve at the supplied MVCC
+//     timestamp). `revision`
 //     of 0 means "latest" and is byte-identical to KV_OP_GET.
 //     Visibility is the winning version whose assigned revision is
 //     `<= revision`; if that version is a tombstone the key reads
@@ -371,8 +557,8 @@ pub const KV_OP_IDEMPOTENT_LOOKUP: u8 = 0x1B;
 //     provider below its committed GC floor, or the memory provider
 //     for ANY revision below its current one, since it retains no
 //     history — returns `KV_RESULT_COMPACTED`. It never guesses and
-//     never downgrades to latest (RFC §9: providers expose equivalent
-//     logical state where they can and fail closed where they cannot).
+//     never downgrades to latest: providers expose equivalent
+//     logical state where they can and fail closed where they cannot.
 //
 //   KV_OP_SCAN_AT
 //     [revision:u64 LE][cursor:u64 LE][limit:u16 LE]
@@ -431,6 +617,28 @@ pub const PUT_FLAG_NX: u8 = 0x01;
 pub const PUT_FLAG_XX: u8 = 0x02;
 pub const PUT_FLAG_GET: u8 = 0x04;
 pub const PUT_FLAG_KEEPTTL: u8 = 0x08;
+/// A lease follows the expiry in the PUT body (`[lease:u64 LE]`) and is
+/// the key's lease after the put (0 = none): etcd's `PutRequest.lease`.
+pub const PUT_FLAG_LEASE: u8 = 0x10;
+/// Answer with the previous KeyValue: `[present:u8]` then, when present,
+/// one [`KV_RESULT_KVS`] entry (key, value, create/mod/version/lease) —
+/// etcd's `prev_kv`.
+pub const PUT_FLAG_PREV_META: u8 = 0x20;
+/// Keep the stored value (the body's is ignored); the key must exist,
+/// else `KV_RESULT_NOT_FOUND` — etcd's `ignore_value`.
+pub const PUT_FLAG_IGNORE_VALUE: u8 = 0x40;
+/// Keep the stored lease; the key must exist, else `KV_RESULT_NOT_FOUND`
+/// — etcd's `ignore_lease`.
+pub const PUT_FLAG_IGNORE_LEASE: u8 = 0x80;
+/// A `KV_OP_PUT` body's optional second flags byte, last: after the
+/// expiry, and after the lease when [`PUT_FLAG_LEASE`] carries one.
+/// [`PUT_FLAG2_MANIFESTS`]: the reader reads a manifest as the previous
+/// value — with [`PUT_FLAG_PREV_META`] the entry ends `[flags:u8]`
+/// (`RECORD_MANIFEST` marking one); with [`PUT_FLAG_GET`] a previous
+/// manifest is answered [`KV_RESULT_MANIFEST`] with its bytes, the write
+/// applied. Without it a previous manifest refuses the write
+/// `KV_RESULT_MANIFEST`, applying nothing.
+pub const PUT_FLAG2_MANIFESTS: u8 = 0x01;
 
 // ── KV result kinds ────────────────────────────────────────────────────
 //
@@ -481,11 +689,11 @@ pub const KV_RESULT_TXN: u8 = 0x0C;
 ///
 /// This is a typed refusal, never an approximation: the alternative
 /// (serving latest, or serving empty) would be a wrong answer to a
-/// historical read, and RFC §21 invariant 14 requires a typed failure
+/// historical read, and the contract requires a typed failure
 /// rather than a silently weaker mode. Two things produce it:
 ///
 /// - the disk provider asked for a revision below its committed GC
-///   floor (§18) — the history was physically reclaimed;
+///   floor — the history was physically reclaimed;
 /// - the memory provider asked for ANY revision below its current one:
 ///   it materializes only current values, so it has no history to
 ///   serve and says so instead of pretending.
@@ -534,7 +742,7 @@ pub const VERSION_KIND_PUT: u8 = 0x00;
 pub const VERSION_KIND_DELETE: u8 = 0x01;
 /// The op's key set spans more than one range on an ordered
 /// multi-range map and the op has no cross-range execution: multi-key
-/// writes and transactions need the Phase 5 coordinator, and a
+/// writes and transactions need a coordinator, and a
 /// version-window scan cannot merge two partitions' independent
 /// revision spaces at all. A typed refusal, body empty — executing on
 /// ONE of the ranges would silently drop the rest of the key set,
@@ -558,21 +766,21 @@ pub const KV_RESULT_CROSS_RANGE: u8 = 0x10;
 pub const KV_RESULT_TXN_PENDING: u8 = 0x11;
 
 /// The range's home partition lives in a DIFFERENT Clustor cluster
-/// domain than the one this router serves (§11.3, §26.5). A
+/// domain than the one this router serves. A
 /// `partition_id` is cluster-local, so a deployment that has grown past
 /// one domain's partition-ID space routes across several domains, and a
 /// key can resolve to a domain this router cannot physically reach.
 ///
 /// Body: `[cluster_domain_id:u32 LE]` — the domain that DOES own the
 /// key, so the caller can redirect to that domain's gateway rather than
-/// only learning it asked the wrong one. The structured redirect §12.1
-/// calls for, at the domain granularity.
+/// only learning it asked the wrong one — a structured redirect at
+/// the domain granularity.
 ///
 /// A typed refusal, never a silent drop and never a guess: serving the
 /// key from the local domain would answer for data this domain does not
 /// hold. Widening the wire `partition_id` (which would remove the need
-/// for domains) is a Clustor protocol migration, deliberately postponed
-/// (§28, §29) — domains are the scaling step that comes first.
+/// for domains) is a Clustor protocol migration, deliberately
+/// postponed — domains are the scaling step that comes first.
 pub const KV_RESULT_CROSS_DOMAIN: u8 = 0x12;
 
 /// The answer to a [`KV_OP_IDEMPOTENT_LOOKUP`]. Body is a
@@ -595,6 +803,47 @@ pub const KV_RESULT_IDEMPOTENT_LOOKUP: u8 = 0x13;
 /// reply, leaving the caller's timeout to re-issue — the standard
 /// fail-closed path. Only `KV_OP_SCAN_VERSIONS` on the disk provider
 /// answers this way (a key-ordered walk of the whole span).
+/// [`KV_OP_RANGE_META`]'s answer:
+/// `[total:u64 LE][more:u8][count:u16 LE]` then per entry
+/// `[key_len:u16 LE][key…][value_len:u32 LE][value…]`
+/// `[create_rev:u64 LE][mod_rev:u64 LE][version:u64 LE][lease:u64 LE]`.
+/// `total` counts every match (the limit does not bound it). `more` is
+/// 0 when every match the limit allows is in the answer,
+/// [`KVS_MORE_LIMIT`] when matches lie past the limit, and
+/// [`KVS_MORE_PARTIAL`] when the answer filled its buffer before the
+/// limit was reached — the rest did not fit. A pager (a lease's keys, a
+/// snapshot page) continues on any non-zero `more`; a caller answering
+/// a client must not present a PARTIAL answer as the whole one.
+pub const KV_RESULT_KVS: u8 = 0x14;
+/// [`KV_RESULT_KVS`] `more`: matches lie past the request's limit.
+pub const KVS_MORE_LIMIT: u8 = 1;
+/// [`KV_RESULT_KVS`] `more`: the answer's space ran out first.
+pub const KVS_MORE_PARTIAL: u8 = 2;
+/// A read at a revision the store has not reached yet (etcd's
+/// "required revision is a future revision").
+pub const KV_RESULT_FUTURE_REV: u8 = 0x15;
+/// [`KV_OP_ETCD_TXN`]'s answer: `[succeeded:u8][count:u8]` then per op
+/// of the chosen branch `[kind:u8][result:u8][len:u32 LE][result body]`
+/// (the op's own answer).
+pub const KV_RESULT_ETCD_TXN: u8 = 0x16;
+/// A Txn branch writes one key twice (etcd's ErrDuplicateKey).
+pub const KV_RESULT_DUPLICATE: u8 = 0x17;
+/// The command is larger than the path it takes can carry (a replicated
+/// write past one consensus log entry). No retry can succeed: each
+/// protocol answers it as its own "too large".
+pub const KV_RESULT_TOO_LARGE: u8 = 0x18;
+/// The record is a large value's manifest (`kv_chunks.rs`): the body is
+/// the manifest, for a reader that fetches the value's chunks. A reader
+/// that did not ask for manifests gets this code with an empty body.
+pub const KV_RESULT_MANIFEST: u8 = 0x19;
+/// A chunk whose bytes do not hash to its name, or that is malformed; a
+/// manifest PUT whose value is not a manifest.
+pub const KV_RESULT_BAD_CHUNK: u8 = 0x1A;
+/// A node chunk or a manifest names a chunk that is not stored.
+pub const KV_RESULT_MISSING_CHUNK: u8 = 0x1B;
+/// The request names one of the store's own keyspaces (its chunk
+/// records), which only the store writes.
+pub const KV_RESULT_RESERVED: u8 = 0x1C;
 pub const KV_RESULT_PAUSED: u8 = 0xFE;
 
 pub const KV_RESULT_INTERNAL: u8 = 0xFF;

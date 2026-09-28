@@ -44,7 +44,7 @@ name = "audit"
 direction = "output"
 content_type = "OctetStream"
 
-# Module-scope telemetry (Phase 14). Output index 3 (auth_decision,
+# Module-scope telemetry. Output index 3 (auth_decision,
 # decision_request, audit, metrics). Wired to the observe collector; a
 # no-op emit when left unwired.
 [[ports]]
@@ -52,7 +52,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name).
 [observability]

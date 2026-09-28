@@ -8,7 +8,7 @@
 //!    minimum, and emits `MSG_COMPACTION_FLOOR` on change. A hint for
 //!    the substrate; nothing irreversible hangs off it.
 //!
-//! 2. **The MVCC GC floor** (RFC §18, §21 invariant 13). Collects
+//! 2. **The MVCC GC floor**. Collects
 //!    fenced `MSG_RETENTION_CLAIM` records, computes a candidate floor
 //!    clamped to the timestamp allocator's COMMITTED high water, and
 //!    **proposes** it (`MSG_GC_FLOOR_PROPOSE`). It never advances the
@@ -151,7 +151,7 @@ struct CompState {
     _pad: [u8; 3],
     propose_wrap: u32,
 
-    // Phase-14 counters (ids follow manifest `[observability] metrics`).
+    // Telemetry counters (ids follow manifest `[observability] metrics`).
     m_updates: u64,
     m_floors_emitted: u64,
     m_claims: u64,
@@ -329,7 +329,7 @@ unsafe fn handle(s: &mut CompState, sys: &SyscallTable, mt: u8, body: &[u8]) {
         }
         // The committed decision. This is the one path that advances
         // anything, and the floor it publishes downstream is the only
-        // floor a provider may reclaim behind (§21 invariant 13).
+        // floor a provider may reclaim behind.
         MSG_GC_FLOOR_COMMITTED if body.len() == GC_FLOOR_WIRE_LEN => {
             if let Some(rec) = GcFloorRecord::decode(body) {
                 if let Some(floor) = s.claims.observe_committed_floor(&rec) {
@@ -466,7 +466,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             evaluate(s, sysr, now_ms);
         }
 
-        // Phase-14: emit module-scope counters on the metrics port at a
+        // Emit module-scope counters on the metrics port at a
         // coarse cadence (no-op until wired). ids follow manifest order.
         if s.step_ctr.is_multiple_of(5000) {
             telemetry::emit_counters(

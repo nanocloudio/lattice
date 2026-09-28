@@ -29,7 +29,7 @@ name = "lease_floor"
 direction = "input"
 content_type = "OctetStream"
 
-# Fenced MSG_RETENTION_CLAIM records from §18 claim sources
+# Fenced MSG_RETENTION_CLAIM records from the retention claim sources
 # (kv_state_worker's active-read claim today; watch and backup claims
 # slot into the reserved source ids later).
 [[ports]]
@@ -66,7 +66,7 @@ name = "gc_floor_propose"
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# ── Observability ──────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
 # Declaration order IS the id contract (id N = the Nth name).
 # APPEND ONLY — never renumber.

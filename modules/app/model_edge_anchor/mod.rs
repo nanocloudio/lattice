@@ -1,6 +1,5 @@
 //! model_edge_anchor — graph, search, vector, and time-series
-//! capabilities over one RESP surface (RFC database foundation
-//! §14.18–§14.21, §14.19; Phase 8).
+//! capabilities over one RESP surface.
 //!
 //! - `TS.ADD series ts value`       — append a sample. The key
 //!   `[series][bucket][timestamp]` sorts ascending so a window is a
@@ -12,18 +11,19 @@
 //!   the window, folded during the same scan (numeric samples only).
 //!
 //! One anchor, three capabilities, three SEPARATE semantic sets —
-//! §14.15's rule enforced by construction: each command family
+//! Shared-foundations rule enforced by construction: each command
+//! family
 //! compiles into ITS model's canonical keys (`models.rs`) and nothing
 //! is shared between them but the byte foundations. The wire is RESP
 //! because the ecosystem's graph/search/vector commands live on redis
 //! wires (`redis-cli` drives every one of these), and the graph has a
 //! RESP codec already.
 //!
-//! ## Commands, and the §-rules they encode
+//! ## Commands, and the rules they encode
 //!
 //! - `GRAPH.VERTEX g v`            — vertex record write.
 //!   `GRAPH.EDGE g src label tgt`  — BOTH adjacency postings
-//!   (edge-out AND edge-in) in ONE `KV_OP_TXN`: §14.18's symmetry is
+//!   (edge-out AND edge-in) in ONE `KV_OP_TXN`: adjacency symmetry is
 //!   a transaction, not a convention, so a crash cannot leave a
 //!   half-edge.
 //!   `GRAPH.OUT g v` / `GRAPH.IN g v` — bounded adjacency expansion
@@ -34,7 +34,7 @@
 //!   frontier/visited sets are capped, so the whole traversal is bounded
 //!   work — pattern matching and unbounded walks stay out.
 //! - `SEARCH.INDEX idx doc text…`  — tokenized postings, ALL terms in
-//!   ONE transaction (§14.20: postings move with the document).
+//!   ONE transaction (postings move with the document).
 //!   `SEARCH.QUERY idx term`       — one term's posting scan, doc ids
 //!   in document order.
 //! - `VECTOR.ADD idx entity v…`    — embedding write (f32 vector); also
@@ -46,19 +46,19 @@
 //!   whole index and are labelled `exact` on the wire.
 //!   `VECTOR.ANN idx k q…`         — APPROXIMATE cosine k-nearest over
 //!   just the query's LSH bucket, so it reads a fraction of the index.
-//!   Labelled `approximate` (§14.21's honesty rule): it may miss a
+//!   Labelled `approximate` (the label-honesty rule): it may miss a
 //!   neighbour that fell in an adjacent bucket, and it never claims not
 //!   to. The exact paths read the authoritative embeddings and are
 //!   unaffected by a stale bucket posting.
 //!
-//! - `FEED.READ ks from to`        — the §15 RESOLVED CHANGE FEED:
+//! - `FEED.READ ks from to`        — the RESOLVED CHANGE FEED:
 //!   every VERSION in the revision window `(from, to]` under a
 //!   keyspace prefix, deletes included, with a resume token. Built on
 //!   `KV_OP_SCAN_VERSIONS`, so a window whose lower bound has been
 //!   reclaimed answers COMPACTED and the feed REFUSES rather than
 //!   serving the surviving tail — a partial history is
 //!   indistinguishable from a whole one to a consumer, which is the
-//!   entire reason §15 makes it a typed failure.
+//!   entire reason the change-feed contract makes it a typed failure.
 //!
 //! Router pairing: POSITIONAL pair #2 (the `memcached_*` port names),
 //! stamped `PROTO_MEMCACHED` — sixteen router outputs are allocated
@@ -884,7 +884,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
     anchor.d_slot = idx as u8;
     anchor.slots[idx].state = S_BUSY;
 
-    // ── Graph (§14.18) ──────────────────────────────────────────────
+    // ── Graph ───────────────────────────────────────────────────────
     if eq_ci(cmd, b"GRAPH.VERTEX") {
         if argv.count != 3 {
             reply_error_str(anchor, b"ERR GRAPH.VERTEX graph vertex");
@@ -950,7 +950,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
             return;
         };
         anchor.reply_kind = R_OK;
-        // BOTH adjacency postings in one transaction: the §14.18
+        // BOTH adjacency postings in one transaction: the adjacency
         // symmetry cannot be half-true after a crash.
         let end_guard = BODY_AT + 3800;
         let mut p = BODY_AT;
@@ -1006,7 +1006,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
             reply_error_str(anchor, b"ERR internal");
             return;
         };
-        // BOTH half-edges leave in ONE delete: §14.18's symmetry cannot be
+        // BOTH half-edges leave in ONE delete: adjacency symmetry cannot be
         // half-broken after a crash, the same reason GRAPH.EDGE writes both
         // in one transaction.
         let mut ka = [0u8; KEY_MAX + 8];
@@ -1357,7 +1357,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
         return;
     }
 
-    // ── Search (§14.20) ─────────────────────────────────────────────
+    // ── Search ──────────────────────────────────────────────────────
     if eq_ci(cmd, b"SEARCH.INDEX") {
         if argv.count < 4 {
             reply_error_str(anchor, b"ERR SEARCH.INDEX index doc term...");
@@ -1372,7 +1372,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
         }
         anchor.reply_kind = R_OK;
         // Every posting in ONE transaction: the document's terms move
-        // together (§14.20).
+        // together.
         let end_guard = BODY_AT + 3800;
         let mut p = BODY_AT;
         anchor.env[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
@@ -1521,7 +1521,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
         return;
     }
 
-    // ── Vector (§14.21) ─────────────────────────────────────────────
+    // ── Vector ──────────────────────────────────────────────────────
     if eq_ci(cmd, b"VECTOR.ADD") {
         if (argv.count as usize) < 4 || argv.count as usize - 3 > MAX_DIMS {
             reply_error_str(anchor, b"ERR VECTOR.ADD index entity v...");
@@ -1824,7 +1824,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
             if cur.format_version != db_ops::FEED_EVENT_FORMAT_VERSION {
                 // The token was issued against another event format.
                 // Serving it would hand the consumer events it will
-                // misparse — refuse loudly instead (§15).
+                // misparse — refuse loudly instead.
                 reply_error_str(anchor, b"ERR cursor format stale; resubscribe");
                 return;
             }
@@ -1834,9 +1834,9 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
             // was issued across a topology transition and cannot be
             // resumed by revision here — the spelled TOPOLOGY refusal
             // is the in-stream transition signal in its minimal form;
-            // the consumer derives successors via the §5.4 cursor
+            // the consumer derives successors via the feed-cursor
             // rules (split/merge of a fed keyrange is refused until
-            // multi-range feed serving lands).
+            // multi-range feed serving is supported).
             let mut expect_range = [0u8; 16];
             expect_range[15] = 1;
             if cur.range_id != expect_range || cur.range_generation != 1 {
@@ -1891,7 +1891,7 @@ fn begin_command(anchor: &mut AnchorState, idx: usize, recv: &[u8], argv: &Argv)
         return;
     }
 
-    // ── Time series (§14.19) ────────────────────────────────────────
+    // ── Time series ─────────────────────────────────────────────────
     //
     // `TS.ADD series timestamp value` — append a sample.
     // `TS.RANGE series from to`       — every sample in `[from, to]`,
@@ -3679,7 +3679,7 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
         }
         D_FEED => {
             if result == types::KV_RESULT_COMPACTED {
-                // §15: the window's lower bound has been reclaimed.
+                // The window's lower bound has been reclaimed.
                 // Serving the surviving tail would be a gap the
                 // consumer cannot see, so the feed fails LOUDLY.
                 reply_error_str(
@@ -3742,8 +3742,8 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
 
             // The resume token: a FeedCursor at the last rendered
             // position. Range identity is the single implicit range of
-            // this composition until multi-range feeds land (§5.4
-            // refuses split/merge of a fed range).
+            // this composition until multi-range feeds exist (the
+            // feed-cursor rules refuse split/merge of a fed range).
             let mut range_id = [0u8; 16];
             range_id[15] = 1;
             let cur = db_ops::FeedCursor {
@@ -3793,7 +3793,8 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                 let tn = fmt_u64(ts, &mut tb);
                 let _ = enc_bulk(&mut out, &mut n, &tb[..tn]);
                 // Kind is spelled, not numbered: a delete that reads
-                // as an empty put is the §15 failure this avoids.
+                // as an empty put is the silent-gap failure this
+                // avoids.
                 let kname: &[u8] = if kind == types::VERSION_KIND_DELETE {
                     b"delete"
                 } else {
@@ -3912,7 +3913,7 @@ fn on_kv_response(anchor: &mut AnchorState, result: u8, body: &[u8]) {
                 }
             } else {
                 // Render [label, entity, dist, …] nearest first. The
-                // label is §14.21's honesty on the wire: a full-index
+                // label is response honesty on the wire: a full-index
                 // scan is "exact"; an LSH-bucket scan is "approximate"
                 // and never wears the exact label.
                 let mut out = [0u8; SEND_BUF];

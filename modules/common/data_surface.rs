@@ -1,8 +1,7 @@
-//! The `lattice.data` contract surface — RFC database foundation
-//! §14.7-§14.14, §11.5, §26 phases 9-10, §21 invariants 15/16/17.
+//! The `lattice.data` contract surface.
 //!
-//! Phases 9 and 10 separate relational compute from Lattice storage.
-//! This file is the contract that boundary is made of: the operation
+//! Relational compute is separated from Lattice storage, and this
+//! file is the contract that boundary is made of: the operation
 //! vocabulary, the request/response framing, the session and authority
 //! model, cache-coherence keys, the bounded pushdown program, and the
 //! placement/upgrade admission rules. Contracts only — no ports, no
@@ -10,24 +9,25 @@
 //! `lattice_data_anchor` exactly as `txn.rs` stands to the transaction
 //! coordinator.
 //!
-//! ## 1. The surface is not a transparent FIFO (§28, §14.8)
+//! ## 1. The surface is not a transparent FIFO
 //!
-//! §28 rejects "treat remote database calls as transparent FIFOs"
-//! because that composition "hides ambiguous delivery, stale routing,
-//! cancellation, and transaction recovery that must remain explicit".
-//! A FIFO gives a caller exactly two facts — bytes arrived, or the pipe
-//! hung up — and neither is an outcome. Four rules replace them, and
+//! Remote database calls are never treated as transparent FIFOs:
+//! that composition hides ambiguous delivery, stale routing,
+//! cancellation, and transaction recovery, all of which must remain
+//! explicit. A FIFO gives a caller exactly two facts — bytes arrived,
+//! or the pipe hung up — and neither is an outcome. Four rules replace them, and
 //! each is an executable function here rather than a paragraph:
 //!
 //! - **Every retryable mutation carries a discovery identity.**
 //!   [`admit_request`] REFUSES a mutation whose
 //!   [`db_context::RequestContext::idempotency_key`] is zero. The
 //!   refusal happens at admission, before the request is sent, because
-//!   the alternative is sending it and hoping — and "hoping" is the
-//!   FIFO behaviour §28 rejects. Given an admitted mutation,
+//!   the alternative is sending it and hoping — and "hoping" is
+//!   exactly the transparent-FIFO behaviour this surface rejects.
+//!   Given an admitted mutation,
 //!   [`outcome_is_discoverable`] names *how* a lost response is
 //!   resolved: [`Discoverability::ViaTransactionStatus`] for a
-//!   transactional mutation (§13.2's home record IS the outcome), or
+//!   transactional mutation (the home record IS the outcome), or
 //!   [`Discoverability::ViaIdempotencyIdentity`] otherwise. It can
 //!   only return [`Discoverability::Undiscoverable`] for a request
 //!   admission already rejected, and a test pins that.
@@ -43,8 +43,9 @@
 //!   typed [`Termination`]: `OperationCancelled` carries the
 //!   transaction status *unchanged*, so a cancelled statement inside a
 //!   `Pending` transaction is still `Pending`. Only an explicit abort
-//!   produces `TransactionAborted`. §14.11's "client disconnect never
-//!   decides a transaction outcome" is exactly this distinction, and
+//!   produces `TransactionAborted`. The rule that a client disconnect
+//!   never decides a transaction outcome is exactly this distinction,
+//!   and
 //!   [`cancellation_decides_transaction`] states it as `false`.
 //! - **Scan resumption composes rather than re-derives.**
 //!   [`scan_resume_valid`] delegates to [`db_ops::cursor_is_resumable`]
@@ -52,7 +53,7 @@
 //!   [`DataRetryClass`] the response must carry. The retention-floor
 //!   rule has exactly one implementation in this repository.
 //!
-//! ## 2. Composition (§8, §11.3, §13.2, §15)
+//! ## 2. Composition
 //!
 //! The request envelope is [`db_context::RequestContext`]. It already
 //! carries tenant/database/keyspace, request identity, deadline,
@@ -60,12 +61,12 @@
 //! transaction identity, read timestamp, idempotency key, and response
 //! limits; restating them here would create a second definition of the
 //! same fields and therefore a second place for them to drift.
-//! [`DataRequest`] adds only what §14.8 asks for beyond it: session
+//! [`DataRequest`] adds only what the surface needs beyond it: session
 //! identity and epoch, cancellation identity, partition-map revision,
 //! range identity, physical partition incarnation, transaction epoch,
 //! isolation, and the row/work/chunk bounds.
 //!
-//! Continuation tokens are [`db_ops::FeedCursor`] — §15's resume-token
+//! Continuation tokens are [`db_ops::FeedCursor`] — its resume-token
 //! field list is already database, partition-map identity, range
 //! identity and generation, timestamp/revision, and format version,
 //! which is precisely what a scan resume needs. Range identity comes
@@ -189,19 +190,19 @@ pub const MAX_PUSHDOWN_AGGREGATES: usize = 4;
 /// than a descriptor can hold.
 pub const MAX_PLACEMENT_REPLICAS: usize = MAX_REPLICAS;
 
-/// §11.5: "The default data range has three voters on distinct eligible
-/// failure domains."
+/// The default data range has three voters on distinct eligible
+/// failure domains.
 pub const DEFAULT_VOTERS: u8 = 3;
 
-/// §11.5: "Five voters may be used where the failure objective
-/// justifies the write and resource cost."
+/// Five voters may be used where the failure objective justifies the
+/// write and resource cost.
 pub const MAX_VOTERS: u8 = 5;
 
 // ══════════════════════════════════════════════════════════════════════
-// 1. Operation vocabulary (§14.8)
+// 1. Operation vocabulary
 // ══════════════════════════════════════════════════════════════════════
 
-/// The six operation families §14.8 names. The family is derived from
+/// The six operation families. The family is derived from
 /// the opcode's high nibble rather than carried separately, so a
 /// request cannot claim a family its opcode does not belong to.
 #[repr(u8)]
@@ -215,7 +216,7 @@ pub enum OpFamily {
     Control = 0x05,
 }
 
-/// The `lattice.data` operation vocabulary (§14.8).
+/// The `lattice.data` operation vocabulary.
 ///
 /// Opcodes are `0xFN` where `F` is the [`OpFamily`] discriminant, which
 /// makes [`DataOp::family`] a shift and keeps future additions inside
@@ -237,7 +238,7 @@ pub enum DataOp {
     ScanOpen = 0x23,
     ScanNext = 0x24,
     ScanClose = 0x25,
-    /// §15/§26.6 record change feed: read the versions of a key span in
+    /// Record change feed: read the versions of a key span in
     /// a revision window `(from, to]`, resumable by advancing `from`
     /// past the highest revision returned. Carries a `KV_OP_SCAN_VERSIONS`
     /// body; answers `KV_RESULT_VERSIONS` (per-entry revision + kind).
@@ -341,7 +342,7 @@ impl DataOp {
 
     /// Does this operation change durable state?
     ///
-    /// `Begin` counts: §13.2's home transaction record is durable the
+    /// `Begin` counts: the home transaction record is durable the
     /// moment a transaction exists, and a lost `begin` response leaves
     /// a real record behind that the caller must be able to find.
     /// `Abort` counts for the same reason — a durable abort is a
@@ -372,15 +373,15 @@ impl DataOp {
         )
     }
 
-    /// Is this a long-lived stream with no request deadline? §14.8
-    /// bounds every operation, but a subscription's bound is its
+    /// Is this a long-lived stream with no request deadline? Every
+    /// operation is bounded, but a subscription's bound is its
     /// chunk/row budget and its cancellation identity, not a wall-clock
     /// deadline.
     pub const fn is_subscription(self) -> bool {
         matches!(self, Self::SubscribeTopology | Self::SubscribeCatalog)
     }
 
-    /// Does this operation require an already-resolved route (§11.3)?
+    /// Does this operation require an already-resolved route?
     /// `resolve_span` is what *produces* one, so it is excluded.
     pub const fn requires_resolved_route(self) -> bool {
         matches!(
@@ -410,7 +411,7 @@ impl DataOp {
     }
 
     /// Does this operation return rows, and therefore need explicit
-    /// cardinality and byte bounds (§21 invariant 14)?
+    /// cardinality and byte bounds?
     pub const fn returns_rows(self) -> bool {
         matches!(
             self,
@@ -425,18 +426,17 @@ impl DataOp {
     }
 
     /// May a [`PushdownProgram`] accompany this operation? Only a scan
-    /// open: §14.13's pushdown exists to avoid "one request per row",
+    /// open: pushdown exists to avoid "one request per row",
     /// and a point read has no rows to avoid.
     pub const fn accepts_pushdown(self) -> bool {
         matches!(self, Self::ScanOpen)
     }
 }
 
-/// Isolation levels the surface represents (§14.8's "consistency,
-/// isolation, read timestamp, and minimum durability").
+/// Isolation levels the surface represents.
 ///
 /// [`db_context::RequestContext`] carries consistency, read timestamp,
-/// and durability but not isolation, so this is the one §14.8 field the
+/// and durability but not isolation, so this is the one field the
 /// envelope cannot supply.
 ///
 /// **Byte-identical to `relational::Isolation` by requirement.** The
@@ -464,16 +464,16 @@ impl Isolation {
 
 // ── Retry classification ──────────────────────────────────────────────
 
-/// §14.8's response classification: "stale route, contention,
+/// The response classification: stale route, contention,
 /// unavailable authority, deadline, cancellation, unsupported
-/// capability, and ambiguous client delivery".
+/// capability, and ambiguous client delivery.
 ///
 /// This is a *superset* of [`db_context::RetryClass`]. The native
 /// context classification has no cancellation class, because a local
 /// request that is cancelled simply does not return; across the
 /// separated boundary cancellation is an observable outcome that must
-/// be distinguishable from an abort and from a deadline
-/// (§28's rejected "transparent FIFO"). [`DataRetryClass::from_native`]
+/// be distinguishable from an abort and from a deadline — a
+/// transparent FIFO would collapse them. [`DataRetryClass::from_native`]
 /// and [`DataRetryClass::to_native`] are the total/partial mapping
 /// between the two, and `to_native` returning `None` for `Cancelled` is
 /// the honest statement that the native enum cannot express it.
@@ -525,7 +525,7 @@ impl DataRetryClass {
         }
     }
 
-    /// Widen a native §8 classification to the surface classification.
+    /// Widen a native envelope classification to the surface one.
     /// Total — every native class has a surface counterpart.
     pub const fn from_native(native: RetryClass) -> Self {
         match native {
@@ -539,7 +539,7 @@ impl DataRetryClass {
         }
     }
 
-    /// Narrow to the native §8 classification. Partial: `Cancelled` has
+    /// Narrow to the native envelope classification. `Cancelled` has
     /// no native counterpart and must NOT be folded into
     /// `DeadlineExpired` or `Malformed` — a caller that cancels needs
     /// to know its own cancellation came back, not a fabricated
@@ -558,8 +558,7 @@ impl DataRetryClass {
     }
 }
 
-/// The typed outcome of one request (§14.8 "request identity and typed
-/// outcome").
+/// The typed outcome of one request.
 ///
 /// Four values, not two. `Indeterminate` and `Cancelled` are separate
 /// from `Refused` because collapsing them is exactly the FIFO failure:
@@ -618,21 +617,21 @@ impl Outcome {
     }
 }
 
-// ── Source-aware fences (§14.8, §21 invariant 11) ─────────────────────
+// ── Source-aware fences ───────────────────────────────────────────────
 
-/// Which authority produced a fence. §21 invariant 11: "a storage fence
-/// is valid only with the correct source identity and epoch" — so the
-/// kind travels with the identity and the epoch, never alone.
+/// Which authority produced a fence. A storage fence is valid only
+/// with the correct source identity and epoch, so the kind travels
+/// with the identity and the epoch, never alone.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FenceSource {
     /// Range leader ReadIndex or apply fence.
     RangeLeader = 0x01,
-    /// Declared follower fence (§14.10's "declared follower fence").
+    /// Declared follower fence.
     Follower = 0x02,
-    /// Explicitly stale read-only observer (§11.5).
+    /// Explicitly stale read-only observer.
     Observer = 0x03,
-    /// The transaction home range (§13.2).
+    /// The transaction home range.
     TransactionHome = 0x04,
     /// Control-plane metadata authority (catalog, partition map).
     ControlPlane = 0x05,
@@ -659,8 +658,8 @@ impl FenceSource {
     }
 
     /// May a response from this source claim
-    /// [`Durability::ReplicatedDurable`]? §21 invariant 2: only the
-    /// authority that observed the quorum durable proof may, and a
+    /// [`Durability::ReplicatedDurable`]? Only the authority that
+    /// observed the quorum durable proof may, and a
     /// follower or observer never observes one.
     pub const fn may_claim_replicated_durable(self) -> bool {
         matches!(self, Self::RangeLeader | Self::TransactionHome)
@@ -695,7 +694,8 @@ impl SourceFence {
         source_epoch: 0,
     };
 
-    /// §21 invariant 11 made executable. A fence is accepted only when
+    /// The fence-source rule made executable. A fence is accepted only
+    /// when
     /// its kind AND identity match what the caller expected and its
     /// epoch is at least the caller's last observed epoch. All three
     /// conditions, because any one alone admits a stale or misattributed
@@ -715,7 +715,7 @@ impl SourceFence {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 2. Request framing (§14.8)
+// 2. Request framing
 // ══════════════════════════════════════════════════════════════════════
 
 /// Request flag bits. Unknown bits are REJECTED by
@@ -729,7 +729,7 @@ pub const REQ_FLAG_ALLOW_CONTINUATION: u8 = 0b0000_0010;
 /// Mask of every flag this version defines.
 pub const REQ_FLAG_KNOWN: u8 = REQ_FLAG_PUSHDOWN | REQ_FLAG_ALLOW_CONTINUATION;
 
-/// One `lattice.data` request (§14.8).
+/// One `lattice.data` request.
 ///
 /// Wire layout (integers LE):
 ///
@@ -759,38 +759,38 @@ pub const REQ_FLAG_KNOWN: u8 = REQ_FLAG_PUSHDOWN | REQ_FLAG_ALLOW_CONTINUATION;
 /// A [`PushdownProgram`] is NOT embedded. It is a variable-length
 /// record carried alongside a `scan_open` and flagged by
 /// [`REQ_FLAG_PUSHDOWN`], which keeps `DataRequest` fixed-size for the
-/// 22 operations that never push anything down.
+/// 23 operations that never push anything down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DataRequest {
     pub op: DataOp,
     pub isolation: Isolation,
     pub flags: u8,
-    /// §14.9: the session directory maps `session_id` to a worker.
+    /// The session directory maps `session_id` to a worker.
     /// Zero only on [`DataOp::Open`], which is what allocates one.
     pub session_id: u64,
-    /// §14.9: stale `session_epoch` values are fenced. See
+    /// Stale `session_epoch` values are fenced. See
     /// [`fence_stale_session`].
     pub session_epoch: u32,
-    /// §14.8's "cancellation identity". Distinct from `request_id`
+    /// The cancellation identity. Distinct from `request_id`
     /// because one cancellation identity may cover a statement made of
     /// several requests.
     pub cancellation_id: u64,
-    /// §11.3 partition-map revision the caller resolved against.
+    /// The partition-map revision the caller resolved against.
     pub partition_map_revision: u32,
     pub range_id: [u8; 16],
     pub range_generation: u32,
-    /// §14.8's "physical partition incarnation" (§21 invariant 6).
+    /// The physical partition incarnation.
     pub partition_incarnation: u32,
     /// Transaction epoch where applicable; 0 = none.
     pub transaction_epoch: u32,
-    /// §14.8's "maximum rows"; 0 = unbounded, which
+    /// Maximum rows; 0 = unbounded, which
     /// [`admit_request`] refuses for row-returning operations.
     pub max_rows: u32,
-    /// §14.8's "maximum work" in abstract units.
+    /// Maximum work in abstract units.
     pub max_work_units: u32,
-    /// §14.8's "maximum response chunks".
+    /// Maximum response chunks.
     pub max_chunks: u16,
-    /// The native envelope (§8) — tenant, database, keyspace, request
+    /// The native envelope — tenant, database, keyspace, request
     /// identity, deadline, consistency, durability, routing epoch,
     /// range generation, transaction identity, read timestamp,
     /// idempotency key, and response limits.
@@ -947,17 +947,18 @@ impl DataRequest {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 3. Response framing (§14.8)
+// 3. Response framing
 // ══════════════════════════════════════════════════════════════════════
 
-/// The fenced observation a response reports (§14.8's "serving range
-/// identity and generation; observed revision or resolved timestamp;
-/// applied index and source-aware consistency/durability fences").
+/// The fenced observation a response reports: serving range identity
+/// and generation; observed revision or resolved timestamp; applied
+/// index and source-aware consistency/durability fences.
 ///
-/// Split out of [`DataResponse`] as its own type because §21 invariant
-/// 16 is stated over exactly these fields: "combined and separated
-/// placements execute the same canonical command and return equivalent
-/// fenced observations". Having the invariant's subject be a value you
+/// Split out of [`DataResponse`] as its own type because the
+/// placement-equivalence rule is stated over exactly these fields:
+/// combined and separated placements execute the same canonical
+/// command and must return equivalent fenced observations. Having the
+/// invariant's subject be a value you
 /// can compare with `==` is the difference between an invariant and a
 /// paragraph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -972,7 +973,7 @@ pub struct ObservedFences {
     pub applied_index: u64,
     pub fence: SourceFence,
     /// The durability class actually ACHIEVED, which may be weaker than
-    /// the class requested. §21 invariant 2 lives here.
+    /// the class requested. The durability-honesty rule lives here.
     pub durability_achieved: Durability,
 }
 
@@ -987,7 +988,7 @@ impl ObservedFences {
         durability_achieved: Durability::Volatile,
     };
 
-    /// §21 invariant 2: a response may claim
+    /// A response may claim
     /// [`Durability::ReplicatedDurable`] only from a source that can
     /// observe a quorum durable proof.
     pub const fn durability_claim_is_sound(&self) -> bool {
@@ -998,7 +999,7 @@ impl ObservedFences {
     }
 }
 
-/// One `lattice.data` response (§14.8).
+/// One `lattice.data` response.
 ///
 /// Wire layout (integers LE):
 ///
@@ -1022,7 +1023,7 @@ impl ObservedFences {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DataResponse {
-    /// §24's correlation identity, echoed from
+    /// The operator-visible correlation identity, echoed from
     /// [`RequestContext::request_id`].
     pub request_id: u64,
     pub session_id: u64,
@@ -1030,9 +1031,9 @@ pub struct DataResponse {
     /// Present exactly when [`Outcome::admits`] says it must be.
     pub retry: Option<DataRetryClass>,
     pub fences: ObservedFences,
-    /// RFC §14.2's schema generation, current when this response's
+    /// The schema generation current when this response's
     /// command executed. Not part of [`ObservedFences`] because it is
-    /// not compared for §21 invariant 16 equivalence — a schema
+    /// not compared for placement equivalence — a schema
     /// generation is the same across placements of one range by
     /// construction, and folding it into the compared fences would make
     /// a legitimate mid-flight DDL look like a placement divergence.
@@ -1040,7 +1041,7 @@ pub struct DataResponse {
     /// mapping against it; zero means "no generation available", which
     /// disables the cache rather than trusting an unverified mapping.
     pub catalog_generation: u64,
-    /// §14.8's "bounded continuation or resume token where applicable".
+    /// Bounded continuation or resume token where applicable.
     pub continuation: Option<FeedCursor>,
 }
 
@@ -1113,8 +1114,8 @@ impl DataResponse {
     /// Parse the versioned wire form. Fails closed on unknown version,
     /// length disagreement, unknown outcome/retry/durability/fence
     /// discriminants, a non-zero reserved byte, an
-    /// outcome/retry-class disagreement, or an unsound durability claim
-    /// (§21 invariant 2).
+    /// outcome/retry-class disagreement, or an unsound durability
+    /// claim.
     pub fn decode(src: &[u8]) -> Option<Self> {
         if src.len() != Self::WIRE_LEN {
             return None;
@@ -1176,7 +1177,7 @@ impl DataResponse {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 3a. The two consistency vocabularies (§20)
+// 3a. The two consistency vocabularies
 // ══════════════════════════════════════════════════════════════════════
 
 /// The adapter-requirement bytes that ride the native `MSG_KV_REQUEST`
@@ -1198,10 +1199,10 @@ impl DataResponse {
 ///
 /// They also overlap at exactly one value, `0x01`, and nowhere else,
 /// which makes them look interchangeable in the one case anybody tests
-/// first. Passing one where the other belongs cost a full debugging
-/// session: `REQ_SERIALIZABLE` is `0x00`, which is not a [`Consistency`]
+/// first. Passing one where the other belongs fails broadly:
+/// `REQ_SERIALIZABLE` is `0x00`, which is not a [`Consistency`]
 /// discriminant at all, so every statement crossing the separated
-/// boundary was refused before it left the compute graph.
+/// boundary is refused before it leaves the compute graph.
 pub const REQ_SERIALIZABLE: u8 = 0x00;
 /// See [`REQ_SERIALIZABLE`].
 pub const REQ_LINEARIZABLE: u8 = 0x01;
@@ -1215,8 +1216,8 @@ pub const REQ_TXN_FENCE: u8 = 0x03;
 /// Only [`REQ_LINEARIZABLE`] asks for the fence. The router serves every
 /// other requirement with an ordinary local read, so they map to the
 /// WEAKEST policy — mapping them to something stronger would have the
-/// separated path promise a guarantee the combined path never made, and
-/// §21 invariant 16 compares those two paths.
+/// separated path promise a guarantee the combined path never made,
+/// and placement equivalence compares those two paths.
 ///
 /// `None` for a requirement this build does not know: a value we cannot
 /// read might be asking for something stronger than what we would
@@ -1235,8 +1236,8 @@ pub const fn read_policy(requirement: u8) -> Option<Consistency> {
 /// the two MUST stay inverses: a request that leaves compute as
 /// `REQ_LINEARIZABLE` has to reach the router as `REQ_LINEARIZABLE`, or
 /// the separated path silently serves a weaker read than the combined
-/// one — which is exactly the difference §30's proof is measuring, so
-/// the proof would be measuring the bug.
+/// one — which is exactly the difference the placement-equivalence
+/// proof measures, so the proof would be measuring the bug.
 pub const fn adapter_requirement(policy: Consistency) -> u8 {
     match policy {
         Consistency::Linearizable => REQ_LINEARIZABLE,
@@ -1257,12 +1258,12 @@ pub const fn isolation_for(requirement: u8) -> Isolation {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 3b. Transport framing (§14.8)
+// 3b. Transport framing
 // ══════════════════════════════════════════════════════════════════════
 
 /// [`DataRequest`] and [`DataResponse`] are fixed-width records that say
 /// what an operation *is*. Neither carries keys, values, or rows — and
-/// deliberately so: the 23 operations share one envelope precisely
+/// deliberately so: the 24 operations share one envelope precisely
 /// because the envelope is the part that does not vary. The bytes an
 /// operation acts on vary in every dimension.
 ///
@@ -1275,9 +1276,9 @@ pub const fn isolation_for(requirement: u8) -> Isolation {
 ///
 /// ## Why the request carries a canonical KV opcode
 ///
-/// §14.2 and §19 put the compile step in the *compute* layer: relational
-/// and model capability modules "compile authoritative mutations into
-/// canonical KV operations". By the time a request reaches this wire
+/// The compile step lives in the *compute* layer: relational and
+/// model capability modules compile authoritative mutations into
+/// canonical KV operations. By the time a request reaches this wire
 /// that compilation has already happened, so the frame carries its
 /// result rather than asking the storage side to re-derive it from a
 /// [`DataOp`] that was never meant to encode it. `DataOp::Write` is one
@@ -1443,9 +1444,9 @@ pub fn decode_response_frame(src: &[u8]) -> Option<ResponseFrame<'_>> {
     })
 }
 
-// ── §21 invariant 16: combined and separated equivalence ──────────────
+// ── Combined and separated placement equivalence ──────────────────────
 
-/// Where the canonical command actually executed (§14.7). The two
+/// Where the canonical command actually executed. The two
 /// compositions differ only in whether the contract was serialized.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1458,14 +1459,14 @@ pub enum Placement {
     Separated = 2,
 }
 
-/// §21 invariant 16 made executable.
+/// Placement equivalence made executable.
 ///
 /// Two executions of the *same* canonical request are equivalent when
 /// their fenced observations are field-for-field identical. Nothing
 /// weaker: a combined execution that reported a stronger durability
 /// class, a later applied index, or a different serving generation
-/// would be §14.7's forbidden "local fast path [that] gains stronger
-/// semantics than the remote path".
+/// would be the forbidden local fast path that gains stronger
+/// semantics than the remote path.
 pub const fn fences_equivalent(a: &ObservedFences, b: &ObservedFences) -> bool {
     a.serving_range_generation == b.serving_range_generation
         && a.observed_revision == b.observed_revision
@@ -1490,9 +1491,9 @@ const fn same_range(a: &[u8; 16], b: &[u8; 16]) -> bool {
     true
 }
 
-/// §14.7's local-fast-path rule: the fast path must "consume and
+/// The local-fast-path rule: the fast path must consume and
 /// produce the same versioned contract and must not gain stronger
-/// semantics than the remote path".
+/// semantics than the remote path.
 ///
 /// Takes the SAME request and the two responses, so a caller cannot
 /// compare responses to different commands and call it equivalence.
@@ -1508,13 +1509,13 @@ pub fn placement_equivalence_holds(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 4. Admission — the family matrix and invariant 17's refusal
+// 4. Admission — the family matrix and the discoverability refusal
 // ══════════════════════════════════════════════════════════════════════
 
 /// Why a request is refused before it is sent.
 ///
-/// Every variant is a *required field* rule from §14.8's request list
-/// or a bound from §21 invariant 14. They are separate variants rather
+/// Every variant is a *required field* rule from the request contract
+/// or a result bound. They are separate variants rather
 /// than one `Malformed` because the client's recovery differs: a
 /// missing route is a `resolve_span` away, a missing idempotency
 /// identity is a caller bug, and a missing bound is a policy error.
@@ -1526,13 +1527,13 @@ pub enum AdmissionError {
     MissingSessionIdentity,
     /// `open` allocates the session; presenting one is a protocol error.
     SessionIdentityOnOpen,
-    /// A session identity without an epoch cannot be fenced (§14.9).
+    /// A session identity without an epoch cannot be fenced.
     MissingSessionEpoch,
     MissingTenant,
     MissingDatabase,
-    /// §24: every request is correlatable.
+    /// Every request is correlatable.
     MissingRequestIdentity,
-    /// §11.3: the operation acts on a resolved route.
+    /// The operation acts on a resolved route.
     MissingRoute {
         have_generation: u32,
     },
@@ -1543,18 +1544,18 @@ pub enum AdmissionError {
     MissingTransactionIdentity,
     /// `begin` allocates the transaction; presenting one is an error.
     TransactionIdentityOnBegin,
-    /// **§21 invariant 17.** A retryable mutation with no idempotency
+    /// **The discoverability rule.** A retryable mutation with no
+    /// idempotency
     /// identity has no discoverable outcome, so it is refused HERE and
     /// never sent.
     MissingIdempotencyIdentity {
         op: DataOp,
     },
-    /// A bounded operation with no deadline (§8).
+    /// A bounded operation with no deadline.
     MissingDeadline,
     /// `cancel` with nothing to cancel.
     MissingCancellationIdentity,
-    /// §21 invariant 14: an unbounded result is not a weaker mode, it is
-    /// a refusal.
+    /// An unbounded result is not a weaker mode; it is a refusal.
     UnboundedRows,
     UnboundedResponseBytes,
     UnboundedWork,
@@ -1590,7 +1591,7 @@ impl AdmissionError {
     ///   for a capability this operation does not have, which is a
     ///   negotiation answer rather than a syntax error.
     /// - [`AdmissionError::MissingIdempotencyIdentity`] stays
-    ///   `Malformed` on purpose even though it is §21 invariant 17's
+    ///   `Malformed` on purpose even though it is the discoverability
     ///   refusal. Retrying identically genuinely cannot succeed, and
     ///   that is precisely what `Malformed` means.
     pub const fn refusal_class(&self) -> DataRetryClass {
@@ -1602,8 +1603,7 @@ impl AdmissionError {
     }
 }
 
-/// Admit a request, or refuse it with the reason (§14.8, §21 invariants
-/// 14 and 17).
+/// Admit a request, or refuse it with the reason.
 ///
 /// ### Check order is part of the contract
 ///
@@ -1645,7 +1645,7 @@ pub fn admit_request(request: &DataRequest) -> Result<(), AdmissionError> {
         return Err(AdmissionError::MissingRequestIdentity);
     }
 
-    // ── Routing (§11.3) ──
+    // ── Routing ──
     if op.requires_resolved_route()
         && (request.range_id == [0u8; 16] || request.range_generation == 0)
     {
@@ -1662,7 +1662,7 @@ pub fn admit_request(request: &DataRequest) -> Result<(), AdmissionError> {
         return Err(AdmissionError::UnexpectedContinuation);
     }
 
-    // ── Transaction identity (§13.2) ──
+    // ── Transaction identity ──
     if op == DataOp::Begin && ctx.transaction_id != 0 {
         return Err(AdmissionError::TransactionIdentityOnBegin);
     }
@@ -1670,9 +1670,9 @@ pub fn admit_request(request: &DataRequest) -> Result<(), AdmissionError> {
         return Err(AdmissionError::MissingTransactionIdentity);
     }
 
-    // ── §21 invariant 17: discoverability at admission ──
+    // ── Discoverability at admission ──
     //
-    // §14.8: "idempotency identity for every retryable mutation". Not
+    // An idempotency identity for every retryable mutation. Not
     // "for every mutation without a transaction": a transaction
     // identity makes the *transaction's* outcome discoverable, but a
     // retried `write` inside a live transaction still needs to be
@@ -1691,7 +1691,7 @@ pub fn admit_request(request: &DataRequest) -> Result<(), AdmissionError> {
         return Err(AdmissionError::MissingCancellationIdentity);
     }
 
-    // ── Bounds (§21 invariant 14) ──
+    // ── Bounds ──
     if op.returns_rows() {
         if request.max_rows == 0 {
             return Err(AdmissionError::UnboundedRows);
@@ -1704,12 +1704,12 @@ pub fn admit_request(request: &DataRequest) -> Result<(), AdmissionError> {
         }
     }
 
-    // ── Pushdown placement (§14.13) ──
+    // ── Pushdown placement ──
     if request.has_pushdown() && !op.accepts_pushdown() {
         return Err(AdmissionError::PushdownNotPermitted { op });
     }
 
-    // ── Snapshot reads must name their timestamp (§20) ──
+    // ── Snapshot reads must name their timestamp ──
     if ctx.consistency as u8 == Consistency::Snapshot as u8
         && op.returns_rows()
         && ctx.read_timestamp == 0
@@ -1721,7 +1721,7 @@ pub fn admit_request(request: &DataRequest) -> Result<(), AdmissionError> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 5. Not a transparent FIFO (§28, §14.8, §21 invariant 17)
+// 5. Not a transparent FIFO
 // ══════════════════════════════════════════════════════════════════════
 
 /// One operation the caller believes is in flight, reduced to the
@@ -1792,7 +1792,7 @@ pub enum TransportFailure {
     /// already fenced). Nothing to discover; it did not apply.
     NeverSent = 1,
     /// The request was sent and no response arrived. THIS is the case
-    /// that makes invariant 17 necessary.
+    /// that makes the discoverability rule necessary.
     ResponseLost = 2,
     /// The session was fenced or closed underneath the operation.
     SessionLost = 3,
@@ -1802,14 +1802,13 @@ impl TransportFailure {
     pub const ALL: [Self; 3] = [Self::NeverSent, Self::ResponseLost, Self::SessionLost];
 }
 
-/// How a caller finds out what actually happened (§14.8, §21 invariant
-/// 17).
+/// How a caller finds out what actually happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Discoverability {
     /// Nothing to discover: the operation could not have changed state,
     /// or provably never left the client. Retry freely.
     NotRequired,
-    /// Ask the transaction home range (§13.2). Its `TxnStatus` IS the
+    /// Ask the transaction home range. Its `TxnStatus` IS the
     /// outcome; there is no other place to look.
     ViaTransactionStatus { transaction_id: u64 },
     /// Look the idempotency identity up in the owning range. Applies to
@@ -1823,16 +1822,16 @@ pub enum Discoverability {
     Undiscoverable { op: DataOp },
 }
 
-/// §21 invariant 17 made executable: "every remote mutation is
-/// idempotently identifiable and its outcome remains discoverable after
-/// compute or transport failure".
+/// The discoverability rule made executable: every remote mutation is
+/// idempotently identifiable and its outcome remains discoverable
+/// after compute or transport failure.
 ///
 /// A lost response for a mutation is never "assume it failed" and never
 /// "assume it succeeded". It is one of two lookups, and which one
 /// depends only on whether the mutation was transactional.
 ///
 /// Note the ordering: the transaction status is preferred over the
-/// idempotency identity when both exist, because §13.2's home record is
+/// idempotency identity when both exist, because the home record is
 /// the *authority* for the outcome while the idempotency identity only
 /// tells you whether this particular request was applied.
 pub fn outcome_is_discoverable(
@@ -1863,20 +1862,20 @@ pub fn outcome_is_discoverable(
 /// What the caller must refresh before it can proceed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rediscovery {
-    /// Refetch descriptors (§11.3) and retry.
+    /// Refetch descriptors and retry.
     Route,
-    /// Ask the home range for the transaction's status (§13.2).
+    /// Ask the home range for the transaction's status.
     TransactionOutcome { transaction_id: u64 },
     /// Look up the idempotency identity in the owning range.
     IdempotentOutcome { idempotency_key: u64 },
-    /// Refetch the catalog revision and re-subscribe (§14.12).
+    /// Refetch the catalog revision and re-subscribe.
     CatalogRevision,
-    /// Re-open the session; the old one is fenced (§14.9).
+    /// Re-open the session; the old one is fenced.
     Session { session_id: u64 },
 }
 
-/// The answer to "the connection dropped — now what?" (§14.8's "network
-/// loss cannot be reduced to FIFO hangup").
+/// The answer to "the connection dropped — now what?". Network loss
+/// cannot be reduced to FIFO hangup.
 ///
 /// Three values, and the boundary between them is the contract:
 /// `Resumable` is a promise that no rows are skipped, `MustRediscover`
@@ -1908,7 +1907,7 @@ pub fn continuation_is_well_formed(cursor: &FeedCursor, op: &InflightOp) -> bool
         && cursor.range_generation == op.range_generation
 }
 
-/// Classify a disconnect (§14.8, §28).
+/// Classify a disconnect.
 ///
 /// ### Order of reasoning
 ///
@@ -1986,7 +1985,7 @@ pub fn classify_disconnect(op: &InflightOp) -> Disconnect {
     }
 }
 
-// ── Cancellation is not abort (§14.8, §14.11) ─────────────────────────
+// ── Cancellation is not abort ─────────────────────────────────────────
 
 /// What ended an operation.
 #[repr(u8)]
@@ -2014,8 +2013,9 @@ impl TerminationSignal {
 /// The typed proof that cancellation is not abort.
 ///
 /// `OperationCancelled` carries the transaction status **unchanged**.
-/// That is the whole content of §14.11's "client disconnect never
-/// decides a transaction outcome": stopping an operation is a local
+/// That is the whole content of the rule that a client disconnect
+/// never decides a transaction outcome: stopping an operation is a
+/// local
 /// event, and deciding a transaction is a durable replicated one. The
 /// two are different variants so no caller can accidentally treat one
 /// as the other.
@@ -2039,20 +2039,20 @@ impl Termination {
     }
 }
 
-/// §14.11's rule as a named constant: no cancellation, deadline, or
+/// The rule as a named constant: no cancellation, deadline, or
 /// disconnect decides a transaction outcome. Only an explicit abort
 /// that reaches the home range does.
 pub const fn cancellation_decides_transaction() -> bool {
     false
 }
 
-/// Classify what a termination signal did (§14.8, §14.11).
+/// Classify what a termination signal did.
 ///
 /// `transaction_status` is the status observed *before* the signal.
 /// Only [`TerminationSignal::ExplicitAbort`] produces
 /// [`Termination::TransactionAborted`], and even then only when the
 /// transaction was still undecided — aborting a `Committed` transaction
-/// does not un-commit it (§21 invariant 9), so it reports the cancelled
+/// does not un-commit it, so it reports the cancelled
 /// operation with the terminal status intact.
 pub fn classify_termination(
     signal: TerminationSignal,
@@ -2088,7 +2088,7 @@ pub fn classify_termination(
     }
 }
 
-// ── Scan resumption (§15, §18, composed) ──────────────────────────────
+// ── Scan resumption (composed) ────────────────────────────────────────
 
 /// The answer [`scan_resume_valid`] gives, paired with the
 /// [`DataRetryClass`] the response must carry.
@@ -2119,7 +2119,7 @@ impl ScanResume {
     }
 }
 
-/// Validate a scan resume (§14.8's "resume scans where permitted").
+/// Validate a scan resume (scans resume where permitted).
 ///
 /// Composes [`db_ops::cursor_is_resumable`] rather than restating it.
 /// The retention-floor rule, the check ORDER, and the refusal to
@@ -2159,14 +2159,14 @@ pub fn scan_resume_valid(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 6. Session and worker lifecycle (§14.9, §14.11)
+// 6. Session and worker lifecycle
 // ══════════════════════════════════════════════════════════════════════
 
-/// How a SQL session is attached to a worker (§14.9).
+/// How a SQL session is attached to a worker.
 ///
-/// §14.9: "Short operations may drain; durable cursors and sessions are
+/// Short operations may drain; durable cursors and sessions are
 /// resumable; deployments requiring connection preservation use
-/// edge-anchored workers."
+/// edge-anchored workers.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentKind {
@@ -2177,7 +2177,7 @@ pub enum AttachmentKind {
     /// requires it, then rebound to a replacement worker.
     Movable = 2,
     /// The session drains its short operations and then fails cleanly.
-    /// §14.9's "short operations may drain".
+    /// Short operations may drain.
     DrainOnly = 3,
 }
 
@@ -2194,9 +2194,9 @@ impl AttachmentKind {
     }
 }
 
-/// What a replacement worker does with this session (§14.11's "after
-/// compute failure, a replacement worker ... resumes only explicitly
-/// resumable operations, and fails all others cleanly").
+/// What a replacement worker does with this session. After compute
+/// failure, a replacement worker resumes only explicitly resumable
+/// operations and fails all others cleanly.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerLossAction {
@@ -2209,7 +2209,7 @@ pub enum WorkerLossAction {
     DrainAndFail = 3,
 }
 
-/// A session as the session directory knows it (§14.9).
+/// A session as the session directory knows it.
 ///
 /// Wire layout (integers LE):
 ///
@@ -2299,7 +2299,7 @@ impl SessionDescriptor {
     }
 }
 
-/// Why a presented session identity is refused (§14.9).
+/// Why a presented session identity is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionError {
     /// The directory has no such session.
@@ -2316,9 +2316,9 @@ pub enum SessionError {
     UninitializedEpoch,
 }
 
-/// Fence a presented session epoch against the directory (§14.9's "the
-/// session directory maps `session_id` to worker and fences stale
-/// `session_epoch` values").
+/// Fence a presented session epoch against the directory: the session
+/// directory maps `session_id` to a worker and fences stale
+/// `session_epoch` values.
 pub fn fence_stale_session(
     presented_session_id: u64,
     presented_epoch: u32,
@@ -2347,10 +2347,10 @@ pub fn fence_stale_session(
     Ok(())
 }
 
-// ── The §14.11 authority table ────────────────────────────────────────
+// ── The state-authority table ─────────────────────────────────────────
 
-/// Every kind of state the separated composition holds (§14.11's table,
-/// left column).
+/// Every kind of state the separated composition holds (the authority
+/// table's left column).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateKind {
@@ -2375,10 +2375,10 @@ pub enum StateKind {
 }
 
 impl StateKind {
-    /// Every row of §14.11's table. The tests iterate this, so a state
-    /// kind added without an authority mapping fails to compile and one
-    /// added without a recoverability answer fails the invariant-15
-    /// test.
+    /// Every row of the authority table. The tests iterate this, so a
+    /// state kind added without an authority mapping fails to compile
+    /// and one added without a recoverability answer fails the
+    /// compute-holds-nothing-durable test.
     pub const ALL: [Self; 9] = [
         Self::RowsIndexesCatalogRecords,
         Self::TransactionOutcome,
@@ -2407,14 +2407,14 @@ impl StateKind {
     }
 }
 
-/// Who holds a state kind (§14.11's table, right column).
+/// Who holds a state kind (the authority table's right column).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
     /// Lattice ranges — including the transactional and lease records
     /// that hold durable sequences and surviving advisory locks.
     LatticeRange = 1,
-    /// The transaction's home range (§13.2).
+    /// The transaction's home range.
     TransactionHomeRange = 2,
     /// The participant ranges holding the intents.
     ParticipantRange = 3,
@@ -2471,7 +2471,8 @@ impl Authority {
     /// Does this authority live in the relational-compute graph
     /// (including its protocol anchors and session workers)?
     ///
-    /// §21 invariant 15 is exactly the statement that these two
+    /// Compute holding no unique durable outcome is exactly the
+    /// statement that these two
     /// predicates never both hold, and a test asserts it over
     /// [`Authority::ALL`].
     pub const fn is_compute_side(self) -> bool {
@@ -2485,7 +2486,7 @@ impl Authority {
     }
 }
 
-/// §14.11's authority table as a total function.
+/// The authority table as a total function.
 ///
 /// | State | Authority |
 /// |---|---|
@@ -2500,9 +2501,9 @@ impl Authority {
 /// | Movable SQL session state | [`Authority::SessionWorker`] |
 ///
 /// Durable sequences and surviving advisory locks map to
-/// `LatticeRange` rather than a distinct authority because §14.11
-/// places them in "Lattice transactional or lease records" — ordinary
-/// range-held records, reached through the ordinary transaction path.
+/// `LatticeRange` rather than a distinct authority because they live
+/// in Lattice transactional or lease records — ordinary range-held
+/// records, reached through the ordinary transaction path.
 pub const fn authority_of(state_kind: StateKind) -> Authority {
     match state_kind {
         StateKind::RowsIndexesCatalogRecords => Authority::LatticeRange,
@@ -2518,20 +2519,20 @@ pub const fn authority_of(state_kind: StateKind) -> Authority {
 }
 
 /// What a replacement worker does with this state kind after compute
-/// loss (§14.11's recovery paragraph).
+/// loss.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryAction {
     /// Nothing to do — the state never left the Lattice authority that
     /// holds it. Compute failure did not touch it.
     HeldByLattice = 1,
-    /// Reload it from its durable authority ("reloads catalog and
-    /// routing state").
+    /// Reload it from its durable authority (catalog and routing
+    /// state).
     Reload = 2,
-    /// Throw it away and recompute ("warming disposable caches").
+    /// Throw it away and recompute (disposable caches rewarm).
     Discard = 3,
-    /// Ask the durable record by identity ("checks durable transaction
-    /// status by identity").
+    /// Ask the durable record by identity (durable transaction status
+    /// is checked by identity).
     DiscoverByIdentity = 4,
     /// Rebind a replacement worker behind the surviving anchor.
     Reattach = 5,
@@ -2539,7 +2540,7 @@ pub enum RecoveryAction {
     MigrateOrFailCleanly = 6,
 }
 
-/// The recovery action for one state kind (§14.11).
+/// The recovery action for one state kind.
 pub const fn recovery_action(state_kind: StateKind) -> RecoveryAction {
     match state_kind {
         // Durable Lattice authorities: compute loss is not an event
@@ -2560,8 +2561,8 @@ pub const fn recovery_action(state_kind: StateKind) -> RecoveryAction {
     }
 }
 
-/// §21 invariant 15 made executable: "relational compute holds no
-/// unique durable database outcome or storage file".
+/// The compute-statelessness rule made executable: relational compute
+/// holds no unique durable database outcome or storage file.
 ///
 /// This returns `true` for EVERY state kind, and that totality is the
 /// invariant, not an oversight:
@@ -2569,8 +2570,7 @@ pub const fn recovery_action(state_kind: StateKind) -> RecoveryAction {
 /// - the four durable kinds are held by Lattice ranges, so losing
 ///   compute cannot lose them — there is nothing to recover;
 /// - the four compute-side kinds are disposable or reconstructable by
-///   construction, which is *why* §14.7 permits compute to be replaced
-///   at all.
+///   construction, which is *why* compute may be replaced at all.
 ///
 /// If a future state kind cannot answer `true`, that kind is a unique
 /// durable outcome living in compute, and the correct fix is to move it
@@ -2585,12 +2585,12 @@ pub const fn compute_loss_is_recoverable(state_kind: StateKind) -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 7. Cache coherence (§14.12)
+// 7. Cache coherence
 // ══════════════════════════════════════════════════════════════════════
 
-/// The key a compute metadata cache entry is filed under (§14.12:
-/// "compute metadata caches key entries by catalog revision,
-/// partition-map revision, range generation, and schema format").
+/// The key a compute metadata cache entry is filed under: compute
+/// metadata caches key entries by catalog revision, partition-map
+/// revision, range generation, and schema format.
 ///
 /// All four dimensions, not a subset: each one can move independently,
 /// and an entry keyed on three of them survives a change to the fourth.
@@ -2664,10 +2664,11 @@ impl CacheEntryKey {
     }
 }
 
-/// The fences a compute cache currently believes (§14.12). Carries the
-/// subscription health alongside the revisions, because §14.12's rule
-/// is that "a gap or stale source fence forces refresh rather than
-/// best-effort continuation" — so the gap must be part of the input, not
+/// The fences a compute cache currently believes. Carries the
+/// subscription health alongside the revisions, because the coherence
+/// rule is that a gap or stale source fence forces refresh rather
+/// than best-effort continuation — so the gap must be part of the
+/// input, not
 /// something the caller is trusted to check separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CurrentFences {
@@ -2717,15 +2718,14 @@ pub enum CacheValidity {
         entry: u16,
         current: u16,
     },
-    /// §14.12: "a gap ... forces refresh rather than best-effort
-    /// continuation".
+    /// A gap forces refresh rather than best-effort continuation.
     SubscriptionGap,
-    /// §14.12 + §21 invariant 11: a fence from the wrong source, or
+    /// A fence from the wrong source, or
     /// from the right source at a stale epoch.
     StaleSourceFence,
 }
 
-/// Classify a cache entry against the current fences (§14.12).
+/// Classify a cache entry against the current fences.
 ///
 /// ### Check order is part of the contract
 ///
@@ -2733,7 +2733,7 @@ pub enum CacheValidity {
 /// invalidation channel itself is broken, the four revision comparisons
 /// are comparing against numbers that may already be wrong, and a
 /// "Valid" answer derived from untrustworthy inputs is precisely the
-/// best-effort continuation §14.12 rejects.
+/// best-effort continuation the coherence rule rejects.
 pub fn cache_validity(entry: &CacheEntryKey, current: &CurrentFences) -> CacheValidity {
     if current.subscription_gap {
         return CacheValidity::SubscriptionGap;
@@ -2772,16 +2772,16 @@ pub fn cache_validity(entry: &CacheEntryKey, current: &CurrentFences) -> CacheVa
     CacheValidity::Valid
 }
 
-/// §14.12's rule in one predicate.
+/// The coherence rule in one predicate.
 pub fn cache_entry_valid(entry: &CacheEntryKey, current_fences: &CurrentFences) -> bool {
     matches!(cache_validity(entry, current_fences), CacheValidity::Valid)
 }
 
-// ── Cacheable and non-cacheable observations (§14.12) ─────────────────
+// ── Cacheable and non-cacheable observations ──────────────────────────
 
-/// An immutable MVCC observation (§14.12: "a later cache may store
-/// immutable MVCC observations keyed by range identity, generation,
-/// key/span, and read timestamp").
+/// An immutable MVCC observation: a later cache may store immutable
+/// MVCC observations keyed by range identity, generation, key/span,
+/// and read timestamp.
 ///
 /// It is cacheable precisely because it carries its own fences: the
 /// range it came from, that range's generation, and the timestamp it
@@ -2833,8 +2833,8 @@ impl MvccObservation {
     }
 }
 
-/// An unfenced "latest value" observation (§14.12: "An unfenced 'latest
-/// value' cannot be retained across requests").
+/// An unfenced "latest value" observation. An unfenced latest value
+/// cannot be retained across requests.
 ///
 /// The rule is enforced by TYPE, not by discipline: this struct has no
 /// `cache_key` method, no read timestamp field to key on, and no
@@ -2871,7 +2871,7 @@ impl LatestObservation {
 /// The two observation kinds a data client can hold.
 ///
 /// [`Observation::cacheable`] is the single entry point to the cache,
-/// and it returns `None` for every `Latest` value. §14.12's rule is
+/// and it returns `None` for every `Latest` value. The rule is
 /// therefore not a convention a future author must remember; it is the
 /// only behaviour the type admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2886,21 +2886,20 @@ impl Observation {
     pub const fn cacheable(&self) -> Option<CacheEntryKey> {
         match self {
             Self::Immutable(o) => o.cache_key(),
-            // §14.12. Not "usually not"; never.
+            // Never retained across requests. Not "usually not".
             Self::Latest(_) => None,
         }
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 8. Bounded pushdown (§14.13)
+// 8. Bounded pushdown
 // ══════════════════════════════════════════════════════════════════════
 
-/// The registered deterministic partial aggregates (§14.13's
-/// "explicitly registered deterministic partial aggregates").
+/// The explicitly registered deterministic partial aggregates.
 ///
 /// A closed registry with stable IDs is the entire mechanism by which
-/// §28's "no arbitrary connector SQL or opaque executable code" is
+/// "no arbitrary connector SQL or opaque executable code" is
 /// enforced: an aggregate is either a member of this enum or it is
 /// refused. Adding one is a deliberate act with a version bump, not
 /// something a connector can do by sending bytes.
@@ -2931,8 +2930,8 @@ impl RegisteredAggregate {
     }
 }
 
-/// The server-side bounds a program is admitted against (§14.13:
-/// "bounded by rows, bytes, memory, and work").
+/// The server-side bounds a program is admitted against: bounded by
+/// rows, bytes, memory, and work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PushdownLimits {
     pub max_rows: u32,
@@ -2948,15 +2947,15 @@ impl PushdownLimits {
     };
 }
 
-/// A bounded pushdown program (§14.13).
+/// A bounded pushdown program.
 ///
-/// §14.13 permits exactly seven things to be pushed down: key spans,
+/// Exactly seven things may be pushed down: key spans,
 /// MVCC timestamps, index lookup, prefix filters, projection, limit,
 /// and registered deterministic partial aggregates. This record has a
 /// field for each and nothing else. There is no expression tree, no
-/// bytecode, and no filter language, because §28 rejects "arbitrary
-/// connector SQL or opaque executable code" and the reliable way to
-/// reject something is to have nowhere to put it.
+/// bytecode, and no filter language, because arbitrary
+/// connector SQL and opaque executable code are rejected and the
+/// reliable way to reject something is to have nowhere to put it.
 ///
 /// `opaque_payload_len` exists solely so that a peer attempting to
 /// smuggle such a payload is refused EXPLICITLY by
@@ -2986,13 +2985,13 @@ impl PushdownLimits {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PushdownProgram {
-    /// §14.13's "schema-bound": the catalog revision this program was
+    /// Schema-bound: the catalog revision this program was
     /// compiled against. A storage graph at a different revision refuses
     /// it rather than executing a plan built for another schema.
     pub catalog_revision: u64,
     pub schema_format_version: u16,
     /// The MVCC timestamp the scan reads at. Never 0 — an unfenced
-    /// "latest" pushdown has no reproducible result (§14.12).
+    /// "latest" pushdown has no reproducible result.
     pub mvcc_timestamp: Timestamp,
     /// Secondary index to look up through; 0 = primary scan.
     pub index_id: u32,
@@ -3001,12 +3000,12 @@ pub struct PushdownProgram {
     /// The program's own row limit.
     pub limit_rows: u32,
     /// Hard bounds the program declares for itself. All three must be
-    /// non-zero: 0 means "no bound", and §21 invariant 14 has no such
-    /// mode.
+    /// non-zero: 0 means "no bound", and the bounded-results rule has
+    /// no such mode.
     pub max_rows: u32,
     pub max_bytes: u32,
     pub max_work_units: u32,
-    /// §14.13's "cancellable".
+    /// Every pushdown is cancellable.
     pub cancellation_id: u64,
     /// MUST be 0. See the type docs.
     pub opaque_payload_len: u16,
@@ -3262,10 +3261,10 @@ impl PushdownProgram {
     }
 }
 
-/// Why a pushdown program is refused (§14.13, §28).
+/// Why a pushdown program is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushdownError {
-    /// §14.13 "schema-bound": compiled against a different catalog.
+    /// Schema-bound: compiled against a different catalog.
     StaleCatalogRevision {
         program: u64,
         current: u64,
@@ -3274,17 +3273,17 @@ pub enum PushdownError {
         program: u16,
         current: u16,
     },
-    /// §28: an aggregate that is not in the registry. The one refusal
+    /// An aggregate that is not in the registry. The one refusal
     /// that keeps "no arbitrary connector SQL" true.
     UnregisteredAggregate {
         id: u16,
     },
-    /// §28: an opaque payload — connector SQL, bytecode, a filter
+    /// An opaque payload — connector SQL, bytecode, a filter
     /// expression — has no representation here and is refused by name.
     OpaquePayloadPresent {
         bytes: u16,
     },
-    /// §21 invariant 14: 0 is not "unlimited", it is a refusal.
+    /// 0 is not "unlimited", it is a refusal.
     UnboundedRows,
     UnboundedBytes,
     UnboundedWork,
@@ -3306,9 +3305,9 @@ pub enum PushdownError {
         limit: u32,
         max_rows: u32,
     },
-    /// §14.13 "cancellable".
+    /// Every pushdown is cancellable.
     MissingCancellationIdentity,
-    /// §14.12: an unfenced "latest" pushdown is not reproducible.
+    /// An unfenced "latest" pushdown is not reproducible.
     MissingMvccTimestamp,
     /// `start >= end` with a bounded end: an empty or inverted span is
     /// a compiler bug, not a zero-row scan.
@@ -3318,14 +3317,15 @@ pub enum PushdownError {
 }
 
 /// Validate a pushdown program against the server's limits and the
-/// storage graph's catalog revision (§14.13, §28).
+/// storage graph's catalog revision.
 ///
 /// ### Check order is part of the contract
 ///
 /// 1. schema binding — a program compiled against another catalog is
 ///    describing columns that may not exist, so nothing else it says
 ///    can be trusted;
-/// 2. the opaque payload — the §28 refusal, checked before any bound so
+/// 2. the opaque payload — the no-executable-content refusal, checked
+///    before any bound so
 ///    that smuggled executable content is never reported as merely
 ///    "too large";
 /// 3. the aggregate registry;
@@ -3351,7 +3351,7 @@ pub fn validate_pushdown(
         });
     }
 
-    // 2. §28: no opaque executable content.
+    // 2. No opaque executable content.
     if program.opaque_payload_len != 0 {
         return Err(PushdownError::OpaquePayloadPresent {
             bytes: program.opaque_payload_len,
@@ -3417,8 +3417,7 @@ pub fn validate_pushdown(
     Ok(())
 }
 
-/// §14.13's closing rule: "Pushdown must never block Raft apply or
-/// compaction."
+/// Pushdown must never block Raft apply or compaction.
 ///
 /// A named `false` rather than a comment, so the rule has a call site a
 /// test can assert on and a reviewer can grep for. A pushdown program
@@ -3431,40 +3430,40 @@ pub const fn pushdown_may_block_apply() -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 9. Placement and fleet (§11.5, §14.14, phase 10)
+// 9. Placement and fleet
 // ══════════════════════════════════════════════════════════════════════
 
-/// Provider capability bits (§11.5's "provider capabilities and format
-/// versions"). A candidate must offer every bit the constraints
+/// Provider capability bits (provider capabilities and format
+/// versions). A candidate must offer every bit the constraints
 /// require.
 pub const CAP_DISK_STATE_STORE: u32 = 0b0000_0001;
 pub const CAP_ENCRYPTION_AT_REST: u32 = 0b0000_0010;
 pub const CAP_SNAPSHOT_STREAMING: u32 = 0b0000_0100;
 pub const CAP_MVCC_HISTORY: u32 = 0b0000_1000;
 
-/// One node considered for a replica (§11.5).
+/// One node considered for a replica.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CandidateReplica {
     pub node_id: u32,
-    /// §11.5's "node and failure-domain diversity". Two voters sharing
+    /// Node and failure-domain diversity. Two voters sharing
     /// a domain is the violation the default rule exists to prevent.
     pub failure_domain: u32,
     pub role: ReplicaRole,
-    /// §11.5's "persistent storage capacity".
+    /// Persistent storage capacity.
     pub free_capacity_mib: u64,
-    /// §11.5's "write endurance", as remaining percent.
+    /// Write endurance, as remaining percent.
     pub write_endurance_pct: u8,
-    /// §11.5's "number of leaders and hot ranges per node".
+    /// Number of leaders and hot ranges on this node.
     pub leader_count: u32,
-    /// §11.5's "tenant isolation"; 0 = shared node.
+    /// Tenant isolation; 0 = shared node.
     pub tenant_id: u32,
-    /// §11.5's "residency policy"; 0 = unrestricted.
+    /// Residency policy; 0 = unrestricted.
     pub residency_zone: u32,
-    /// §11.5's "provider capabilities".
+    /// Provider capabilities.
     pub capabilities: u32,
-    /// §11.5's "format versions".
+    /// Storage format version.
     pub storage_format_version: u16,
-    /// §11.5's "control-plane reserve and recovery headroom" still
+    /// Control-plane reserve and recovery headroom still
     /// available on this node.
     pub control_plane_reserve_mib: u64,
 }
@@ -3485,7 +3484,7 @@ impl CandidateReplica {
     };
 }
 
-/// A proposed replica set (§11.5). Fixed capacity; a proposal larger
+/// A proposed replica set. Fixed capacity; a proposal larger
 /// than a descriptor can hold is not a placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlacementCandidate {
@@ -3514,7 +3513,7 @@ impl PlacementCandidate {
     }
 
     /// Quorum participants only. Learners and observers do not vote
-    /// (§11.5) and therefore do not count towards the voter rule or the
+    /// and therefore do not count towards the voter rule or the
     /// failure-domain diversity rule.
     pub fn voter_count(&self) -> u8 {
         self.replicas()
@@ -3524,7 +3523,7 @@ impl PlacementCandidate {
     }
 }
 
-/// The placement policy a candidate is admitted against (§11.5, §14.14).
+/// The placement policy a candidate is admitted against.
 ///
 /// Wire layout (integers LE):
 ///
@@ -3544,7 +3543,7 @@ impl PlacementCandidate {
 pub struct PlacementConstraints {
     pub required_voters: u8,
     /// Distinct failure domains required across the voters. Equal to
-    /// `required_voters` for the §11.5 default rule.
+    /// `required_voters` for the default rule.
     pub min_distinct_failure_domains: u8,
     pub min_endurance_pct: u8,
     pub min_free_capacity_mib: u64,
@@ -3563,8 +3562,8 @@ impl PlacementConstraints {
     /// Encoded wire size: header + fixed payload.
     pub const WIRE_LEN: usize = 4 + 38;
 
-    /// §11.5's default: "three voters on distinct eligible failure
-    /// domains". The other fields default to "unconstrained" so that a
+    /// The default: three voters on distinct eligible failure
+    /// domains. The other fields default to "unconstrained" so that a
     /// deployment adds requirements deliberately — except the voter and
     /// diversity rule, which is never optional.
     pub const DEFAULT: PlacementConstraints = PlacementConstraints {
@@ -3645,7 +3644,7 @@ impl PlacementConstraints {
     }
 }
 
-/// Why a placement is refused (§11.5). One variant per policy
+/// Why a placement is refused. One variant per policy
 /// dimension, each naming the offending node, so an operator sees which
 /// rule and which machine rather than "placement failed".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3654,7 +3653,7 @@ pub enum PlacementError {
         want: u8,
         got: u8,
     },
-    /// The §11.5 default rule's violation: two voters in one domain.
+    /// The default rule's violation: two voters in one domain.
     FailureDomainCollision {
         domain: u32,
         node_a: u32,
@@ -3709,7 +3708,7 @@ pub enum PlacementError {
     EmptyCandidate,
 }
 
-/// Admit a placement, or refuse it with the offending rule (§11.5).
+/// Admit a placement, or refuse it with the offending rule.
 ///
 /// ### Check order is part of the contract
 ///
@@ -3717,7 +3716,7 @@ pub enum PlacementError {
 /// because they are the availability objective; a set that satisfies
 /// every resource constraint but puts three voters in one rack has not
 /// placed a range, it has placed a single point of failure. Per-node
-/// eligibility follows, in the order §11.5 lists it.
+/// eligibility follows, in the policy's declared order.
 pub fn placement_is_admissible(
     candidate: &PlacementCandidate,
     constraints: &PlacementConstraints,
@@ -3736,7 +3735,7 @@ pub fn placement_is_admissible(
         });
     }
 
-    // ── Failure-domain diversity across voters (§11.5 default rule) ──
+    // ── Failure-domain diversity across voters (default rule) ──
     //
     // Any two voters sharing a domain is reported as the collision it
     // is, naming both nodes. Because that returns, reaching the count
@@ -3767,7 +3766,7 @@ pub fn placement_is_admissible(
         });
     }
 
-    // ── Per-node eligibility, in §11.5's order ──
+    // ── Per-node eligibility, in the policy's order ──
     for r in replicas {
         if constraints.tenant_id != 0 && r.tenant_id != constraints.tenant_id {
             return Err(PlacementError::TenantIsolationViolation {
@@ -3831,10 +3830,9 @@ pub fn placement_is_admissible(
     Ok(())
 }
 
-// ── Rolling format upgrade (phase 10) ─────────────────────────────────
+// ── Rolling format upgrade ────────────────────────────────────────────
 
-/// Phases of a rolling storage-format upgrade (§26 phase 10's "rolling
-/// format upgrade").
+/// Phases of a rolling storage-format upgrade.
 ///
 /// The ordering is the safety property: every replica must be *able to
 /// read* the new format before any replica *writes* it, because a
@@ -3907,8 +3905,8 @@ pub enum UpgradeError {
         from: UpgradePhase,
         to: UpgradePhase,
     },
-    /// **The phase-10 gate.** A replica cannot read the target format,
-    /// so enabling it would strand that replica.
+    /// **The readability gate.** A replica cannot read the target
+    /// format, so enabling it would strand that replica.
     ReplicaCannotReadFormat {
         node: u32,
         max_readable: u16,
@@ -3922,7 +3920,7 @@ pub enum UpgradeError {
     EmptyPlan,
 }
 
-/// A rolling format upgrade in progress (§26 phase 10).
+/// A rolling format upgrade in progress.
 ///
 /// Carries no wire form on purpose: this is control-plane planning
 /// state evaluated in-process by the placement/upgrade coordinator and
@@ -3980,8 +3978,8 @@ impl RollingUpgradePlan {
         Ok(())
     }
 
-    /// **The phase-10 gate**: a format-version upgrade may not proceed
-    /// while any replica cannot read the new format.
+    /// **The readability gate**: a format-version upgrade may not
+    /// proceed while any replica cannot read the new format.
     ///
     /// Checked over EVERY replica in the plan, voters and non-voters
     /// alike: a learner that cannot read the new format cannot catch
@@ -4022,26 +4020,26 @@ impl RollingUpgradePlan {
     }
 }
 
-// ── Independent scaling (§14.14) ──────────────────────────────────────
+// ── Independent scaling ───────────────────────────────────────────────
 
-/// A compute-graph lifecycle action (§14.14).
+/// A compute-graph lifecycle action.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
     clippy::enum_variant_names,
-    reason = "every §14.14 lifecycle action acts on a compute worker; naming them Add/Drain/Start/Replace would lose the subject the RFC names"
+    reason = "every lifecycle action acts on a compute worker; naming them Add/Drain/Start/Replace would lose the subject being acted on"
 )]
 pub enum ComputeLifecycle {
-    /// "Add read or write-capable compute workers without creating new
-    /// data copies."
+    /// Add read or write-capable compute workers without creating new
+    /// data copies.
     AddWorker = 1,
-    /// "Drain or suspend compute while Lattice storage remains
-    /// available and durable."
+    /// Drain or suspend compute while Lattice storage remains
+    /// available and durable.
     DrainWorker = 2,
-    /// "Start compute by loading catalog/routing revisions and warming
-    /// disposable caches."
+    /// Start compute by loading catalog/routing revisions and warming
+    /// disposable caches.
     StartWorker = 3,
-    /// Replace a failed worker (§14.11's recovery paragraph).
+    /// Replace a failed worker.
     ReplaceWorker = 4,
 }
 
@@ -4053,27 +4051,26 @@ impl ComputeLifecycle {
         Self::ReplaceWorker,
     ];
 
-    /// §14.14's headline property: none of these actions copies a
-    /// database file. "Adding a reader copies no database files" is
-    /// phase 9's acceptance criterion and it is true for every action
-    /// here, because compute holds no storage file at all (§21
-    /// invariant 15).
+    /// The headline scaling property: none of these actions copies a
+    /// database file. Adding a reader copies no database files, and
+    /// that is true for every action
+    /// here, because compute holds no storage file at all.
     pub const fn copies_database_files(self) -> bool {
         false
     }
 
     /// Does this action require Lattice storage to be quiesced? No:
-    /// §14.14 requires storage to remain "available and durable"
+    /// storage must remain available and durable
     /// throughout.
     pub const fn requires_storage_quiesce(self) -> bool {
         false
     }
 }
 
-/// §14.14's writer policy: "Begin with one active relational writer per
-/// database plus many readers; allow multiple writer workers only after
-/// cross-range transaction and compatibility invariants pass their
-/// evidence gates."
+/// The writer policy: begin with one active relational writer per
+/// database plus many readers; allow multiple writer workers only
+/// after cross-range transaction and compatibility invariants pass
+/// their evidence gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterPolicy {
     pub active_writers: u16,
@@ -4095,16 +4092,16 @@ impl WriterPolicy {
         self.active_writers == 0 || self.multi_writer_gates_passed
     }
 
-    /// Readers are never gated — adding one copies no data (§14.14).
+    /// Readers are never gated — adding one copies no data.
     pub const fn may_add_reader(&self) -> bool {
         true
     }
 }
 
-// ── Idempotency records (§9 Phase 9) ─────────────────────────────────
+// ── Idempotency records ───────────────────────────────────────────────
 
-// `IdempotencyRecord`, `IdempotencyLookup` and `interpret_lookup` moved
-// to `txn.rs` and are re-exported below. They belong with the
+// `IdempotencyRecord`, `IdempotencyLookup` and `interpret_lookup` live
+// in `txn.rs` and are re-exported below. They belong with the
 // transaction contracts — an idempotency record IS the durable identity
 // of a committed transaction — and the engine needs them without
 // mounting this whole module, which drags in db_ops and partition_map

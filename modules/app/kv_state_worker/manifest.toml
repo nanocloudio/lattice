@@ -11,7 +11,7 @@ hardware_targets = ["bcm2712"]
 # core even for short request/response operations because all stable
 # state lives here.
 #
-# State-store provider (RFC database foundation §6/§30): the
+# State-store provider: the
 # `state_store` param selects the physical materialization provider at
 # graph construction — 0 = bounded in-memory table (default), 1 = the
 # ordered disk provider over the Fluxor FS contract. The `fs` resource
@@ -79,7 +79,7 @@ direction = "input"
 content_type = "OctetStream"
 
 # Quorum durability proof from substrate durability, and the COMMITTED
-# MVCC GC floor (`MSG_GC_FLOOR_COMMITTED`, RFC §18 / §21 invariant 13)
+# MVCC GC floor (`MSG_GC_FLOOR_COMMITTED`)
 # once the compaction_coordinator's proposal has been through
 # consensus. Envelope type discriminates; a floor record arriving
 # anywhere else is ignored, because only a committed one may authorize
@@ -128,7 +128,7 @@ name = "mutations"
 direction = "output"
 content_type = "OctetStream"
 
-# Retention claims to compaction_coordinator: this worker's §18
+# Retention claims to compaction_coordinator: this worker's
 # ACTIVE-READ claim (`MSG_RETENTION_CLAIM`), republished on a cadence
 # so that going quiet BLOCKS floor advancement instead of permitting it.
 [[ports]]
@@ -188,7 +188,19 @@ index = 7
 direction = "output"
 content_type = "OctetStream"
 
-# ── Observability (Phase 14) ──────────────────────────────────────────
+# Chunk sweeps this worker proposes: `KV_OP_CHUNK_SWEEP` commands naming
+# the floor it saw commit (the committed GC floor on disk; unbounded on
+# the memory store, which keeps no history). Wired back to `commands`
+# in a single-node graph (param `sweep_wrap` = command), or to consensus
+# (`sweep_wrap` = proposal) so the sweep applies at one log position on
+# every replica. Unwired, the store never reclaims a chunk.
+[[ports]]
+name = "sweep_out"
+index = 8
+direction = "output"
+content_type = "OctetStream"
+
+# ── Observability ─────────────────────────────────────────────────────
 # Module-scope metrics emitted on `metrics` at a ~1 s WALL-CLOCK cadence
 # (NOT a step cadence — see the emitter's docs: a step cadence goes
 # silent exactly when a step blocks, which is the failure you most need
@@ -197,7 +209,7 @@ content_type = "OctetStream"
 #
 # ids 0-2 are monotonic counters (METRIC_COUNTER). ids 3-13 are the disk
 # state-store diagnostic block, added so a wedged worker is readable from
-# a `/metrics` scrape when the request path is timing out (rig.md §5).
+# a `/metrics` scrape when the request path is timing out.
 # APPEND ONLY — never renumber, ids are a wire contract.
 #
 # Counters (METRIC_COUNTER, monotonic):
@@ -228,7 +240,7 @@ content_type = "OctetStream"
 #   7 disk_mem_count    memtable occupancy (flush watermark 384 of 512)
 #   8 disk_run_count    live run files (compaction trigger at 16)
 #  17 cfg_state_store   EFFECTIVE `state_store` param as parsed by the
-#                       module (0=memory 1=disk). rig.md §7a: report what
+#                       module (0=memory 1=disk). Report what
 #                       was applied, never what the config intended. A
 #                       config that says `state_store: 1` while this reads
 #                       0 IS the bug. Emitted in BOTH modes.
@@ -236,6 +248,10 @@ content_type = "OctetStream"
 #                       1=8.3 names at the FS root). Same rule.
 #  19 cfg_store_id      EFFECTIVE `store_id` param (0=`kv/`, N=`kvN/`;
 #                       multi-range graphs run one worker per range).
+#  23 sweeps_proposed   chunk sweeps written to `sweep_out`
+#  24 sweeps_applied    chunk sweeps applied (proposed here or by a
+#                       replica). Proposed far ahead of applied means
+#                       the sweeps never reach the ordering.
 [observability]
 metrics = [
     "applied",
@@ -261,4 +277,6 @@ metrics = [
     "ts_stamped",
     "ts_unstamped",
     "snapshot_refusals",
+    "sweeps_proposed",
+    "sweeps_applied",
 ]
