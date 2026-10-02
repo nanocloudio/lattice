@@ -1920,6 +1920,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         types::KV_OP_CHUNK_SWEEP
             | types::KV_OP_ORIGIN_REGISTER
             | types::KV_OP_ORIGIN_WRITE
+            | types::KV_OP_ORIGIN_IMPORT
             | types::KV_OP_ORIGIN_CHUNK
     ) {
         emit_reject(
@@ -2999,26 +3000,46 @@ unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
         if poll <= 0 || (poll as u32) & POLL_IN == 0 {
             break;
         }
-        // `gateway/surface.rs::send_response` framing — conn-tagged,
-        // NOT the standard 3-byte envelope:
+        // `gateway/surface.rs::send_response` framing: one envelope per
+        // response, `[msg_type:u8][len:u16 LE]`, around the conn-tagged
+        // wire frame
         //   [conn_id:u16 LE][msg_type:u8][len:u16 LE][payload…]
         // Lattice conn ids are u8-ranged, so the u16 narrows losslessly.
-        let mut hdr = [0u8; 5];
-        if (sys.channel_read)(router.gateway_reject_in, hdr.as_mut_ptr(), 5) < 5 {
+        let mut env = [0u8; 3];
+        if (sys.channel_read)(router.gateway_reject_in, env.as_mut_ptr(), 3) < 3 {
             break;
         }
-        let conn_id = (u16::from_le_bytes([hdr[0], hdr[1]]) & 0xFF) as u8;
-        let msg_type = hdr[2];
-        let plen = u16::from_le_bytes([hdr[3], hdr[4]]) as usize;
-        let mut payload = [0u8; 64];
-        let take = plen.min(payload.len());
+        let body_len = u16::from_le_bytes([env[1], env[2]]) as usize;
+        let mut body = [0u8; 5 + 64];
+        let take = body_len.min(body.len());
         if take > 0
-            && ((sys.channel_read)(router.gateway_reject_in, payload.as_mut_ptr(), take) as usize)
+            && ((sys.channel_read)(router.gateway_reject_in, body.as_mut_ptr(), take) as usize)
                 < take
         {
             break;
         }
+        // A response past what a reject carries: the rest is drained.
+        let mut rest = body_len - take;
+        while rest > 0 {
+            let mut sink = [0u8; 64];
+            let n = rest.min(sink.len());
+            if ((sys.channel_read)(router.gateway_reject_in, sink.as_mut_ptr(), n) as usize) < n {
+                break;
+            }
+            rest -= n;
+        }
         progressed = true;
+        if take < 5 {
+            continue;
+        }
+        let conn_id = (u16::from_le_bytes([body[0], body[1]]) & 0xFF) as u8;
+        let msg_type = body[2];
+        let plen = (u16::from_le_bytes([body[3], body[4]]) as usize).min(take - 5);
+        let mut payload = [0u8; 64];
+        for (d, s) in payload.iter_mut().zip(body.get(5..5 + plen).unwrap_or(&[])) {
+            *d = *s;
+        }
+        let take = plen;
         // This port also carries the gateway's other client responses
         // (admin, read grants for graphs that route them here). Only
         // rejects are ours to act on; the rest is drained so the ring

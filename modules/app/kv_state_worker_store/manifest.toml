@@ -21,6 +21,13 @@ provides         = ["storage.object", "storage.namespace"]
 # (`group_durable: 1`). Any other configuration registers no contract and
 # logs `[kvw] store provider=0 (why)`.
 #
+# A replica on a node with private records names them (`scope`: the node,
+# `scoped`: its prefixes, comma-separated): its graph keeps the plain
+# names, the store keeps them under `/~node/<scope>`, so every replica
+# holds each node's apart. A LIST, CHANGES or subscription on a scoped
+# prefix answers in the graph's names; one on a broader prefix sees the
+# store's. A scope it cannot keep registers no contract.
+#
 # A separate module TYPE, not a variant of kv_state_worker: only a graph
 # that makes lattice its store carries the provider's heap (the provider,
 # its read slots and subscriptions, and a 4 MiB value cache). Ports,

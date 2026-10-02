@@ -1808,7 +1808,8 @@ fn forward_to_router(
     let corr = anchor.next_corr();
     // A value too large for one write: its chunks go first, in order, and
     // the command after them (rewritten to name its manifest).
-    let (op, body_len) = if kv_large::carries_large(op, &body[..body_len]) {
+    let (op, body_len) = if kv_large::carries_large(op, &body[..body_len], kv_large::ENTRY_BODY_MAX)
+    {
         match upload_chunks(anchor, slot_idx, op, &mut body, body_len) {
             Some(r) => r,
             None => {
@@ -2131,7 +2132,11 @@ fn upload_chunks(
 ) -> Option<(u8, usize)> {
     const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
     let tenant = anchor.slots[slot_idx].tenant;
-    if !anchor.uploader.start(op, &body[..len]).ok()? {
+    if !anchor
+        .uploader
+        .start(op, &body[..len], kv_large::ENTRY_BODY_MAX)
+        .ok()?
+    {
         return Some((op, len));
     }
     let mut chunk = [0u8; kv_large::CHUNK_REQUEST_MAX];

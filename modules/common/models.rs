@@ -366,7 +366,7 @@ impl<'a> KeyReader<'a> {
 /// 0x8006_00xx  vector
 /// 0x8007_00xx  shared cross-model catalog
 /// 0x8008_00xx  the store's own: large values' chunks (`kv_chunks.rs`)
-/// 0x800C_00xx  the store provider's own records (`store_provider.rs`)
+/// 0x800C_00xx  the store provider's own records (`origin.rs`, `store_provider.rs`)
 /// ```
 pub const KS_DOCUMENT_CATALOG: u32 = 0x8001_0001;
 pub const KS_DOCUMENT_DATA: u32 = 0x8001_0002;

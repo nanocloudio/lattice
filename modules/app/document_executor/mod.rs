@@ -1114,7 +1114,7 @@ fn kv_send(exec: &mut ExecState, op: u8, body_len: usize, next: u8) {
         fail_plain(exec, OUT_UNAVAILABLE);
         return;
     };
-    let large = exec.lg_up.start(op, body);
+    let large = exec.lg_up.start(op, body, kv_large::ENTRY_BODY_MAX);
     exec.lg_req[..body_len].copy_from_slice(body);
     exec.lg_req_len = body_len;
     exec.lg_op = op;

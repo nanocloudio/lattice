@@ -56,14 +56,14 @@ use super::kv_large::kv_chunks::{
     sha256_of, Builder, Hash, Manifest, CHUNK_MAX, DATA_MAX, HASH_LEN, MANIFEST_LEN,
 };
 use super::kv_large::{self, Expander, Need};
-use super::origin::{self, Outcome, Record, NO_OUTCOME, RING};
+use super::origin::{self, Outcome, Record, IMPORT_MARK_LEN, NO_OUTCOME, RING};
 use super::types::{
-    KV_OP_DELETE, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_REGISTER, KV_OP_ORIGIN_WRITE, KV_OP_PUT,
-    KV_OP_PUT_MANIFEST, KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS, KV_OP_TXN, KV_RESULT_COMPACTED,
-    KV_RESULT_INTEGER, KV_RESULT_KVS, KV_RESULT_MISSING_CHUNK, KV_RESULT_OK, KV_RESULT_PAUSED,
-    KV_RESULT_TOO_LARGE, KV_RESULT_TXN, KV_RESULT_VERSIONS, RANGE_META_FLAG_MANIFESTS,
-    RECORD_FLAG_MANIFEST, TXN_CMP_MOD_EQUAL, VERSIONS_FLAG_MANIFESTS, VERSIONS_FLAG_META,
-    VERSION_KIND_DELETE,
+    KV_OP_DELETE, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_IMPORT, KV_OP_ORIGIN_REGISTER,
+    KV_OP_ORIGIN_WRITE, KV_OP_PUT, KV_OP_PUT_MANIFEST, KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS,
+    KV_OP_TXN, KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_KVS, KV_RESULT_MISSING_CHUNK,
+    KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_TOO_LARGE, KV_RESULT_TXN, KV_RESULT_VERSIONS,
+    RANGE_META_FLAG_MANIFESTS, RECORD_FLAG_MANIFEST, TXN_CMP_MOD_EQUAL, VERSIONS_FLAG_MANIFESTS,
+    VERSIONS_FLAG_META, VERSION_KIND_DELETE,
 };
 
 // ── The contracts' wire ─────────────────────────────────────────────
@@ -176,7 +176,7 @@ pub const FEED_MIN: usize = 16 * EVENT_MAX;
 /// replicated path carries (`wire::CONSENSUS_PROPOSAL_BODY_MAX`, 2040)
 /// less the entry tag and the command head (the worker holds it to them).
 /// A chunk entry fills it exactly.
-pub const ENTRY_BODY_MAX: usize = 2004;
+pub const ENTRY_BODY_MAX: usize = kv_large::ENTRY_BODY_MAX;
 /// Writes a replica holds undecided for its callers at once.
 pub const PENDING_WRITES: usize = 32;
 /// Steps a proposal goes unanswered before it is offered again (the
@@ -290,6 +290,9 @@ const NO_SLOT: Slot = Slot {
 struct Sub {
     used: bool,
     lost: bool,
+    /// The scope's head on every key it hears (a scoped prefix): stripped
+    /// from each event's key.
+    strip: u8,
     prefix_len: u8,
     sink: i32,
     seq: u32,
@@ -299,6 +302,7 @@ struct Sub {
 const NO_SUB: Sub = Sub {
     used: false,
     lost: false,
+    strip: 0,
     prefix_len: 0,
     sink: -1,
     seq: 0,
@@ -308,6 +312,66 @@ const NO_SUB: Sub = Sub {
 impl Sub {
     fn watches(&self, key: &[u8]) -> bool {
         self.used && key.starts_with(self.prefix.get(..self.prefix_len as usize).unwrap_or(&[]))
+    }
+}
+
+// ── Scope: a node's private records ──────────────────────────────────
+
+/// Where a scope's records are kept: `/~node/<scope><key>`.
+pub const SCOPE_ROOT: &[u8] = b"/~node/";
+/// A scope's name, at most.
+pub const SCOPE_NAME_MAX: usize = 63;
+/// Its prefixes, comma-separated, at most.
+pub const SCOPED_MAX: usize = 512;
+const SCOPE_HEAD_MAX: usize = SCOPE_ROOT.len() + SCOPE_NAME_MAX;
+
+/// A replica's scope: the keys under its prefixes are this node's own.
+/// Its graph names them plainly; the store keeps them under
+/// [`SCOPE_ROOT`] and the scope's name, so every replica holds them, apart
+/// from every other node's. A namespace operation on a prefix under a
+/// scoped one is answered in the graph's names; one on a broader prefix
+/// sees the store as it is.
+struct Scope {
+    head: [u8; SCOPE_HEAD_MAX],
+    head_len: u8,
+    prefixes: [u8; SCOPED_MAX],
+    prefixes_len: u16,
+}
+
+const NO_SCOPE: Scope = Scope {
+    head: [0; SCOPE_HEAD_MAX],
+    head_len: 0,
+    prefixes: [0; SCOPED_MAX],
+    prefixes_len: 0,
+};
+
+impl Scope {
+    fn head(&self) -> &[u8] {
+        self.head.get(..self.head_len as usize).unwrap_or(&[])
+    }
+
+    /// Whether `key` (or a prefix) is under one of the scope's prefixes.
+    fn holds(&self, key: &[u8]) -> bool {
+        self.head_len != 0
+            && self
+                .prefixes
+                .get(..self.prefixes_len as usize)
+                .unwrap_or(&[])
+                .split(|&b| b == b',')
+                .any(|p| !p.is_empty() && key.starts_with(p))
+    }
+
+    /// `key` as the store keeps it, into `out`: its length, or `None` when
+    /// the scoped name is past [`KEY_MAX`].
+    fn inward(&self, key: &[u8], out: &mut [u8; KEY_MAX]) -> Option<usize> {
+        let head = if self.holds(key) { self.head() } else { &[] };
+        let n = head.len() + key.len();
+        if n > KEY_MAX {
+            return None;
+        }
+        copy(out, head);
+        copy(out.get_mut(head.len()..)?, key);
+        Some(n)
     }
 }
 
@@ -327,6 +391,8 @@ pub struct Provider {
     cache_at: u32,
     /// Writes through the group's log (a replica's).
     rep: Replication,
+    /// This node's private records (a replica's).
+    scope: Scope,
 }
 
 impl Provider {
@@ -339,6 +405,7 @@ impl Provider {
             cached: 0,
             cache_at: 0,
             rep: NO_REPLICATION,
+            scope: NO_SCOPE,
         }
     }
 
@@ -367,6 +434,36 @@ impl Provider {
     /// Subscriptions owed a LOST sentinel.
     pub fn owed(&self) -> usize {
         self.subs.iter().filter(|s| s.used && s.lost).count()
+    }
+
+    /// Keep the keys under `prefixes` (comma-separated, each from `/`) as
+    /// scope `name`'s own (see [`Scope`]). `false`, and no scope, for a
+    /// name with a `/` or past [`SCOPE_NAME_MAX`], or a prefix list past
+    /// [`SCOPED_MAX`] or naming a prefix not from `/`.
+    #[allow(
+        clippy::manual_contains,
+        reason = "slice::contains links core's memchr, which PIC modules cannot resolve"
+    )]
+    pub fn scope(&mut self, name: &[u8], prefixes: &[u8]) -> bool {
+        self.scope = NO_SCOPE;
+        let ok = !name.is_empty()
+            && name.len() <= SCOPE_NAME_MAX
+            && !name.iter().any(|&b| b == b'/')
+            && utf8_is_valid(name)
+            && prefixes.len() <= SCOPED_MAX
+            && prefixes
+                .split(|&b| b == b',')
+                .all(|p| p.first() == Some(&b'/') && key_ok(p));
+        if !ok {
+            return false;
+        }
+        let sc = &mut self.scope;
+        copy(&mut sc.head, SCOPE_ROOT);
+        copy(sc.head.get_mut(SCOPE_ROOT.len()..).unwrap_or(&mut []), name);
+        sc.head_len = (SCOPE_ROOT.len() + name.len()) as u8;
+        copy(&mut sc.prefixes, prefixes);
+        sc.prefixes_len = prefixes.len() as u16;
+        true
     }
 
     /// Write through the group's log as `replica`, registering with
@@ -874,6 +971,9 @@ struct WriteArgs<'a> {
     rev: u64,
     fence_ptr: u64,
     fence_cap: usize,
+    /// A record of a host log's import: how far the import has come once
+    /// it is in (`origin::IMPORTED_KEY`'s value).
+    mark: Option<[u8; IMPORT_MARK_LEN]>,
 }
 
 /// `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64]
@@ -900,6 +1000,7 @@ unsafe fn put_args(a: &[u8]) -> Result<WriteArgs<'_>, i32> {
         rev,
         fence_ptr: rd64(a, p).unwrap_or(0),
         fence_cap: rd16(a, p + 8).unwrap_or(0),
+        mark: None,
     })
 }
 
@@ -915,6 +1016,7 @@ fn delete_args(a: &[u8]) -> Result<WriteArgs<'_>, i32> {
         rev,
         fence_ptr: rd64(a, p).unwrap_or(0),
         fence_cap: rd16(a, p + 8).unwrap_or(0),
+        mark: None,
     })
 }
 
@@ -925,7 +1027,7 @@ fn obj_put<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
         Err(e) => return e,
     };
     if b.replicated() {
-        return replicated_write(pv, b, a, &w);
+        return replicated_write(pv, b, &w);
     }
     match put_value(pv, b, bufs, w.key, w.value.unwrap_or(&[]), w.pre, w.rev) {
         Err(e) => e,
@@ -991,6 +1093,48 @@ pub fn delete_key<B: Backend>(
     Ok(())
 }
 
+/// One record of a host store's log imported into a replicated store: put
+/// `value` at `key` (`None`: delete it) as this replica's write, carrying
+/// how far the import has come once it is in — `offset` into the log and
+/// the CRC state `crc` of the bytes before it — which every replica
+/// records under `origin::imported_key` as it applies the record. `EINPROGRESS`
+/// until it is decided here (asked again with the same record, it is the
+/// same write), then 0 or what refused it.
+pub fn import_record<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    key: &[u8],
+    value: Option<&[u8]>,
+    offset: u64,
+    crc: u32,
+) -> i32 {
+    if key.is_empty() || !key_ok(key) {
+        return EINVAL;
+    }
+    // In the store's names, as a graph's write would be.
+    let mut name = [0u8; KEY_MAX];
+    let Some(n) = pv.scope.inward(key, &mut name) else {
+        return EINVAL;
+    };
+    let key = name.get(..n).unwrap_or(&[]);
+    let mut mark = [0u8; IMPORT_MARK_LEN];
+    mark[..8].copy_from_slice(&offset.to_le_bytes());
+    mark[8..].copy_from_slice(&crc.to_le_bytes());
+    replicated_write(
+        pv,
+        b,
+        &WriteArgs {
+            key,
+            value,
+            pre: PRE_ANY,
+            rev: 0,
+            fence_ptr: 0,
+            fence_cap: 0,
+            mark: Some(mark),
+        },
+    )
+}
+
 /// A DELETE: an absent key is a no-op under ANY and ABSENT alike.
 fn obj_delete<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
     let w = match delete_args(a) {
@@ -998,7 +1142,7 @@ fn obj_delete<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: 
         Err(e) => return e,
     };
     if b.replicated() {
-        return replicated_write(pv, b, a, &w);
+        return replicated_write(pv, b, &w);
     }
     match delete_key(pv, b, bufs, w.key, w.pre, w.rev) {
         Err(e) => e,
@@ -1658,6 +1802,8 @@ fn event_with<B: Backend>(
     val: &[u8],
     flags: u8,
 ) -> bool {
+    // A scoped subscription hears its keys in the graph's names.
+    let key = key.get(s.strip as usize..).unwrap_or(key);
     let payload = (15 + key.len() + val.len()) as u16;
     let mut at = 0usize;
     let framed = put(ev, &mut at, &SOURCE).is_some()
@@ -1797,7 +1943,13 @@ fn elided_to<B: Backend>(
 
 /// `[prefix_len u16][prefix][sink u32][flags u8]` (bit 0: every entry
 /// now first, as Added): a subscription.
-fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
+fn ns_subscribe<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    a: &[u8],
+    strip: usize,
+) -> i32 {
     let mut p = 0usize;
     let Some(prefix) = field16(a, &mut p).filter(|k| key_ok(k)) else {
         return EINVAL;
@@ -1816,6 +1968,7 @@ fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a
     };
     let mut s = NO_SUB;
     s.used = true;
+    s.strip = strip as u8;
     s.sink = sink as i32;
     s.prefix_len = prefix.len() as u8;
     copy(&mut s.prefix, prefix);
@@ -1888,6 +2041,9 @@ struct Write {
     /// A PUT (else a DELETE), and its precondition's kind.
     put: bool,
     pre: u8,
+    /// A record of a host log's import: its body starts with the import's
+    /// marker (`KV_OP_ORIGIN_IMPORT`).
+    import: bool,
     /// Offered since it was last found lost.
     offered: bool,
     /// The caller and the request it is.
@@ -1902,7 +2058,7 @@ struct Write {
     index: u64,
     term: u64,
     len: u16,
-    /// Its `KV_OP_TXN` body.
+    /// Its `KV_OP_TXN` body, after an import's marker.
     body: [u8; ENTRY_BODY_MAX],
 }
 
@@ -1910,6 +2066,7 @@ const NO_WRITE: Write = Write {
     state: W_FREE,
     put: false,
     pre: 0,
+    import: false,
     offered: false,
     id: [0; HASH_LEN],
     seq: 0,
@@ -2061,17 +2218,12 @@ impl Replication {
 
 /// A write asked of a replica: taken, moved on as far as it goes now, and
 /// answered — `EINPROGRESS` until it is decided.
-fn replicated_write<B: Backend>(
-    pv: &mut Provider,
-    b: &mut B,
-    req: &[u8],
-    w: &WriteArgs<'_>,
-) -> i32 {
+fn replicated_write<B: Backend>(pv: &mut Provider, b: &mut B, w: &WriteArgs<'_>) -> i32 {
     let rep = &mut pv.rep;
     if rep.superseded {
         return ERROR;
     }
-    let id = sha256_of(&[&b.caller(), req]);
+    let id = write_id(&b.caller(), w);
     let found = rep
         .writes
         .iter()
@@ -2087,6 +2239,7 @@ fn replicated_write<B: Backend>(
             x.state = W_QUEUED;
             x.put = w.value.is_some();
             x.pre = w.pre;
+            x.import = w.mark.is_some();
             x.offered = false;
             x.id = id;
             x.seq = 0;
@@ -2126,6 +2279,40 @@ fn replicated_write<B: Backend>(
     rc
 }
 
+/// Which write a request is: its caller and what it asks — the operation,
+/// key, precondition and value — not where the caller keeps those bytes. A
+/// caller asking again rebuilds the request; wherever its buffers sit then,
+/// it is the same write.
+fn write_id(caller: &[u8], w: &WriteArgs<'_>) -> Hash {
+    let head = [u8::from(w.value.is_some()), w.pre];
+    let mark = w.mark.unwrap_or([0; IMPORT_MARK_LEN]);
+    sha256_of(&[
+        caller,
+        &head,
+        &[u8::from(w.mark.is_some())],
+        &mark,
+        &w.rev.to_le_bytes(),
+        &(w.key.len() as u32).to_le_bytes(),
+        w.key,
+        w.value.unwrap_or(&[]),
+    ])
+}
+
+/// Lay write `x`'s entry body: an import's marker, then the
+/// `KV_OP_TXN` body for `w` putting `what` (`None`: deleting). Its length,
+/// or `None` when it does not fit one entry.
+fn write_body(x: &mut Write, w: &WriteArgs<'_>, what: Option<&Put<'_>>) -> Option<usize> {
+    let at = match w.mark {
+        Some(m) => {
+            x.body.get_mut(..IMPORT_MARK_LEN)?.copy_from_slice(&m);
+            IMPORT_MARK_LEN
+        }
+        None => 0,
+    };
+    let n = txn(x.body.get_mut(at..)?, w.key, w.pre != PRE_ANY, w.rev, what)?;
+    Some(at + n)
+}
+
 /// Move write `i` on: a body and a seq once the log has room for it, its
 /// value's chunks first when the value is not carried inline.
 fn advance<B: Backend>(rep: &mut Replication, b: &mut B, i: usize, w: &WriteArgs<'_>) {
@@ -2133,16 +2320,11 @@ fn advance<B: Backend>(rep: &mut Replication, b: &mut B, i: usize, w: &WriteArgs
         if !rep.may_sequence() {
             return;
         }
-        let guarded = w.pre != PRE_ANY;
         let inline = match w.value {
-            None => txn(&mut rep.writes[i].body, w.key, guarded, w.rev, None),
-            Some(v) if v.len() <= INLINE_MAX => txn(
-                &mut rep.writes[i].body,
-                w.key,
-                guarded,
-                w.rev,
-                Some(&Put::Value(v)),
-            ),
+            None => write_body(&mut rep.writes[i], w, None),
+            Some(v) if v.len() <= INLINE_MAX => {
+                write_body(&mut rep.writes[i], w, Some(&Put::Value(v)))
+            }
             Some(_) => None,
         };
         match (inline, w.value) {
@@ -2241,15 +2423,7 @@ fn upload_chunks<B: Backend>(rep: &mut Replication, b: &mut B, i: usize, w: &Wri
         if !rep.may_sequence() {
             return;
         }
-        let body = &mut rep.writes[i].body;
-        let guarded = w.pre != PRE_ANY;
-        let Some(n) = txn(
-            body,
-            w.key,
-            guarded,
-            w.rev,
-            Some(&Put::Manifest(m.encode())),
-        ) else {
+        let Some(n) = write_body(&mut rep.writes[i], w, Some(&Put::Manifest(m.encode()))) else {
             rep.refuse(i, EINVAL);
             return;
         };
@@ -2296,7 +2470,12 @@ fn offer<B: Backend>(rep: &mut Replication, b: &mut B) {
         let x = &rep.writes[i];
         let corr = origin::corr(rep.replica, rep.inc, x.seq);
         let body = x.body.get(..x.len as usize).unwrap_or(&[]);
-        if !b.propose(KV_OP_ORIGIN_WRITE, corr, &[body]) {
+        let op = if x.import {
+            KV_OP_ORIGIN_IMPORT
+        } else {
+            KV_OP_ORIGIN_WRITE
+        };
+        if !b.propose(op, corr, &[body]) {
             return;
         }
         rep.writes[i].offered = true;
@@ -2531,11 +2710,6 @@ pub fn origin_step<B: Backend>(pv: &mut Provider, b: &mut B) {
 /// [key][val]` per write (`fluxor/src/platform/linux/store.rs`); a store
 /// moving onto lattice replays it once (the worker's import).
 pub const STORE_LOG_HEAD: usize = 15;
-/// The provider's own records (an import's completion), apart from the
-/// keys consumers see: the reserved family 0x800C (`models.rs`).
-pub const KS_PROVIDER_META: u32 = 0x800C_0001;
-/// The key an import's completion is recorded under.
-pub const IMPORTED_KEY: &[u8] = b"store.log imported";
 pub const STORE_LOG_PUT: u8 = 1;
 pub const STORE_LOG_DELETE: u8 = 2;
 
@@ -2578,6 +2752,126 @@ pub unsafe fn needs_store(op: u32, arg: *const u8, arg_len: usize) -> bool {
 /// # Safety
 /// `arg` names `arg_len` bytes; the pointers the arguments carry name
 /// what the contract says they do (the caller's buffers).
+/// The most a key-bearing argument takes once its names are the store's.
+const SCOPED_ARG_MAX: usize = 1024;
+
+/// Move `len` bytes from `from` to `to` (`to <= from`) within `b`.
+fn shift_down(b: &mut [u8], to: usize, from: usize, len: usize) {
+    for i in 0..len {
+        if let Some(&x) = b.get(from + i) {
+            if let Some(y) = b.get_mut(to + i) {
+                *y = x;
+            }
+        }
+    }
+}
+
+/// `a` with its leading `[len u16][name]` field (and, for a LIST, the
+/// cursor field after it) in the store's names, into `out`: its length,
+/// and whether the name was a scoped one (the answer then names keys the
+/// graph's way once stripped). `Err` for an argument too short or a scoped
+/// name past [`KEY_MAX`].
+fn scoped_arg(
+    sc: &Scope,
+    op: u32,
+    a: &[u8],
+    out: &mut [u8; SCOPED_ARG_MAX],
+) -> Result<(usize, bool), i32> {
+    let mut name = [0u8; KEY_MAX];
+    if op == OBJ_GET {
+        let n = sc.inward(a, &mut name).ok_or(EINVAL)?;
+        copy(out, name.get(..n).unwrap_or(&[]));
+        return Ok((n, sc.holds(a)));
+    }
+    let mut p = 0usize;
+    let first = field16(a, &mut p).ok_or(EINVAL)?;
+    let scoped = sc.holds(first);
+    let mut at = 0usize;
+    let n = sc.inward(first, &mut name).ok_or(EINVAL)?;
+    put(out, &mut at, &(n as u16).to_le_bytes()).ok_or(EINVAL)?;
+    put(out, &mut at, name.get(..n).unwrap_or(&[])).ok_or(EINVAL)?;
+    if op == NS_LIST {
+        let cursor = field16(a, &mut p).ok_or(EINVAL)?;
+        let c = if scoped && !cursor.is_empty() {
+            sc.inward(cursor, &mut name).ok_or(EINVAL)?
+        } else {
+            copy(&mut name, cursor);
+            cursor.len()
+        };
+        put(out, &mut at, &(c as u16).to_le_bytes()).ok_or(EINVAL)?;
+        put(out, &mut at, name.get(..c).unwrap_or(&[])).ok_or(EINVAL)?;
+    }
+    put(out, &mut at, a.get(p..).unwrap_or(&[])).ok_or(EINVAL)?;
+    Ok((at, scoped))
+}
+
+/// A LIST page in the graph's names: `head` bytes off every entry's key
+/// and off the next page's cursor. Its new length.
+fn strip_list(out: &mut [u8], len: usize, head: usize) -> usize {
+    let (mut r, mut w) = (0usize, 0usize);
+    while r + 2 < len + 1 {
+        let (Some(&kl), Some(&kind)) = (out.get(r), out.get(r + 1)) else {
+            break;
+        };
+        if kl == TRAILER_MARK && kind == TRAILER_MARK {
+            let nl = out.get(r + 2).copied().unwrap_or(0) as usize;
+            let keep = nl.saturating_sub(head);
+            if let Some(x) = out.get_mut(w) {
+                *x = TRAILER_MARK;
+            }
+            if let Some(x) = out.get_mut(w + 1) {
+                *x = TRAILER_MARK;
+            }
+            if let Some(x) = out.get_mut(w + 2) {
+                *x = keep as u8;
+            }
+            shift_down(out, w + 3, r + 3 + (nl - keep), keep);
+            return w + 3 + keep;
+        }
+        let kl = kl as usize;
+        let keep = kl.saturating_sub(head);
+        if let Some(x) = out.get_mut(w) {
+            *x = keep as u8;
+        }
+        if let Some(x) = out.get_mut(w + 1) {
+            *x = kind;
+        }
+        shift_down(out, w + 2, r + 2 + (kl - keep), keep);
+        r += 2 + kl;
+        w += 2 + keep;
+    }
+    w
+}
+
+/// A CHANGES answer in the graph's names: `head` bytes off every change's
+/// key. Its new length.
+fn strip_changes(out: &mut [u8], len: usize, head: usize) -> usize {
+    let count = match out.get(1..5).and_then(|c| c.try_into().ok()) {
+        Some(c) => u32::from_le_bytes(c),
+        None => return len,
+    };
+    let (mut r, mut w) = (5usize, 5usize);
+    for _ in 0..count {
+        let (Some(kl), Some(vl)) = (rd16(out, r + 9), rd32(out, r + 11)) else {
+            break;
+        };
+        let keep = kl.saturating_sub(head);
+        shift_down(out, w, r, 9);
+        let k = (keep as u16).to_le_bytes();
+        if let Some(x) = out.get_mut(w + 9) {
+            *x = k[0];
+        }
+        if let Some(x) = out.get_mut(w + 10) {
+            *x = k[1];
+        }
+        shift_down(out, w + 11, r + 11, 4);
+        shift_down(out, w + 15, r + 15 + (kl - keep), keep + vl);
+        r += 15 + kl + vl;
+        w += 15 + keep + vl;
+    }
+    w
+}
+
 pub unsafe fn dispatch<B: Backend>(
     pv: &mut Provider,
     b: &mut B,
@@ -2587,10 +2881,31 @@ pub unsafe fn dispatch<B: Backend>(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    let a: &[u8] = if arg.is_null() {
+    let raw: &[u8] = if arg.is_null() {
         &[]
     } else {
         core::slice::from_raw_parts(arg as *const u8, arg_len)
+    };
+    // A scope's names: the key (or prefix) in the store's, the answer back
+    // in the graph's.
+    let mut tr = [0u8; SCOPED_ARG_MAX];
+    let mut strip = 0usize;
+    let keyed = matches!(
+        op,
+        OBJ_PUT | OBJ_GET | OBJ_HEAD | OBJ_DELETE | NS_LIST | NS_CHANGES | NS_SUBSCRIBE
+    );
+    let a: &[u8] = if pv.scope.head_len != 0 && keyed {
+        match scoped_arg(&pv.scope, op, raw, &mut tr) {
+            Ok((n, scoped)) => {
+                if scoped {
+                    strip = pv.scope.head_len as usize;
+                }
+                tr.get(..n).unwrap_or(&[])
+            }
+            Err(e) => return e,
+        }
+    } else {
+        raw
     };
     let slot = slot_of(handle);
     // Every read but a slot's own passes through the cache.
@@ -2630,9 +2945,35 @@ pub unsafe fn dispatch<B: Backend>(
             0
         }
         NS_CAPS => NS_CAPS_SERVED,
-        NS_LIST => ns_list(b, bufs, a),
-        NS_CHANGES => ns_changes(b, bufs, a),
-        NS_SUBSCRIBE => ns_subscribe(pv, b, bufs, a),
+        NS_LIST | NS_CHANGES => {
+            let rc = if op == NS_LIST {
+                ns_list(b, bufs, a)
+            } else {
+                ns_changes(b, bufs, a)
+            };
+            if rc <= 0 || strip == 0 {
+                return rc;
+            }
+            // `[prefix][cursor (a LIST's)][out_ptr u64][out_cap u32]…`
+            let mut p = 0usize;
+            let _ = field16(a, &mut p);
+            if op == NS_LIST {
+                let _ = field16(a, &mut p);
+            } else {
+                p += 8;
+            }
+            let (Some(out_ptr), Some(out_cap)) = (rd64(a, p), rd32(a, p + 8)) else {
+                return rc;
+            };
+            let out = caller_out(out_ptr, out_cap);
+            let n = if op == NS_LIST {
+                strip_list(out, rc as usize, strip)
+            } else {
+                strip_changes(out, rc as usize, strip)
+            };
+            n as i32
+        }
+        NS_SUBSCRIBE => ns_subscribe(pv, b, bufs, a, strip),
         NS_CLOSE => {
             if let Some(s) = slot.checked_sub(SLOTS).and_then(|i| pv.subs.get_mut(i)) {
                 *s = NO_SUB;

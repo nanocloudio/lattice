@@ -440,6 +440,34 @@ define_params! {
         => |s, d, len| { s.group_quorum = p_u8(d, len, 0, 1); };
     16, group_durable, u8, 0, enum { ordered=0, quorum_fsync=1 }
         => |s, d, len| { s.group_durable = p_u8(d, len, 0, 0); };
+
+    // A store provider's scope: the node whose private records the keys
+    // under `scoped` (comma-separated prefixes) are. The graph names them
+    // plainly; the store keeps them under `/~node/<scope>`, so each node
+    // of a group keeps its own apart from every other's
+    // (`store_provider::Scope`). Empty: no scope.
+    17, scope, str, 0
+        => |s, d, len| {
+            if len <= s.scope_name.len() {
+                // SAFETY: the params TLV names `len` bytes at `d`.
+                let src = unsafe { core::slice::from_raw_parts(d, len) };
+                for (x, y) in s.scope_name.iter_mut().zip(src) {
+                    *x = *y;
+                }
+                s.scope_name_len = len as u8;
+            }
+        };
+    18, scoped, str, 0
+        => |s, d, len| {
+            if len <= s.scoped.len() {
+                // SAFETY: the params TLV names `len` bytes at `d`.
+                let src = unsafe { core::slice::from_raw_parts(d, len) };
+                for (x, y) in s.scoped.iter_mut().zip(src) {
+                    *x = *y;
+                }
+                s.scoped_len = len as u16;
+            }
+        };
 }
 
 /// Steps between chunk sweeps while writes may have queued chunk work.
@@ -796,6 +824,11 @@ struct WorkerState {
     /// `import_log` param: the host store log to import (store twin).
     import_path: [u8; 255],
     import_path_len: u16,
+    /// `scope` / `scoped` params: this node's private records.
+    scope_name: [u8; 63],
+    scope_name_len: u8,
+    scoped: [u8; 512],
+    scoped_len: u16,
 
     /// `command_log` param, and the log's life: off, replaying its tail
     /// after recovery, or live (every applied op logged).
@@ -1123,6 +1156,11 @@ unsafe fn retain_history(worker: &mut WorkerState) {
 fn write_bound(op: u8, body: &[u8]) -> Option<usize> {
     match op {
         types::KV_OP_ORIGIN_WRITE => kv_store::write_bound(KV_OP_TXN, body).map(|b| b + 1),
+        // The write, its origin's record, and the import's marker.
+        types::KV_OP_ORIGIN_IMPORT => body
+            .get(origin::IMPORT_MARK_LEN..)
+            .and_then(|txn| kv_store::write_bound(KV_OP_TXN, txn))
+            .map(|b| b + 2),
         types::KV_OP_ORIGIN_CHUNK => kv_store::write_bound(types::KV_OP_PUT_CHUNK, body),
         types::KV_OP_ORIGIN_REGISTER => Some(1),
         _ => kv_store::write_bound(op, body),
@@ -1498,7 +1536,10 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
     // answered (to its origin) by the provider, never here.
     if matches!(
         op,
-        types::KV_OP_ORIGIN_REGISTER | types::KV_OP_ORIGIN_WRITE | types::KV_OP_ORIGIN_CHUNK
+        types::KV_OP_ORIGIN_REGISTER
+            | types::KV_OP_ORIGIN_WRITE
+            | types::KV_OP_ORIGIN_IMPORT
+            | types::KV_OP_ORIGIN_CHUNK
     ) {
         apply_origin_entry(worker, &head, body);
         return CmdOutcome::Answered(true);
@@ -2865,12 +2906,12 @@ unsafe fn provider_new(worker: &mut WorkerState) {
     let sys = &*worker.syscalls;
     let replicated = worker.sweep_wrap != 0;
     // A replica proposes its writes, registered under a nonce of its own
-    // (a restarted replica's must differ), and imports nothing: a host
-    // store moves onto a single-node store.
+    // (a restarted replica's must differ); a host store it imports goes
+    // through the log too, a record at a time.
     let mut nonce = [0u8; 8];
     let random = !replicated || (sys.provider_call)(-1, RANDOM_FILL, nonce.as_mut_ptr(), 8) == 0;
-    let wanted = worker.state_store == STATE_STORE_DISK
-        && (!replicated || (worker.prov_out >= 0 && worker.import_path_len == 0 && random));
+    let wanted =
+        worker.state_store == STATE_STORE_DISK && (!replicated || (worker.prov_out >= 0 && random));
     let p = &mut worker.prov;
     if wanted {
         p.state = (sys.heap_alloc)(core::mem::size_of::<store_provider::Provider>() as u32)
@@ -2889,6 +2930,23 @@ unsafe fn provider_new(worker: &mut WorkerState) {
             if replicated {
                 (*p.state).replicate(worker.replica_id, u64::from_le_bytes(nonce));
             }
+            // A scope that cannot be kept is refused rather than ignored:
+            // the node's records would land in every node's names.
+            if worker.scope_name_len > 0 {
+                let name = worker
+                    .scope_name
+                    .get(..worker.scope_name_len as usize)
+                    .unwrap_or(&[]);
+                let scoped = worker
+                    .scoped
+                    .get(..worker.scoped_len as usize)
+                    .unwrap_or(&[]);
+                p.provides = (*p.state).scope(name, scoped);
+                if !p.provides {
+                    let m = b"[kvw] scope refused: a name with no '/', prefixes from '/'";
+                    dev_log(sys, DISK_LOG_LEVEL, m.as_ptr(), m.len());
+                }
+            }
         }
         if p.provides && worker.import_path_len > 0 {
             p.import_buf = (sys.heap_alloc)(IMPORT_RECORD_MAX as u32);
@@ -2906,12 +2964,6 @@ unsafe fn provider_new(worker: &mut WorkerState) {
             write_prefix(&mut buf, n, b" (needs state_store=disk: its history)")
         } else if worker.prov_out < 0 {
             write_prefix(&mut buf, n, b" (replicated: prov_out unwired)")
-        } else if worker.import_path_len != 0 {
-            write_prefix(
-                &mut buf,
-                n,
-                b" (replicated: import_log is a single store's)",
-            )
         } else {
             write_prefix(&mut buf, n, b" (replicated: no random nonce)")
         };
@@ -2956,6 +3008,17 @@ unsafe fn provider_ready(worker: &mut WorkerState) -> bool {
 #[cfg(feature = "store_provider")]
 unsafe fn provider_step(worker: &mut WorkerState) {
     if worker.prov.provides && store_serving(worker) && worker.prov.import_phase != IMPORT_NONE {
+        // A replica imports through the log: its registration, and the
+        // offering of what it proposed, go on meanwhile.
+        if worker.sweep_wrap != 0 {
+            let pv = &mut *worker.prov.state;
+            store_provider::origin_step(
+                pv,
+                &mut WorkerBackend {
+                    worker: &mut *worker,
+                },
+            );
+        }
         provider_import(worker);
         return;
     }
@@ -3070,6 +3133,21 @@ unsafe fn provider_make_ready(worker: &mut WorkerState) -> i32 {
                 dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len());
                 return 0;
             }
+            // A replica imports through the log, which runs only once the
+            // graph steps: it imports then, answering ask-again meanwhile,
+            // as it does before its own writes can be decided. Its change
+            // feed opens now, so a consumer that subscribed while it
+            // imported hears what the import brought once it serves.
+            if worker.sweep_wrap != 0 {
+                let pv = &mut *worker.prov.state;
+                pv.open(&WorkerBackend {
+                    worker: &mut *worker,
+                });
+                worker.prov.open = true;
+                let m = b"[kvw] store ready at construction, importing through the log";
+                dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len());
+                return 0;
+            }
             provider_import(worker);
             // An import writes as commands do: the memtable flushed and the
             // command log reclaimed behind it, or a long host log fills the
@@ -3100,15 +3178,31 @@ unsafe fn provider_make_ready(worker: &mut WorkerState) -> i32 {
 }
 
 /// The host store log import, a bounded slice per step, before the store
-/// serves (see the `import_log` param).
+/// serves (see the `import_log` param). A single store applies each record
+/// directly and marks the import done at its end; a replica proposes each
+/// record through the group's log with its progress marker, so every
+/// replica records how far each replica's import of its own node's log
+/// has come, and a restart resumes from the marker the log committed.
 #[cfg(feature = "store_provider")]
 unsafe fn provider_import(worker: &mut WorkerState) {
-    let meta = (0, 0, store_provider::KS_PROVIDER_META);
+    let meta = (0, 0, origin::KS_PROVIDER_META);
     let consistency = kv_store::ReadPolicy::LATEST.consistency;
     let mut ans = [0u8; 64];
+    // A replica reads how far the import has come once its registration
+    // has applied here: everything the log committed before it has too,
+    // so the marker is the group's, not a stale view of it.
+    if worker.sweep_wrap != 0 && !(*worker.prov.state).report().registered {
+        return;
+    }
     if worker.prov.import_phase == IMPORT_CHECK {
         let mut body = [0u8; 2 + 32];
-        let k = store_provider::IMPORTED_KEY;
+        // A replica's own import: it imports its node's log.
+        let own = origin::imported_key(worker.replica_id);
+        let k: &[u8] = if worker.sweep_wrap != 0 {
+            &own
+        } else {
+            origin::IMPORTED_KEY
+        };
         let mut at = 0usize;
         for b in (k.len() as u16).to_le_bytes().iter().chain(k.iter()) {
             if let Some(d) = body.get_mut(at) {
@@ -3179,9 +3273,10 @@ unsafe fn provider_import(worker: &mut WorkerState) {
     // SAFETY: `IMPORT_RECORD_MAX` bytes of this module's heap, apart from
     // the state.
     let buf = core::slice::from_raw_parts_mut(worker.prov.import_buf, IMPORT_RECORD_MAX);
-    // Nobody is answered during an import, and it runs again whole until
-    // its end is recorded: its ops need be durable only by then.
-    worker.clog_defer = true;
+    // Nobody is answered during an import, and a single store's runs
+    // again whole until its end is recorded: its ops need be durable only
+    // by then. A replica's records are the log's, each with its marker.
+    worker.clog_defer = worker.sweep_wrap == 0;
     import_slice(worker, meta, consistency, path, buf);
     worker.clog_defer = false;
 }
@@ -3242,38 +3337,56 @@ unsafe fn import_slice(
             import_done(worker, meta, consistency);
             return;
         }
+        let next_at = at + (store_provider::STORE_LOG_HEAD + kl + vl) as u64;
+        let crc = kv_store::disk_store::crc32_update(worker.prov.import_crc, &head);
+        let next_crc = kv_store::disk_store::crc32_update(crc, body);
         let (key, value) = body.split_at(kl);
+        let value = (op != store_provider::STORE_LOG_DELETE).then_some(value);
         let pv = &mut *worker.prov.state;
-        let mut bufs = provider_bufs(&worker.prov);
         let mut b = WorkerBackend {
             worker: &mut *worker,
         };
-        let done = if op == store_provider::STORE_LOG_DELETE {
-            store_provider::delete_key(pv, &mut b, &mut bufs, key, store_provider::PRE_ANY, 0)
+        let done = if b.worker.sweep_wrap != 0 {
+            // Through the log, the import's marker with it.
+            match store_provider::import_record(pv, &mut b, key, value, next_at, next_crc) {
+                0 => Ok(()),
+                e => Err(e),
+            }
         } else {
-            store_provider::put_value(
-                pv,
-                &mut b,
-                &mut bufs,
-                key,
-                value,
-                store_provider::PRE_ANY,
-                0,
-            )
+            let mut bufs = provider_bufs(&b.worker.prov);
+            match value {
+                None => store_provider::delete_key(
+                    pv,
+                    &mut b,
+                    &mut bufs,
+                    key,
+                    store_provider::PRE_ANY,
+                    0,
+                ),
+                Some(v) => store_provider::put_value(
+                    pv,
+                    &mut b,
+                    &mut bufs,
+                    key,
+                    v,
+                    store_provider::PRE_ANY,
+                    0,
+                ),
+            }
         };
         match done {
             Ok(()) => {}
-            // The store is making room: the same record next step.
-            Err(store_provider::EAGAIN) => return,
+            // The store is making room, or the log has not decided it yet:
+            // the same record next step.
+            Err(store_provider::EAGAIN | store_provider::EINPROGRESS) => return,
             Err(_) => {
                 log_disk_errno(worker, b"[kvw] import refused a record, QUARANTINE errno=");
                 worker.disk_phase = DISK_PHASE_QUARANTINED;
                 return;
             }
         }
-        let crc = kv_store::disk_store::crc32_update(worker.prov.import_crc, &head);
-        worker.prov.import_crc = kv_store::disk_store::crc32_update(crc, body);
-        worker.prov.import_at = at + (store_provider::STORE_LOG_HEAD + kl + vl) as u64;
+        worker.prov.import_crc = next_crc;
+        worker.prov.import_at = next_at;
         worker.prov.import_n = worker.prov.import_n.wrapping_add(1);
     }
 }
@@ -3285,6 +3398,13 @@ unsafe fn import_slice(
 unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consistency: u8) {
     worker.prov.import_phase = IMPORT_NONE;
     worker.clog_defer = false;
+    // A replica's marker applied with each record it imported.
+    if worker.sweep_wrap != 0 {
+        if worker.prov.import_n > 0 {
+            import_logged(worker);
+        }
+        return;
+    }
     if worker.prov.import_n == 0 && worker.prov.import_marked {
         return;
     }
@@ -3297,7 +3417,7 @@ unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consisten
         worker.disk_phase = DISK_PHASE_QUARANTINED;
         return;
     }
-    let k = store_provider::IMPORTED_KEY;
+    let k = origin::IMPORTED_KEY;
     let mut body = [0u8; 2 + 32 + 4 + 12 + 1 + 8];
     let mut at = 0usize;
     let offset = worker.prov.import_at.to_le_bytes();
@@ -3337,6 +3457,12 @@ unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consisten
         return;
     }
     worker.prov.import_marked = true;
+    import_logged(worker);
+}
+
+/// `[kvw] store.log imported n=`: the records this start imported.
+#[cfg(feature = "store_provider")]
+unsafe fn import_logged(worker: &WorkerState) {
     let mut buf = [0u8; 64];
     let mut n = write_prefix(&mut buf, 0, b"[kvw] store.log imported n=");
     n = write_dec(&mut buf, n, worker.prov.import_n);

@@ -141,6 +141,7 @@ must expose any overrides and keep them consistent at every participant.
 | etcd Txn nesting | Semantic | `ETCD_TXN_DEPTH_MAX` | modules/common/types.rs | 4 | Txns nested below the outermost; the store and the large-value layer refuse deeper ones alike. |
 | Chunk sweep budget | Shape | `SWEEP_BUDGET_MAX` | modules/common/kv_store.rs | 64 | Queue entries one replicated sweep takes, so one command's apply stays bounded; the proposer sweeps again while more are due. |
 | Data chunk | Shape | `DATA_MAX` | modules/common/kv_chunks.rs | — | Derived: `CHUNK_MAX` less the chunk's kind byte; a value within it is stored inline. |
+| Replicated write body | Shape | `ENTRY_BODY_MAX` | modules/common/kv_chunks.rs | — | Derived as 2004 (`CONSENSUS_PROPOSAL_BODY_MAX` less the entry tag and the command head; a contract test holds it): one replicated write's command body — exactly a chunk upload. A request past it carries its largest values as chunks until it fits, counting what the rewrite adds (an MSET's per-pair marks); one that cannot fit is refused too large. |
 | Chunk tree depth | Semantic | `MAX_DEPTH` | modules/common/kv_chunks.rs | 9 | Node levels any u64 total needs at 61-way fanout; a producer and a reader hold one node per level. Value size itself is each protocol's declared object policy, not this. |
 | CDC wire value | Shape | `CDC_MAX_VALUE_LEN` | modules/common/cdc_wire.rs | 4096 | Encoder/decoder reject rather than truncate. |
 
@@ -597,6 +598,7 @@ KEY_MAX | modules/common/cdc_feed.rs | 256
 CDC_MAX_KEY_LEN | modules/common/cdc_wire.rs | 2584
 CHUNK_MAX | modules/common/kv_chunks.rs | 1970
 DATA_MAX | modules/common/kv_chunks.rs | -
+ENTRY_BODY_MAX | modules/common/kv_chunks.rs | -
 MAX_LARGE_PER_REQUEST | modules/common/kv_large.rs | 64
 CHUNK_REQUEST_MAX | modules/common/kv_large.rs | -
 MAX_LARGE_PER_REPLY | modules/common/kv_large.rs | 64

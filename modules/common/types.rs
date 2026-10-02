@@ -496,6 +496,13 @@ pub const KV_OP_ORIGIN_WRITE: u8 = 0x29;
 /// A chunk of a store provider's large value: a [`KV_OP_PUT_CHUNK`] body.
 /// Proposed and answered as `KV_OP_ORIGIN_REGISTER`.
 pub const KV_OP_ORIGIN_CHUNK: u8 = 0x2A;
+/// A record of a host store's log imported into a replicated store
+/// (`origin.rs`): `[offset:u64 LE][crc:u32 LE]` — how far the log is
+/// imported once this record is, and the CRC state of those bytes — then
+/// a [`KV_OP_TXN`] body. Applied as [`KV_OP_ORIGIN_WRITE`], with the
+/// import's marker in the same entry. Proposed and answered as
+/// `KV_OP_ORIGIN_REGISTER`.
+pub const KV_OP_ORIGIN_IMPORT: u8 = 0x2B;
 
 // ── KV op-specific body shapes ─────────────────────────────────────────
 //

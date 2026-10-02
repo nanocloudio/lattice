@@ -41,13 +41,39 @@
 //! no panic path: the worker that mounts it is a PIC module.
 
 use super::types::{
-    KV_OP_GET, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_REGISTER, KV_OP_ORIGIN_WRITE, KV_OP_PUT,
-    KV_OP_PUT_CHUNK, KV_OP_TXN, KV_RESULT_INTERNAL, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
+    KV_OP_GET, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_IMPORT, KV_OP_ORIGIN_REGISTER, KV_OP_ORIGIN_WRITE,
+    KV_OP_PUT, KV_OP_PUT_CHUNK, KV_OP_TXN, KV_RESULT_INTERNAL, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
     KV_RESULT_TXN,
 };
 
+/// The provider's own records (an import's progress), apart from the keys
+/// consumers see: the reserved family 0x800C (`models.rs`).
+pub const KS_PROVIDER_META: u32 = 0x800C_0001;
 /// The origin records: one per replica, keyed by its id (2 bytes, BE).
 pub const KS_PROVIDER_ORIGINS: u32 = 0x800C_0002;
+/// The key an import's progress is recorded under, in
+/// [`KS_PROVIDER_META`]: `[offset:u64 LE][crc:u32 LE]`, how far the host
+/// log is imported and the CRC state of those bytes. A replica's import is
+/// of its own node's log, so a replicated store records each importing
+/// replica's under this key and its id ([`imported_key`]).
+pub const IMPORTED_KEY: &[u8] = b"store.log imported";
+/// [`IMPORTED_KEY`] and a replica id (2 bytes, BE).
+pub const IMPORTED_KEY_REPLICA_LEN: usize = IMPORTED_KEY.len() + 2;
+
+/// The key replica `replica`'s import progress is recorded under.
+pub fn imported_key(replica: u16) -> [u8; IMPORTED_KEY_REPLICA_LEN] {
+    let mut k = [0u8; IMPORTED_KEY_REPLICA_LEN];
+    for (d, s) in k
+        .iter_mut()
+        .zip(IMPORTED_KEY.iter().chain(replica.to_be_bytes().iter()))
+    {
+        *d = *s;
+    }
+    k
+}
+/// An import's marker, as [`KV_OP_ORIGIN_IMPORT`] carries it ahead of its
+/// write and [`IMPORTED_KEY`] holds it.
+pub const IMPORT_MARK_LEN: usize = 12;
 
 /// The store provider's own family (`models.rs`): only the worker writes
 /// it, never a command.
@@ -256,6 +282,21 @@ pub fn read_record<S: Store>(s: &mut S, replica: u16) -> Result<Option<Record>, 
     }
 }
 
+/// Record how far `replica`'s import has come (`mark`,
+/// [`IMPORT_MARK_LEN`] bytes) under its [`imported_key`].
+fn write_import_mark<S: Store>(s: &mut S, replica: u16, mark: &[u8; IMPORT_MARK_LEN]) -> bool {
+    // `[key_len u16][key][value_len u32][value][flags u8][ttl u64]`.
+    const V: usize = 2 + IMPORTED_KEY_REPLICA_LEN;
+    let mut body = [0u8; V + 4 + IMPORT_MARK_LEN + 9];
+    body[..2].copy_from_slice(&(IMPORTED_KEY_REPLICA_LEN as u16).to_le_bytes());
+    body[2..V].copy_from_slice(&imported_key(replica));
+    let v = V;
+    body[v..v + 4].copy_from_slice(&(IMPORT_MARK_LEN as u32).to_le_bytes());
+    body[v + 4..v + 4 + IMPORT_MARK_LEN].copy_from_slice(mark);
+    let mut ans = [0u8; 16];
+    s.apply(KS_PROVIDER_META, KV_OP_PUT, &body, &mut ans).0 == KV_RESULT_OK
+}
+
 fn write_record<S: Store>(s: &mut S, replica: u16, rec: &Record) -> bool {
     // `[key_len u16][key][value_len u32][value][flags u8][ttl u64]`.
     let mut body = [0u8; 4 + 4 + RECORD_LEN + 9];
@@ -304,7 +345,22 @@ pub fn apply_entry<S: Store>(s: &mut S, op: u8, corr: u64, body: &[u8], out: &mu
                 Some(_) => Applied::Faulted,
             }
         }
-        KV_OP_ORIGIN_WRITE => {
+        KV_OP_ORIGIN_WRITE | KV_OP_ORIGIN_IMPORT => {
+            // An import's record carries how far the import has come once
+            // it is in. The marker is written by the same entry's apply,
+            // after the origin record: a replica never holds the marker
+            // without the write it covers. A store fault between the two
+            // faults the entry like any fault after its TXN, and leaves the
+            // marker behind the write — the import then re-sends records it
+            // already applied, which are puts of the same bytes.
+            let (mark, body) = if op == KV_OP_ORIGIN_IMPORT {
+                match body.split_first_chunk::<IMPORT_MARK_LEN>() {
+                    Some((m, b)) => (Some(m), b),
+                    None => return Applied::Refused,
+                }
+            } else {
+                (None, body)
+            };
             let Ok(rec) = read_record(s, replica) else {
                 return Applied::Faulted;
             };
@@ -340,6 +396,11 @@ pub fn apply_entry<S: Store>(s: &mut S, op: u8, corr: u64, body: &[u8], out: &mu
             // it twice.
             if !write_record(s, replica, &rec) {
                 return Applied::Faulted;
+            }
+            if let Some(m) = mark {
+                if !write_import_mark(s, replica, m) {
+                    return Applied::Faulted;
+                }
             }
             Applied::Wrote {
                 replica,

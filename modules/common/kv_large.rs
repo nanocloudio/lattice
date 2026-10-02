@@ -43,7 +43,9 @@ use super::types::{
 use super::types::{
     KV_ARRAY_ELEMENT_NULL, KV_OP_MGET, KV_OP_MSET, KV_RESULT_ARRAY, MGET_FLAG_MANIFESTS,
 };
-use kv_chunks::{Builder, Hash, Manifest, Reader, Step, CHUNK_MAX, DATA_MAX, HASH_LEN};
+use kv_chunks::{
+    Builder, Hash, Manifest, Reader, Step, CHUNK_MAX, DATA_MAX, HASH_LEN, MANIFEST_LEN,
+};
 
 /// Large values one request may carry (a TXN's `PUT`s).
 pub const MAX_LARGE_PER_REQUEST: usize = 64;
@@ -182,6 +184,8 @@ pub struct Uploader {
     fed: usize,
     builder: Option<Builder>,
     manifests: [Manifest; MAX_LARGE_PER_REQUEST],
+    /// Values longer than this go as chunks ([`cut_for`]).
+    cut: usize,
 }
 
 const NO_MANIFEST: Manifest = Manifest {
@@ -200,70 +204,35 @@ impl Uploader {
             fed: 0,
             builder: None,
             manifests: [NO_MANIFEST; MAX_LARGE_PER_REQUEST],
+            cut: DATA_MAX,
         }
     }
 
     /// Look at an outgoing request (`op`, `body`, which the caller holds
-    /// unchanged until [`Uploader::rewrite`]): does it carry large
-    /// values? `Ok(false)`: send it as it is. A `KV_OP_TXN_STAGED` is
-    /// always `Ok(true)`: it goes out only rewritten.
-    pub fn start(&mut self, op: u8, body: &[u8]) -> Result<bool, LargeError> {
+    /// unchanged until [`Uploader::rewrite`]): does it carry values that
+    /// go as chunks — every one past a data chunk, and, when the request
+    /// would still not fit `room` bytes (one replicated entry's command,
+    /// [`ENTRY_BODY_MAX`]), its largest others until it does?
+    /// `Ok(false)`: send it as it is. A `KV_OP_TXN_STAGED` is always
+    /// `Ok(true)`: it goes out only rewritten.
+    pub fn start(&mut self, op: u8, body: &[u8], room: usize) -> Result<bool, LargeError> {
         self.op = op;
         self.count = 0;
         self.current = 0;
         self.fed = 0;
         self.builder = None;
-        let mut over = false;
-        let mut note = |off: usize, len: usize, count: &mut usize, values: &mut [(u32, u32)]| {
-            if len > DATA_MAX {
+        self.cut = cut_for(op, body, room)?;
+        let (cut, count, values) = (self.cut, &mut self.count, &mut self.values);
+        each_value(op, body, &mut |off, len| {
+            if len > cut {
                 if *count == MAX_LARGE_PER_REQUEST {
-                    over = true;
                     return false;
                 }
                 values[*count] = (off as u32, len as u32);
                 *count += 1;
             }
             true
-        };
-        match op {
-            KV_OP_PUT => {
-                let (off, len) = put_value(body).ok_or(LargeError::Malformed)?;
-                note(off, len, &mut self.count, &mut self.values);
-            }
-            KV_OP_TXN | KV_OP_TXN_STAGED => {
-                let (count, values) = (&mut self.count, &mut self.values);
-                txn_puts(body, op == KV_OP_TXN_STAGED, |_, b, bl| {
-                    match body.get(b..b + bl).and_then(put_value) {
-                        Some((off, len)) => note(b + off, len, count, values),
-                        None => false,
-                    }
-                })
-                .ok_or(if over {
-                    LargeError::Overflow
-                } else {
-                    LargeError::Malformed
-                })?;
-            }
-            KV_OP_MSET => {
-                let (count, values) = (&mut self.count, &mut self.values);
-                mset_values(body, |off, len| note(off, len, count, values)).ok_or(if over {
-                    LargeError::Overflow
-                } else {
-                    LargeError::Malformed
-                })?;
-            }
-            KV_OP_ETCD_TXN => {
-                let (count, values) = (&mut self.count, &mut self.values);
-                etcd_txn_puts(body, 0, 0, &mut |off, len| note(off, len, count, values)).ok_or(
-                    if over {
-                        LargeError::Overflow
-                    } else {
-                        LargeError::Malformed
-                    },
-                )?;
-            }
-            _ => return Ok(false),
-        }
+        })?;
         Ok(self.count > 0 || op == KV_OP_TXN_STAGED)
     }
 
@@ -340,7 +309,7 @@ impl Uploader {
                             txn_op_at(body, p, staged).ok_or(LargeError::Malformed)?;
                         let sub = body.get(p + h..p + h + bl).ok_or(LargeError::Malformed)?;
                         let is_large = op == KV_OP_PUT
-                            && put_value(sub).is_some_and(|(_, len)| len > DATA_MAX);
+                            && put_value(sub).is_some_and(|(_, len)| len > self.cut);
                         if is_large {
                             let m = self.manifests[large].encode();
                             large += 1;
@@ -379,7 +348,7 @@ impl Uploader {
                     put(out, &mut at, sl(body, p, p + 2 + kl)?)?;
                     p += 2 + kl;
                     let vl = rd_u32(body, p).ok_or(LargeError::Malformed)?;
-                    if vl > DATA_MAX {
+                    if vl > self.cut {
                         let m = self
                             .manifests
                             .get(large)
@@ -397,7 +366,7 @@ impl Uploader {
                 for _ in 0..n {
                     q += 2 + rd_u16(body, q).ok_or(LargeError::Malformed)?;
                     let vl = rd_u32(body, q).ok_or(LargeError::Malformed)?;
-                    put(out, &mut at, &[u8::from(vl > DATA_MAX)])?;
+                    put(out, &mut at, &[u8::from(vl > self.cut)])?;
                     q += 4 + vl;
                 }
                 Ok((KV_OP_MSET, at))
@@ -433,7 +402,7 @@ impl Uploader {
                 let (kind, len) = txn_op(body, p).ok_or(Malformed)?;
                 let sub = body.get(p + 5..p + 5 + len).ok_or(Malformed)?;
                 let is_large =
-                    kind == ETCD_OP_PUT && put_value(sub).is_some_and(|(_, len)| len > DATA_MAX);
+                    kind == ETCD_OP_PUT && put_value(sub).is_some_and(|(_, len)| len > self.cut);
                 let head = *at;
                 put(
                     out,
@@ -649,42 +618,100 @@ pub const fn mark_room(len: usize) -> usize {
     len + mark_growth(len / 12)
 }
 
-/// Does an outgoing write carry a value too large to go inline (a `PUT`'s,
-/// or a Txn's `PUT`s)? Such a request needs the layer to upload it.
-pub fn carries_large(op: u8, body: &[u8]) -> bool {
-    let big = |len: usize| len > DATA_MAX;
-    match op {
-        KV_OP_PUT => put_value(body).is_some_and(|(_, len)| big(len)),
+/// Does an outgoing write carry a value that goes as chunks — one past a
+/// data chunk, or one the request needs chunked to fit `room` bytes
+/// ([`Uploader::start`])? Such a request needs the layer to upload it.
+pub fn carries_large(op: u8, body: &[u8], room: usize) -> bool {
+    if op == KV_OP_TXN_STAGED {
         // Staged, it goes out only through the layer.
-        KV_OP_TXN_STAGED => true,
-        KV_OP_TXN => {
-            let mut any = false;
-            let _ = txn_puts(body, false, |_, b, bl| {
-                any |= body
-                    .get(b..b + bl)
-                    .and_then(put_value)
-                    .is_some_and(|(_, len)| big(len));
-                true
-            });
-            any
+        return true;
+    }
+    let Ok(cut) = cut_for(op, body, room) else {
+        return false;
+    };
+    let mut any = false;
+    let _ = each_value(op, body, &mut |_, len| {
+        any |= len > cut;
+        true
+    });
+    any
+}
+
+pub use kv_chunks::ENTRY_BODY_MAX;
+
+/// Each value an outgoing write puts (a `PUT`'s, a Txn's or an etcd Txn's
+/// `PUT`s, an MSET's): `f(offset, length)` in `body`. `f` answering
+/// `false` is [`LargeError::Overflow`]. `Ok(false)`: the op puts none.
+fn each_value<F: FnMut(usize, usize) -> bool>(
+    op: u8,
+    body: &[u8],
+    f: &mut F,
+) -> Result<bool, LargeError> {
+    let mut over = false;
+    let mut g = |off: usize, len: usize| {
+        let ok = f(off, len);
+        over |= !ok;
+        ok
+    };
+    let walked =
+        match op {
+            KV_OP_PUT => put_value(body).map(|(off, len)| {
+                g(off, len);
+            }),
+            KV_OP_TXN | KV_OP_TXN_STAGED => txn_puts(body, op == KV_OP_TXN_STAGED, |_, b, bl| {
+                match body.get(b..b + bl).and_then(put_value) {
+                    Some((off, len)) => g(b + off, len),
+                    None => false,
+                }
+            })
+            .map(|_| ()),
+            KV_OP_MSET => mset_values(body, &mut g).map(|_| ()),
+            KV_OP_ETCD_TXN => etcd_txn_puts(body, 0, 0, &mut |off, len| g(off, len)).map(|_| ()),
+            _ => return Ok(false),
+        };
+    match walked {
+        Some(()) if !over => Ok(true),
+        _ if over => Err(LargeError::Overflow),
+        _ => Err(LargeError::Malformed),
+    }
+}
+
+/// The length past which a write's values go as chunks: a data chunk's,
+/// lowered past the largest values that remain inline while the request
+/// as rewritten would not fit `room` bytes. Each chunked value leaves a
+/// manifest in its place, and a rewritten MSET gains one mark byte per
+/// pair ([`Uploader::rewrite`]); every other rewrite is no longer than
+/// that accounting (a staged Txn's op heads shrink). A value no longer
+/// than a manifest is never chunked: it would not shrink the request.
+fn cut_for(op: u8, body: &[u8], room: usize) -> Result<usize, LargeError> {
+    let marks = if op == KV_OP_MSET {
+        rd_u16(body, 0).ok_or(LargeError::Malformed)?
+    } else {
+        0
+    };
+    let mut cut = DATA_MAX;
+    loop {
+        let mut saved = 0usize;
+        let mut chunked = false;
+        let mut next = 0usize;
+        each_value(op, body, &mut |_, len| {
+            if len > cut {
+                saved += len - MANIFEST_LEN;
+                chunked = true;
+            } else if len > next {
+                next = len;
+            }
+            true
+        })?;
+        let rewritten = if chunked {
+            body.len().saturating_sub(saved) + marks
+        } else {
+            body.len()
+        };
+        if rewritten <= room || next <= MANIFEST_LEN {
+            return Ok(cut);
         }
-        KV_OP_ETCD_TXN => {
-            let mut any = false;
-            let _ = etcd_txn_puts(body, 0, 0, &mut |_, len| {
-                any |= big(len);
-                true
-            });
-            any
-        }
-        KV_OP_MSET => {
-            let mut any = false;
-            let _ = mset_values(body, |_, len| {
-                any |= big(len);
-                true
-            });
-            any
-        }
-        _ => false,
+        cut = next - 1;
     }
 }
 
@@ -1366,7 +1393,7 @@ impl Session {
             }
         };
         let work = sl(work, 0, self.work_len)?;
-        if self.up.start(op, work)? {
+        if self.up.start(op, work, ENTRY_BODY_MAX)? {
             self.state = S_UPLOAD;
             return self.next_upload(work, send);
         }

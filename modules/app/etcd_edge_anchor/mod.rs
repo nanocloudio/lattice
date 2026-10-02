@@ -2262,7 +2262,7 @@ fn dispatch_kv(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     let via_layer = {
         let body = &anchor.scratch[op_body_start..op_body_start + op_body_len];
         anchor.slots[slot_idx].streams[strm].lg_retry
-            || kv_large::carries_large(op, body)
+            || kv_large::carries_large(op, body, kv_large::ENTRY_BODY_MAX)
             || (op == types::KV_OP_ETCD_TXN && kv_large::etcd_txn_reads(body))
     };
     if via_layer {

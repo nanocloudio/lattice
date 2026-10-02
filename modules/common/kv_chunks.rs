@@ -57,6 +57,11 @@ pub type Hash = [u8; HASH_LEN];
 pub const CHUNK_MAX: usize = 1970;
 /// A data chunk's share of the value.
 pub const DATA_MAX: usize = CHUNK_MAX - 1;
+/// The largest one replicated write's command body may be: the proposal
+/// bound (`wire::CONSENSUS_PROPOSAL_BODY_MAX`, 2040) less the entry tag
+/// and the command head — exactly a chunk upload. A write whose request
+/// is larger goes with values as chunks until it is not.
+pub const ENTRY_BODY_MAX: usize = HASH_LEN + 2 + CHUNK_MAX;
 /// Children one node names.
 pub const FANOUT: usize = (CHUNK_MAX - 1) / HASH_LEN;
 /// Levels of nodes a value may have: enough for any value a u64 total can
