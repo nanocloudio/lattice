@@ -4,6 +4,10 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 timer_class      = "wall_clock"
 
+# A provider of the exchange contract: each request's body is one SQL
+# simple query, answered once with its result set (see mod.rs for the
+# request and answer layouts byte for byte).
+
 # NetProto pair to the network provider (ip on embedded, linux_net on linux).
 [[ports]]
 name         = "net_in"
@@ -11,14 +15,13 @@ direction    = "input"
 content_type = "NetProto"
 buffer_size  = 2048
 
-# SQL query text (a simple-query string), optionally led by a `cid_len`-byte
-# opaque correlation prefix that is echoed at the front of the reply.
 [[ports]]
 name         = "request_in"
 index        = 1
 direction    = "input"
-content_type = "TextPlain"
-buffer_size  = 4096
+content_type = "ExchangeRequest"
+buffer_size  = 16384
+max_record   = 8192
 
 [[ports]]
 name         = "net_out"
@@ -27,13 +30,13 @@ content_type = "NetProto"
 buffer_size  = 2048
 max_record   = 1600
 
-# The result set: first column of every row, newline-joined (see mod.rs).
 [[ports]]
-name         = "reply_out"
+name         = "response_out"
 index        = 1
 direction    = "output"
-content_type = "TextPlain"
-buffer_size  = 4096
+content_type = "ExchangeResponse"
+buffer_size  = 16384
+max_record   = 8192
 
 [[resources]]
 requires_contract = "channel"

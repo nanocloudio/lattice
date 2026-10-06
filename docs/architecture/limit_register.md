@@ -131,7 +131,8 @@ must expose any overrides and keep them consistent at every participant.
 | Successor cursors | Capacity | `MAX_SUCCESSOR_CURSORS` | modules/common/db_ops.rs | 2 | Rejects another concurrent successor scan. |
 | Backup key | Shape | `KEY_MAX` | modules/app/backup_coordinator/mod.rs | 128 | Rejects larger keys on backup even when storage accepts them. |
 | Backup page buffer | Capacity | `PAGE_BUF` | modules/app/backup_coordinator/mod.rs | 3584 | Splits/defer pages; a single unrepresentable item fails explicitly. |
-| Unacknowledged CDC batches | Capacity | `UNACKED_CAP` | modules/common/cdc_feed.rs | 16 | Backpressures the feed until acknowledgement. |
+| Unacknowledged CDC batches | Capacity | `UNACKED_CAP` | modules/common/cdc_feed.rs | 16 | The in-flight window of publish exchanges; backpressures the feed until the sink answers 200. |
+| CDC publish request record | Shape | `PUBLISH_RECORD_MAX` | modules/common/cdc_feed.rs | — | The request HEAD, the ordering key and the worst-case envelope; fits one exchange record, so an event is never split. |
 | CDC key | Shape | `KEY_MAX` | modules/common/cdc_feed.rs | 256 | Rejects malformed/oversized events. |
 | CDC wire key | Shape | `CDC_MAX_KEY_LEN` | modules/common/cdc_wire.rs | 2584 | Any key the store holds; encoder/decoder reject rather than truncate. |
 | Chunk | Shape | `CHUNK_MAX` | modules/common/kv_chunks.rs | 1970 | Derived (a contract test holds it): the largest payload one replicated `KV_OP_PUT_CHUNK` carries — the 2040-byte proposal body less the entry tag, the 35-byte command head and the op's hash and length. Nothing that travels is larger. |
@@ -594,6 +595,7 @@ MAX_SUCCESSOR_CURSORS | modules/common/db_ops.rs | 2
 KEY_MAX | modules/app/backup_coordinator/mod.rs | 128
 PAGE_BUF | modules/app/backup_coordinator/mod.rs | 3584
 UNACKED_CAP | modules/common/cdc_feed.rs | 16
+PUBLISH_RECORD_MAX | modules/common/cdc_feed.rs | -
 KEY_MAX | modules/common/cdc_feed.rs | 256
 CDC_MAX_KEY_LEN | modules/common/cdc_wire.rs | 2584
 CHUNK_MAX | modules/common/kv_chunks.rs | 1970

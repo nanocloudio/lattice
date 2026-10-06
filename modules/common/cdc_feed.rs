@@ -37,12 +37,37 @@
 //! revision — every multi-page window dropped events and the
 //! checkpoint advanced past them.)
 //!
-//! # Replay (LINK_DOWN contract)
+//! # Publishing (the exchange contract)
 //!
-//! Every published-but-unacked frame is retained verbatim in a bounded
-//! ring. LINK_DOWN marks the whole ring unknowable; LINK_UP replays it
-//! in order. A full ring is backpressure: the pump stops reading feed
-//! pages until acks drain it, and reports STALLED past a grace period.
+//! The pump is a REQUESTER of the fluxor SDK exchange contract
+//! (`contracts/exchange.rs`) toward any `stream.ordered_ack` provider.
+//! Each event is one METHOD_PUBLISH exchange carried whole in its request
+//! HEAD: the exchange id is the event's ring correlation
+//! (`ExchangeId::from_u64(corr)`), `target` the ordering key
+//! (`cdc_wire::sink_msg_key`: `[table_id:u32 BE][key…]`), the body the
+//! encoded `CdcEvent` envelope, `flag::BROADCAST` on control events that
+//! must reach every ordering unit (resolved watermarks, the
+//! backfill-complete marker), `resp_credit` 0 (a sink's 200 carries no
+//! body).
+//!
+//! Every published request record is retained verbatim in a bounded ring
+//! — the in-flight window. The answer decides each entry:
+//!
+//! - 200: durably accepted; the contiguous accepted prefix folds into the
+//!   checkpoint candidate.
+//! - 5xx, or a provider ABORT: not accepted, retryable; the entry is
+//!   re-issued after a backoff (100 ms, doubling to 5 s, reset by the next
+//!   200), and nothing new is published while any re-issue is owed.
+//! - any other status: a refusal; counted, surfaced, and deliberately NOT
+//!   skipped — the contiguous prefix stops there, so the checkpoint can
+//!   never claim the hole was delivered.
+//!
+//! LINK DOWN marks every entry still open unknowable; LINK UP re-issues
+//! them in ring order. An event read while the link is down joins the
+//! window owed rather than sent, and goes out with that re-issue. The pump does not wait for a LINK UP before its
+//! first publish — LINK only reports a change. A full ring is
+//! backpressure: the pump stops reading feed pages until answers drain
+//! it, and reports STALLED past a grace period.
 //!
 //! # Resolved watermarks
 //!
@@ -109,7 +134,8 @@ use cdc_wire::{
 };
 use compaction_floor::{RetentionClaim, CLAIM_SOURCE_WATCH, GC_CLAIM_WIRE_LEN};
 use exchange::{
-    Ack, Publish, FLAG_BROADCAST, MSG_PUBLISH, STATUS_LINK_DOWN, STATUS_LINK_UP, STATUS_OK,
+    abort, flag, link, parse_response, status, write_abort, write_request_head, ExchangeId, Record,
+    RequestHead, HDR, METHOD_PUBLISH, REQ_HEAD_FIXED,
 };
 use types::{
     KV_OP_CAS, KV_OP_GET, KV_OP_PUT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS,
@@ -120,16 +146,18 @@ use wire::{MSG_KV_REQUEST, MSG_RETENTION_CLAIM};
 
 /// Every side effect the feed machine can have. The module shell
 /// implements this over syscalls; the host harness implements it over
-/// Vecs and a scripted world. All three sends are complete channel
-/// frames (3-byte envelope included) — a `false` return is channel
-/// backpressure and the core treats it as retryable.
+/// Vecs and a scripted world. Each send is one complete channel record
+/// — a `false` return is channel backpressure and the core treats it as
+/// retryable.
 pub trait FeedIo {
-    /// Ship a `MSG_KV_REQUEST` frame toward the router pair. The
-    /// slice is `&mut` because the kernel channel-write ABI takes a
-    /// mutable pointer; implementations must not actually mutate it.
+    /// Ship a `MSG_KV_REQUEST` frame (3-byte envelope included) toward
+    /// the router pair. The slice is `&mut` because the kernel
+    /// channel-write ABI takes a mutable pointer; implementations must
+    /// not actually mutate it.
     fn send_kv(&mut self, frame: &mut [u8]) -> bool;
-    /// Ship a `MSG_PUBLISH` frame toward the sink.
-    fn ship(&mut self, frame: &mut [u8]) -> bool;
+    /// Ship one exchange request record (a publish HEAD, or an ABORT)
+    /// toward the sink on `request_out`.
+    fn ship(&mut self, record: &mut [u8]) -> bool;
     /// Ship a `MSG_RETENTION_CLAIM` frame toward the GC coordinator.
     fn send_claim(&mut self, frame: &mut [u8]) -> bool;
     /// Diagnostic log line (state moves, CAS outcomes, wedge ticks) —
@@ -163,10 +191,20 @@ pub const P_PTR_CAS: u8 = 4;
 pub const P_FEED_PAGE: u8 = 5;
 pub const P_BACKFILL_PAGE: u8 = 6;
 
-/// Published-but-unacked ring capacity. Full ring = backpressure.
+/// Published-but-unacked ring capacity — the in-flight window. Full
+/// ring = backpressure.
 pub const UNACKED_CAP: usize = 16;
 
 pub const KEY_MAX: usize = 256;
+
+/// The largest publish request record: the HEAD's fixed parts, the
+/// ordering key (`[table_id:u32][key…]`) and the worst-case envelope.
+pub const PUBLISH_RECORD_MAX: usize =
+    HDR + REQ_HEAD_FIXED + 4 + KEY_MAX + cdc_wire::CDC_ENVELOPE_MAX;
+
+/// Re-issue backoff after a 5xx answer: the first wait, and its ceiling.
+pub const RETRY_MIN_MS: u64 = 100;
+pub const RETRY_MAX_MS: u64 = 5000;
 pub const SCRATCH: usize = 12288;
 
 /// Default feed-page request size (`page_limit` param). The worker
@@ -181,7 +219,8 @@ pub const WEDGE_BUDGET: u32 = 16;
 /// are idempotent, duplicate events are covered by at-least-once).
 pub const PHASE_TIMEOUT_MS: u64 = 3000;
 
-/// One retained unacked publish: the full frame for replay, plus the
+/// One retained unacked publish: the full request record for re-issue,
+/// plus the
 /// SAFE RESUME POSITION this entry promotes when it and everything
 /// before it is acked. An event's own revision is NOT that position:
 /// the provider walks windows in key order, so acking one
@@ -202,6 +241,7 @@ pub const PHASE_TIMEOUT_MS: u64 = 3000;
 /// - resolved watermark: neutral (`ck_rev = 0`, fold is monotonic max).
 #[repr(C)]
 pub struct Unacked {
+    /// The exchange id's counter (`ExchangeId::from_u64(corr)`).
     pub corr: u64,
     pub ck_rev: u64,
     pub ck_scan: u64,
@@ -210,7 +250,11 @@ pub struct Unacked {
     pub len: u16,
     pub acked: bool,
     pub refused: bool,
-    pub frame: [u8; exchange::PUBLISH_FRAME_MAX],
+    /// An exchange is open for this entry: issued, not yet answered.
+    pub open: bool,
+    /// The entry must be issued again (LINK DOWN, or a 5xx answer).
+    pub owed: bool,
+    pub record: [u8; PUBLISH_RECORD_MAX],
 }
 
 /// The whole feed machine. The module shell owns one inside its state
@@ -242,7 +286,13 @@ pub struct FeedCore {
     // ── feed state ──
     pub state: u8,
     pub phase: u8,
+    /// The sink's link, as its LINK records last reported it. Up until a
+    /// LINK DOWN says otherwise.
     pub link_up: bool,
+    /// Earliest time an owed re-issue after a 5xx may go out, and the
+    /// wait the next 5xx adds.
+    pub retry_at_ms: u64,
+    pub backoff_ms: u64,
     /// Config refused at init (bad prefix) — hard no-serve.
     pub config_bad: bool,
     /// A compaction lapse is being re-latched: the next pointer read
@@ -361,7 +411,9 @@ impl FeedCore {
         self.prefix_len = 0;
         self.state = ST_CREATED;
         self.phase = P_IDLE;
-        self.link_up = false;
+        self.link_up = true;
+        self.retry_at_ms = 0;
+        self.backoff_ms = RETRY_MIN_MS;
         self.config_bad = false;
         self.force_backfill = false;
         self.kv_corr = 0;
@@ -409,7 +461,9 @@ impl FeedCore {
                 len: 0,
                 acked: false,
                 refused: false,
-                frame: [0; exchange::PUBLISH_FRAME_MAX],
+                open: false,
+                owed: false,
+                record: [0; PUBLISH_RECORD_MAX],
             };
             i += 1;
         }
@@ -560,9 +614,9 @@ impl FeedCore {
 
     // ── Publishing ───────────────────────────────────────────────────
 
-    /// Encode one event into a publish frame and ship it, retaining the
-    /// frame in the unacked ring together with the safe resume
-    /// position its contiguous ack promotes (see [`Unacked`]).
+    /// Encode one event into a publish request and ship it, retaining the
+    /// record in the unacked ring together with the safe resume
+    /// position its contiguous acceptance promotes (see [`Unacked`]).
     /// `false` = ring full / channel refused (caller treats as
     /// backpressure and retries the page later).
     fn publish_event(
@@ -588,16 +642,20 @@ impl FeedCore {
             Some(n) => n,
             None => return false,
         };
-        let publ = Publish {
-            corr,
-            flags: if broadcast { FLAG_BROADCAST } else { 0 },
-            msg_key: &mkey[..mklen],
-            payload: &payload[..plen],
+        let head = RequestHead {
+            id: ExchangeId::from_u64(corr),
+            flags: if broadcast { flag::BROADCAST } else { 0 },
+            method: METHOD_PUBLISH,
+            target: &mkey[..mklen],
+            headers: &[],
+            peer: &[],
+            resp_credit: 0,
+            body: &payload[..plen],
         };
         let slot = (self.ring_head as usize) % UNACKED_CAP;
-        let frame_len = {
+        let record_len = {
             let entry = &mut self.ring[slot];
-            let Some(n) = publ.encode(&mut entry.frame) else {
+            let Some(n) = write_request_head(&head, &mut entry.record) else {
                 return false;
             };
             entry.corr = corr;
@@ -608,12 +666,21 @@ impl FeedCore {
             entry.len = n as u16;
             entry.acked = false;
             entry.refused = false;
+            entry.open = false;
+            entry.owed = false;
             n
         };
-        if !self.ship_frame(io, slot, frame_len) {
+        if !self.link_up {
+            // The sink's link is down: a request now would be dropped
+            // unanswered, so the entry waits in the window, owed, and
+            // goes out with the re-issue after LINK UP.
+            self.ring[slot].owed = true;
+        } else if !io.ship(&mut self.ring[slot].record[..record_len]) {
             // Channel backpressure: the entry stays staged in the ring
             // slot but head does not advance; the caller retries.
             return false;
+        } else {
+            self.ring[slot].open = true;
         }
         self.corr_next = self.corr_next.wrapping_add(1).max(1);
         self.ring_head = self.ring_head.wrapping_add(1);
@@ -621,85 +688,143 @@ impl FeedCore {
         true
     }
 
-    fn ship_frame(&mut self, io: &mut impl FeedIo, slot: usize, len: usize) -> bool {
-        let total = 3 + len;
-        let mut buf = [0u8; 3 + exchange::PUBLISH_FRAME_MAX];
-        buf[0] = MSG_PUBLISH;
-        buf[1] = (len & 0xFF) as u8;
-        buf[2] = ((len >> 8) & 0xFF) as u8;
-        buf[3..total].copy_from_slice(&self.ring[slot].frame[..len]);
-        io.ship(&mut buf[..total])
+    /// Whether any ring entry must be issued again.
+    pub fn reissue_owed(&self) -> bool {
+        let mut i = self.ring_tail;
+        while i != self.ring_head {
+            if self.ring[(i as usize) % UNACKED_CAP].owed {
+                return true;
+            }
+            i = i.wrapping_add(1);
+        }
+        false
     }
 
-    /// Replay every unacked frame in ring order after LINK_UP (the
-    /// unacked set became unknowable at LINK_DOWN).
-    fn replay_unacked(&mut self, io: &mut impl FeedIo) {
+    /// Issue every owed entry again, in ring order (per-key order is
+    /// kept: nothing new is published while any re-issue is owed).
+    fn reissue(&mut self, io: &mut impl FeedIo) {
         let mut i = self.ring_tail;
         while i != self.ring_head {
             let slot = (i as usize) % UNACKED_CAP;
-            if !self.ring[slot].acked && !self.ring[slot].refused {
+            if self.ring[slot].owed {
                 let len = self.ring[slot].len as usize;
-                if !self.ship_frame(io, slot, len) {
-                    // Backpressure mid-replay: stop; the remaining
-                    // frames replay on later steps (ordering per key
-                    // preserved — nothing new is published while any
-                    // replay is owed, because the ring is drained
-                    // front-first).
+                if !io.ship(&mut self.ring[slot].record[..len]) {
+                    // Backpressure mid-re-issue: the rest go out on
+                    // later steps.
                     break;
                 }
+                self.ring[slot].owed = false;
+                self.ring[slot].open = true;
                 self.m_replays = self.m_replays.wrapping_add(1);
             }
             i = i.wrapping_add(1);
         }
     }
 
-    /// Fold one sink frame in: link-state signals drive the replay
-    /// contract, replies advance the contiguous acked prefix and the
-    /// checkpoint candidate.
-    pub fn on_sink_ack(&mut self, io: &mut impl FeedIo, ack: &Ack) {
-        if ack.is_link_state() {
-            match ack.status {
-                STATUS_LINK_DOWN => {
-                    self.link_up = false;
-                }
-                STATUS_LINK_UP => {
-                    let was_up = self.link_up;
-                    self.link_up = true;
-                    if !was_up {
-                        io.log(b"lkup", u64::from(self.state));
-                        self.replay_unacked(io);
-                    }
-                }
-                _ => {}
-            }
-            return;
+    /// The ring entry an exchange id names, when it is still unsettled.
+    fn entry_for(&self, id: &ExchangeId) -> Option<usize> {
+        let corr = id.as_u64();
+        if ExchangeId::from_u64(corr) != *id {
+            return None;
         }
         let mut i = self.ring_tail;
         while i != self.ring_head {
             let slot = (i as usize) % UNACKED_CAP;
-            if self.ring[slot].corr == ack.corr {
-                if ack.status == STATUS_OK {
-                    self.ring[slot].acked = true;
-                    self.m_acked = self.m_acked.wrapping_add(1);
-                    self.acked_since_ck = self.acked_since_ck.wrapping_add(1);
-                } else {
-                    // Typed refusal: counted, surfaced, and deliberately
-                    // NOT skipped — the contiguous prefix stops here, so
-                    // the checkpoint can never claim a hole was delivered.
-                    self.ring[slot].refused = true;
-                    self.m_refusals = self.m_refusals.wrapping_add(1);
-                }
-                break;
+            let e = &self.ring[slot];
+            if e.corr == corr && !e.acked && !e.refused {
+                return Some(slot);
             }
             i = i.wrapping_add(1);
         }
-        // Advance the contiguous prefix — monotonic max, never a raw
-        // assignment: control events ride the ring with ck_rev 0, and
-        // a cursor that regressed on their ack would block every later
-        // checkpoint behind a position already durable (monotonic-max
-        // discipline, applied locally). The BACKFILL -> STREAMING flip
-        // and the acked scan ordinal promote here too — durable claims
-        // follow ACKS, never publishes.
+        None
+    }
+
+    /// An open exchange was not accepted and may be repeated: re-issue it
+    /// after the backoff.
+    fn retry_later(&mut self, slot: usize, now_ms: u64) {
+        if !self.ring[slot].open {
+            return;
+        }
+        self.ring[slot].open = false;
+        self.ring[slot].owed = true;
+        self.m_refusals = self.m_refusals.wrapping_add(1);
+        self.retry_at_ms = now_ms.wrapping_add(self.backoff_ms);
+        self.backoff_ms = (self.backoff_ms * 2).min(RETRY_MAX_MS);
+    }
+
+    /// Fold one record from the sink's `response_out`: LINK drives the
+    /// re-issue contract, answers advance the contiguous accepted prefix
+    /// and the checkpoint candidate.
+    pub fn on_response(&mut self, io: &mut impl FeedIo, now_ms: u64, record: &[u8]) {
+        match parse_response(record) {
+            Some(Record::Link { state: link::DOWN }) => {
+                self.link_up = false;
+                let mut i = self.ring_tail;
+                while i != self.ring_head {
+                    let slot = (i as usize) % UNACKED_CAP;
+                    let e = &mut self.ring[slot];
+                    if !e.acked && !e.refused {
+                        e.open = false;
+                        e.owed = true;
+                    }
+                    i = i.wrapping_add(1);
+                }
+            }
+            Some(Record::Link { state: link::UP }) => {
+                if !self.link_up {
+                    io.log(b"lkup", u64::from(self.state));
+                }
+                self.link_up = true;
+                self.retry_at_ms = 0;
+                self.reissue(io);
+            }
+            Some(Record::Head(h)) => {
+                if h.flags & flag::MORE != 0 {
+                    // A body follows that the pump never reads (it grants no
+                    // response credit): end the exchange here. Best effort —
+                    // the status below is the answer either way.
+                    let mut ab = [0u8; HDR + 1];
+                    if let Some(n) = write_abort(&h.id, abort::UNDELIVERABLE, &mut ab) {
+                        let _ = io.ship(&mut ab[..n]);
+                    }
+                }
+                let Some(slot) = self.entry_for(&h.id) else {
+                    return;
+                };
+                if h.status == status::OK {
+                    let e = &mut self.ring[slot];
+                    e.acked = true;
+                    e.open = false;
+                    e.owed = false;
+                    self.m_acked = self.m_acked.wrapping_add(1);
+                    self.acked_since_ck = self.acked_since_ck.wrapping_add(1);
+                    self.backoff_ms = RETRY_MIN_MS;
+                } else if (500..600).contains(&h.status) {
+                    self.retry_later(slot, now_ms);
+                } else if self.ring[slot].open {
+                    self.ring[slot].refused = true;
+                    self.ring[slot].open = false;
+                    self.m_refusals = self.m_refusals.wrapping_add(1);
+                }
+            }
+            Some(Record::Abort { id, .. }) => {
+                // The provider could not finish it: retryable.
+                if let Some(slot) = self.entry_for(&id) {
+                    self.retry_later(slot, now_ms);
+                }
+            }
+            _ => return,
+        }
+        self.fold_prefix();
+    }
+
+    /// Advance the contiguous accepted prefix — monotonic max, never a raw
+    /// assignment: control events ride the ring with ck_rev 0, and a
+    /// cursor that regressed on their acceptance would block every later
+    /// checkpoint behind a position already durable. The BACKFILL ->
+    /// STREAMING flip and the accepted scan ordinal promote here too —
+    /// durable claims follow ACCEPTANCE, never publishes.
+    fn fold_prefix(&mut self) {
         while self.ring_tail != self.ring_head {
             let slot = (self.ring_tail as usize) % UNACKED_CAP;
             if !self.ring[slot].acked {
@@ -710,7 +835,7 @@ impl FeedCore {
             if self.ck_state == ST_BACKFILL {
                 if self.ring[slot].ck_state == ST_STREAMING && self.ring[slot].ck_rev > 0 {
                     // The completion marker folded: every row before it
-                    // is acked, the scan is durably done.
+                    // is accepted, the scan is durably done.
                     self.ck_state = ST_STREAMING;
                     self.ck_scan_cursor = 0;
                 } else if self.ring[slot].ck_state == ST_BACKFILL {
@@ -1364,11 +1489,17 @@ impl FeedCore {
     // ── step ─────────────────────────────────────────────────────────
 
     /// One scheduler step's worth of progress. The shell calls this
-    /// after draining acks and the KV response into `on_sink_ack` /
-    /// `on_kv_response`.
+    /// after draining the sink's answers and the KV response into
+    /// `on_response` / `on_kv_response`.
     pub fn step(&mut self, io: &mut impl FeedIo, now_ms: u64) {
         if self.config_bad || self.state == ST_HALTED || self.state == ST_WEDGED {
             return;
+        }
+
+        // Owed re-issues go out first, once the link is up and any 5xx
+        // backoff has passed.
+        if self.link_up && now_ms >= self.retry_at_ms && self.reissue_owed() {
+            self.reissue(io);
         }
 
         // A response overdue past the timeout re-opens the phase. The
@@ -1419,7 +1550,7 @@ impl FeedCore {
                     if ck_due {
                         self.last_ck_ms = now_ms;
                         let _ = self.issue_gen_write(io, now_ms);
-                    } else if self.link_up && !self.ring_full() {
+                    } else if self.link_up && !self.ring_full() && !self.reissue_owed() {
                         self.blocked_since_ms = 0;
                         if self.state == ST_STALLED {
                             self.state = if self.ck_state == ST_BACKFILL {
@@ -1457,8 +1588,9 @@ impl FeedCore {
                             }
                         }
                     } else {
-                        // Sink blocked (link down or ring full):
-                        // STALLED after the grace period, loudly.
+                        // Sink blocked (link down, ring full, or a
+                        // re-issue owed): STALLED after the grace
+                        // period, loudly.
                         if self.blocked_since_ms == 0 {
                             self.blocked_since_ms = now_ms;
                         } else if now_ms.wrapping_sub(self.blocked_since_ms)

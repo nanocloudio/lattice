@@ -177,6 +177,7 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ev {
     HaveRequest, // a command is queued to send
+    Probe,       // reconnect with no command queued (after a lost link)
     Connected,   // the socket connected
     ReplyOk,     // a complete reply arrived (not a `-ERR`)
     ReplyErr,    // a complete `-ERR` reply arrived
@@ -191,13 +192,14 @@ pub enum Act {
     Connect,      // open the socket
     SendAuth,     // send AUTH <password>
     SendRequest,  // send the queued command
-    DeliverReply, // emit the reply downstream, connection stays open
-    FailRequest,  // drop the in-flight request and reset the connection
+    DeliverReply, // answer the command, connection stays open
+    FailRequest,  // the session failed: reset the connection
+    Opened,       // the session is ready with no command queued
 }
 
 /// The pure Redis connection state machine. Given the current `phase`, an `ev`,
-/// and whether a password is configured (`needs_auth`), return the action to
-/// perform and the next phase.
+/// whether a password is configured (`needs_auth`), and whether a command is
+/// queued (`has_request`), return the action to perform and the next phase.
 ///
 /// The two properties a codec cannot have live here:
 ///  * **persistence** — a delivered reply returns to `Ready` with the socket
@@ -205,32 +207,41 @@ pub enum Act {
 ///  * **the AUTH handshake** — `Connecting → Connected` sends AUTH first when a
 ///    password is set, and `Ready` is only reached after the server's `+OK`; a
 ///    `-ERR` to AUTH fails closed rather than serving requests unauthenticated.
-pub fn redis_transition(phase: Phase, ev: Ev, needs_auth: bool) -> (Act, Phase) {
+pub fn redis_transition(phase: Phase, ev: Ev, needs_auth: bool, has_request: bool) -> (Act, Phase) {
     use Act::*;
     use Ev::*;
     use Phase::*;
     match (phase, ev) {
-        // A request while disconnected opens the connection.
-        (Disconnected, HaveRequest) => (Connect, Connecting),
-        // Connected: authenticate first if a password is set, else send now.
+        // A request (or a reconnect probe) while disconnected opens the
+        // connection.
+        (Disconnected, HaveRequest) | (Disconnected, Probe) => (Connect, Connecting),
+        // Connected: authenticate first if a password is set, else send now
+        // (or sit ready when nothing is queued).
         (Connecting, Connected) => {
             if needs_auth {
                 (SendAuth, Authing)
-            } else {
+            } else if has_request {
                 (SendRequest, Awaiting)
+            } else {
+                (Opened, Ready)
             }
         }
         // AUTH reply gates readiness: +OK → serve the queued request; -ERR → fail.
-        (Authing, ReplyOk) => (SendRequest, Awaiting),
+        (Authing, ReplyOk) => {
+            if has_request {
+                (SendRequest, Awaiting)
+            } else {
+                (Opened, Ready)
+            }
+        }
         (Authing, ReplyErr) => (FailRequest, Disconnected),
         // A command reply (ok OR -ERR) is delivered; the socket stays open.
         (Awaiting, ReplyOk) | (Awaiting, ReplyErr) => (DeliverReply, Ready),
         // Ready with a queued request → reuse the open socket, no reconnect.
         (Ready, HaveRequest) => (SendRequest, Awaiting),
-        // Transport failure: fail an in-flight request, otherwise just reset.
-        (Awaiting, PeerClosed) | (Awaiting, NetError) => (FailRequest, Disconnected),
-        (Authing, PeerClosed) | (Authing, NetError) => (FailRequest, Disconnected),
-        (_, PeerClosed) | (_, NetError) => (None, Disconnected),
+        // Transport failure: the session is lost, whatever it was doing.
+        (Disconnected, PeerClosed) | (Disconnected, NetError) => (None, Disconnected),
+        (_, PeerClosed) | (_, NetError) => (FailRequest, Disconnected),
         _ => (None, phase),
     }
 }

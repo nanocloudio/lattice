@@ -1,24 +1,25 @@
 //! The CDC event envelope a `cdc_pump` publishes.
 //!
 //! This file owns the ENVELOPE and nothing else. The transport it rides —
-//! the `stream.ordered_ack` port pair — is a fluxor SDK contract, NOT a
-//! lattice file: its source is `modules/sdk/contracts/exchange.rs` in the
-//! fluxor repo (`deps/fluxor/modules/sdk/contracts/exchange.rs` in this
-//! checkout), and PIC modules mount the built copy `fluxor build` vendors
-//! into `target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`. Edits
-//! to the frame layout go to the fluxor SDK, never here.
+//! a METHOD_PUBLISH exchange toward a `stream.ordered_ack` provider — is
+//! the fluxor SDK exchange contract, NOT a lattice file: its source is
+//! `modules/sdk/contracts/exchange.rs` in the fluxor repo
+//! (`deps/fluxor/modules/sdk/contracts/exchange.rs` in this checkout), and
+//! PIC modules mount the built copy `fluxor build` vendors into
+//! `target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`. Edits to the
+//! record layout go to the fluxor SDK, never here.
 //!
 //! The surface is an SDK contract because it is not a CDC concept:
 //! quantum implements it for MQTT, Kafka and AMQP, wave for HTTP, and
 //! lattice must not depend on quantum — a contract owned here would be
-//! one those providers could not name. CDC is ONE producer of the
-//! surface, and the envelope below is one possible `payload`.
+//! one those providers could not name. CDC is ONE requester of the
+//! surface, and the envelope below is one possible body.
 //!
 //! Dual-target facade: `#[path]`-mounted by the PIC modules (`cdc_pump`,
 //! `loopback_sink`) and by the host conformance suite
 //! (`tests/harness/tests/contract_cdc_wire.rs`). This file is the ONE place
-//! the ENVELOPE layout lives; the frame layout lives in the SDK contract, and
-//! a provider that hand-rolls either has already failed conformance.
+//! the ENVELOPE layout lives; the record layout lives in the SDK contract,
+//! and a provider that hand-rolls either has already failed conformance.
 //!
 //! # The envelope
 //!
@@ -43,11 +44,10 @@
 //! ```
 //!
 //! A `resolved` event carries `[frontier_ts:u64 LE]` as its 8-byte
-//! value with an empty key, and is published with
-//! [`FLAG_BROADCAST`] (the watermark must reach EVERY
-//! ordering unit of the destination). `backfill_complete` and
-//! `topology` carry an empty key; `topology`'s value is
-//! provider-opaque notice bytes.
+//! value with an empty key, and is published with the exchange's
+//! `flag::BROADCAST` (the watermark must reach EVERY ordering unit of
+//! the destination). `backfill_complete` and `topology` carry an empty
+//! key; `topology`'s value is provider-opaque notice bytes.
 //!
 //! The event identity is `(feed_id, table_id, key, commit_ts)` —
 //! deliberately NOT range/revision, which change across split/merge
@@ -61,26 +61,25 @@
 //!
 //! Not defined here. See the fluxor SDK contract
 //! `modules/sdk/contracts/exchange.rs` (in `deps/fluxor/` here) for the
-//! authoritative port pair, the optional `reply_out` that makes the surface
-//! an exchange, the status vocabulary, and the size envelope
-//! (`PAYLOAD_MAX` and friends). A provider declares
-//! `capabilities = ["stream.ordered_ack"]` and the terms it offers as
-//! capability facts.
+//! records, the status vocabulary, LINK, and the size envelope
+//! (`PAYLOAD_MAX`, `KEY_MAX`). A provider declares
+//! `capabilities = ["stream.ordered_ack.sink"]` (or `.exchange`) and the
+//! terms it offers as capability facts.
 //!
 //! What follows is the CDC-specific reading of that surface — what a pump
-//! puts in a publish and what it does with an ack.
+//! puts in a publish and what it does with the answer.
 //!
-//! `corr` is never 0 on a publish. Ack statuses: 0 = durably accepted
-//! by the backend at the strongest level its configuration offers;
-//! 1..=15 typed refusals; and two `corr = 0` LINK-STATE signals that
-//! are not replies: [`STATUS_LINK_DOWN`] (every unacked corr is
-//! now unknowable — the pump MUST re-publish all of them after the
-//! next LINK_UP) and [`STATUS_LINK_UP`]. Contract terms a
-//! conforming provider must satisfy (the conformance vectors assert
-//! them): ack = durable acceptance; per-key order within a connection;
-//! no silent drops (every non-zero corr answered or invalidated by
-//! LINK_DOWN); backpressure by channel, never by dropping; broadcast
-//! delivered to every ordering unit and acked once after the slowest.
+//! One event is one METHOD_PUBLISH exchange whose request HEAD carries
+//! it whole: `target` = the sink message key below, body = the envelope.
+//! Answers: 200 = durably accepted by the backend at the strongest level
+//! its configuration offers; 5xx = not accepted, retryable; any other
+//! status = a refusal. LINK DOWN says every exchange still open is now
+//! unknowable — the pump MUST issue all of them again after the next
+//! LINK UP. Contract terms a conforming provider must satisfy: 200 =
+//! durable acceptance; per-key order within a connection; no silent
+//! drops (every exchange answered or invalidated by LINK DOWN);
+//! backpressure by channel, never by dropping; broadcast delivered to
+//! every ordering unit and answered once after the slowest.
 //!
 //! The sink message key is `[table_id:u32 BE][key…]` so per-key
 //! ordering maps onto partitioned backends without the provider
@@ -242,8 +241,8 @@ impl<'a> CdcEvent<'a> {
     }
 }
 
-/// Build a `resolved` watermark event. Published with
-/// [`FLAG_BROADCAST`]; the frontier rides as the 8-byte value.
+/// Build a `resolved` watermark event. Published with the exchange's
+/// `flag::BROADCAST`; the frontier rides as the 8-byte value.
 pub fn resolved_event(feed_id: u64, frontier_ts: u64, scratch: &mut [u8; 8]) -> CdcEvent<'_> {
     *scratch = frontier_ts.to_le_bytes();
     CdcEvent {
@@ -285,21 +284,20 @@ pub fn sink_msg_key(table_id: u32, key: &[u8], out: &mut [u8]) -> Option<usize> 
 
 // ── The surface this envelope rides ───────────────────────────────────
 //
-// NOT DEFINED HERE, and deliberately not re-exported either. The
-// `stream.ordered_ack` frames live in the fluxor SDK — source
-// `modules/sdk/contracts/exchange.rs` in the fluxor repo (`deps/fluxor/`
-// here) — and every consumer mounts the built copy DIRECTLY:
+// NOT DEFINED HERE, and deliberately not re-exported either. The exchange
+// records live in the fluxor SDK — source `modules/sdk/contracts/exchange.rs`
+// in the fluxor repo (`deps/fluxor/` here) — and every consumer mounts the
+// built copy DIRECTLY:
 //
 //   #[path = "…/sdk/contracts/exchange.rs"]
 //   mod exchange;
 //
-// They are deliberately NOT re-exported from here: a re-export would
-// leave two paths to one set of types — `cdc_wire::Publish` and
-// `exchange::Publish` — and a lattice-flavoured alias (`MSG_CDC_ACK`
-// for `MSG_ACK`) would make a portable contract look like a CDC one.
-// This file owns the ENVELOPE, the SDK owns the FRAME, and nothing
-// owns both.
+// They are deliberately NOT re-exported from here: a re-export would leave
+// two paths to one set of types — `cdc_wire::RequestHead` and
+// `exchange::RequestHead` — and a lattice-flavoured alias would make a
+// portable contract look like a CDC one. This file owns the ENVELOPE, the
+// SDK owns the RECORD, and nothing owns both.
 //
-// `PUBLISH_FRAME_MAX` from the contract is the worst-case frame; there is no
-// CDC-specific ceiling to state, because the envelope is bounded by the
-// payload the contract already sizes.
+// `RECORD_MAX` from the contract bounds one record; the worst-case envelope
+// plus its key and the request HEAD fit it (`contract_cdc_wire.rs` pins
+// that), so an event always travels whole in one request HEAD.

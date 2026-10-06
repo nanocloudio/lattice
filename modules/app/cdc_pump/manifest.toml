@@ -6,9 +6,12 @@ hardware_targets = ["bcm2712"]
 # The egress pump. Reads committed change-feed windows from the KV
 # surface (an ordinary anchor-pair client — no privileged read path),
 # translates versions into the versioned CDC envelope
-# (modules/common/cdc_wire.rs), publishes to a `stream.ordered_ack`
-# provider, and checkpoints past the contiguous acknowledged prefix
-# through the normal KV path (the generation-pointer protocol).
+# (modules/common/cdc_wire.rs), publishes each event as a METHOD_PUBLISH
+# exchange to a `stream.ordered_ack` provider (it is the REQUESTER of the
+# fluxor exchange contract), and checkpoints past the contiguous prefix
+# answered 200 through the normal KV path (the generation-pointer
+# protocol). See modules/common/cdc_feed.rs for the request layout, the
+# in-flight window, re-issue after LINK UP and 5xx retry.
 #
 # One pump instance serves one feed (simpler WCET reasoning; a graph
 # adds an instance per feed). Ownership is a static pin: this instance
@@ -20,7 +23,7 @@ hardware_targets = ["bcm2712"]
 #
 # Wiring (see configs/single-models-cdc.yaml):
 #   kv_out/kv_in      → a free router anchor pair (e.g. etcd_in/out)
-#   publish_out/ack_in → the sink provider's publish_in/ack_out
+#   request_out/response_in → the sink provider's request_in/response_out
 #   retention          → compaction_coordinator.claims (budgeted GC
 #                        claim; lapse is enforced by the claim EXPIRY,
 #                        so release needs no pump cooperation)
@@ -31,12 +34,14 @@ name = "kv_in"
 direction = "input"
 content_type = "OctetStream"
 
-# MSG_CDC_ACK from the sink provider.
+# The sink's answers and LINK records.
 [[ports]]
-name = "ack_in"
+name = "response_in"
 index = 1
 direction = "input"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 # MSG_KV_REQUEST into the router pair input.
 [[ports]]
@@ -44,20 +49,20 @@ name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
 
-# MSG_CDC_PUBLISH to the sink provider. Sized for a worst-case
-# envelope (a full 4 KiB row image plus framing).
+# One METHOD_PUBLISH request record per event. Sized for four worst-case
+# records (a full 4 KiB row image, its key, and the request HEAD).
 [[ports]]
-name = "publish_out"
+name = "request_out"
 index = 1
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 # The consumer half of the capability registry: whatever this edge is wired
 # to must declare it provides the surface. A module-level requirement would
 # only ask whether SOME module in the graph declares it — this asks the peer
 # on this wire, which is what the requirement actually means.
 requires_capability = "stream.ordered_ack"
-buffer_size = 34868
-max_record = 8717
+buffer_size = 32768
+max_record = 8192
 
 # MSG_RETENTION_CLAIM to compaction_coordinator (GC budget).
 [[ports]]

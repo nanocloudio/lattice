@@ -7,14 +7,63 @@
 //! Those are reply-dependent, stateful behaviours a stateless codec cannot
 //! express — which is the whole reason a real connector is a module.
 //!
-//! The protocol logic lives in the shared, host-tested `redis_core.rs`; this file
-//! is the I/O pump that maps its actions onto net_proto frames.
+//! The protocol logic lives in the shared `redis_core.rs`, the exchange
+//! provider half in `query_exchange.rs`; this file is the I/O pump that maps
+//! their actions onto net_proto frames and exchange records.
 //!
-//! Ports:  net_in/net_out (transport), request_in (structured commands),
-//!         reply_out (reply values).
-//! Params: `authority` (`host[:port]`, port 6379 when omitted), `password` (optional; enables AUTH).
-//! request_in frame: `[nargs:u8]` then per arg `[len:u16 LE][bytes]` — the module
-//!         builds the RESP wire bytes, so upstream sends args, not protocol bytes.
+//! # Ports
+//!
+//! `net_in`/`net_out` (transport), and the exchange provider pair
+//! `request_in` (`ExchangeRequest`) / `response_out` (`ExchangeResponse`).
+//! A module with `request_in` wired and `response_out` unwired refuses to
+//! construct.
+//!
+//! # Params
+//!
+//! `authority` (`host[:port]`, port 6379 when omitted), `password` (optional;
+//! enables AUTH).
+//!
+//! # Request
+//!
+//! Method POST; `target` empty; headers ignored; body = exactly one
+//! STRUCTURED command, little-endian:
+//!
+//! ```text
+//! [nargs:u8] then nargs × ( [len:u16][arg bytes] )
+//! ```
+//!
+//! e.g. `SET greeting hi` is `03 | 03 00 "SET" | 08 00 "greeting" | 02 00 "hi"`.
+//! The module builds the RESP wire bytes itself, so a requester sends
+//! arguments, never protocol bytes. Body up to 4096 bytes.
+//!
+//! # Answer
+//!
+//! One answer per request, no content type, no headers:
+//!
+//! | Status | Reply | Body |
+//! |---|---|---|
+//! | 200 | `+OK` simple string | the text, without `+` and CRLF (`OK`) |
+//! | 200 | `:N` integer | the decimal digits as sent (`42`, `-1`) |
+//! | 200 | `$n` bulk string | the `n` data bytes |
+//! | 200 | `$-1` nil | empty |
+//! | 200 | `*N` array | the whole RESP reply, header included, verbatim |
+//! | 400 | `-ERR …` error | the error text, without `-` and CRLF (`ERR unknown command …`) |
+//! | 400 | — | another method, a non-empty target, a body that is not exactly one structured command |
+//! | 413 | — | a body over 4096 bytes, or a command whose RESP form exceeds 8192 bytes |
+//! | 502 | — | the server could not be reached, or refused AUTH, before the link was ever up (the `-ERR` text as the body when AUTH was refused); or a reply over 8192 bytes (the connection is closed) |
+//! | 503 | — | four requests already held, or draining |
+//! | 504 | — | no reply within 15 s (the connection is closed; the command's effect is unknown) |
+//!
+//! The body streams under the requester's response credit.
+//!
+//! # LINK
+//!
+//! The connection opens on the first request. Once a session has been ready,
+//! losing it (a close, a transport error, a failed reconnect) writes LINK DOWN:
+//! every request held is dropped unanswered for the requester to re-issue, and
+//! request records are read and dropped until LINK UP. The module reconnects
+//! on its own (1 s, doubling to 30 s), re-running AUTH, and writes LINK UP once
+//! the new session is ready.
 
 #![no_std]
 #![allow(
@@ -42,13 +91,18 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// Shared, host-tested cores — identical source to the `chronicle-bytecode` crate.
+// Shared cores.
 include!("../../common/resp_core.rs");
 include!("../../common/redis_core.rs");
 
 #[path = "../../common/authority.rs"]
 mod authority;
 use authority::{Authority, PORT_REDIS};
+
+#[path = "../../common/query_exchange.rs"]
+mod query_exchange;
+use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::QueryDesk;
 
 use abi::contracts::net::net_proto::{
     conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
@@ -58,12 +112,22 @@ use abi::contracts::net::net_proto::{
 };
 
 const NET_BUF: usize = 2048;
-const REQ_BUF: usize = 4096;
+/// Longest structured command one request carries.
+const CMD_MAX: usize = 4096;
+/// The RESP form of a command (or AUTH) being written.
+const REQ_BUF: usize = 8192;
+/// One whole reply.
 const REPLY_BUF: usize = 8192;
-const PEND_BUF: usize = 8192;
 const PASS_BUF: usize = 128;
+/// Requests held at once: one performed, the rest queued in arrival order.
+const SLOTS: usize = 4;
+/// A request target is refused unless empty; this bounds what is read.
+const TARGET_MAX: usize = 64;
+const QUEUE: usize = 8;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const REPLY_TIMEOUT_MS: u64 = 15_000;
+const PROBE_MIN_MS: u64 = 1_000;
+const PROBE_MAX_MS: u64 = 30_000;
 
 #[repr(C)]
 struct RedisState {
@@ -71,7 +135,7 @@ struct RedisState {
     net_in: i32,
     net_out: i32,
     request_in: i32,
-    reply_out: i32,
+    response_out: i32,
 
     authority: Authority,
     password: [u8; PASS_BUF],
@@ -83,29 +147,38 @@ struct RedisState {
     started_ms: u64,
     draining: u8,
 
-    // The structured command currently in flight (kept so it can be (re)sent
-    // after the AUTH handshake completes), and whether one is queued.
-    cmd: [u8; REQ_BUF],
+    // Reconnect after a LINK DOWN: the next attempt and the current wait.
+    probing: u8,
+    probe_at_ms: u64,
+    backoff_ms: u64,
+
+    // The structured command being performed (kept so it can be sent after
+    // the AUTH handshake completes).
+    cmd: [u8; CMD_MAX],
     cmd_len: u16,
     has_cmd: u8,
 
-    // Transient flush buffer: the RESP bytes currently being written (AUTH or the
-    // encoded command).
+    // Transient flush buffer: the RESP bytes currently being written (AUTH or
+    // the encoded command).
     req: [u8; REQ_BUF],
     req_len: u16,
     req_sent: u16,
 
     reply: [u8; REPLY_BUF],
     reply_len: u16,
-
-    pending: [u8; PEND_BUF],
-    pending_len: u16,
-    pending_off: u16,
+    // The answer body: the reply's value.
+    result: [u8; REPLY_BUF],
 
     nbuf: [u8; NET_BUF],
     completed: u32,
     errors: u32,
     reconnects: u32,
+
+    desk: QueryDesk<SLOTS, TARGET_MAX, CMD_MAX, QUEUE>,
+    outbox: ExchangeOutbox,
+    // The request record being read, and the response record being written.
+    rec: [u8; RECORD_MAX],
+    out: [u8; RECORD_MAX],
 }
 
 define_params! {
@@ -166,7 +239,7 @@ pub extern "C" fn module_new(
         s.net_in = in_chan;
         s.net_out = out_chan;
         s.request_in = dev_channel_port(sys, 0, 1);
-        s.reply_out = dev_channel_port(sys, 1, 1);
+        s.response_out = dev_channel_port(sys, 1, 1);
         s.authority.clear();
         s.password_len = 0;
         s.phase = Phase::Disconnected;
@@ -174,19 +247,27 @@ pub extern "C" fn module_new(
         s.tag = dev_requester_tag(sys);
         s.started_ms = 0;
         s.draining = 0;
+        s.probing = 0;
+        s.probe_at_ms = 0;
+        s.backoff_ms = 0;
         s.cmd_len = 0;
         s.has_cmd = 0;
         s.req_len = 0;
         s.req_sent = 0;
         s.reply_len = 0;
-        s.pending_len = 0;
-        s.pending_off = 0;
         s.completed = 0;
         s.errors = 0;
         s.reconnects = 0;
+        s.desk.reset(METHOD_POST, 0);
+        s.outbox = ExchangeOutbox::new();
         parse_tlv(s, params, params_len);
         if !s.authority.adopt(PORT_REDIS) {
             let m = b"[redis] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
+        if s.request_in >= 0 && s.response_out < 0 {
+            let m = b"[redis] refusing to construct: request_in is wired but response_out is not";
             dev_log(sys, 2, m.as_ptr(), m.len());
             return -1;
         }
@@ -205,10 +286,93 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
     }
 }
 
+/// Close the connection (if one is open) and return to Disconnected.
+unsafe fn close_conn(s: &mut RedisState) {
+    let sys = &*s.syscalls;
+    if s.conn_id != 0 {
+        let close = s.conn_id.to_le_bytes();
+        net_write_frame(
+            sys,
+            s.net_out,
+            NET_CMD_CLOSE,
+            close.as_ptr(),
+            CONN_ID_LEN,
+            s.nbuf.as_mut_ptr(),
+            NET_BUF,
+        );
+    }
+    s.conn_id = 0;
+    s.phase = Phase::Disconnected;
+    s.reply_len = 0;
+    s.req_len = 0;
+    s.req_sent = 0;
+}
+
+/// The session failed or dropped. After the link was up this is a LINK DOWN
+/// (every request held is dropped for the requester to re-issue) and the
+/// module reconnects on its own; before it ever came up nothing was
+/// reported, so the request being performed is answered 502 here, with the
+/// first `text_len` bytes of `result` as the body.
+unsafe fn connection_lost(s: &mut RedisState, now: u64, text_len: usize) {
+    close_conn(s);
+    s.errors = s.errors.wrapping_add(1);
+    s.reconnects = s.reconnects.wrapping_add(1);
+    if s.probing == 1 {
+        s.probe_at_ms = now.wrapping_add(s.backoff_ms);
+        s.backoff_ms = (s.backoff_ms * 2).min(PROBE_MAX_MS);
+        return;
+    }
+    if s.desk.link_down() {
+        let sys = &*s.syscalls;
+        dev_log(sys, 2, b"[redis] link down".as_ptr(), 17);
+        s.has_cmd = 0;
+        s.probing = 1;
+        s.probe_at_ms = now.wrapping_add(PROBE_MIN_MS);
+        s.backoff_ms = (PROBE_MIN_MS * 2).min(PROBE_MAX_MS);
+        return;
+    }
+    if s.has_cmd == 1 {
+        s.desk.finish(status::BAD_GATEWAY, text_len.min(REPLY_BUF));
+        s.has_cmd = 0;
+    }
+}
+
+/// A session is ready: the link is up.
+unsafe fn session_ready(s: &mut RedisState) {
+    if s.probing == 1 {
+        let sys = &*s.syscalls;
+        dev_log(sys, 3, b"[redis] link up".as_ptr(), 15);
+    }
+    s.probing = 0;
+    s.backoff_ms = 0;
+    s.desk.link_up();
+}
+
+/// Copy the classified reply's value into the answer buffer.
+fn reply_value(s: &mut RedisState) -> (RespReply, usize) {
+    let r = resp_classify(&s.reply[..s.reply_len as usize]);
+    let n = if r.val_end <= s.reply_len as usize && r.val_end >= r.val_start {
+        let n = r.val_end - r.val_start;
+        let (reply, result) = (&s.reply, &mut s.result);
+        result[..n].copy_from_slice(&reply[r.val_start..r.val_end]);
+        n
+    } else {
+        0
+    };
+    (r, n)
+}
+
 /// Feed one event into the state machine and execute the resulting action.
 unsafe fn feed(s: &mut RedisState, sys: &SyscallTable, ev: Ev, now: u64) {
     let needs_auth = s.password_len > 0;
-    let (action, next) = redis_transition(s.phase, ev, needs_auth);
+    let prev = s.phase;
+    let (action, next) = redis_transition(prev, ev, needs_auth, s.has_cmd == 1);
+    s.phase = next;
+    if matches!(prev, Phase::Connecting | Phase::Authing)
+        && matches!(next, Phase::Ready | Phase::Awaiting)
+    {
+        session_ready(s);
+    }
     match action {
         Act::Connect => {
             let mut payload = [0u8; CONNECT_TO_MAX];
@@ -242,62 +406,106 @@ unsafe fn feed(s: &mut RedisState, sys: &SyscallTable, ev: Ev, now: u64) {
         Act::SendRequest => {
             s.reply_len = 0;
             let cmd_len = s.cmd_len as usize;
-            // Encode the queued structured command into the flush buffer.
-            let mut tmp = [0u8; REQ_BUF];
-            let encoded = {
-                let src = &s.cmd[..cmd_len];
-                resp_cmd_structured(src, &mut tmp)
-            };
-            match encoded {
-                Some(n) => {
-                    s.req[..n].copy_from_slice(&tmp[..n]);
-                    s.req_len = n as u16;
-                }
-                None => s.req_len = 0,
-            }
+            // The command was checked to encode when it was taken.
+            let (cmd, req) = (&s.cmd, &mut s.req);
+            s.req_len = resp_cmd_structured(&cmd[..cmd_len], req).unwrap_or(0) as u16;
             s.req_sent = 0;
             s.started_ms = now;
         }
         Act::DeliverReply => {
-            let r = resp_classify(&s.reply[..s.reply_len as usize]);
-            if s.reply_out >= 0 && r.val_end <= s.reply_len as usize && r.val_end >= r.val_start {
-                let poll = (sys.channel_poll)(s.reply_out, 0x02);
-                if poll > 0 && (poll as u32 & 0x02) != 0 {
-                    (sys.channel_write)(
-                        s.reply_out,
-                        s.reply.as_ptr().add(r.val_start),
-                        r.val_end - r.val_start,
-                    );
-                }
-            }
+            let (r, n) = reply_value(s);
+            let code = if r.is_error() {
+                status::BAD_REQUEST
+            } else {
+                status::OK
+            };
+            s.desk.finish(code, n);
             s.reply_len = 0;
             s.has_cmd = 0;
             s.completed = s.completed.wrapping_add(1);
         }
         Act::FailRequest => {
-            if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
-                net_write_frame(
-                    sys,
-                    s.net_out,
-                    NET_CMD_CLOSE,
-                    close.as_ptr(),
-                    CONN_ID_LEN,
-                    s.nbuf.as_mut_ptr(),
-                    NET_BUF,
-                );
-            }
-            s.reply_len = 0;
-            s.has_cmd = 0;
-            s.conn_id = 0;
-            s.errors = s.errors.wrapping_add(1);
+            // AUTH refused: the server's text explains it.
+            let text = if prev == Phase::Authing && ev == Ev::ReplyErr {
+                reply_value(s).1
+            } else {
+                0
+            };
+            connection_lost(s, now, text);
         }
-        Act::None => {}
+        Act::Opened | Act::None => {}
     }
-    if next == Phase::Disconnected && s.phase != Phase::Disconnected {
-        s.reconnects = s.reconnects.wrapping_add(1);
+}
+
+/// Place owed response records until the port is full or nothing is owed.
+unsafe fn flush_answers(s: &mut RedisState) {
+    let sys = &*s.syscalls;
+    if s.response_out < 0 {
+        return;
     }
-    s.phase = next;
+    loop {
+        if !s.outbox.flush(sys, s.response_out, &s.out) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&s.result, &mut s.out) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out, &s.out, n) {
+            return;
+        }
+    }
+}
+
+/// Read request records while the desk can take them; after a LINK DOWN,
+/// read and drop them until the LINK UP is away.
+unsafe fn read_requests(s: &mut RedisState) {
+    let sys = &*s.syscalls;
+    if s.request_in < 0 {
+        return;
+    }
+    loop {
+        let discarding = s.desk.discarding();
+        if !discarding && !s.desk.can_take() {
+            return;
+        }
+        let poll = (sys.channel_poll)(s.request_in, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            return;
+        }
+        let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), RECORD_MAX);
+        if n <= 0 {
+            return;
+        }
+        if !discarding {
+            s.desk.accept(&s.rec[..n as usize]);
+        }
+    }
+}
+
+/// Take the oldest complete request, when none is being performed.
+unsafe fn take_request(s: &mut RedisState) {
+    if s.has_cmd == 1 || s.probing == 1 {
+        return;
+    }
+    let Some(at) = s.desk.next_request() else {
+        return;
+    };
+    let Some((target, body)) = s.desk.request(at).map(|r| (r.target.len(), r.body)) else {
+        return;
+    };
+    if target != 0 || structured_len(body) != Some(body.len()) {
+        s.desk.refuse(at, status::BAD_REQUEST);
+        return;
+    }
+    if resp_cmd_structured(body, &mut s.req).is_none() {
+        s.desk.refuse(at, status::TOO_LARGE);
+        return;
+    }
+    let n = body.len();
+    s.cmd[..n].copy_from_slice(body);
+    s.cmd_len = n as u16;
+    s.has_cmd = 1;
+    s.desk.start(at);
 }
 
 #[no_mangle]
@@ -308,40 +516,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
 
-        // 1. Load the next structured command when none is in flight.
-        if s.has_cmd == 0 && s.draining == 0 && s.request_in >= 0 {
-            if s.pending_off >= s.pending_len {
-                let poll = (sys.channel_poll)(s.request_in, 0x01);
-                if poll > 0 && (poll as u32 & 0x01) != 0 {
-                    let n = (sys.channel_read)(s.request_in, s.pending.as_mut_ptr(), PEND_BUF);
-                    if n > 0 {
-                        s.pending_len = n as u16;
-                        s.pending_off = 0;
-                    }
-                }
-            }
-            let base = s.pending_off as usize;
-            let plen = s.pending_len as usize;
-            if base < plen {
-                // One structured command: [nargs:u8] then [len:u16][bytes] per arg.
-                if let Some(clen) = structured_len(&s.pending[base..plen]) {
-                    if clen <= REQ_BUF {
-                        s.cmd[..clen].copy_from_slice(&s.pending[base..base + clen]);
-                        s.cmd_len = clen as u16;
-                        s.has_cmd = 1;
-                        s.pending_off = (base + clen) as u16;
-                    } else {
-                        s.pending_off = s.pending_len; // oversized: skip the batch
-                    }
-                } else {
-                    s.pending_off = s.pending_len; // malformed: drop the batch
-                }
-            }
+        // 1. Answers first, then requests in, and the next one to perform.
+        flush_answers(s);
+        if s.draining == 1 {
+            s.desk.drain();
         }
+        read_requests(s);
+        take_request(s);
 
-        // 2. A queued command drives connect (if disconnected) or send (if ready).
+        // 2. A queued command drives connect (if disconnected) or send (if
+        //    ready); after a LINK DOWN the module reconnects on its own.
         if s.has_cmd == 1 && matches!(s.phase, Phase::Disconnected | Phase::Ready) {
             feed(s, sys, Ev::HaveRequest, now);
+        } else if s.probing == 1 && s.phase == Phase::Disconnected && now >= s.probe_at_ms {
+            feed(s, sys, Ev::Probe, now);
         }
 
         // 3. Drain network events into the state machine.
@@ -371,13 +559,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         if plen > CONN_ID_LEN && conn_id(pl) == s.conn_id {
                             let data_len = plen - CONN_ID_LEN;
                             let space = REPLY_BUF - s.reply_len as usize;
-                            let take = if data_len < space { data_len } else { space };
+                            if data_len > space {
+                                // A reply larger than the buffer can never
+                                // complete: it cannot be carried back.
+                                overflowed(s, now);
+                                break;
+                            }
                             core::ptr::copy_nonoverlapping(
                                 payload.add(CONN_ID_LEN),
                                 s.reply.as_mut_ptr().add(s.reply_len as usize),
-                                take,
+                                data_len,
                             );
-                            s.reply_len += take as u16;
+                            s.reply_len += data_len as u16;
                             let r = resp_classify(&s.reply[..s.reply_len as usize]);
                             if r.kind != RespKind::Incomplete {
                                 let ev = if r.is_error() {
@@ -386,6 +579,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     Ev::ReplyOk
                                 };
                                 feed(s, sys, ev, now);
+                            } else if s.reply_len as usize == REPLY_BUF {
+                                overflowed(s, now);
+                                break;
                             }
                         }
                     }
@@ -445,11 +641,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // 5. Timeouts on any active exchange.
-        if matches!(
-            s.phase,
-            Phase::Connecting | Phase::Authing | Phase::Awaiting
-        ) {
+        // 5. Timeouts. A command the server has not answered is answered 504
+        //    and its connection closed (the next request reconnects); a
+        //    connect or AUTH that stalls is a lost session.
+        if s.phase == Phase::Awaiting && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
+            s.desk.finish(status::TIMEOUT, 0);
+            s.has_cmd = 0;
+            s.errors = s.errors.wrapping_add(1);
+            close_conn(s);
+        } else if matches!(s.phase, Phase::Connecting | Phase::Authing) {
             let budget = if s.phase == Phase::Connecting {
                 CONNECT_TIMEOUT_MS
             } else {
@@ -460,34 +660,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        flush_answers(s);
+
         // 6. Drain: once no work remains, close any idle socket and report Done.
         if s.draining == 1
             && s.has_cmd == 0
-            && s.pending_off >= s.pending_len
+            && s.desk.idle()
+            && !s.outbox.holding()
             && matches!(s.phase, Phase::Disconnected | Phase::Ready)
         {
-            if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
-                net_write_frame(
-                    sys,
-                    s.net_out,
-                    NET_CMD_CLOSE,
-                    close.as_ptr(),
-                    CONN_ID_LEN,
-                    s.nbuf.as_mut_ptr(),
-                    NET_BUF,
-                );
-                s.conn_id = 0;
-            }
+            close_conn(s);
             return 1; // StepOutcome::Done
         }
         0
     }
 }
 
+/// The server sent more than one reply buffer holds.
+unsafe fn overflowed(s: &mut RedisState, now: u64) {
+    if s.phase == Phase::Awaiting {
+        s.desk.finish(status::BAD_GATEWAY, 0);
+        s.has_cmd = 0;
+        s.errors = s.errors.wrapping_add(1);
+        close_conn(s);
+    } else {
+        connection_lost(s, now, 0);
+    }
+}
+
 /// Byte length of one structured command `[nargs:u8]{[len:u16][bytes]}` at the
-/// start of `buf`, or `None` if truncated/malformed. Lets the step loop split a
-/// batch of concatenated commands.
+/// start of `buf`, or `None` if truncated/malformed.
 fn structured_len(buf: &[u8]) -> Option<usize> {
     let nargs = *buf.first()? as usize;
     let mut off = 1usize;

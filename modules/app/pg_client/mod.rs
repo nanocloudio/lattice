@@ -7,19 +7,54 @@
 //! express. So this MUST be a compiled module.
 //!
 //! The crypto lives in the host-tested `scram_core.rs` (verified against RFC 7677
-//! vectors); the wire framing in `pg_core.rs`; this file is the connection state
-//! machine that drives startup -> SASL(SCRAM) -> ready -> simple query.
+//! vectors); the wire framing in `pg_core.rs`; the exchange provider half in
+//! `query_exchange.rs`; this file is the connection state machine that drives
+//! startup -> SASL(SCRAM) -> ready -> simple query.
 //!
-//! Ports:  net_in/net_out (transport), request_in (SQL query text),
-//!         reply_out (result set: first column of EVERY row, newline-joined —
-//!         one reply record per query; a set that overflows the reply buffer
-//!         is DROPPED with `errors` counted, never truncated: a consumer
-//!         must not mistake a prefix for the whole set).
-//! Params: `authority` (`host[:port]`, port 5432 when omitted), `user`, `database`, `password`,
-//!         `cid_len` (0 = off; N = the first N bytes of each request record are
-//!         an opaque correlation prefix, echoed at the front of the reply —
-//!         and every query then yields a reply, a row-less one being the bare
-//!         prefix — so request/response chains can correlate across this hop).
+//! # Ports
+//!
+//! `net_in`/`net_out` (transport), and the exchange provider pair
+//! `request_in` (`ExchangeRequest`) / `response_out` (`ExchangeResponse`).
+//! A module with `request_in` wired and `response_out` unwired refuses to
+//! construct: its answers would have nowhere to go.
+//!
+//! # Params
+//!
+//! `authority` (`host[:port]`, port 5432 when omitted), `user`, `database`,
+//! `password`.
+//!
+//! # Request
+//!
+//! Method POST; `target` empty; headers ignored; body = the SQL text of one
+//! simple query (1..=4096 bytes, no NUL byte), sent to the server verbatim.
+//! The body may arrive inline in the HEAD or in BODY records (the module
+//! grants the credit for the rest at once).
+//!
+//! # Answer
+//!
+//! One answer per request, no content type, no headers:
+//!
+//! | Status | When | Body |
+//! |---|---|---|
+//! | 200 | the query completed — for a write, the server has committed it (the answer follows ReadyForQuery) | the first column of every row, in row order, joined by `\n` (0x0A); no trailing separator; a NULL first column contributes no row; a statement with no rows answers an empty body |
+//! | 400 | the server refused the query (ErrorResponse) | the server's message text (the `M` field), UTF-8 as sent |
+//! | 400 | another method, a non-empty target, an empty body, a NUL in the body | empty |
+//! | 413 | a body over 4096 bytes, a target over 64, headers over 256 | empty |
+//! | 502 | the server could not be reached or refused the session before the link was ever up (the server's message text when it sent one), or a result set over 8192 bytes (refused whole, never truncated) | as stated |
+//! | 503 | four requests already held, or draining | empty |
+//! | 504 | the server did not finish the query within 15 s (the connection is closed; the query's effect is unknown) | empty |
+//!
+//! The body streams under the requester's response credit: the HEAD carries
+//! as much as `resp_credit` allows, BODY records the rest as CREDIT arrives.
+//!
+//! # LINK
+//!
+//! The connection opens on the first request. Once it has reached
+//! ReadyForQuery, losing it (a close, a transport error, a failed lazy
+//! reconnect) writes LINK DOWN: every request held is dropped unanswered for
+//! the requester to re-issue, and request records are read and dropped until
+//! LINK UP. The module reconnects on its own (1 s, doubling to 30 s) and
+//! writes LINK UP once the new session is ready.
 
 #![no_std]
 #![allow(
@@ -47,7 +82,7 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// Shared, host-tested cores — identical source to the `chronicle-bytecode` crate.
+// Shared, host-tested cores.
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
 include!("../../common/scram_core.rs");
@@ -58,6 +93,11 @@ include!("../../common/pg_reply.rs");
 mod authority;
 use authority::{Authority, PORT_PG};
 
+#[path = "../../common/query_exchange.rs"]
+mod query_exchange;
+use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::QueryDesk;
+
 use abi::contracts::net::net_proto::{
     conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
     CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
@@ -66,12 +106,24 @@ use abi::contracts::net::net_proto::{
 };
 
 const NET_BUF: usize = 2048;
-const REQ_BUF: usize = 2048;
+/// Longest SQL text one request carries.
+const QUERY_MAX: usize = 4096;
+/// Outgoing message buffer: the Query message is the SQL plus 6 bytes.
+const REQ_BUF: usize = 4160;
+/// Server bytes accumulated toward complete messages.
 const ACC_BUF: usize = 16384;
-const PEND_BUF: usize = 4096;
+/// Largest answer body: a result set, or an error's message text.
+const RESULT_MAX: usize = 8192;
 const NAME_BUF: usize = 128;
+/// Requests held at once: one performed, the rest queued in arrival order.
+const SLOTS: usize = 4;
+/// A request target is refused unless empty; this bounds what is read.
+const TARGET_MAX: usize = 64;
+const QUEUE: usize = 8;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const REPLY_TIMEOUT_MS: u64 = 15_000;
+const PROBE_MIN_MS: u64 = 1_000;
+const PROBE_MAX_MS: u64 = 30_000;
 
 // Connection phases.
 const DISCONNECTED: u8 = 0;
@@ -89,7 +141,7 @@ struct PgState {
     net_in: i32,
     net_out: i32,
     request_in: i32,
-    reply_out: i32,
+    response_out: i32,
 
     authority: Authority,
     user: [u8; NAME_BUF],
@@ -106,53 +158,55 @@ struct PgState {
     draining: u8,
     nonce_ctr: u32,
 
+    // Reconnect after a LINK DOWN: the next attempt and the current wait.
+    probing: u8,
+    probe_at_ms: u64,
+    backoff_ms: u64,
+
     // SCRAM: the client-first-bare (for AuthMessage) + expected server signature.
     cfirst: [u8; 128],
     cfirst_len: u16,
     server_sig: [u8; 32],
 
-    // The queued SQL query.
-    query: [u8; 1024],
+    // The SQL query being performed.
+    query: [u8; QUERY_MAX],
     query_len: u16,
     has_query: u8,
-    // The accumulated result set: first column of every row, newline-joined.
-    result: [u8; 1024],
+    // The answer body: the result set (first column of every row,
+    // newline-joined), or the server's error text.
+    result: [u8; RESULT_MAX],
     result_len: u16,
     have_result: u8,
-    // Set when a row would overflow `result`: the whole reply is refused at
-    // emit (fail closed) rather than truncated to a plausible-looking prefix.
+    // Set when a row would overflow `result`: the whole answer is refused
+    // (502) rather than truncated to a plausible-looking prefix.
     result_overflow: u8,
-
-    // Opt-in correlation prefix (`cid_len` param, 0 = off): the first
-    // `cid_cfg` bytes of each request record are OPAQUE — carried here, not
-    // sent to the server — and echoed verbatim at the front of the reply
-    // record. With it on, every query yields a reply (a row-less INSERT
-    // replies with just the prefix), so a request/response upstream like
-    // wave's HANDLER_APP can correlate across this connector.
-    cid: [u8; 16],
-    cid_have: u8,
-    cid_cfg: u8,
+    // Set when the server refused the query; `result` holds its message.
+    query_error: u8,
 
     req: [u8; REQ_BUF],
     req_len: u16,
     req_sent: u16,
-    // Accumulated server bytes (may hold several messages).
+    // Accumulated server bytes (may hold several messages), and one
+    // message body copied out of it for dispatch.
     acc: [u8; ACC_BUF],
     acc_len: u32,
-
-    pending: [u8; PEND_BUF],
-    pending_len: u16,
-    pending_off: u16,
+    msg: [u8; ACC_BUF],
 
     nbuf: [u8; NET_BUF],
     completed: u32,
     errors: u32,
+
+    desk: QueryDesk<SLOTS, TARGET_MAX, QUERY_MAX, QUEUE>,
+    outbox: ExchangeOutbox,
+    // The request record being read, and the response record being written.
+    rec: [u8; RECORD_MAX],
+    out: [u8; RECORD_MAX],
 }
 
 define_params! {
     PgState;
 
-    // Tag 1 is retired.
+    // Tags 1 and 5 are retired.
     // The peer, `host[:port]`; the port defaults to 5432.
     6, authority, str, 0 => |s, d, len| {
         if len > 0 {
@@ -176,9 +230,6 @@ define_params! {
         while i < len && (s.password_len as usize) < NAME_BUF {
             s.password[s.password_len as usize] = *d.add(i); s.password_len += 1; i += 1;
         }
-    };
-    5, cid_len, u32, 0 => |s, d, len| {
-        s.cid_cfg = p_u32(d, len, 0, 16).min(16) as u8;
     };
 }
 
@@ -226,7 +277,7 @@ pub extern "C" fn module_new(
         s.net_in = in_chan;
         s.net_out = out_chan;
         s.request_in = dev_channel_port(sys, 0, 1);
-        s.reply_out = dev_channel_port(sys, 1, 1);
+        s.response_out = dev_channel_port(sys, 1, 1);
         s.authority.clear();
         s.user_len = 0;
         s.database_len = 0;
@@ -237,25 +288,31 @@ pub extern "C" fn module_new(
         s.started_ms = 0;
         s.draining = 0;
         s.nonce_ctr = 0;
+        s.probing = 0;
+        s.probe_at_ms = 0;
+        s.backoff_ms = 0;
         s.cfirst_len = 0;
         s.query_len = 0;
         s.has_query = 0;
         s.result_len = 0;
         s.have_result = 0;
         s.result_overflow = 0;
-        s.cid = [0u8; 16];
-        s.cid_have = 0;
-        s.cid_cfg = 0;
+        s.query_error = 0;
         s.req_len = 0;
         s.req_sent = 0;
         s.acc_len = 0;
-        s.pending_len = 0;
-        s.pending_off = 0;
         s.completed = 0;
         s.errors = 0;
+        s.desk.reset(METHOD_POST, 0);
+        s.outbox = ExchangeOutbox::new();
         parse_tlv(s, params, params_len);
         if !s.authority.adopt(PORT_PG) {
             let m = b"[pg] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
+        if s.request_in >= 0 && s.response_out < 0 {
+            let m = b"[pg] refusing to construct: request_in is wired but response_out is not";
             dev_log(sys, 2, m.as_ptr(), m.len());
             return -1;
         }
@@ -304,12 +361,12 @@ unsafe fn send_startup(s: &mut PgState, now: u64) {
         stage_send(s, n, now);
         s.phase = STARTUP;
     } else {
-        fail(s, now);
+        connection_lost(s, now, 0);
     }
 }
 
-/// Reset on error / disconnect.
-unsafe fn fail(s: &mut PgState, _now: u64) {
+/// Close the connection (if one is open) and return to DISCONNECTED.
+unsafe fn close_conn(s: &mut PgState) {
     let sys = &*s.syscalls;
     if s.conn_id != 0 {
         let close = s.conn_id.to_le_bytes();
@@ -328,30 +385,89 @@ unsafe fn fail(s: &mut PgState, _now: u64) {
     s.acc_len = 0;
     s.req_len = 0;
     s.req_sent = 0;
-    s.has_query = 0;
-    s.errors = s.errors.wrapping_add(1);
 }
 
-/// Handle one framed server message; returns false on a fatal error.
-unsafe fn on_message(s: &mut PgState, tag: u8, body: &[u8], now: u64) -> bool {
+/// The connection failed or dropped. After the link was up this is a LINK
+/// DOWN (every request held is dropped for the requester to re-issue) and
+/// reconnecting is the module's own business; before it ever came up there
+/// was nothing to report, so the request being performed is answered 502
+/// here, with the first `text_len` bytes of `result` (the server's message,
+/// when it sent one) as the body.
+unsafe fn connection_lost(s: &mut PgState, now: u64, text_len: usize) {
+    close_conn(s);
+    s.errors = s.errors.wrapping_add(1);
+    if s.probing == 1 {
+        s.probe_at_ms = now.wrapping_add(s.backoff_ms);
+        s.backoff_ms = (s.backoff_ms * 2).min(PROBE_MAX_MS);
+        return;
+    }
+    if s.desk.link_down() {
+        let sys = &*s.syscalls;
+        dev_log(sys, 2, b"[pg] link down".as_ptr(), 14);
+        s.has_query = 0;
+        s.probing = 1;
+        s.probe_at_ms = now.wrapping_add(PROBE_MIN_MS);
+        s.backoff_ms = (PROBE_MIN_MS * 2).min(PROBE_MAX_MS);
+        return;
+    }
+    if s.has_query == 1 {
+        s.desk.finish(status::BAD_GATEWAY, text_len.min(RESULT_MAX));
+        s.has_query = 0;
+    }
+}
+
+/// The session reached ReadyForQuery after the handshake: the link is up.
+unsafe fn session_ready(s: &mut PgState) {
+    if s.probing == 1 {
+        let sys = &*s.syscalls;
+        dev_log(sys, 3, b"[pg] link up".as_ptr(), 12);
+    }
+    s.probing = 0;
+    s.backoff_ms = 0;
+    s.desk.link_up();
+}
+
+/// Handle one framed server message (its body in `s.msg[..len]`); returns
+/// false on a handshake failure, with the server's message (if any) left in
+/// `result` and its length returned through `text_len`.
+unsafe fn on_message(s: &mut PgState, tag: u8, len: usize, now: u64, text_len: &mut usize) -> bool {
     if tag == b'E' {
-        // A statement-level error (duplicate key, missing relation, …) is
-        // an ORDINARY query outcome: the server stays open and
-        // ReadyForQuery follows, which completes the round trip — with a
-        // cid prefix the echoed reply IS the completion signal the
-        // upstream request/response chain is waiting on. Treating it as
-        // fatal closed the connection and DROPPED the pending reply, so
-        // the caller hung to its own timeout. Only a handshake-phase
-        // error is fatal.
+        let span = pg_error_message(&s.msg[..len]);
         if s.phase == QUERYING {
+            // A statement-level error (duplicate key, missing relation, …)
+            // is an ordinary query outcome: the server stays open and
+            // ReadyForQuery follows, which completes the exchange with 400
+            // and the server's message as the body.
+            if s.query_error == 0 {
+                s.query_error = 1;
+                s.result_len = match span {
+                    Some((a, b)) => {
+                        let n = (b - a).min(RESULT_MAX);
+                        let (msg, result) = (&s.msg, &mut s.result);
+                        result[..n].copy_from_slice(&msg[a..a + n]);
+                        n as u16
+                    }
+                    None => 0,
+                };
+            }
             s.errors = s.errors.wrapping_add(1);
             return true;
         }
-        return false; // ErrorResponse during startup/auth
+        // An ErrorResponse during startup/auth ends the session.
+        *text_len = match span {
+            Some((a, b)) => {
+                let n = (b - a).min(RESULT_MAX);
+                let (msg, result) = (&s.msg, &mut s.result);
+                result[..n].copy_from_slice(&msg[a..a + n]);
+                n
+            }
+            None => 0,
+        };
+        return false;
     }
     match s.phase {
-        STARTUP if tag == b'R' => match pg_auth_type(body) {
-            Some(10) if pg_sasl_has_scram_sha256(body) => {
+        STARTUP if tag == b'R' => match pg_auth_type(&s.msg[..len]) {
+            Some(10) if pg_sasl_has_scram_sha256(&s.msg[..len]) => {
                 // Build client-first with a fresh nonce, send SASLInitialResponse.
                 s.nonce_ctr = s.nonce_ctr.wrapping_add(1);
                 let seed = now ^ ((s.tag as u64) << 32) ^ (s.nonce_ctr as u64);
@@ -377,8 +493,7 @@ unsafe fn on_message(s: &mut PgState, tag: u8, body: &[u8], now: u64) -> bool {
             _ => false,
         },
         SASL_CONT if tag == b'R' => {
-            if pg_auth_type(body) == Some(11) {
-                let server_first = &body[4..]; // after the auth_type
+            if pg_auth_type(&s.msg[..len]) == Some(11) {
                 let bare_len = s.cfirst_len as usize;
                 let mut bare = [0u8; 128];
                 bare[..bare_len].copy_from_slice(&s.cfirst[..bare_len]);
@@ -387,7 +502,7 @@ unsafe fn on_message(s: &mut PgState, tag: u8, body: &[u8], now: u64) -> bool {
                 // client-first-bare is cfirst[3..] (after "n,,").
                 if let Some(fnl) = scram_build_client_final(
                     &bare[3..bare_len],
-                    server_first,
+                    &s.msg[4..len], // server-first, after the auth type
                     &s.password[..s.password_len as usize],
                     &mut cfinal,
                     &mut ssig,
@@ -404,7 +519,7 @@ unsafe fn on_message(s: &mut PgState, tag: u8, body: &[u8], now: u64) -> bool {
             true
         }
         SASL_FINAL if tag == b'R' => {
-            match pg_auth_type(body) {
+            match pg_auth_type(&s.msg[..len]) {
                 Some(12) => true, // SASLFinal (server signature); accepted
                 Some(0) => {
                     s.phase = AUTH_OK;
@@ -415,36 +530,34 @@ unsafe fn on_message(s: &mut PgState, tag: u8, body: &[u8], now: u64) -> bool {
         }
         _ => {
             // After auth: a ReadyForQuery moves us to READY; DataRows during a
-            // query are captured; the closing ReadyForQuery emits the result.
+            // query are captured; the closing ReadyForQuery answers.
             if tag == b'Z' {
-                if s.phase == QUERYING {
-                    emit_result(s);
+                let was = s.phase;
+                if was == QUERYING {
+                    finish_query(s);
                 }
                 s.phase = READY;
-            } else if s.phase == QUERYING && tag == b'D' && s.result_overflow == 0 {
-                if let Some((cs, ce)) = pg_datarow_col0(body) {
-                    // Split-borrow: the column bytes live in `acc` (via `body`),
-                    // the accumulation in `result` — disjoint state fields.
-                    let mut col = [0u8; 1024];
-                    let rl = ce - cs;
-                    if rl > col.len() {
-                        // A column wider than the staging copy cannot be
-                        // appended whole; refuse the reply, never clip it.
-                        s.result_overflow = 1;
-                    } else {
-                        col[..rl].copy_from_slice(&body[cs..ce]);
-                        match pg_reply_append(
-                            &mut s.result,
-                            s.result_len as usize,
-                            s.have_result == 1,
-                            &col[..rl],
-                        ) {
-                            Some(n) => {
-                                s.result_len = n as u16;
-                                s.have_result = 1;
-                            }
-                            None => s.result_overflow = 1,
+                if was != QUERYING && was != READY {
+                    session_ready(s);
+                }
+            } else if s.phase == QUERYING
+                && tag == b'D'
+                && s.result_overflow == 0
+                && s.query_error == 0
+            {
+                if let Some((cs, ce)) = pg_datarow_col0(&s.msg[..len]) {
+                    let (msg, result) = (&s.msg, &mut s.result);
+                    match pg_reply_append(
+                        result,
+                        s.result_len as usize,
+                        s.have_result == 1,
+                        &msg[cs..ce],
+                    ) {
+                        Some(n) => {
+                            s.result_len = n as u16;
+                            s.have_result = 1;
                         }
+                        None => s.result_overflow = 1,
                     }
                 }
             }
@@ -453,36 +566,106 @@ unsafe fn on_message(s: &mut PgState, tag: u8, body: &[u8], now: u64) -> bool {
     }
 }
 
-unsafe fn emit_result(s: &mut PgState) {
-    let sys = &*s.syscalls;
-    if s.result_overflow == 1 {
-        // The set did not fit: refuse the whole reply. A truncated result
-        // would be indistinguishable from a complete one downstream.
+/// The query's ReadyForQuery arrived: answer it.
+unsafe fn finish_query(s: &mut PgState) {
+    let (code, len) = if s.query_error == 1 {
+        (status::BAD_REQUEST, s.result_len as usize)
+    } else if s.result_overflow == 1 {
+        // The set did not fit: refused whole. A truncated result would be
+        // indistinguishable from a complete one downstream.
         s.errors = s.errors.wrapping_add(1);
-    } else if s.reply_out >= 0 && s.cid_have == 1 {
-        // Correlated reply: [cid prefix][rows]. Emitted even when the query
-        // produced no rows (an INSERT) — the prefix alone IS the completion
-        // signal the upstream request/response chain is waiting on.
-        let poll = (sys.channel_poll)(s.reply_out, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            let cid = s.cid_cfg as usize;
-            let rl = s.result_len as usize;
-            s.nbuf[..cid].copy_from_slice(&s.cid[..cid]);
-            s.nbuf[cid..cid + rl].copy_from_slice(&s.result[..rl]);
-            (sys.channel_write)(s.reply_out, s.nbuf.as_ptr(), cid + rl);
-        }
-    } else if s.reply_out >= 0 && s.have_result == 1 {
-        let poll = (sys.channel_poll)(s.reply_out, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            (sys.channel_write)(s.reply_out, s.result.as_ptr(), s.result_len as usize);
-        }
-    }
-    s.cid_have = 0;
-    s.have_result = 0;
-    s.result_len = 0;
-    s.result_overflow = 0;
+        (status::BAD_GATEWAY, 0)
+    } else {
+        (status::OK, s.result_len as usize)
+    };
+    s.desk.finish(code, len);
     s.has_query = 0;
     s.completed = s.completed.wrapping_add(1);
+}
+
+/// Place owed response records until the port is full or nothing is owed.
+unsafe fn flush_answers(s: &mut PgState) {
+    let sys = &*s.syscalls;
+    if s.response_out < 0 {
+        return;
+    }
+    loop {
+        if !s.outbox.flush(sys, s.response_out, &s.out) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&s.result, &mut s.out) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out, &s.out, n) {
+            return;
+        }
+    }
+}
+
+/// Read request records while the desk can take them; after a LINK DOWN,
+/// read and drop them until the LINK UP is away.
+unsafe fn read_requests(s: &mut PgState) {
+    let sys = &*s.syscalls;
+    if s.request_in < 0 {
+        return;
+    }
+    loop {
+        let discarding = s.desk.discarding();
+        if !discarding && !s.desk.can_take() {
+            return;
+        }
+        let poll = (sys.channel_poll)(s.request_in, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            return;
+        }
+        let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), RECORD_MAX);
+        if n <= 0 {
+            return;
+        }
+        if !discarding {
+            s.desk.accept(&s.rec[..n as usize]);
+        }
+    }
+}
+
+/// Whether `b` holds a NUL — the simple-query terminator, so SQL text that
+/// carries one would be cut short by the server. A plain scan: the
+/// library's search lowers to a `memchr` a PIC module cannot link.
+fn has_nul(b: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == 0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Take the oldest complete request, when none is being performed.
+unsafe fn take_request(s: &mut PgState) {
+    if s.has_query == 1 || s.probing == 1 {
+        return;
+    }
+    let Some(at) = s.desk.next_request() else {
+        return;
+    };
+    let Some((target, body)) = s.desk.request(at).map(|r| (r.target.len(), r.body)) else {
+        return;
+    };
+    if target != 0 || body.is_empty() || has_nul(body) {
+        s.desk.refuse(at, status::BAD_REQUEST);
+        return;
+    }
+    let n = body.len();
+    s.query[..n].copy_from_slice(body);
+    s.query_len = n as u16;
+    s.has_query = 1;
+    s.result_len = 0;
+    s.have_result = 0;
+    s.result_overflow = 0;
+    s.query_error = 0;
+    s.desk.start(at);
 }
 
 #[no_mangle]
@@ -493,72 +676,47 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
 
-        // 1. Load the next SQL query when none is in flight.
-        if s.has_query == 0
-            && s.draining == 0
-            && s.request_in >= 0
-            && s.pending_off >= s.pending_len
-        {
-            let poll = (sys.channel_poll)(s.request_in, 0x01);
-            if poll > 0 && (poll as u32 & 0x01) != 0 {
-                let n = (sys.channel_read)(s.request_in, s.pending.as_mut_ptr(), PEND_BUF);
-                if n > 0 {
-                    s.pending_len = n as u16;
-                    s.pending_off = 0;
-                }
-            }
-        }
-        if s.has_query == 0 && s.pending_off < s.pending_len {
-            let base = s.pending_off as usize;
-            let end = s.pending_len as usize;
-            // Peel the opaque correlation prefix (if configured) before the
-            // SQL text; a record no longer than the prefix carries no query.
-            let cid = s.cid_cfg as usize;
-            let start = if cid > 0 && end - base > cid {
-                s.cid[..cid].copy_from_slice(&s.pending[base..base + cid]);
-                s.cid_have = 1;
-                base + cid
-            } else {
-                s.cid_have = 0;
-                base
-            };
-            let n = (end - start).min(1024);
-            s.query[..n].copy_from_slice(&s.pending[start..start + n]);
-            s.query_len = n as u16;
-            s.has_query = 1;
-            s.pending_off = end as u16;
+        // 1. Answers first: an owed record leaves before more work starts.
+        flush_answers(s);
+        if s.draining == 1 {
+            s.desk.drain();
         }
 
-        // 2. A queued query drives connect (if down) or send (if ready).
-        if s.has_query == 1 {
-            if s.phase == DISCONNECTED {
-                let mut payload = [0u8; CONNECT_TO_MAX];
-                let n = s.authority.connect_record(&mut payload, Some(s.tag));
-                if n > 0 {
-                    net_write_frame(
-                        sys,
-                        s.net_out,
-                        NET_CMD_CONNECT_TO,
-                        payload.as_ptr(),
-                        n,
-                        s.nbuf.as_mut_ptr(),
-                        NET_BUF,
-                    );
-                }
-                s.phase = CONNECTING;
-                s.started_ms = now;
-            } else if s.phase == READY {
-                let qn = s.query_len as usize;
-                let mut q = [0u8; 1024];
-                q[..qn].copy_from_slice(&s.query[..qn]);
-                if let Some(n) = pg_query(&q[..qn], &mut s.req) {
-                    stage_send(s, n, now);
-                    s.phase = QUERYING;
-                }
+        // 2. Requests in, and the next one to perform.
+        read_requests(s);
+        take_request(s);
+
+        // 3. A query drives connect (if down) or send (if ready); after a
+        //    LINK DOWN the module reconnects on its own cadence.
+        let connect = (s.has_query == 1 || (s.probing == 1 && now >= s.probe_at_ms))
+            && s.phase == DISCONNECTED;
+        if connect {
+            let mut payload = [0u8; CONNECT_TO_MAX];
+            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            if n > 0 {
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CONNECT_TO,
+                    payload.as_ptr(),
+                    n,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
+            }
+            s.phase = CONNECTING;
+            s.started_ms = now;
+        } else if s.has_query == 1 && s.phase == READY {
+            let qn = s.query_len as usize;
+            let mut q = [0u8; QUERY_MAX];
+            q[..qn].copy_from_slice(&s.query[..qn]);
+            if let Some(n) = pg_query(&q[..qn], &mut s.req) {
+                stage_send(s, n, now);
+                s.phase = QUERYING;
             }
         }
 
-        // 3. Drain network events.
+        // 4. Drain network events.
         if s.net_in >= 0 {
             loop {
                 let poll = (sys.channel_poll)(s.net_in, 0x01);
@@ -585,19 +743,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         if plen > CONN_ID_LEN && conn_id(pl) == s.conn_id {
                             let data_len = plen - CONN_ID_LEN;
                             let space = ACC_BUF - s.acc_len as usize;
-                            let take = if data_len < space { data_len } else { space };
+                            if data_len > space {
+                                // A server message larger than the
+                                // accumulator can never complete: the
+                                // answer cannot be carried back.
+                                overflowed(s, now);
+                                break;
+                            }
                             core::ptr::copy_nonoverlapping(
                                 payload.add(CONN_ID_LEN),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
-                                take,
+                                data_len,
                             );
-                            s.acc_len += take as u32;
+                            s.acc_len += data_len as u32;
                             drain_messages(s, now);
                         }
                     }
                     NET_MSG_CLOSED if s.phase != DISCONNECTED => {
                         if plen >= CONN_ID_LEN && conn_id(pl) == s.conn_id {
-                            fail(s, now);
+                            connection_lost(s, now, 0);
                         }
                     }
                     NET_MSG_ERROR if plen > CONN_ID_LEN => {
@@ -611,7 +775,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.phase == CONNECTING && tag == s.tag
                         };
                         if ours {
-                            fail(s, now);
+                            connection_lost(s, now, 0);
                         }
                     }
                     _ => {}
@@ -619,7 +783,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // 4. Send pump.
+        // 5. Send pump.
         if s.conn_id != 0 && s.req_sent < s.req_len {
             // CMD_SEND payload is `[conn_id:2 LE][data…]`.
             let max_chunk = NET_BUF - NET_FRAME_HDR - CONN_ID_LEN;
@@ -651,41 +815,50 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // 5. Timeouts.
-        if !matches!(s.phase, DISCONNECTED | READY) {
+        // 6. Timeouts. A query the server has not finished is answered 504
+        //    and its connection closed (the next request reconnects); a
+        //    handshake that stalls is a lost connection.
+        if s.phase == QUERYING && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
+            s.desk.finish(status::TIMEOUT, 0);
+            s.has_query = 0;
+            s.errors = s.errors.wrapping_add(1);
+            close_conn(s);
+        } else if !matches!(s.phase, DISCONNECTED | READY | QUERYING) {
             let budget = if s.phase == CONNECTING {
                 CONNECT_TIMEOUT_MS
             } else {
                 REPLY_TIMEOUT_MS
             };
             if now.wrapping_sub(s.started_ms) > budget {
-                fail(s, now);
+                connection_lost(s, now, 0);
             }
         }
 
-        // 6. Drain: report Done once idle.
+        flush_answers(s);
+
+        // 7. Drain: report Done once idle.
         if s.draining == 1
             && s.has_query == 0
-            && s.pending_off >= s.pending_len
+            && s.desk.idle()
+            && !s.outbox.holding()
             && matches!(s.phase, DISCONNECTED | READY)
         {
-            if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
-                net_write_frame(
-                    sys,
-                    s.net_out,
-                    NET_CMD_CLOSE,
-                    close.as_ptr(),
-                    2,
-                    s.nbuf.as_mut_ptr(),
-                    NET_BUF,
-                );
-                s.conn_id = 0;
-            }
+            close_conn(s);
             return 1;
         }
         0
     }
+}
+
+/// The server sent more than the accumulator holds: whatever is in flight
+/// cannot be answered from it.
+unsafe fn overflowed(s: &mut PgState, _now: u64) {
+    s.errors = s.errors.wrapping_add(1);
+    if s.phase == QUERYING {
+        s.desk.finish(status::BAD_GATEWAY, 0);
+        s.has_query = 0;
+    }
+    close_conn(s);
 }
 
 /// Process every complete message in the accumulation buffer, then compact it.
@@ -701,12 +874,14 @@ unsafe fn drain_messages(s: &mut PgState, now: u64) {
         let bstart = off + m.body_start;
         let bend = off + m.body_end;
         let blen = bend - bstart;
-        let mut body = [0u8; 1024];
-        let take = blen.min(body.len());
-        body[..take].copy_from_slice(&s.acc[bstart..bstart + take]);
+        s.msg[..blen].copy_from_slice(&s.acc[bstart..bend]);
         let tag = s.acc[off];
-        if !on_message(s, tag, &body[..take], now) {
-            fail(s, now);
+        let mut text_len = 0usize;
+        if !on_message(s, tag, blen, now, &mut text_len) {
+            connection_lost(s, now, text_len);
+            return;
+        }
+        if s.phase == DISCONNECTED {
             return;
         }
         off += m.total;

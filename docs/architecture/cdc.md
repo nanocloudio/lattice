@@ -4,8 +4,8 @@ Lattice's CDC is an egress pump: a module that reads committed
 changes out of a running graph and delivers them, in order and with
 acknowledged durability, to a sink of the operator's choosing. The
 protocol logic lives in `modules/common/cdc_feed.rs` (the feed state
-machine) and `modules/common/cdc_wire.rs` (the event and sink
-envelopes); the module shell is `modules/app/cdc_pump/mod.rs`. One
+machine) and `modules/common/cdc_wire.rs` (the event envelope and
+the sink message key); the module shell is `modules/app/cdc_pump/mod.rs`. One
 pump instance serves one feed.
 
 ## Position in the graph
@@ -47,20 +47,41 @@ broadcast to every ordering unit: a consumer that has seen
 
 ## The sink contract
 
-Events leave the graph as `SinkPublish` frames on a channel to any
-module declaring the `stream.ordered_ack` capability. The sink
-answers each frame with a `SinkAck`: status 0 means durably
-accepted, non-zero statuses are typed refusals, and correlation 0
-carries link-down/link-up signals that force republication of every
-unacknowledged event. The pump advances its durable checkpoint only
-past the contiguous acknowledged prefix, so delivery is
-at-least-once end to end: a sink outage stalls the feed, never loses
-it.
+The pump is a requester of fluxor's exchange contract
+(`contracts/exchange.rs` in the fluxor SDK): `request_out` and
+`response_in` wire to the `request_in` and `response_out` of any module
+declaring a `stream.ordered_ack` capability. Each event is one
+`METHOD_PUBLISH` exchange carried whole in its request HEAD:
 
-The in-repo reference sink is `modules/app/loopback_sink`, which
-validates, counts, digests, and acknowledges in order, with a
-scripted link-loss param to exercise replay. MQTT delivery lives in
-quantum.
+| Part | Value |
+|---|---|
+| id | the event's correlation counter, `ExchangeId::from_u64` |
+| flags | `BROADCAST` for resolved watermarks and the backfill-complete marker, else none |
+| target | the ordering key `[table_id:u32 BE][key]` |
+| headers, peer | empty |
+| resp_credit | 0 |
+| body | the `CdcEvent` envelope above, exactly |
+
+The answer decides each event. 200 means durably accepted. A 5xx (or an
+ABORT from the sink) is retried after a backoff of 100 ms doubling to
+5 s, and nothing new is published while a retry is owed. Any other
+status is a refusal: counted, and never skipped. LINK DOWN makes every
+open exchange unknowable; the pump publishes nothing more until LINK UP
+and then issues each open one again, in order. It does not wait for a
+LINK UP before its first publish, because LINK only reports a change.
+At most 16 exchanges are open at once (`UNACKED_CAP`).
+
+The pump advances its durable checkpoint only past the contiguous
+prefix answered 200, so delivery is at-least-once end to end: a sink
+outage stalls the feed, never loses it, and a refusal pins the
+checkpoint before the refused event.
+
+The in-repo reference sink is `modules/app/loopback_sink`. It validates,
+counts and digests each publish and answers 200 in order, and its
+`linkdown_every` param scripts link loss to exercise re-issue. MQTT,
+Kafka and AMQP delivery are quantum's `mqtt_sink`, `kafka_sink` and
+`amqp_sink`, wired the same way. `configs/bare-metal-pi5-cdc.yaml` uses
+`mqtt_sink`.
 
 ## Lifecycle and retention
 

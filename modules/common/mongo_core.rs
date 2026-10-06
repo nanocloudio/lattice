@@ -184,6 +184,22 @@ pub fn bson_ok(doc: &[u8]) -> bool {
     false
 }
 
+/// A top-level string field's bytes (without its length or NUL), as a byte
+/// range into `doc`.
+pub fn bson_get_str(doc: &[u8], name: &[u8]) -> Option<(usize, usize)> {
+    let (ty, at) = bson_find(doc, name)?;
+    if ty != bson::STRING {
+        return None;
+    }
+    let n = i32::from_le_bytes(doc.get(at..at + 4)?.try_into().ok()?) as usize;
+    let start = at + 4;
+    let end = start + n.checked_sub(1)?; // the length counts the NUL
+    if end > doc.len() {
+        return None;
+    }
+    Some((start, end))
+}
+
 /// The `payload` binary field's byte range (the SCRAM message from the server).
 pub fn bson_get_bin(doc: &[u8], name: &[u8]) -> Option<(usize, usize)> {
     let (ty, at) = bson_find(doc, name)?;

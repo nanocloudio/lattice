@@ -4,19 +4,23 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 timer_class      = "wall_clock"
 
+# A provider of the exchange contract: with `collection` set, each
+# request's body is inserted as `{ value: <body> }` and answered once the
+# server acknowledges it (see mod.rs for the layouts).
+
 [[ports]]
 name         = "net_in"
 direction    = "input"
 content_type = "NetProto"
 buffer_size  = 2048
 
-# Reserved for post-auth commands; auth needs no input.
 [[ports]]
-name         = "publish_in"
+name         = "request_in"
 index        = 1
 direction    = "input"
-content_type = "OctetStream"
-buffer_size  = 2048
+content_type = "ExchangeRequest"
+buffer_size  = 8192
+max_record   = 8192
 
 [[ports]]
 name         = "net_out"
@@ -25,13 +29,21 @@ content_type = "NetProto"
 buffer_size  = 2048
 max_record   = 1600
 
-# Auth/ping result status.
+# Auth/ping/insert status lines.
 [[ports]]
 name         = "status_out"
 index        = 1
 direction    = "output"
 content_type = "TextPlain"
 buffer_size  = 2048
+
+[[ports]]
+name         = "response_out"
+index        = 2
+direction    = "output"
+content_type = "ExchangeResponse"
+buffer_size  = 16384
+max_record   = 8192
 
 [[resources]]
 requires_contract = "channel"

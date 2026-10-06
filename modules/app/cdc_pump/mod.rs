@@ -14,10 +14,11 @@
 //! change windows with `KV_OP_SCAN_VERSIONS`, backfills with
 //! `KV_OP_SNAPSHOT_VERSIONS`, and checkpoints with `KV_OP_GET` /
 //! `KV_OP_PUT` / `KV_OP_CAS` — the same surface any external feed
-//! consumer sees, with no privileged read path. Events leave as
-//! `cdc_wire::CdcEvent` envelopes wrapped in `Publish` frames; the
-//! sink answers with `Ack`s, and the DURABLE checkpoint advances
-//! only past the contiguous acknowledged prefix.
+//! consumer sees, with no privileged read path. Each event leaves as one
+//! METHOD_PUBLISH exchange on `request_out` (target = the ordering key,
+//! body = the `cdc_wire::CdcEvent` envelope); the sink answers on
+//! `response_in`, and the DURABLE checkpoint advances only past the
+//! contiguous prefix answered 200.
 
 #![no_std]
 #![allow(
@@ -49,7 +50,7 @@ mod hex_core;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
-use cdc_feed::exchange::{Ack, MSG_ACK};
+use cdc_feed::exchange::RECORD_MAX;
 use cdc_feed::wire::{FenceTail, MSG_KV_RESPONSE};
 use cdc_feed::{FeedCore, FeedIo, KEY_MAX, SCRATCH};
 
@@ -59,12 +60,14 @@ const EMIT_EVERY: u64 = 2000;
 struct PumpState {
     syscalls: *const SyscallTable,
     kv_in: i32,
-    ack_in: i32,
+    response_in: i32,
     kv_out: i32,
-    publish_out: i32,
+    request_out: i32,
     retention_out: i32,
     metrics_out: i32,
     step_ctr: u64,
+    /// One response record read from the sink.
+    resp: [u8; RECORD_MAX],
     core: FeedCore,
 }
 
@@ -73,7 +76,7 @@ struct PumpState {
 struct ShellIo<'a> {
     sys: &'a SyscallTable,
     kv_out: i32,
-    publish_out: i32,
+    request_out: i32,
     retention_out: i32,
 }
 
@@ -95,8 +98,8 @@ impl FeedIo for ShellIo<'_> {
         self.write_chan(self.kv_out, frame)
     }
 
-    fn ship(&mut self, frame: &mut [u8]) -> bool {
-        self.write_chan(self.publish_out, frame)
+    fn ship(&mut self, record: &mut [u8]) -> bool {
+        self.write_chan(self.request_out, record)
     }
 
     fn send_claim(&mut self, frame: &mut [u8]) -> bool {
@@ -268,8 +271,8 @@ pub extern "C" fn module_new(
         s.core.init();
         s.kv_in = in_chan;
         s.kv_out = out_chan;
-        s.ack_in = dev_channel_port(sys, 0, 1);
-        s.publish_out = dev_channel_port(sys, 1, 1);
+        s.response_in = dev_channel_port(sys, 0, 1);
+        s.request_out = dev_channel_port(sys, 1, 1);
         s.retention_out = dev_channel_port(sys, 1, 2);
         s.metrics_out = dev_channel_port(sys, 1, 3);
         parse_tlv(s, params, params_len);
@@ -298,23 +301,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     let mut io = ShellIo {
         sys,
         kv_out: s.kv_out,
-        publish_out: s.publish_out,
+        request_out: s.request_out,
         retention_out: s.retention_out,
     };
 
-    // 1. Drain acks (bounded).
+    // 1. Drain the sink's answers (bounded): one exchange record per read.
     for _ in 0..8 {
-        let mut buf = [0u8; 32];
-        let Some((mt, len)) = (unsafe { read_envelope(sys, s.ack_in, &mut buf) }) else {
+        if s.response_in < 0 {
             break;
-        };
-        if mt != MSG_ACK {
-            continue;
         }
-        let Some(ack) = Ack::decode(&buf[..len]) else {
-            continue;
+        let n = unsafe {
+            let poll = (sys.channel_poll)(s.response_in, POLL_IN);
+            if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+                break;
+            }
+            (sys.channel_read)(s.response_in, s.resp.as_mut_ptr(), RECORD_MAX)
         };
-        s.core.on_sink_ack(&mut io, &ack);
+        if n <= 0 {
+            break;
+        }
+        s.core.on_response(&mut io, now, &s.resp[..n as usize]);
     }
 
     // 2. Drain the KV response (one outstanding at a time).

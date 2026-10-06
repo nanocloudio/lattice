@@ -140,3 +140,24 @@ pub fn pg_sasl_has_scram_sha256(body: &[u8]) -> bool {
 pub fn pg_ready_status(body: &[u8]) -> Option<u8> {
     body.first().copied()
 }
+
+/// The human-readable message (`M` field) of an ErrorResponse (`E`) body —
+/// a run of `[code:u8][text\0]` fields closed by a lone `\0` — as a byte
+/// range into `body`. `None` when the body carries no `M` field or is
+/// truncated.
+pub fn pg_error_message(body: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    while i < body.len() {
+        let code = body[i];
+        if code == 0 {
+            return None;
+        }
+        let start = i + 1;
+        let len = body.get(start..)?.iter().position(|&b| b == 0)?;
+        if code == b'M' {
+            return Some((start, start + len));
+        }
+        i = start + len + 1;
+    }
+    None
+}

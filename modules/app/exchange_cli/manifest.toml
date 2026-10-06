@@ -1,0 +1,44 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# exchange_cli — a REQUESTER of the fluxor exchange contract for the
+# standalone client examples (examples/*_client/linux.yaml): each record
+# on `body_in` (one stdin chunk from the linux `cli_in` built-in) becomes
+# one request whose body it is, sent whole in the HEAD; each answer is
+# written to `text_out` as text — the body and a newline for a 200, else
+# `<status> <body>` and a newline — and each LINK record as a `LINK DOWN`
+# or `LINK UP` line. One exchange in flight at a time; one held across a
+# LINK DOWN is sent again after LINK UP.
+
+[[ports]]
+name = "body_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "response_in"
+index = 1
+direction = "input"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "text_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[observability]
+exempt = "example fixture: its text output is the observable the live client tests read"

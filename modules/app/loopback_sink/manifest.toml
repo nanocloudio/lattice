@@ -3,35 +3,44 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# The in-repo REFERENCE implementation of the
-# `stream.ordered_ack` capability (modules/common/cdc_wire.rs),
-# and the sink lattice's own CI runs the cdc_pump against so no gate
-# needs a broker. The "backend" is the module itself: a publish is
-# durably accepted the moment it is validated, and acked status 0 in
-# arrival order — which trivially satisfies contract terms 1 (ack =
-# durable acceptance at the strongest level this backend offers) and 2
-# (per-key order within a connection).
+# The in-repo REFERENCE implementation of the `stream.ordered_ack.sink`
+# capability, and the sink lattice's own CI runs the cdc_pump against so
+# no gate needs a broker. A PROVIDER of the fluxor exchange contract: each
+# request is a METHOD_PUBLISH exchange (target = ordering key, body = the
+# record). The "backend" is the module itself: a publish is durably
+# accepted the moment it is validated, and answered 200 in arrival order
+# — which trivially satisfies the capability's terms (200 = durable
+# acceptance at the strongest level this backend offers; per-key order
+# within a connection).
 #
-# Fault injection for pump conformance: `linkdown_every` acks, the
-# sink emits LINK_DOWN (invalidating every unacked corr) and, after
-# `linkdown_hold_steps`, LINK_UP — exercising the pump's mandatory
-# replay path. While down, arriving publishes are dropped WITHOUT ack:
-# they were already invalidated by the LINK_DOWN, which is exactly the
-# hole the replay rule exists to cover.
+# Fault injection for pump conformance: after every `linkdown_every`
+# acceptances the sink writes LINK DOWN (every exchange the pump holds
+# open becomes unknowable) and, after `linkdown_hold_steps`, LINK UP —
+# exercising the pump's mandatory re-issue path. Between the two, request
+# records are read and dropped unanswered: they were already invalidated
+# by the LINK DOWN, which is exactly the hole re-issuing exists to cover.
 
 capabilities = ["stream.ordered_ack.sink"]
 
-# MSG_CDC_PUBLISH `SinkPublish` frames from the pump.
-[[ports]]
-name = "publish_in"
-direction = "input"
-content_type = "OctetStream"
+[capability_facts."stream.ordered_ack.sink"]
+ack         = "durable"
+ordering    = "single"
+broadcast   = "degenerate"
+max_payload = 8192
 
-# MSG_CDC_ACK `SinkAck` frames (replies + link-state signals).
 [[ports]]
-name = "ack_out"
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 32768
+max_record = 8192
+
+[[ports]]
+name = "response_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
 name = "metrics"
@@ -41,7 +50,7 @@ content_type = "OctetStream"
 
 # ── Observability ──────────────────────────────────────────────────────
 # Declaration order IS the metric-id contract, append-only.
-# `delivered_key_hash` is a rolling FNV over (msg_key, payload) of every
+# `delivered_key_hash` is a rolling FNV over (target, body) of every
 # delivered publish — a content DIGEST the end-to-end tests compare
 # against the expected event stream without a second transport.
 [observability]

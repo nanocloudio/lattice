@@ -8,11 +8,50 @@
 //! instead of re-implementing it.
 //!
 //! Flow: connect -> saslStart(client-first) -> saslContinue(client-final) ->
-//! authenticated -> ping -> emit ok. Protocol logic in `scram_core.rs` +
-//! `mongo_core.rs`; this file is the I/O pump.
+//! authenticated -> ping -> ready. Protocol logic in `scram_core.rs` +
+//! `mongo_core.rs`, the exchange provider half in `query_exchange.rs`; this
+//! file is the I/O pump.
 //!
-//! Ports:  net_in/net_out (transport), status_out (auth/ping result).
-//! Params: `authority` (`host[:port]`, port 27017 when omitted), `user`, `database`, `password`.
+//! # Ports
+//!
+//! `net_in`/`net_out` (transport), `status_out` (auth/ping/insert status
+//! lines, TextPlain), and the exchange provider pair `request_in`
+//! (`ExchangeRequest`) / `response_out` (`ExchangeResponse`). A module with
+//! `request_in` wired and `response_out` unwired refuses to construct.
+//!
+//! # Params
+//!
+//! `authority` (`host[:port]`, port 27017 when omitted), `user`, `database`,
+//! `password`, `collection` (enables inserts; without it every request is
+//! refused 400 and the module only authenticates and pings).
+//!
+//! # Request
+//!
+//! Method POST; `target` empty; headers ignored; body = the value to insert,
+//! at least one byte, stored as `{ value: <body> }` (a BSON string) in
+//! `database.collection`; the whole insert command must fit 512 BSON bytes. Requests are performed one at a time, in arrival
+//! order, once the session is authenticated; until then they wait.
+//!
+//! # Answer
+//!
+//! One answer per request, no content type, no headers:
+//!
+//! | Status | When | Body |
+//! |---|---|---|
+//! | 200 | the server acknowledged the insert (`ok` set, no write errors) | empty |
+//! | 400 | the server refused the insert | its `errmsg` when the reply names one at top level, else empty |
+//! | 400 | another method, a non-empty target, an empty body, no `collection` configured | empty |
+//! | 413 | a body whose insert command exceeds 512 BSON bytes | empty |
+//! | 503 | four requests already held, or draining | empty |
+//! | 504 | no reply within 15 s (the connection is closed and reopened; the insert's effect is unknown) | empty |
+//!
+//! # LINK
+//!
+//! The module connects at boot and reconnects on its own after any failure
+//! (1 s, doubling to 30 s). Once the session has been ready, losing it writes
+//! LINK DOWN: every request held is dropped unanswered for the requester to
+//! re-issue, and request records are read and dropped until LINK UP, which
+//! the next ready session writes.
 
 #![no_std]
 #![allow(
@@ -50,6 +89,11 @@ include!("../../common/mongo_core.rs");
 mod authority;
 use authority::{Authority, PORT_MONGO};
 
+#[path = "../../common/query_exchange.rs"]
+mod query_exchange;
+use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::QueryDesk;
+
 use abi::contracts::net::net_proto::{
     conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
     CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
@@ -61,16 +105,29 @@ const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 1024;
 const ACC_BUF: usize = 8192;
 const NAME_BUF: usize = 128;
+/// Longest value one insert request carries; the BSON insert command it
+/// becomes must also fit its 512-byte build buffer.
+const VALUE_MAX: usize = 512;
+/// The answer body: a refusal's `errmsg`.
+const RESULT_MAX: usize = 512;
+/// Requests held at once: one performed, the rest queued in arrival order.
+const SLOTS: usize = 4;
+/// A request target is refused unless empty; this bounds what is read.
+const TARGET_MAX: usize = 64;
+const QUEUE: usize = 8;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const REPLY_TIMEOUT_MS: u64 = 15_000;
+const RETRY_MIN_MS: u64 = 1_000;
+const RETRY_MAX_MS: u64 = 30_000;
 
 #[repr(C)]
 struct MongoState {
     syscalls: *const SyscallTable,
     net_in: i32,
     net_out: i32,
-    publish_in: i32,
+    request_in: i32,
     status_out: i32,
+    response_out: i32,
 
     authority: Authority,
     user: [u8; NAME_BUF],
@@ -104,12 +161,23 @@ struct MongoState {
     authed: u32,
     errors: u32,
 
-    // INSERT-sink mode: when `collection` is set the module, once authenticated,
-    // inserts each publish_in message as `{ value: <msg> }` into the collection.
+    // Insert mode: when `collection` is set the module, once authenticated,
+    // inserts each request's body as `{ value: <body> }` into the collection.
     collection: [u8; NAME_BUF],
     collection_len: u16,
     inserting: u8,
     inserted: u32,
+
+    // The next connect attempt after a failure, and the current wait.
+    retry_at_ms: u64,
+    backoff_ms: u64,
+
+    desk: QueryDesk<SLOTS, TARGET_MAX, VALUE_MAX, QUEUE>,
+    outbox: ExchangeOutbox,
+    result: [u8; RESULT_MAX],
+    // The request record being read, and the response record being written.
+    rec: [u8; RECORD_MAX],
+    out: [u8; RECORD_MAX],
 }
 
 define_params! {
@@ -196,8 +264,9 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.net_in = in_chan;
         s.net_out = out_chan;
-        s.publish_in = dev_channel_port(sys, 0, 1);
+        s.request_in = dev_channel_port(sys, 0, 1);
         s.status_out = dev_channel_port(sys, 1, 1);
+        s.response_out = dev_channel_port(sys, 1, 2);
         s.authority.clear();
         s.user_len = 0;
         s.database_len = 0;
@@ -219,9 +288,18 @@ pub extern "C" fn module_new(
         s.collection_len = 0;
         s.inserting = 0;
         s.inserted = 0;
+        s.retry_at_ms = 0;
+        s.backoff_ms = RETRY_MIN_MS;
+        s.desk.reset(METHOD_POST, 0);
+        s.outbox = ExchangeOutbox::new();
         parse_tlv(s, params, params_len);
         if !s.authority.adopt(PORT_MONGO) {
             let m = b"[mongo] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
+        if s.request_in >= 0 && s.response_out < 0 {
+            let m = b"[mongo] refusing to construct: request_in is wired but response_out is not";
             dev_log(sys, 2, m.as_ptr(), m.len());
             return -1;
         }
@@ -326,6 +404,14 @@ unsafe fn feed(s: &mut MongoState, sys: &SyscallTable, ev: MEv, now: u64) {
             s.req_len = 0;
             s.req_sent = 0;
             s.errors = s.errors.wrapping_add(1);
+            s.retry_at_ms = now.wrapping_add(s.backoff_ms);
+            s.backoff_ms = (s.backoff_ms * 2).min(RETRY_MAX_MS);
+            // A session that had been ready is a LINK DOWN: whatever was
+            // held — an insert awaiting its ack included — is now the
+            // requester's to re-issue.
+            if s.desk.link_down() {
+                dev_log(sys, 2, b"[mongo] link down".as_ptr(), 17);
+            }
             emit_status(s, b"mongo: auth failed\n");
         }
         MAct::None => {}
@@ -405,7 +491,7 @@ unsafe fn on_reply(s: &mut MongoState, body: &[u8], now: u64) {
         MPhase::AwaitCommand => {
             if bson_ok(body) {
                 if s.inserting != 0 {
-                    // Insert-sink mode: skip idle-Ready, wait for messages.
+                    // Insert mode: skip idle-Ready, wait for requests.
                     emit_status(s, b"mongo: authenticated, insert ready\n");
                     s.phase = MPhase::InsertIdle;
                 } else {
@@ -416,14 +502,33 @@ unsafe fn on_reply(s: &mut MongoState, body: &[u8], now: u64) {
                 emit_status(s, b"mongo: ping failed\n");
                 s.phase = MPhase::Ready;
             }
+            // The session is ready: the link is up.
+            s.backoff_ms = RETRY_MIN_MS;
+            if s.desk.link_is_down() {
+                dev_log(sys, 3, b"[mongo] link up".as_ptr(), 15);
+            }
+            s.desk.link_up();
         }
         MPhase::InsertWait => {
-            if bson_ok(body) {
+            // Acknowledged only with `ok` set and no write errors; a reply
+            // carrying a `writeErrors` array reads as not-ok here, since
+            // the reader stops at the array.
+            if bson_ok(body) && bson_find(body, b"writeErrors").is_none() {
                 s.inserted = s.inserted.wrapping_add(1);
                 emit_status(s, b"mongo: inserted\n");
+                s.desk.finish(status::OK, 0);
             } else {
                 s.errors = s.errors.wrapping_add(1);
                 emit_status(s, b"mongo: insert failed\n");
+                let n = match bson_get_str(body, b"errmsg") {
+                    Some((a, b)) => {
+                        let n = (b - a).min(RESULT_MAX);
+                        s.result[..n].copy_from_slice(&body[a..a + n]);
+                        n
+                    }
+                    None => 0,
+                };
+                s.desk.finish(status::BAD_REQUEST, n);
             }
             s.phase = MPhase::InsertIdle;
         }
@@ -439,41 +544,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
 
-        // Authenticate on boot.
-        if s.phase == MPhase::Disconnected && s.draining == 0 && s.user_len > 0 {
+        // Answers first, then requests in.
+        flush_answers(s);
+        if s.draining == 1 {
+            s.desk.drain();
+        }
+        read_requests(s);
+
+        // Authenticate on boot, and again after a failure once its wait is
+        // over.
+        if s.phase == MPhase::Disconnected
+            && s.draining == 0
+            && s.user_len > 0
+            && now >= s.retry_at_ms
+        {
             feed(s, sys, MEv::Start, now);
         }
 
-        // Insert-sink: once authenticated, pull one message off publish_in and
-        // insert it as `{ value: <msg> }`. One in flight at a time.
-        if s.inserting != 0 && s.phase == MPhase::InsertIdle && s.publish_in >= 0 {
-            let poll = (sys.channel_poll)(s.publish_in, 0x01);
-            if poll > 0 && (poll as u32 & 0x01) != 0 {
-                let mut m = [0u8; 256];
-                let n = (sys.channel_read)(s.publish_in, m.as_mut_ptr(), m.len());
-                if n > 0 {
-                    let dl = s.database_len as usize;
-                    let mut db = [0u8; NAME_BUF];
-                    db[..dl].copy_from_slice(&s.database[..dl]);
-                    let cl = s.collection_len as usize;
-                    let mut coll = [0u8; NAME_BUF];
-                    coll[..cl].copy_from_slice(&s.collection[..cl]);
-                    s.req_id = s.req_id.wrapping_add(1);
-                    let mut out = [0u8; REQ_BUF];
-                    if let Some(bn) = mongo_insert_body(
-                        s.req_id,
-                        &db[..dl],
-                        &coll[..cl],
-                        &m[..n as usize],
-                        &mut out,
-                    ) {
-                        s.req[..bn].copy_from_slice(&out[..bn]);
-                        stage_send(s, bn, now);
-                        s.phase = MPhase::InsertWait;
-                    }
-                }
-            }
-        }
+        // Inserts: once authenticated, perform the oldest complete request.
+        // One in flight at a time.
+        take_request(s, now);
 
         // Connected → begin SASL.
         // Drain network events.
@@ -582,8 +672,33 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Timeouts on any in-flight exchange.
-        if !matches!(s.phase, MPhase::Disconnected | MPhase::Ready) {
+        // Timeouts. An insert the server has not acknowledged is answered
+        // 504 and its connection reopened; any other stalled phase is a
+        // lost session.
+        if s.phase == MPhase::InsertWait && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
+            s.desk.finish(status::TIMEOUT, 0);
+            s.errors = s.errors.wrapping_add(1);
+            if s.conn_id != 0 {
+                let close = s.conn_id.to_le_bytes();
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CLOSE,
+                    close.as_ptr(),
+                    CONN_ID_LEN,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
+            }
+            s.conn_id = 0;
+            s.acc_len = 0;
+            s.req_len = 0;
+            s.req_sent = 0;
+            s.phase = MPhase::Disconnected;
+        } else if !matches!(
+            s.phase,
+            MPhase::Disconnected | MPhase::Ready | MPhase::InsertIdle
+        ) {
             let budget = if s.phase == MPhase::Connecting {
                 CONNECT_TIMEOUT_MS
             } else {
@@ -594,8 +709,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        flush_answers(s);
+
         // Drain.
-        if s.draining == 1 && matches!(s.phase, MPhase::Disconnected | MPhase::Ready) {
+        if s.draining == 1
+            && s.desk.idle()
+            && !s.outbox.holding()
+            && matches!(
+                s.phase,
+                MPhase::Disconnected | MPhase::Ready | MPhase::InsertIdle
+            )
+        {
             if s.conn_id != 0 {
                 let close = s.conn_id.to_le_bytes();
                 net_write_frame(
@@ -613,4 +737,85 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         0
     }
+}
+
+/// Place owed response records until the port is full or nothing is owed.
+unsafe fn flush_answers(s: &mut MongoState) {
+    let sys = &*s.syscalls;
+    if s.response_out < 0 {
+        return;
+    }
+    loop {
+        if !s.outbox.flush(sys, s.response_out, &s.out) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&s.result, &mut s.out) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out, &s.out, n) {
+            return;
+        }
+    }
+}
+
+/// Read request records while the desk can take them; after a LINK DOWN,
+/// read and drop them until the LINK UP is away.
+unsafe fn read_requests(s: &mut MongoState) {
+    let sys = &*s.syscalls;
+    if s.request_in < 0 {
+        return;
+    }
+    loop {
+        let discarding = s.desk.discarding();
+        if !discarding && !s.desk.can_take() {
+            return;
+        }
+        let poll = (sys.channel_poll)(s.request_in, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            return;
+        }
+        let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), RECORD_MAX);
+        if n <= 0 {
+            return;
+        }
+        if !discarding {
+            s.desk.accept(&s.rec[..n as usize]);
+        }
+    }
+}
+
+/// Perform the oldest complete request: refused at once without a
+/// `collection`, otherwise inserted when the session is idle.
+unsafe fn take_request(s: &mut MongoState, now: u64) {
+    if s.inserting != 0 && s.phase != MPhase::InsertIdle {
+        return;
+    }
+    let Some(at) = s.desk.next_request() else {
+        return;
+    };
+    let Some((target, value)) = s.desk.request(at).map(|r| (r.target.len(), r.body)) else {
+        return;
+    };
+    if s.inserting == 0 || target != 0 || value.is_empty() {
+        s.desk.refuse(at, status::BAD_REQUEST);
+        return;
+    }
+    let dl = s.database_len as usize;
+    let cl = s.collection_len as usize;
+    let mut out = [0u8; REQ_BUF];
+    let Some(bn) = mongo_insert_body(
+        s.req_id.wrapping_add(1),
+        &s.database[..dl],
+        &s.collection[..cl],
+        value,
+        &mut out,
+    ) else {
+        s.desk.refuse(at, status::TOO_LARGE);
+        return;
+    };
+    s.req_id = s.req_id.wrapping_add(1);
+    s.req[..bn].copy_from_slice(&out[..bn]);
+    stage_send(s, bn, now);
+    s.phase = MPhase::InsertWait;
+    s.desk.start(at);
 }
