@@ -468,6 +468,19 @@ define_params! {
                 s.scoped_len = len as u16;
             }
         };
+
+    // A store provider's volume: with one it is a keyed provider of
+    // storage.object and storage.namespace, reached by that name's selector,
+    // leaving the graph's default providers to others (Loam's, beside it).
+    // Empty: the default provider.
+    19, volume, str, 0
+        => |s, d, len| {
+            if len > 0 && len <= 32 {
+                // SAFETY: the params TLV names `len` bytes at `d`.
+                let src = unsafe { core::slice::from_raw_parts(d, len) };
+                s.selector = abi::kernel_abi::provider_selector::hash(src);
+            }
+        };
 }
 
 /// Steps between chunk sweeps while writes may have queued chunk work.
@@ -829,6 +842,8 @@ struct WorkerState {
     scope_name_len: u8,
     scoped: [u8; 512],
     scoped_len: u16,
+    /// `provider_selector::hash(volume)`, or 0: the default provider.
+    selector: u32,
 
     /// `command_log` param, and the log's life: off, replaying its tail
     /// after recovery, or live (every applied op logged).
@@ -2042,13 +2057,34 @@ unsafe fn apply_to_store(
             body,
         };
         let frozen = worker.disk_state.last_freeze();
-        match worker.clog.append(
+        let mut appended = worker.clog.append(
             &mut worker.fs_storage,
             &rec,
             revision_before,
             frozen,
             !worker.clog_defer,
-        ) {
+        );
+        // Every segment is taken: reclaim those the runs already hold (as
+        // the step's maintenance would) and try once more. A writer that
+        // keeps the store busy for many flushes inside one step reaches
+        // this before any step runs maintenance. `Full` is answered before
+        // a byte is written, so the retry appends the record once.
+        if appended == Err(command_log::LogError::Full) {
+            let durable = worker.disk_state.durable_highest_revision;
+            if durable > worker.clog_reclaimed
+                && worker.clog.reclaim(&mut worker.fs_storage, durable).is_ok()
+            {
+                worker.clog_reclaimed = durable;
+                appended = worker.clog.append(
+                    &mut worker.fs_storage,
+                    &rec,
+                    revision_before,
+                    frozen,
+                    !worker.clog_defer,
+                );
+            }
+        }
+        match appended {
             Ok(()) => worker.clog_appends = worker.clog_appends.wrapping_add(1),
             Err(_) => {
                 log_disk_errno(
@@ -3467,6 +3503,18 @@ unsafe fn import_logged(worker: &WorkerState) {
     let mut n = write_prefix(&mut buf, 0, b"[kvw] store.log imported n=");
     n = write_dec(&mut buf, n, worker.prov.import_n);
     log_line(worker, &buf, n);
+}
+
+/// The selector this store provider answers to (its `volume`), or 0.
+#[cfg(feature = "store_provider")]
+#[no_mangle]
+#[link_section = ".text.module_provider_selector"]
+pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
+    if state.is_null() {
+        return 0;
+    }
+    // SAFETY: the loader passes this module's own initialised state.
+    unsafe { (*state.cast::<WorkerState>()).selector }
 }
 
 /// `[0x14, 0x13]`: objects and their namespace, from one store — or

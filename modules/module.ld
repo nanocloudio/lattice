@@ -30,6 +30,14 @@ SECTIONS
         KEEP(*(.text.module_arena_size*))
         KEEP(*(.text.module_provider_dispatch*))
         KEEP(*(.text.module_provides_contract*))
+        /* Instance selector for a keyed provider, and the owner-release
+         * subscription marker. Both are resolved by the loader through
+         * `get_export_addr`, so nothing in the module references them and
+         * --gc-sections discards them unless they are kept here. */
+        KEEP(*(.text.module_provider_selector*))
+        KEEP(*(.text.module_observes_owner_release*))
+        KEEP(*(.text.module_pipeline_refill*))
+        KEEP(*(.text.module_post_tick_flush*))
         KEEP(*(.text.module_flash_store_dispatch*))
         KEEP(*(.text.module_isr_init*))
         KEEP(*(.text.module_isr_entry*))
