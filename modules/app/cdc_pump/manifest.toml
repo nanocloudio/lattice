@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The egress pump. Reads committed change-feed windows from the KV
 # surface (an ordinary anchor-pair client — no privileged read path),

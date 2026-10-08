@@ -45,6 +45,7 @@ big     | feature = "big"
 | Disk value record | Shape | `MAX_VALUE_LEN` | modules/common/disk_store.rs | — | Derived as 4150 bytes to include metadata around the 4096-byte public value. |
 | Memtable entries | Capacity | `MEMTABLE_MAX_ENTRIES` | modules/common/disk_store.rs | 512 | Backpressures mutation while flush catches up. |
 | Memtable flush watermark | Pacing | `MEMTABLE_FLUSH_WATERMARK` | modules/common/disk_store.rs | 384 | Starts flush early; not a refusal ceiling. |
+| Run-block cache | Capacity | `BLOCK_CACHE_SLOTS` | modules/common/disk_store.rs | 8 | Blocks of immutable runs kept for re-reads (~37 KiB of state); covers a replicated write's own bookkeeping reads. |
 | Version-scan blocks per step | Pacing | `SCAN_STEP_BLOCKS` | modules/common/disk_store.rs | 2 | The walk pauses holding its position; the worker re-drives it next step. Bounds run-file I/O per step, not the window. |
 | Version-scan records per step | Pacing | `SCAN_STEP_RECORDS` | modules/common/disk_store.rs | — | Derived as `MEMTABLE_MAX_ENTRIES` (512); bounds the memtable-resident part of a walk, which loads no blocks. |
 | Parked version-scan page | Capacity | `SCAN_PAGE_MAX` | modules/common/disk_store.rs | 8192 | The reply prefix kept across a pause. The engine caps every page at this budget, so a park can never be refused; the cap therefore bounds one command's reply, not a refusal path. |
@@ -530,6 +531,7 @@ MAX_ENCODED_KEY | modules/common/disk_store.rs | -
 MAX_VALUE_LEN | modules/common/disk_store.rs | -
 MEMTABLE_MAX_ENTRIES | modules/common/disk_store.rs | 512
 MEMTABLE_FLUSH_WATERMARK | modules/common/disk_store.rs | 384
+BLOCK_CACHE_SLOTS | modules/common/disk_store.rs | 8
 SCAN_STEP_BLOCKS | modules/common/disk_store.rs | 2
 SCAN_STEP_RECORDS | modules/common/disk_store.rs | -
 SCAN_PAGE_MAX | modules/common/disk_store.rs | 8192

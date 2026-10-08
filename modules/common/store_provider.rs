@@ -379,6 +379,12 @@ impl Scope {
 pub struct Provider {
     slots: [Slot; SLOTS],
     subs: [Sub; SUBSCRIPTIONS],
+    /// Delivery, counted (telemetry): pumps whose history read came back
+    /// incomplete (every subscriber then told LOST), events told, events a
+    /// subscriber's channel refused.
+    pub m_pump_partial: u32,
+    pub m_told: u32,
+    pub m_refused: u32,
     /// The revision subscribers have been told of.
     seen: u64,
     /// The store is serving: subscribers are told of changes from `seen`
@@ -400,6 +406,9 @@ impl Provider {
         Provider {
             slots: [NO_SLOT; SLOTS],
             subs: [NO_SUB; SUBSCRIPTIONS],
+            m_pump_partial: 0,
+            m_told: 0,
+            m_refused: 0,
             seen: 0,
             opened: false,
             cached: 0,
@@ -508,6 +517,11 @@ impl Provider {
             held: held as u32,
             in_log: in_log as u32,
             uploaded: if r.upload_for != 0 { r.upload.fed() } else { 0 },
+            step: r.step,
+            reg_tries: r.reg_tries,
+            reg_sent: r.reg_sent,
+            reg_seen: r.reg_seen,
+            reg_miss: r.reg_miss,
         }
     }
 }
@@ -524,6 +538,12 @@ pub struct ReplicaReport {
     pub in_log: u32,
     /// Bytes of the value being uploaded fed so far (0: none).
     pub uploaded: u64,
+    /// Origin steps taken, and registration as counted in `Replication`.
+    pub step: u32,
+    pub reg_tries: u32,
+    pub reg_sent: u32,
+    pub reg_seen: u32,
+    pub reg_miss: u32,
 }
 
 impl Default for Provider {
@@ -847,8 +867,12 @@ fn upload<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, value: &[u8]) -> Result<Ma
                 bufs.req.get(..p).ok_or(ERROR)?,
                 bufs.ans,
             );
+            // A store making room refuses the chunk for now, as it refuses
+            // a commit: not yet, so asked again (`EAGAIN` would say an etag
+            // was lost). The chunks already sent are stored, so the same
+            // value uploaded again resends them as no-ops.
             if r != KV_RESULT_OK {
-                return Err(ERROR);
+                return Err(if b.busy() { EINPROGRESS } else { ERROR });
             }
         }
         if fed == value.len() {
@@ -919,7 +943,8 @@ fn txn(
 fn commit<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, len: usize, put: bool) -> Result<bool, i32> {
     let (r, n) = b.apply(KV_OP_TXN, bufs.req.get(..len).ok_or(EINVAL)?, bufs.ans);
     if r != KV_RESULT_TXN {
-        return Err(if b.busy() { EAGAIN } else { ERROR });
+        // Not applied: a store making room takes it when asked again.
+        return Err(if b.busy() { EINPROGRESS } else { ERROR });
     }
     // `[succeeded u8][op_count u16]`, then each op's `[result][len u16]
     // [answer]`: a write is one op, and it must have done what it said.
@@ -1836,6 +1861,7 @@ pub fn pump<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>) {
         pv.cached = 0;
         let whole = feed(pv, b, bufs, now);
         if !whole {
+            pv.m_pump_partial = pv.m_pump_partial.wrapping_add(1);
             // What happened is not (or no longer) wholly readable here:
             // every subscriber reads again.
             for s in pv.subs.iter_mut().filter(|s| s.used) {
@@ -1909,7 +1935,10 @@ fn feed<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, now: u64)
             } else {
                 event_to(s, b, walk.req, rev, kind, key, val)
             };
-            if !told {
+            if told {
+                pv.m_told = pv.m_told.wrapping_add(1);
+            } else {
+                pv.m_refused = pv.m_refused.wrapping_add(1);
                 s.lost = true;
             }
         }
@@ -2113,6 +2142,12 @@ struct Replication {
     /// A registration has been offered, last at step `register_at`.
     register_offered: bool,
     register_at: u32,
+    /// Registration, counted (telemetry): offers tried, offers the log
+    /// took, our REGISTERs seen applied, and of them nonce mismatches.
+    reg_tries: u32,
+    reg_sent: u32,
+    reg_seen: u32,
+    reg_miss: u32,
     /// The seq the next write takes (`u32::MAX`: none left in this
     /// incarnation).
     next_seq: u32,
@@ -2144,6 +2179,10 @@ const NO_REPLICATION: Replication = Replication {
     superseded: false,
     register_offered: false,
     register_at: 0,
+    reg_tries: 0,
+    reg_sent: 0,
+    reg_seen: 0,
+    reg_miss: 0,
     next_seq: 0,
     hwm: 0,
     step: 0,
@@ -2525,6 +2564,10 @@ pub fn origin_applied(pv: &mut Provider, a: &origin::Applied) {
             inc,
             nonce,
         } if replica == rep.replica => {
+            rep.reg_seen = rep.reg_seen.wrapping_add(1);
+            if nonce != rep.nonce {
+                rep.reg_miss = rep.reg_miss.wrapping_add(1);
+            }
             if nonce == rep.nonce {
                 registered(rep, inc);
             } else if rep.registered {
@@ -2679,7 +2722,9 @@ pub fn origin_step<B: Backend>(pv: &mut Provider, b: &mut B) {
     let since_register = rep.step.wrapping_sub(rep.register_at);
     if !rep.registered && (!rep.register_offered || since_register >= REOFFER_STEPS) {
         let corr = origin::corr(rep.replica, 0, 0);
+        rep.reg_tries = rep.reg_tries.wrapping_add(1);
         if b.propose(KV_OP_ORIGIN_REGISTER, corr, &[&rep.nonce.to_le_bytes()]) {
+            rep.reg_sent = rep.reg_sent.wrapping_add(1);
             rep.register_offered = true;
             rep.register_at = rep.step;
         }

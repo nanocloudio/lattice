@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Owns `kv_compaction_floor_revision`, watch retention floors, and
 # application-side compaction policy. Emits generic retention-floor

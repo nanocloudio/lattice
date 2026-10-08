@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Protocol"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 timer_class      = "wall_clock"
 
 # A provider of the exchange contract: each request's body is one SQL

@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Deterministic KPG KV state machine. Owns `revision`,
 # `create_revision`, `mod_revision`, `version`, CAS fences,

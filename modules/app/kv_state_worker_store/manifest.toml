@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 provides         = ["storage.object", "storage.namespace"]
 # mod.rs is a SYMLINK to ../kv_state_worker/mod.rs: the same source, built
 # with `store_provider`. (A symlink, not an `entry` outside this directory:

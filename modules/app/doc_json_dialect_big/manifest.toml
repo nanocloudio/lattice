@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 # mod.rs is a SYMLINK to ../doc_json_dialect/mod.rs: the same source,
 # built with `big`, for documents past one channel frame up to the
 # executor big twin's bound (1.5 MiB). Its whole-document buffers are one

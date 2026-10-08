@@ -45,7 +45,7 @@
 //!
 //! The footer carries a 1 KiB per-run Bloom filter over record key
 //! PREFIXES. Without it a point lookup scanned a
-//! run's blocks sequentially — `Merge::init` opens each run and reads
+//! run's blocks sequentially — `Merge::fill_filtered` opens each run and reads
 //! forward to the start bound — and on FAT32/NVMe the rig measured ONE
 //! such command at 11-15 ms against a single run, past the burst
 //! ceiling and therefore unbounded by any per-step drain budget. See
@@ -208,12 +208,14 @@ pub const BATCH_HDR_LEN: usize = 8;
 
 /// "LRUN" — run file magic.
 pub const RUN_MAGIC: u32 = 0x4C52_554E;
+/// The run header's format tag: a sanity check that fails a garbage file
+/// closed, not a compatibility axis — the layout changes in place.
 pub const RUN_FORMAT_VERSION: u16 = 1;
 
 // ── Per-run Bloom filter ──────────────────────────────────────────────
 //
 // WHY. Without the filter a point lookup costs a sequential block
-// scan of every run: `Merge::init` opens each run and reads forward
+// scan of every run: `Merge::fill_filtered` opens each run and reads forward
 // until it reaches
 // the start bound. On FAT32/NVMe each block read is a synchronous
 // sector read plus a cluster-chain walk, and the rig measured a SINGLE
@@ -273,12 +275,19 @@ pub const RUN_FORMAT_VERSION: u16 = 1;
 // scan by a block or two, which is a cost, never a wrong answer. The
 // index can only ever narrow where the scan STARTS; the scan itself
 // still decides the result.
+//
+// DENSITY. An API server's keys share long prefixes — `/events/default/
+// ...`, `/replicasets.apps/default/...` — so an index whose entries keep
+// too few key bytes ties across a whole region, the seek lands at the
+// region's head, and a lookup walks it: with 32 entries of 20 escaped
+// user-key bytes, one event in a 3,000-event run cost 141 blocks, every
+// block a synchronous device read on bare metal. 256 entries of 64
+// escaped user-key bytes put the same lookup at one block.
 /// Entries in one run's sparse index.
-pub const SPARSE_INDEX_ENTRIES: usize = 32;
+pub const SPARSE_INDEX_ENTRIES: usize = 256;
 /// Bytes of the encoded key stored per entry. `IDENTITY_PREFIX_LEN` is
-/// 12, so this keeps 20 bytes of escaped user key — enough to separate
-/// realistic keys while keeping the footer at a few sectors.
-pub const INDEX_KEY_BYTES: usize = 32;
+/// 12, so this keeps 64 bytes of escaped user key.
+pub const INDEX_KEY_BYTES: usize = 76;
 /// `[block_off:u32][key_prefix:INDEX_KEY_BYTES]`
 pub const INDEX_ENTRY_LEN: usize = 4 + INDEX_KEY_BYTES;
 /// `[count:u32][stride:u32]` then the entries.
@@ -754,8 +763,12 @@ fn normalize_revision(revision: Revision) -> u64 {
     }
 }
 
-fn map_storage(_e: StorageError) -> StoreError {
-    StoreError::StorageFault
+fn map_storage(e: StorageError) -> StoreError {
+    match e {
+        // Not a fault: the provider continues the call next step.
+        StorageError::Again => StoreError::Backpressure,
+        _ => StoreError::StorageFault,
+    }
 }
 
 /// Create `(kind, id)` for a *fresh* write, tolerating the debris of an
@@ -788,6 +801,9 @@ fn create_fresh<S: RunStorage + ?Sized>(
             }
             storage.create(kind, id).map_err(map_storage)
         }
+        // `Again` maps to Backpressure: the flush is not started, stays
+        // wanted, and the next step asks the same create again — which is
+        // what lets a provider's saved directory scan continue.
         Err(e) => Err(map_storage(e)),
     }
 }
@@ -1178,6 +1194,26 @@ struct FlushState {
 /// exists for explicit reuse.
 #[repr(C)]
 pub struct DiskState {
+    /// The last step `recover` was on (telemetry `rr=`): 0 once it
+    /// succeeded, else the step it refused at — 1 manifest slots, 2 run
+    /// listing, 3 a referenced run absent, 4x `verify_run` (41 too
+    /// short, 42 header, 43 read, 44 CRC, 45 trailing bytes, 46 footer),
+    /// 5 orphan delete, 6 filter load, 7 unpublished-run delete, 8 the
+    /// record walk. A quarantine with no errno is explained by this.
+    pub recover_refusal: u32,
+    /// The run a manifest named that the listing did not hold (`rm=`),
+    /// how many runs the listing held (`rl=`), and how many times
+    /// recovery served the OTHER manifest slot because the higher
+    /// generation's runs did not validate (`rf=`).
+    pub recover_missing_id: u32,
+    pub recover_listed: u32,
+    pub recover_fallbacks: u32,
+    /// What the last recovery found in each manifest slot (A, B):
+    /// `verdict | (generation << 4)`, verdict 0 untried, 1 absent, 2 short,
+    /// 3 magic/version, 4 run count, 5 short for its entries, 6 CRC, 7 valid
+    /// (telemetry `ma=`/`mb=`), and the highest run id it names (`ra=`/`rb=`).
+    pub manifest_seen: [core::cell::Cell<u32>; 2],
+    pub manifest_runs: [core::cell::Cell<u32>; 2],
     pub mem_count: u32,
     pub run_count: u32,
     pub next_run_id: u32,
@@ -1309,7 +1345,13 @@ pub struct DiskState {
     /// keeps the verified block it last read, so a hot key read again
     /// parses its blocks where they lie. Behind a cell because a point
     /// read borrows the state shared; no point read nests another.
+    /// Lent, between reads, to the whole-store walks (recovery, snapshot
+    /// capture, compaction), which run no point read inside them: no
+    /// merge is ever built on the stack, where two of them would outgrow
+    /// a bare-metal kernel stack.
     point: UnsafeCell<Merge>,
+    /// The last blocks read from runs (see [`BlockCache`]).
+    pub block_cache: BlockCache,
     pub entries: [MemEntry; MEMTABLE_MAX_ENTRIES],
 }
 
@@ -1556,7 +1598,7 @@ impl DiskState {
         self.memo_valid = false;
     }
 
-    /// Diagnostic counter bumps. `Merge::init` takes `&DiskState`
+    /// Diagnostic counter bumps. `Merge::fill_filtered` takes `&DiskState`
     /// (reads must not require exclusive access), so the counters are
     /// `Cell`s — interior mutability, not a cast through a shared
     /// reference, which would be UB and which the optimiser is entitled
@@ -1583,7 +1625,74 @@ impl DiskState {
             order: &self.order,
             entries: &self.entries,
             blocks_read: &self.blocks_read,
+            cache: &self.block_cache,
         }
+    }
+
+    /// The version scan's memo, and the sources its merge opens from.
+    fn scan_parts(&mut self) -> (&mut ScanState, MergeSources<'_>) {
+        let Self {
+            scan,
+            mem_count,
+            order,
+            entries,
+            blocks_read,
+            run_count,
+            runs,
+            run_index,
+            scans_opened,
+            block_cache,
+            ..
+        } = self;
+        (
+            scan,
+            MergeSources {
+                mem: MemView {
+                    count: *mem_count as usize,
+                    order,
+                    entries,
+                    blocks_read,
+                    cache: block_cache,
+                },
+                run_count: *run_count as usize,
+                runs,
+                run_index,
+                scans_opened,
+            },
+        )
+    }
+
+    /// The range read's memo, and the sources its merge opens from.
+    fn range_parts(&mut self) -> (&mut RangeMemo, MergeSources<'_>) {
+        let Self {
+            range,
+            mem_count,
+            order,
+            entries,
+            blocks_read,
+            run_count,
+            runs,
+            run_index,
+            scans_opened,
+            block_cache,
+            ..
+        } = self;
+        (
+            range,
+            MergeSources {
+                mem: MemView {
+                    count: *mem_count as usize,
+                    order,
+                    entries,
+                    blocks_read,
+                    cache: block_cache,
+                },
+                run_count: *run_count as usize,
+                runs,
+                run_index,
+                scans_opened,
+            },
+        )
     }
 
     /// The slot the next publish writes into: never the active one.
@@ -1717,6 +1826,86 @@ impl DiskState {
     }
 }
 
+// ── Run-block cache ───────────────────────────────────────────────────
+//
+// A run is immutable: a block at an offset of a run (id + digest) never
+// changes, so the last few blocks read may be kept and handed back
+// without a storage call. The call is what a lookup costs on the board —
+// ~0.7 ms per block on FAT32/NVMe — and a replicated write's bookkeeping
+// reads of a hot key are the same block over and over: 9–20 blocks per
+// write, 5–15 ms, past the step budget. Eight blocks is ~37 KiB of state
+// and covers a write's own reads.
+
+/// Blocks the cache keeps.
+pub const BLOCK_CACHE_SLOTS: usize = 8;
+
+/// One cached block: the whole stored block (header, payload, CRC) as it
+/// was read and verified. `run_id == 0` is an empty slot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CachedBlock {
+    run_id: u32,
+    run_digest: u32,
+    off: u64,
+    len: u32,
+    buf: [u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
+}
+
+/// The cache. Interior mutability through `UnsafeCell`, as `point` is
+/// held: the only reader and writer is `RunScan::next`, which never
+/// re-enters, and the store is single-threaded.
+#[repr(C)]
+pub struct BlockCache {
+    slots: UnsafeCell<[CachedBlock; BLOCK_CACHE_SLOTS]>,
+    next: Cell<u8>,
+    /// Blocks served from the cache (the `disk hb` reports it beside
+    /// `bl`, the blocks that went to storage).
+    pub hits: Cell<u64>,
+}
+
+impl BlockCache {
+    /// The block at `off` of run `(id, digest)` into `dst`, if cached:
+    /// the stored length.
+    fn get(&self, run_id: u32, run_digest: u32, off: u64, dst: &mut [u8]) -> Option<usize> {
+        if run_id == 0 {
+            return None;
+        }
+        // SAFETY: see the type; no other reference to the slots exists
+        // while this one does.
+        let slots = unsafe { &*self.slots.get() };
+        for s in slots.iter() {
+            if s.run_id == run_id && s.run_digest == run_digest && s.off == off {
+                let n = s.len as usize;
+                if n > dst.len() || n > s.buf.len() {
+                    return None;
+                }
+                dst[..n].copy_from_slice(&s.buf[..n]);
+                self.hits.set(self.hits.get().wrapping_add(1));
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// Keep a verified block; the oldest slot goes.
+    fn put(&self, run_id: u32, run_digest: u32, off: u64, block: &[u8]) {
+        if run_id == 0 || block.is_empty() {
+            return;
+        }
+        // SAFETY: as `get`.
+        let slots = unsafe { &mut *self.slots.get() };
+        let i = (self.next.get() as usize) % BLOCK_CACHE_SLOTS;
+        let s = &mut slots[i];
+        let n = block.len().min(s.buf.len());
+        s.run_id = run_id;
+        s.run_digest = run_digest;
+        s.off = off;
+        s.len = n as u32;
+        s.buf[..n].copy_from_slice(&block[..n]);
+        self.next.set(((i + 1) % BLOCK_CACHE_SLOTS) as u8);
+    }
+}
+
 // ── Run-file sequential reader ────────────────────────────────────────
 
 /// Cursor over one run file's records, loading and CRC-checking one
@@ -1736,6 +1925,9 @@ struct RunScan {
     cur_rec_idx: u32,
     next_block_off: u64,
     data_end: u64,
+    /// The run file's length: the clamp for a block read's speculative
+    /// length.
+    file_end: u64,
     payload_len: usize,
     pos: usize,
     key_off: usize,
@@ -1771,6 +1963,7 @@ impl RunScan {
             cur_rec_idx: u32::MAX,
             next_block_off: 0,
             data_end: 0,
+            file_end: 0,
             payload_len: 0,
             pos: 0,
             key_off: 0,
@@ -1798,6 +1991,7 @@ impl RunScan {
         rs.run_id = meta.id;
         rs.run_digest = meta.digest;
         rs.data_end = meta.file_len.saturating_sub(RUN_FOOTER_LEN as u64);
+        rs.file_end = meta.file_len;
         rs.next_block_off = if start_off >= RUN_HDR_LEN as u64 && start_off < rs.data_end {
             start_off
         } else {
@@ -1821,6 +2015,7 @@ impl RunScan {
         self.cur_rec_idx = u32::MAX;
         self.next_block_off = 0;
         self.data_end = 0;
+        self.file_end = 0;
         self.payload_len = 0;
         self.pos = 0;
         self.key_off = 0;
@@ -1835,6 +2030,7 @@ impl RunScan {
         self.run_id = meta.id;
         self.run_digest = meta.digest;
         self.data_end = meta.file_len.saturating_sub(RUN_FOOTER_LEN as u64);
+        self.file_end = meta.file_len;
         self.next_block_off = if start_off >= RUN_HDR_LEN as u64 && start_off < self.data_end {
             start_off
         } else {
@@ -1870,6 +2066,7 @@ impl RunScan {
         block_off: u64,
         rec_idx: u32,
         storage: &S,
+        cache: &BlockCache,
     ) -> Result<Self, StoreError> {
         if block_off == u64::MAX {
             return Ok(Self::idle());
@@ -1882,7 +2079,7 @@ impl RunScan {
         if rec_idx != u32::MAX {
             let mut advanced = 0u64;
             while advanced <= u64::from(rec_idx) {
-                if !rs.next(storage)? {
+                if !rs.next(storage, cache)? {
                     return Err(StoreError::StorageFault);
                 }
                 advanced += 1;
@@ -1910,7 +2107,7 @@ impl RunScan {
 
     /// Advance to the next record; `Ok(false)` = exhausted. Fails
     /// closed on any block CRC mismatch or malformed record framing.
-    fn next<S: RunStorage>(&mut self, storage: &S) -> Result<bool, StoreError> {
+    fn next<S: RunStorage>(&mut self, storage: &S, cache: &BlockCache) -> Result<bool, StoreError> {
         if self.exhausted {
             self.has_cur = false;
             return Ok(false);
@@ -1949,21 +2146,30 @@ impl RunScan {
             // FAT32/NVMe, rig-measured); separate header/payload/CRC
             // reads would triple the dominant cost of every run-backed
             // lookup, so the block travels in one.
-            let remaining =
-                (self.data_end + RUN_FOOTER_LEN as u64).saturating_sub(self.next_block_off);
+            let remaining = self.file_end.saturating_sub(self.next_block_off);
             let want = (BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD).min(remaining as usize);
             if want < BLOCK_OVERHEAD {
                 return Err(StoreError::StorageFault);
             }
             self.held_run = 0;
-            read_exact(
-                storage,
-                FileKind::Run,
+            // The cache first: a block it holds was verified when it
+            // was read, and costs no storage call now.
+            let cached = cache.get(
                 self.run_id,
+                self.run_digest,
                 self.next_block_off,
                 &mut self.buf[..want],
-            )?;
-            self.blocks_loaded = self.blocks_loaded.saturating_add(1);
+            );
+            if cached.is_none() {
+                read_exact(
+                    storage,
+                    FileKind::Run,
+                    self.run_id,
+                    self.next_block_off,
+                    &mut self.buf[..want],
+                )?;
+                self.blocks_loaded = self.blocks_loaded.saturating_add(1);
+            }
             let payload_len = rd_u32(&self.buf, 0) as usize;
             let rec_count = rd_u32(&self.buf, 4);
             if payload_len == 0 || payload_len > BLOCK_MAX_PAYLOAD || rec_count == 0 {
@@ -1976,6 +2182,14 @@ impl RunScan {
             let payload = 8..8 + payload_len;
             if crc32(&self.buf[payload.clone()]) != rd_u32(&self.buf, payload.end) {
                 return Err(StoreError::StorageFault);
+            }
+            if cached.is_none() {
+                cache.put(
+                    self.run_id,
+                    self.run_digest,
+                    self.next_block_off,
+                    &self.buf[..BLOCK_OVERHEAD + payload_len],
+                );
             }
             self.held_run = self.run_id;
             self.held_digest = self.run_digest;
@@ -2053,6 +2267,7 @@ struct MemView<'a> {
     order: &'a [u16; MEMTABLE_MAX_ENTRIES],
     entries: &'a [MemEntry; MEMTABLE_MAX_ENTRIES],
     blocks_read: &'a Cell<u64>,
+    cache: &'a BlockCache,
 }
 
 impl MemView<'_> {
@@ -2086,6 +2301,18 @@ impl MemView<'_> {
     }
 }
 
+/// What a merge is opened from: the memtable and the published runs —
+/// every part of the state but the merges themselves, so a merge the
+/// state holds is opened in place beside them ([`DiskState::scan_parts`],
+/// [`DiskState::range_parts`]).
+struct MergeSources<'a> {
+    mem: MemView<'a>,
+    run_count: usize,
+    runs: &'a [RunMeta; MAX_RUNS],
+    run_index: &'a [[u8; RUN_INDEX_BYTES]; MAX_RUNS],
+    scans_opened: &'a Cell<u64>,
+}
+
 /// `#[repr(C)]` + `Copy` because one instance is arena-resident: the
 /// version scan keeps its merge in `DiskState::scan` across steps, and
 /// the zeroed arena must be a valid (idle) value.
@@ -2099,32 +2326,6 @@ struct Merge {
 }
 
 impl Merge {
-    /// Position every source at its first record with key
-    /// `>= start_bound`. Each run is opened at the block its sparse
-    /// index names for the bound and advanced from there, so the
-    /// positioning cost is O(blocks that hold the bound), not O(blocks
-    /// before it).
-    fn init<S: RunStorage>(
-        state: &DiskState,
-        storage: &S,
-        include_mem: bool,
-        start_bound: &[u8],
-    ) -> Result<Self, StoreError> {
-        Self::init_filtered(state, storage, include_mem, start_bound, None)
-    }
-
-    fn init_filtered<S: RunStorage>(
-        state: &DiskState,
-        storage: &S,
-        include_mem: bool,
-        start_bound: &[u8],
-        point_key: Option<&[u8]>,
-    ) -> Result<Self, StoreError> {
-        let mut m = Self::idle();
-        m.fill_filtered(state, storage, include_mem, start_bound, point_key)?;
-        Ok(m)
-    }
-
     /// A merge with no source positioned: every run scan idle.
     const fn idle() -> Self {
         Self {
@@ -2135,9 +2336,14 @@ impl Merge {
         }
     }
 
-    /// [`Self::init_filtered`] into this merge, in place: a point read
-    /// positions its sources without building a merge (16 run scans,
-    /// each with its block) and copying it out.
+    /// Position every source at its first record with key
+    /// `>= start_bound`. Each run is opened at the block its sparse
+    /// index names for the bound and advanced from there, so the
+    /// positioning cost is O(blocks that hold the bound), not O(blocks
+    /// before it).
+    ///
+    /// In place, into a merge the state holds: no merge (16 run scans,
+    /// each with its block) is ever built on the stack and copied out.
     ///
     /// `point_key`: an EXACT-KEY probe (the full lookup prefix) — any run
     /// whose Bloom filter rules it out is skipped without a read. Only
@@ -2179,7 +2385,7 @@ impl Merge {
             // at", which is exactly the range-scan question. (The Bloom
             // pre-check above is the one point-only optimisation.)
             rs.reopen_at(&state.runs[i], idx_seek(&state.run_index[i], start_bound));
-            while rs.next(storage)? {
+            while rs.next(storage, &state.block_cache)? {
                 if rs.cur_key() >= start_bound {
                     break;
                 }
@@ -2197,29 +2403,29 @@ impl Merge {
     /// cost — up to one index stride of blocks per run — is paid inside
     /// the caller's step budget rather than up front. `include_runs =
     /// false` walks the memtable alone.
-    fn open_lazy<S: RunStorage>(
-        state: &DiskState,
+    ///
+    /// In place, into a merge the state holds: a merge is 16 run scans,
+    /// each with its block, and one built on the stack and moved into the
+    /// state cost two of them (~600 KiB) in the caller's frames — past a
+    /// bare-metal kernel stack when the read arrives as a provider call
+    /// inside another module's step.
+    fn open_lazy_in<S: RunStorage>(
+        &mut self,
+        src: &MergeSources<'_>,
         storage: &S,
         include_runs: bool,
         bound: &[u8],
-    ) -> Result<Self, StoreError> {
-        let mut m = Self {
-            include_mem: true,
-            mem_pos: state.mem_lower_bound(bound),
-            run_count: if include_runs {
-                state.run_count as usize
-            } else {
-                0
-            },
-            runs: [RunScan::idle(); MAX_RUNS],
-        };
-        for (i, rs) in m.runs.iter_mut().take(m.run_count).enumerate() {
-            state.bump_opened();
-            rs.reopen_at(&state.runs[i], idx_seek(&state.run_index[i], bound));
-            rs.next(storage)?;
-            state.add_blocks(rs.take_blocks());
+    ) -> Result<(), StoreError> {
+        self.include_mem = true;
+        self.mem_pos = src.mem.lower_bound(bound);
+        self.run_count = if include_runs { src.run_count } else { 0 };
+        for (i, rs) in self.runs.iter_mut().take(self.run_count).enumerate() {
+            src.scans_opened.set(src.scans_opened.get().wrapping_add(1));
+            rs.reopen_at(&src.runs[i], idx_seek(&src.run_index[i], bound));
+            rs.next(storage, src.mem.cache)?;
+            src.mem.add_blocks(rs.take_blocks());
         }
-        Ok(m)
+        Ok(())
     }
 
     /// Rebuild the compaction merge at the exact positions a paused
@@ -2228,28 +2434,30 @@ impl Merge {
     /// far the compaction has progressed. Ties re-resolve identically
     /// (memtable excluded, runs newest-first by index), so the resumed
     /// merge continues the same sequence the paused one would have.
-    fn resume_compact<S: RunStorage>(state: &DiskState, storage: &S) -> Result<Self, StoreError> {
-        let mut m = Self {
-            include_mem: false,
-            mem_pos: 0,
-            run_count: state.run_count as usize,
-            runs: [RunScan::idle(); MAX_RUNS],
-        };
-        if state.compact.run_pos_count as usize != m.run_count {
+    fn resume_compact_in<S: RunStorage>(
+        &mut self,
+        state: &DiskState,
+        storage: &S,
+    ) -> Result<(), StoreError> {
+        self.include_mem = false;
+        self.mem_pos = 0;
+        self.run_count = state.run_count as usize;
+        if state.compact.run_pos_count as usize != self.run_count {
             // The run set changed under a paused compaction — the
             // exclusion fence forbids that, so this is corruption.
             return Err(StoreError::StorageFault);
         }
-        for i in 0..m.run_count {
-            m.runs[i] = RunScan::resume_to(
+        for i in 0..self.run_count {
+            self.runs[i] = RunScan::resume_to(
                 &state.runs[i],
                 state.compact.run_block[i],
                 state.compact.run_rec[i],
                 storage,
+                &state.block_cache,
             )?;
-            state.add_blocks(m.runs[i].take_blocks());
+            state.add_blocks(self.runs[i].take_blocks());
         }
-        Ok(m)
+        Ok(())
     }
 
     /// Copy the next merged record into `key_out`/`val_out` and return
@@ -2310,7 +2518,7 @@ impl Merge {
         }
         for rs in self.runs.iter_mut().take(self.run_count) {
             if rs.has_cur && rs.cur_key() == &key_out[..klen] {
-                rs.next(storage)?;
+                rs.next(storage, mem.cache)?;
                 mem.add_blocks(rs.take_blocks());
             }
         }
@@ -2390,12 +2598,12 @@ fn write_run_footer<S: RunStorage>(
     mut crc_state: u32,
     file_len: u64,
 ) -> Result<(u64, u32), StoreError> {
-    let mut foot = [0u8; RUN_FOOTER_LEN];
-    foot[0..4].copy_from_slice(&RUN_FOOTER_MAGIC.to_le_bytes());
-    foot[4..8].copy_from_slice(&record_count.to_le_bytes());
-    foot[8..12].copy_from_slice(&block_count.to_le_bytes());
-    foot[12..20].copy_from_slice(&smallest_off.to_le_bytes());
-    foot[20..28].copy_from_slice(&largest_off.to_le_bytes());
+    let mut head = [0u8; RUN_FOOTER_BLOOM_OFF];
+    head[0..4].copy_from_slice(&RUN_FOOTER_MAGIC.to_le_bytes());
+    head[4..8].copy_from_slice(&record_count.to_le_bytes());
+    head[8..12].copy_from_slice(&block_count.to_le_bytes());
+    head[12..20].copy_from_slice(&smallest_off.to_le_bytes());
+    head[20..28].copy_from_slice(&largest_off.to_le_bytes());
     // The filter is PERSISTED rather than rebuilt at recovery. Rebuilding
     // would mean a full record scan of every run at startup — up to 16
     // runs of ~35 KB each — which is exactly the class of unbounded
@@ -2405,13 +2613,18 @@ fn write_run_footer<S: RunStorage>(
     // `file_crc` already covers, so a corrupt filter fails the same
     // whole-file validation that a corrupt block does, and
     // `verify_run` rejects the run before the filter is ever consulted.
-    foot[RUN_FOOTER_BLOOM_OFF..RUN_FOOTER_BLOOM_OFF + BLOOM_BYTES].copy_from_slice(bloom);
-    foot[RUN_FOOTER_INDEX_OFF..RUN_FOOTER_INDEX_OFF + RUN_INDEX_BYTES].copy_from_slice(index);
-    crc_state = crc32_update(crc_state, &foot[..RUN_FOOTER_LEN - 4]);
+    //
+    // Appended piece by piece under the one rolling CRC, so no footer-
+    // sized buffer (21 KiB with the index) sits on the stack.
+    for part in [&head[..], &bloom[..], &index[..]] {
+        storage
+            .append(FileKind::Run, id, part)
+            .map_err(map_storage)?;
+        crc_state = crc32_update(crc_state, part);
+    }
     let file_crc = crc32_finish(crc_state);
-    foot[RUN_FOOTER_LEN - 4..].copy_from_slice(&file_crc.to_le_bytes());
     storage
-        .append(FileKind::Run, id, &foot)
+        .append(FileKind::Run, id, &file_crc.to_le_bytes())
         .map_err(map_storage)?;
     Ok((file_len + RUN_FOOTER_LEN as u64, file_crc))
 }
@@ -2644,7 +2857,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.fill = 0;
             self.state.flush.chunks = 0;
             self.state.flush.bloom = [0u8; BLOOM_BYTES];
-            self.state.flush.index = [0u8; RUN_INDEX_BYTES];
+            self.state.flush.index.fill(0);
             self.state.flush.blk_has_first = false;
             self.state.flush.out_len = file_len;
             self.state.flush.smallest_off = 0;
@@ -2900,10 +3113,13 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         new_blooms[0] = self.state.flush.bloom;
         new_blooms[1..1 + old_count].copy_from_slice(&self.state.run_blooms[..old_count]);
         self.state.run_blooms = new_blooms;
-        let mut new_index = [[0u8; RUN_INDEX_BYTES]; MAX_RUNS];
-        new_index[0] = self.state.flush.index;
-        new_index[1..1 + old_count].copy_from_slice(&self.state.run_index[..old_count]);
-        self.state.run_index = new_index;
+        // In place: sixteen indexes are ~320 KiB, which no
+        // stack frame may hold on bare metal.
+        self.state.run_index.copy_within(0..old_count, 1);
+        self.state.run_index[0].copy_from_slice(&self.state.flush.index);
+        for slot in self.state.run_index.iter_mut().skip(1 + old_count) {
+            slot.fill(0);
+        }
         self.state.runs = new_runs;
         self.state.run_count = (old_count + 1) as u32;
         self.state.generation = new_gen;
@@ -3041,7 +3257,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         // independently, and take the valid one with the HIGHER
         // INTERNAL generation. No enumeration, no deletion: the pair is
         // permanent, so recovery knows both names a priori.
-        let mut winner_gen: Option<u32> = None;
+        let mut winner_gen: Option<u32>;
         let mut winner_slot = MANIFEST_SLOT_A;
         let mut floor = 0u64;
         let mut run_count = 0usize;
@@ -3049,44 +3265,99 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut applied = (0u64, 0u64);
         let mut man_revision = 0u64;
         let mut man_clock = 0u64;
-        for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
-            let Some((gen, f, rc, rs, ai, at, hr, clock)) = self.read_manifest(slot)? else {
-                continue;
-            };
-            if winner_gen.is_none_or(|w| gen > w) {
-                winner_gen = Some(gen);
-                winner_slot = slot;
-                floor = f;
-                run_count = rc;
-                runs = rs;
-                applied = (ai, at);
-                man_revision = hr;
-                man_clock = clock;
-            }
-        }
-
         let mut run_ids = [0u32; MAX_LISTED_RUNS];
+        self.state.recover_refusal = 2;
         let run_n = self
             .storage
             .list(FileKind::Run, &mut run_ids)
             .map_err(map_storage)?;
+        self.state.recover_listed = run_n as u32;
         let run_ids = &run_ids[..run_n];
         let mut max_seen_id = 0u32;
         for &id in run_ids {
             max_seen_id = max_seen_id.max(id);
         }
 
-        if let Some(gen) = winner_gen {
-            // Every referenced run must exist and validate; anything
-            // else is quarantine, not cleanup.
-            for meta in runs.iter().take(run_count) {
-                if !run_ids.contains(&meta.id) {
-                    return Err(StoreError::StorageFault);
+        // The higher generation is tried first. When it names a run the
+        // disk does not hold, or one that does not validate, the OTHER
+        // slot — the previous durable state — is served instead, loudly
+        // counted (`recover_fallbacks`): a generation whose runs did not
+        // outlive the power cut that followed its publish is a torn
+        // publish, and the log replays on top of the older manifest from
+        // its applied index. Only with no usable slot at all is it a
+        // quarantine. The next publish's generation stays above both.
+        let mut bad_slot: Option<u32> = None;
+        let mut bad_gen = 0u32;
+        let mut bad_rr = 0u32;
+        loop {
+            winner_gen = None;
+            self.state.recover_refusal = 1;
+            for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
+                if bad_slot == Some(slot) {
+                    continue;
                 }
-                self.verify_run(meta)?;
+                let Some((gen, f, rc, rs, ai, at, hr, clock)) = self.read_manifest(slot)? else {
+                    continue;
+                };
+                if winner_gen.is_none_or(|w| gen > w) {
+                    winner_gen = Some(gen);
+                    winner_slot = slot;
+                    floor = f;
+                    run_count = rc;
+                    runs = rs;
+                    applied = (ai, at);
+                    man_revision = hr;
+                    man_clock = clock;
+                }
+            }
+            let Some(gen) = winner_gen else {
+                break;
+            };
+            // Every referenced run must exist and validate.
+            let mut bad = false;
+            for meta in runs.iter().take(run_count) {
+                self.state.recover_refusal = 3;
+                if !run_ids.contains(&meta.id) {
+                    self.state.recover_missing_id = meta.id;
+                    bad = true;
+                    break;
+                }
+                let mut at = 40u32;
+                match verify_run(&*self.storage, meta, &mut at) {
+                    Ok(()) => {}
+                    Err(StoreError::StorageFault) => {
+                        self.state.recover_refusal = at;
+                        bad = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
                 max_seen_id = max_seen_id.max(meta.id);
             }
+            if !bad {
+                break;
+            }
+            if bad_slot.is_some() {
+                return Err(StoreError::StorageFault);
+            }
+            bad_slot = Some(winner_slot);
+            bad_gen = gen;
+            bad_rr = self.state.recover_refusal;
+        }
+        if bad_slot.is_some() {
+            // The only usable slot named what the disk does not hold:
+            // quarantine, never an empty store in its place.
+            if winner_gen.is_none() {
+                self.state.recover_refusal = bad_rr;
+                return Err(StoreError::StorageFault);
+            }
+            self.state.recover_fallbacks = self.state.recover_fallbacks.wrapping_add(1);
+        }
+
+        if let Some(gen) = winner_gen {
+            let gen = gen.max(bad_gen);
             // Orphans (present but unreferenced) are deleted.
+            self.state.recover_refusal = 5;
             for &id in run_ids {
                 if !runs.iter().take(run_count).any(|m| m.id == id) {
                     match self.storage.delete(FileKind::Run, id) {
@@ -3103,15 +3374,25 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             // `verify_run` has already validated the whole file
             // (including this region, which the file CRC covers), so
             // these bytes are known good before they are trusted.
+            self.state.recover_refusal = 6;
             for (i, meta) in runs.iter().enumerate().take(run_count) {
-                let off = meta.file_len - (RUN_FOOTER_LEN - RUN_FOOTER_BLOOM_OFF) as u64;
-                let mut filter = [0u8; BLOOM_BYTES];
-                read_exact(&*self.storage, FileKind::Run, meta.id, off, &mut filter)?;
-                self.state.run_blooms[i] = filter;
-                let ioff = meta.file_len - (RUN_FOOTER_LEN - RUN_FOOTER_INDEX_OFF) as u64;
-                let mut index = [0u8; RUN_INDEX_BYTES];
-                read_exact(&*self.storage, FileKind::Run, meta.id, ioff, &mut index)?;
-                self.state.run_index[i] = index;
+                let foot = meta.file_len - RUN_FOOTER_LEN as u64;
+                let off = foot + RUN_FOOTER_BLOOM_OFF as u64;
+                read_exact(
+                    &*self.storage,
+                    FileKind::Run,
+                    meta.id,
+                    off,
+                    &mut self.state.run_blooms[i],
+                )?;
+                let ioff = off + BLOOM_BYTES as u64;
+                read_exact(
+                    &*self.storage,
+                    FileKind::Run,
+                    meta.id,
+                    ioff,
+                    &mut self.state.run_index[i],
+                )?;
             }
             self.state.generation = gen;
             self.state.manifest_slot = winner_slot;
@@ -3138,6 +3419,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         } else {
             // No usable manifest: the durable state is empty; every
             // run present was never published and is an orphan.
+            self.state.recover_refusal = 7;
             for &id in run_ids {
                 match self.storage.delete(FileKind::Run, id) {
                     Ok(()) | Err(StorageError::NotFound) => {}
@@ -3150,7 +3432,12 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         // Rebuild `highest_revision` from the surviving records (the
         // walk also re-validates every block CRC).
         let mut highest = 0u64;
-        let mut m = Merge::init(self.state, &*self.storage, false, b"")?;
+        self.state.recover_refusal = 8;
+        // SAFETY: the state's merge, lent to this walk (see `point`): no
+        // point read runs inside a whole-store walk, nor one walk inside
+        // another, so nothing else holds it while this reference lives.
+        let m = unsafe { &mut *self.state.point.get() };
+        m.fill_filtered(self.state, &*self.storage, false, b"", None)?;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         while let Some((klen, _)) =
@@ -3159,7 +3446,14 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             highest = highest.max(key_timestamp(&kbuf[..klen]));
         }
         self.state.highest_revision = highest;
+        self.state.recover_refusal = 0;
         Ok(())
+    }
+
+    fn note_manifest(&self, slot: u32, verdict: u32, generation: u32, top_run: u32) {
+        let i = if slot == MANIFEST_SLOT_A { 0 } else { 1 };
+        self.state.manifest_seen[i].set(verdict | (generation << 4));
+        self.state.manifest_runs[i].set(top_run);
     }
 
     /// Read + checksum-validate one manifest file. `Ok(None)` = the
@@ -3199,7 +3493,10 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                 {
                     Ok(n) => n,
                     // An absent slot is a normal first-boot state.
-                    Err(StorageError::NotFound) => return Ok(None),
+                    Err(StorageError::NotFound) => {
+                        self.note_manifest(slot, 1, 0, 0);
+                        return Ok(None);
+                    }
                     Err(e) => return Err(map_storage(e)),
                 };
             if n == 0 {
@@ -3208,6 +3505,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             len += n;
         }
         if len < MANIFEST_HDR_LEN + 4 {
+            self.note_manifest(slot, 2, 0, 0);
             return Ok(None);
         }
         let body = &buf[..len];
@@ -3216,6 +3514,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             || rd_u16(body, 6) != internal_key::KEY_FORMAT_VERSION
             || rd_u16(body, 8) != state_store::STATE_STORE_CONTRACT_VERSION
         {
+            self.note_manifest(slot, 3, 0, 0);
             return Ok(None);
         }
         let generation = rd_u32(body, 12);
@@ -3226,6 +3525,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let highest_revision = rd_u64(body, 44);
         let committed_clock_ms = rd_u64(body, 52);
         if run_count > MAX_RUNS {
+            self.note_manifest(slot, 4, generation, 0);
             return Ok(None);
         }
         // The CRC sits immediately after the declared entries; the rest
@@ -3234,9 +3534,11 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         // regardless of how many runs it names.
         let end = MANIFEST_HDR_LEN + run_count * MANIFEST_ENTRY_LEN;
         if len < end + 4 {
+            self.note_manifest(slot, 5, generation, 0);
             return Ok(None);
         }
         if crc32(&body[..end]) != rd_u32(body, end) {
+            self.note_manifest(slot, 6, generation, 0);
             return Ok(None);
         }
         let mut runs = [RunMeta::empty(); MAX_RUNS];
@@ -3248,6 +3550,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             meta.digest = rd_u32(body, p + 16);
             p += MANIFEST_ENTRY_LEN;
         }
+        let top = runs.iter().take(run_count).map(|m| m.id).max().unwrap_or(0);
+        self.note_manifest(slot, 7, generation, top);
         Ok(Some((
             generation,
             floor,
@@ -3264,7 +3568,31 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// header/footer framing and versions, and the whole-file CRC
     /// against both the stored footer field and the manifest digest.
     fn verify_run(&self, meta: &RunMeta) -> Result<(), StoreError> {
-        if meta.file_len < (RUN_HDR_LEN + RUN_FOOTER_LEN) as u64 {
+        let mut at = 0u32;
+        verify_run(&*self.storage, meta, &mut at)
+    }
+}
+
+/// Validate one run file end to end; `at` names the check being made
+/// (41 too short, 42 header, 43 a read, 44 CRC, 45 trailing bytes, 46
+/// footer), so a refusal says which.
+fn verify_run<S: RunStorage>(storage: &S, meta: &RunMeta, at: &mut u32) -> Result<(), StoreError> {
+    {
+        *at = 41;
+        let foot_len = RUN_FOOTER_LEN as u64;
+        if meta.file_len < RUN_HDR_LEN as u64 + foot_len {
+            return Err(StoreError::StorageFault);
+        }
+        // Header framing first.
+        let mut hdr = [0u8; RUN_HDR_LEN];
+        *at = 43;
+        read_exact(storage, FileKind::Run, meta.id, 0, &mut hdr)?;
+        *at = 42;
+        if rd_u32(&hdr, 0) != RUN_MAGIC
+            || rd_u16(&hdr, 4) != RUN_FORMAT_VERSION
+            || rd_u16(&hdr, 8) != internal_key::KEY_FORMAT_VERSION
+            || rd_u16(&hdr, 10) != state_store::STATE_STORE_CONTRACT_VERSION
+        {
             return Err(StoreError::StorageFault);
         }
         // Rolling CRC over [0, file_len - 4).
@@ -3274,55 +3602,47 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut off = 0u64;
         while off < crc_end {
             let want = (crc_end - off).min(chunk.len() as u64) as usize;
-            read_exact(
-                &*self.storage,
-                FileKind::Run,
-                meta.id,
-                off,
-                &mut chunk[..want],
-            )?;
+            *at = 43;
+            read_exact(storage, FileKind::Run, meta.id, off, &mut chunk[..want])?;
             crc_state = crc32_update(crc_state, &chunk[..want]);
             off += want as u64;
         }
         let computed = crc32_finish(crc_state);
         let mut tail = [0u8; 4];
-        read_exact(&*self.storage, FileKind::Run, meta.id, crc_end, &mut tail)?;
+        read_exact(storage, FileKind::Run, meta.id, crc_end, &mut tail)?;
+        *at = 44;
         if computed != rd_u32(&tail, 0) || computed != meta.digest {
             return Err(StoreError::StorageFault);
         }
         // The file must end exactly at file_len.
         let mut probe = [0u8; 1];
-        let n = self
-            .storage
+        *at = 43;
+        let n = storage
             .read_at(FileKind::Run, meta.id, meta.file_len, &mut probe)
             .map_err(map_storage)?;
+        *at = 45;
         if n != 0 {
             return Err(StoreError::StorageFault);
         }
-        // Header + footer framing.
-        let mut hdr = [0u8; RUN_HDR_LEN];
-        read_exact(&*self.storage, FileKind::Run, meta.id, 0, &mut hdr)?;
-        if rd_u32(&hdr, 0) != RUN_MAGIC
-            || rd_u16(&hdr, 4) != RUN_FORMAT_VERSION
-            || rd_u16(&hdr, 8) != internal_key::KEY_FORMAT_VERSION
-            || rd_u16(&hdr, 10) != state_store::STATE_STORE_CONTRACT_VERSION
-        {
-            return Err(StoreError::StorageFault);
-        }
-        let mut foot = [0u8; RUN_FOOTER_LEN];
+        // Footer framing: its magic and record count lead it.
+        let mut foot = [0u8; 8];
+        *at = 43;
         read_exact(
-            &*self.storage,
+            storage,
             FileKind::Run,
             meta.id,
-            meta.file_len - RUN_FOOTER_LEN as u64,
+            meta.file_len - foot_len,
             &mut foot,
         )?;
+        *at = 46;
         if rd_u32(&foot, 0) != RUN_FOOTER_MAGIC || rd_u32(&foot, 4) != meta.record_count {
             return Err(StoreError::StorageFault);
         }
         Ok(())
     }
+}
 
+impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// Abort an in-progress multi-step snapshot capture (e.g. the
     /// caller's export buffer cannot hold the whole stream). Clears
     /// the capture fence so `apply`/`flush` stop returning
@@ -3459,29 +3779,34 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 // a compaction adopted). The key is still exact; reopen
                 // at it — one block per run now, the rest of the
                 // positioning inside this call's budget.
-                let m = Merge::open_lazy(
-                    self.state,
+                let generation = self.state.generation;
+                let (sc, src) = self.state.scan_parts();
+                // Not live until it is whole: a failed open leaves the
+                // key memo, which the next call reopens from.
+                sc.live = false;
+                sc.merge.open_lazy_in(
+                    &src,
                     &*self.storage,
                     include_runs,
                     &boundbuf[..bound_len],
                 )?;
-                let sc = &mut self.state.scan;
-                sc.merge = m;
                 sc.live = true;
-                sc.generation = self.state.generation;
+                sc.generation = generation;
             }
         } else {
             bound_len = span.start.len();
             boundbuf[..bound_len].copy_from_slice(span.start);
             bound_inclusive = false;
-            let m = Merge::open_lazy(self.state, &*self.storage, include_runs, span.start)?;
-            let sc = &mut self.state.scan;
-            sc.merge = m;
+            let generation = self.state.generation;
+            let (sc, src) = self.state.scan_parts();
+            sc.live = false;
+            sc.merge
+                .open_lazy_in(&src, &*self.storage, include_runs, span.start)?;
             sc.valid = true;
             sc.live = true;
             sc.page_valid = false;
             sc.pending_klen = 0;
-            sc.generation = self.state.generation;
+            sc.generation = generation;
             sc.from = from_revision;
             sc.hi = hi;
             sc.ordinal = 0;
@@ -3503,6 +3828,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
             entries,
             mem_count,
             blocks_read,
+            block_cache,
             ..
         } = &mut *self.state;
         let mem = MemView {
@@ -3510,6 +3836,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
             order,
             entries,
             blocks_read,
+            cache: block_cache,
         };
         // The memtable position is re-derived on every call: entries
         // admitted or released since the merge was built have shifted
@@ -3677,24 +4004,29 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 decided = rm.decided;
             }
             if !(rm.live && rm.generation == self.state.generation) {
-                let m = Merge::open_lazy(self.state, &*self.storage, true, &boundbuf[..bound_len])?;
-                let rm = &mut self.state.range;
-                rm.merge = m;
+                let generation = self.state.generation;
+                let (rm, src) = self.state.range_parts();
+                // Not live until it is whole (as the version scan's).
+                rm.live = false;
+                rm.merge
+                    .open_lazy_in(&src, &*self.storage, true, &boundbuf[..bound_len])?;
                 rm.live = true;
-                rm.generation = self.state.generation;
+                rm.generation = generation;
             }
         } else {
             bound_len = span.start.len();
             boundbuf[..bound_len].copy_from_slice(span.start);
             bound_inclusive = false;
-            let m = Merge::open_lazy(self.state, &*self.storage, true, span.start)?;
-            let rm = &mut self.state.range;
-            rm.merge = m;
+            let generation = self.state.generation;
+            let (rm, src) = self.state.range_parts();
+            rm.live = false;
+            rm.merge
+                .open_lazy_in(&src, &*self.storage, true, span.start)?;
             rm.valid = true;
             rm.live = true;
             rm.pending_klen = 0;
             rm.decided = false;
-            rm.generation = self.state.generation;
+            rm.generation = generation;
             rm.revision = revn;
             rm.ordinal = 0;
             rm.last_key_len = 0;
@@ -3713,6 +4045,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
             entries,
             mem_count,
             blocks_read,
+            block_cache,
             ..
         } = &mut *self.state;
         let mem = MemView {
@@ -3720,6 +4053,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
             order,
             entries,
             blocks_read,
+            cache: block_cache,
         };
         rm.merge.mem_pos = mem.lower_bound(bound);
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
@@ -3852,12 +4186,28 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             return Err(StoreError::Compacted);
         }
         let revn = normalize_revision(revision);
+        // Seek to the version wanted, not to the key. Versions sort
+        // newest first (the timestamp is stored inverted), so a walk
+        // started at the key's prefix reads every version NEWER than
+        // `revn` before reaching the one it wants — for an as-of read
+        // of a hot key (replay re-running an old write against a lease
+        // renewed thousands of times since) that is the whole key's
+        // history, hundreds of blocks per lookup. The bound
+        // `prefix ++ !revn` sorts after every newer version and before
+        // every version at or below `revn` (the kind byte that follows
+        // only orders among equals), so the first record at or past it
+        // is the answer, and the sparse index lands within one stride
+        // of it. The Bloom pre-check still asks about the key.
+        let mut bound = [0u8; MAX_ENCODED_KEY];
+        bound[..key.len()].copy_from_slice(key);
+        bound[key.len()..key.len() + 8].copy_from_slice(&(!revn).to_be_bytes());
+        let bound = &bound[..key.len() + 8];
         // SAFETY: the point merge is only ever borrowed here, for this
         // read, and no point read runs inside another — the reference
         // ends with this function; `fill_filtered` and `next` read the
         // rest of the state, never `point`.
         let m = unsafe { &mut *self.state.point.get() };
-        m.fill_filtered(self.state, &*self.storage, true, key, Some(key))?;
+        m.fill_filtered(self.state, &*self.storage, true, bound, Some(key))?;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         loop {
@@ -4071,7 +4421,11 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             // Count total records once (full fidelity: every surviving
             // version, tombstones included).
             let mut total = 0u64;
-            let mut m = Merge::init(self.state, &*self.storage, true, b"")?;
+            // SAFETY: the state's merge, lent to this walk (see `point`): no
+            // point read runs inside a whole-store walk, nor one walk inside
+            // another, so nothing else holds it while this reference lives.
+            let m = unsafe { &mut *self.state.point.get() };
+            m.fill_filtered(self.state, &*self.storage, true, b"", None)?;
             let mut kbuf = [0u8; MAX_ENCODED_KEY];
             let mut vbuf = [0u8; MAX_VALUE_LEN];
             while m
@@ -4119,7 +4473,11 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         }
         // Re-walk the merge, skip the already-emitted ordinal, emit
         // whole records while they fit.
-        let mut m = Merge::init(self.state, &*self.storage, true, b"")?;
+        // SAFETY: the state's merge, lent to this walk (see `point`): no
+        // point read runs inside a whole-store walk, nor one walk inside
+        // another, so nothing else holds it while this reference lives.
+        let m = unsafe { &mut *self.state.point.get() };
+        m.fill_filtered(self.state, &*self.storage, true, b"", None)?;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         let mut ordinal = 0u64;
@@ -4462,11 +4820,15 @@ impl<S: RunStorage> DiskStore<'_, S> {
         if !resuming && resume != 0 {
             return Err(StoreError::StorageFault);
         }
-        let mut m = if resuming {
-            Merge::resume_compact(self.state, &*self.storage)?
+        // SAFETY: the state's merge, lent to this walk (see `point`): no
+        // point read runs inside a whole-store walk, nor one walk inside
+        // another, so nothing else holds it while this reference lives.
+        let m = unsafe { &mut *self.state.point.get() };
+        if resuming {
+            m.resume_compact_in(self.state, &*self.storage)?;
         } else {
-            Merge::init(self.state, &*self.storage, false, b"")?
-        };
+            m.fill_filtered(self.state, &*self.storage, false, b"", None)?;
+        }
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         let mut prefix = [0u8; MAX_ENCODED_KEY];
@@ -4731,7 +5093,9 @@ impl<S: RunStorage> DiskStore<'_, S> {
         let old_runs = self.state.runs;
         self.state.runs = [RunMeta::empty(); MAX_RUNS];
         self.state.run_blooms = [[0u8; BLOOM_BYTES]; MAX_RUNS];
-        self.state.run_index = [[0u8; RUN_INDEX_BYTES]; MAX_RUNS];
+        for slot in self.state.run_index.iter_mut() {
+            slot.fill(0);
+        }
         if c.out_records == 0 {
             self.state.run_count = 0;
         } else {

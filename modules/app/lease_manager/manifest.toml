@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Durable lease state owner and SessionCtrlV1 session worker. A lease is
 # a session (`session_id = [anchor_id:8][lease_id:8]`); the manager

@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Adapter-facing auth and identity translation. Consumes CP-Raft
 # principal manifests, token TTLs, prefix permissions, and adapter

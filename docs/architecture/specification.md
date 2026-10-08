@@ -216,6 +216,23 @@ WAL authoritative (the ceilings are in the
 [limit register](limit_register.md)). Source:
 `modules/app/kv_state_worker/mod.rs`.
 
+A disk store's marker is labelled at its manifest's applied position,
+which only a flush publish moves, so a snapshot request that finds
+the manifest behind the applied position asks for a flush and answers
+once it publishes — otherwise an idle store would never let the log
+compact. The manifest is a pair of slots written alternately. Recovery
+serves the higher valid generation; when that generation names a run
+the disk no longer holds (a power cut after its publish), it serves
+the other slot's older state instead, counted as a fallback, and with
+no usable slot at all it quarantines rather than serve an empty
+store. An older state is only correct while the log still holds what
+came after it, so a recovered store adopts an incoming marker only
+when its own manifest covers the marker's position; otherwise it
+refuses the marker and fails closed — it must be brought up from
+another replica's state — rather than be labelled past writes it
+does not hold. Source:
+`modules/common/disk_store.rs`.
+
 MVCC garbage collection is claim-based
 (`modules/common/compaction_floor.rs`): active readers, watches,
 backups, and operators register retention claims; the candidate

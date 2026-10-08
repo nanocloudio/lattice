@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Client-facing transport anchor. The pub/sub half is edge_anchored
 # (its session state lives in pubsub_worker); command traffic stays

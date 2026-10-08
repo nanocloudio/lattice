@@ -73,6 +73,7 @@ const PEND_RECORD: u8 = 2;
 
 #[repr(C)]
 struct BridgeState {
+    rd: ReadStats,
     syscalls: *const SyscallTable,
     committed_in: i32,
     kv_out: i32,
@@ -174,10 +175,35 @@ impl BridgeState {
         self.pend_len = 0;
         self.pend_term = 0;
         self.pend_index = 0;
+        self.rd = ReadStats {
+            hdr_short: 0,
+            oversize: 0,
+            body_short: 0,
+            last_rc: 0,
+            last_len: 0,
+        };
     }
 }
 
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
+/// Why reads gave up (telemetry, on the heartbeat): a header read short,
+/// a frame longer than the scratch (drained and dropped), a body read
+/// short — and the last rc and length seen. Any of them on a ring that
+/// stays full is a stalled apply path.
+#[derive(Clone, Copy)]
+struct ReadStats {
+    hdr_short: u32,
+    oversize: u32,
+    body_short: u32,
+    last_rc: i32,
+    last_len: u32,
+}
+
+unsafe fn read_envelope(
+    sys: &SyscallTable,
+    chan: i32,
+    scratch: &mut [u8],
+    st: &mut ReadStats,
+) -> Option<(u8, usize)> {
     if chan < 0 {
         return None;
     }
@@ -186,18 +212,39 @@ unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Op
         return None;
     }
     let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+    let rc = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
+    if rc < 3 {
+        st.hdr_short = st.hdr_short.wrapping_add(1);
+        st.last_rc = rc;
         return None;
     }
     let mt = hdr[0];
     let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     if len > scratch.len() {
+        // Drain the frame whole: left half-read, its payload would be
+        // parsed as the next frame's header and desynchronise every
+        // frame after it.
+        st.oversize = st.oversize.wrapping_add(1);
+        st.last_len = len as u32;
+        let mut left = len;
+        while left > 0 {
+            let take = left.min(scratch.len());
+            let rc = (sys.channel_read)(chan, scratch.as_mut_ptr(), take);
+            if rc <= 0 {
+                break;
+            }
+            left -= (rc as usize).min(left);
+        }
         return None;
     }
     if len == 0 {
         return Some((mt, 0));
     }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
+    let rc = (sys.channel_read)(chan, scratch.as_mut_ptr(), len);
+    if (rc as usize) < len || rc < 0 {
+        st.body_short = st.body_short.wrapping_add(1);
+        st.last_rc = rc;
+        st.last_len = len as u32;
         return None;
     }
     Some((mt, len))
@@ -327,6 +374,71 @@ pub extern "C" fn module_new(
     0
 }
 
+/// `[bridge] hb`: where the apply path stands, and what an entry it is
+/// still holding owes. A destination that never takes a held entry stops
+/// every apply behind it, which downstream reads only as silence.
+unsafe fn heartbeat(s: &BridgeState) {
+    fn dec(buf: &mut [u8], mut n: usize, mut v: u64) -> usize {
+        let mut tmp = [0u8; 20];
+        let mut k = 0;
+        loop {
+            tmp[k] = b'0' + (v % 10) as u8;
+            k += 1;
+            v /= 10;
+            if v == 0 || k == tmp.len() {
+                break;
+            }
+        }
+        while k > 0 && n < buf.len() {
+            k -= 1;
+            buf[n] = tmp[k];
+            n += 1;
+        }
+        n
+    }
+    fn lit(buf: &mut [u8], mut n: usize, t: &[u8]) -> usize {
+        for &b in t {
+            if n < buf.len() {
+                buf[n] = b;
+                n += 1;
+            }
+        }
+        n
+    }
+    let mut b = [0u8; 280];
+    let mut n = lit(&mut b, 0, b"[bridge] hb last=");
+    n = dec(&mut b, n, s.last_index);
+    n = lit(&mut b, n, b" pos=");
+    n = dec(&mut b, n, s.pos_index);
+    n = lit(&mut b, n, b" fwd=");
+    n = dec(&mut b, n, s.forwarded);
+    n = lit(&mut b, n, b" rec=");
+    n = dec(&mut b, n, s.records);
+    n = lit(&mut b, n, b" pend=");
+    n = dec(&mut b, n, u64::from(s.pend_kind));
+    n = lit(&mut b, n, b" type=");
+    n = dec(&mut b, n, u64::from(s.pend_type));
+    n = lit(&mut b, n, b" len=");
+    n = dec(&mut b, n, u64::from(s.pend_len));
+    n = lit(&mut b, n, b" owes_kv=");
+    n = dec(&mut b, n, u64::from(s.pend_need_kv));
+    n = lit(&mut b, n, b" owes_rec=");
+    n = dec(&mut b, n, u64::from(s.pend_need_records));
+    n = lit(&mut b, n, b" idx=");
+    n = dec(&mut b, n, s.pend_index);
+    n = lit(&mut b, n, b" rd_hdr=");
+    n = dec(&mut b, n, u64::from(s.rd.hdr_short));
+    n = lit(&mut b, n, b" rd_big=");
+    n = dec(&mut b, n, u64::from(s.rd.oversize));
+    n = lit(&mut b, n, b" rd_body=");
+    n = dec(&mut b, n, u64::from(s.rd.body_short));
+    n = lit(&mut b, n, b" rc=");
+    n = dec(&mut b, n, u64::from(s.rd.last_rc.unsigned_abs()));
+    n = lit(&mut b, n, b" rlen=");
+    n = dec(&mut b, n, u64::from(s.rd.last_len));
+    dev_log(&*s.syscalls, 3, b.as_ptr(), n);
+}
+
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -350,10 +462,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             break;
         }
         let mut scratch = [0u8; SCRATCH];
-        let (mt, len) = match unsafe { read_envelope(&*sys, s.committed_in, &mut scratch) } {
-            Some(p) => p,
-            None => break,
-        };
+        let (mt, len) =
+            match unsafe { read_envelope(&*sys, s.committed_in, &mut scratch, &mut s.rd) } {
+                Some(p) => p,
+                None => break,
+            };
         if mt != MSG_COMMITTED_ENTRY || len < COMMITTED_HEADER_LEN {
             processed += 1;
             continue;
@@ -488,6 +601,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     s.step_ctr = s.step_ctr.wrapping_add(1);
     if s.step_ctr.is_multiple_of(5000) && !s.syscalls.is_null() {
+        unsafe { heartbeat(s) };
         unsafe {
             telemetry::emit_counters(
                 &*s.syscalls,

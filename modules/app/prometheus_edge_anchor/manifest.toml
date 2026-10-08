@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Prometheus-compatible metrics surface: remote-write ingest and PromQL
 # over the Prometheus HTTP API, one dialect surface over the canonical KV

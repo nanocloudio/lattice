@@ -85,6 +85,9 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 const FS_UNLINK: u32 = 0x090A;
 /// FS capability-discovery opcode + bits (`fs.rs::{CAPS, caps}`).
 const FS_CAPS: u32 = 0x09FF;
+/// `last_errno` after `list` overflowed its table: a sentinel, not a
+/// provider errno (those are small negatives).
+const FS_E_LIST_OVERFLOW: i32 = -1000;
 const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
 const FS_CAP_WRITE: u32 = 1 << 3;
 const FS_CAP_UNLINK: u32 = 1 << 5;
@@ -179,6 +182,9 @@ pub struct FsRunStorage {
     /// Raw errno of the most recent provider failure (0 = none).
     /// `Cell` because read-side methods take `&self` per the contract.
     last_errno: Cell<i32>,
+    /// The create whose OPEN_CREATE answered E_AGAIN, `(kind, id)`: the
+    /// one create that is asked again without its existence check.
+    create_again: Cell<Option<(u8, u32)>>,
     /// `read_at` CALLS and bytes. Every call is a full
     /// FS_OPEN + FS_SEEK + FS_READ + FS_CLOSE cycle, and FS_OPEN on
     /// FAT32 is a LINEAR directory scan — so on that backend the call
@@ -223,6 +229,7 @@ impl FsRunStorage {
             len: 0,
         };
         self.last_errno = Cell::new(0);
+        self.create_again = Cell::new(None);
         self.reads = Cell::new(0);
         self.read_bytes = Cell::new(0);
         self.opens = Cell::new(0);
@@ -558,7 +565,24 @@ impl RunStorage for FsRunStorage {
         // A create at this id means the bytes behind it are new.
         self.read_fd_drop(kind, id);
         self.require_write_tier()?;
-        if self.exists(kind, id)? {
+        // A create the provider could not finish last step (its directory
+        // scan ran out of budget: fat32 answers E_AGAIN and continues the
+        // SAME call when it comes again) is asked again as is — another
+        // lookup in between would be a different call and discard the
+        // scan, and a root directory a WAL has grown past one budget would
+        // then never see a run created: every flush attempt answers
+        // E_AGAIN and the memtable never drains.
+        //
+        // Only THAT create is resumed: the one whose OPEN_CREATE answered
+        // E_AGAIN, for the same file. Any other create keeps its existence
+        // check — at boot, while fat32 is still mounting, the store's
+        // first calls all answer E_AGAIN, and a create that skipped the
+        // check there would truncate an existing manifest slot over a
+        // valid manifest.
+        let me = (kind_code(kind), id);
+        let resuming = self.create_again.get() == Some(me);
+        self.create_again.set(None);
+        if !resuming && self.exists(kind, id)? {
             return Err(StorageError::AlreadyExists);
         }
         // A stale cache slot can't refer to this id (it didn't exist),
@@ -569,6 +593,11 @@ impl RunStorage for FsRunStorage {
         let sys = self.sys();
         // SAFETY: valid path buffer; OPEN_CREATE creates the file.
         let fd = unsafe { (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen) };
+        if fd == FS_E_AGAIN {
+            self.last_errno.set(fd);
+            self.create_again.set(Some(me));
+            return Err(StorageError::Again);
+        }
         if fd < 0 {
             self.last_errno.set(fd);
             return Err(StorageError::IoFault);
@@ -881,6 +910,9 @@ impl RunStorage for FsRunStorage {
         // SAFETY: closing the dir fd we opened.
         unsafe { (sys.provider_call)(dir_fd, FS_CLOSE, core::ptr::null_mut(), 0) };
         if overflow {
+            // Not the provider's errno: a listing that outgrew the
+            // caller's table, or a READDIR whose cursor never advances.
+            self.last_errno.set(FS_E_LIST_OVERFLOW);
             return Err(StorageError::Overflow);
         }
         self.last_errno.set(0);

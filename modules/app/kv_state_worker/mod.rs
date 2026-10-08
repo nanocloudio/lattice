@@ -633,6 +633,20 @@ struct WorkerState {
     /// failure) regardless of the watermark, because a run file is
     /// already open.
     disk_flush_active: bool,
+    /// Disk provider: a snapshot capture is owed once the flush now
+    /// wanted publishes. A capture request that found the manifest
+    /// behind the applied position asked for that flush rather than
+    /// answering with a stale (or no) position — see
+    /// `drain_snapshot_ctl`.
+    disk_capture_after_flush: bool,
+    /// The FS errno at the last refusal `log_disk_errno` reported
+    /// (telemetry `qe=`).
+    disk_quarantine_errno: i32,
+    /// The capture path as counts (`cap=` on the disk heartbeat):
+    /// requests seen, flushes asked for, markers emitted.
+    m_cap_req: u32,
+    m_cap_ask: u32,
+    m_cap_emit: u32,
     /// Bounded steps taken by the flush currently in flight.
     disk_flush_chunks: u32,
     /// Bounded compaction steps run since init. Compaction has its own
@@ -777,6 +791,13 @@ struct WorkerState {
     /// snapshot body is offered.
     applied_term: u64,
     applied_index: u64,
+    /// Times the command at the head of the channel waited for room
+    /// (telemetry: a stalled apply shows here first).
+    m_head_blocked: u64,
+    /// The last command message type and KV op drained (telemetry: the
+    /// `[kvw] drain` line names what a slow drain was doing).
+    last_msg: u8,
+    last_op: u8,
 
     /// Highest `applied_index` already reported upstream on `responses`.
     /// The router needs this position to enforce the applied-index half
@@ -916,6 +937,9 @@ impl WorkerState {
         self.cluster_epoch = 1;
         self.applied_term = 0;
         self.applied_index = 0;
+        self.m_head_blocked = 0;
+        self.last_msg = 0;
+        self.last_op = 0;
         self.published_applied_index = 0;
         self.catalog_generation = 0;
         self.importing = false;
@@ -936,6 +960,11 @@ impl WorkerState {
         self.disk_replay_floor = 0;
         self.disk_flush_wanted = false;
         self.disk_flush_active = false;
+        self.disk_capture_after_flush = false;
+        self.disk_quarantine_errno = 0;
+        self.m_cap_req = 0;
+        self.m_cap_ask = 0;
+        self.m_cap_emit = 0;
         self.disk_flush_chunks = 0;
         self.disk_compact_steps = 0;
         self.disk_flush_t0 = 0;
@@ -1242,6 +1271,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     // it: the channel stays FIFO, so nothing behind it (a later write, a
     // clock tick, a position marker) passes it.
     if !head_admitted(worker) {
+        worker.m_head_blocked = worker.m_head_blocked.wrapping_add(1);
         return false;
     }
     let mut hdr = [0u8; 3];
@@ -1250,6 +1280,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         return false;
     }
     let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    worker.last_msg = hdr[0];
     if hdr[0] == MSG_APP_APPLIED_POS {
         // In-band applied-position marker from lattice_apply_bridge.
         // Arriving here means every command ahead of it on this
@@ -1537,6 +1568,7 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
     let conn_id = head.conn_id;
     let consistency = head.consistency;
     let op = head.op;
+    worker.last_op = op;
     let id_tenant = head.tenant;
     let id_database = head.database;
     let id_keyspace = head.keyspace;
@@ -2752,7 +2784,12 @@ struct ProviderHeap {
     feed: *mut u8,
     m_calls: u64,
     m_not_serving: u64,
+    /// Calls by op class (telemetry): get, range, put, delete, list,
+    /// subscribe, changes, other.
+    m_ops: [u32; 8],
     m_refused: u64,
+    /// `Ready` has been signalled to the scheduler (once, see `module_step`).
+    signalled: bool,
 }
 
 /// The worker's store, as the provider applies to it: every op under the
@@ -2775,8 +2812,12 @@ impl store_provider::Backend for WorkerBackend<'_> {
             // for yet waits here while the store makes room — the flush or
             // merge driven on — and is applied once, whole ([`admit`]).
             let mut rounds = 0u32;
+            let t0 = dev_micros(&*w.syscalls);
             while !admit(w, op, body) {
-                if rounds >= BUSY_ROUNDS || w.disk_phase != DISK_PHASE_SERVING {
+                if rounds >= BUSY_ROUNDS
+                    || w.disk_phase != DISK_PHASE_SERVING
+                    || dev_micros(&*w.syscalls).saturating_sub(t0) > BUSY_CALL_BUDGET_US
+                {
                     w.prov.busy = true;
                     return (types::KV_RESULT_INTERNAL, 0);
                 }
@@ -3081,13 +3122,33 @@ const PROVIDER_HB_STEPS: u64 = 5000;
 #[cfg(feature = "store_provider")]
 unsafe fn provider_heartbeat(worker: &WorkerState) {
     let p = &worker.prov;
-    let mut buf = [0u8; 224];
+    let mut buf = [0u8; 320];
     let mut n = write_prefix(&mut buf, 0, b"[kvw] store hb calls=");
     n = write_dec(&mut buf, n, p.m_calls);
     n = write_prefix(&mut buf, n, b" not_serving=");
     n = write_dec(&mut buf, n, p.m_not_serving);
     n = write_prefix(&mut buf, n, b" refused=");
     n = write_dec(&mut buf, n, p.m_refused);
+    {
+        let pv = &*p.state;
+        n = write_prefix(&mut buf, n, b" subs=");
+        n = write_dec(&mut buf, n, pv.subscriptions() as u64);
+        n = write_prefix(&mut buf, n, b" owed=");
+        n = write_dec(&mut buf, n, pv.owed() as u64);
+        n = write_prefix(&mut buf, n, b" partial=");
+        n = write_dec(&mut buf, n, u64::from(pv.m_pump_partial));
+        n = write_prefix(&mut buf, n, b" told=");
+        n = write_dec(&mut buf, n, u64::from(pv.m_told));
+        n = write_prefix(&mut buf, n, b" ev_refused=");
+        n = write_dec(&mut buf, n, u64::from(pv.m_refused));
+    }
+    n = write_prefix(&mut buf, n, b" ops=");
+    for (i, c) in p.m_ops.iter().enumerate() {
+        if i > 0 {
+            n = write_prefix(&mut buf, n, b"/");
+        }
+        n = write_dec(&mut buf, n, u64::from(*c));
+    }
     if worker.sweep_wrap != 0 {
         let r = (*p.state).report();
         n = write_prefix(&mut buf, n, b" reg=");
@@ -3104,7 +3165,21 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
         n = write_dec(&mut buf, n, u64::from(r.in_log));
         n = write_prefix(&mut buf, n, b" uploaded=");
         n = write_dec(&mut buf, n, r.uploaded);
+        n = write_prefix(&mut buf, n, b" ostep=");
+        n = write_dec(&mut buf, n, u64::from(r.step));
+        n = write_prefix(&mut buf, n, b" rtry=");
+        n = write_dec(&mut buf, n, u64::from(r.reg_tries));
+        n = write_prefix(&mut buf, n, b" rsent=");
+        n = write_dec(&mut buf, n, u64::from(r.reg_sent));
+        n = write_prefix(&mut buf, n, b" rseen=");
+        n = write_dec(&mut buf, n, u64::from(r.reg_seen));
+        n = write_prefix(&mut buf, n, b" rmiss=");
+        n = write_dec(&mut buf, n, u64::from(r.reg_miss));
     }
+    n = write_prefix(&mut buf, n, b" ai=");
+    n = write_dec(&mut buf, n, worker.applied_index);
+    n = write_prefix(&mut buf, n, b" hblk=");
+    n = write_dec(&mut buf, n, worker.m_head_blocked);
     log_line(worker, &buf, n);
 }
 
@@ -3139,20 +3214,39 @@ unsafe fn provider_resync(worker: &mut WorkerState) {
 #[cfg(feature = "store_provider")]
 const BUSY_ROUNDS: u32 = 1 << 16;
 
+/// And the time it may spend doing so, in microseconds: this runs inside
+/// the CALLER's step, under the caller's step deadline (2 ms by default).
+/// Past it the write answers not-yet (`EINPROGRESS`: asked again with the
+/// same request) and the worker's own steps finish the flush. On a host each round is a page-cache write
+/// and the budget is rarely met; on bare metal the disk only moves when
+/// fat32 and nvme step, which they cannot while this spins, so without the
+/// bound the call ran until the step guard cut the caller off mid-way
+/// through the store's own maintenance.
+#[cfg(feature = "store_provider")]
+const BUSY_CALL_BUDGET_US: u64 = 1_000;
+
 /// Storage actions construction may take before it leaves the rest to the
 /// loader's next call (each is a bounded slice of recovery, replay or
 /// import, and every one moves the store on).
 #[cfg(feature = "store_provider")]
 const READY_ROUNDS: u32 = 1 << 20;
 
-/// Make the store ready before the provider exists: the loader registers
-/// it when construction returns Ready, and a consumer's very first call
-/// must find the store serving — a host store is ready at open (it
-/// replays its log as it opens), and the store's consumers read "ask
-/// again" as "absent". So the runs are recovered, the command log's tail
-/// replayed and any import done here. `0`: ready (or not a provider);
-/// `1`: the FS provider is still coming up — the loader calls again;
-/// `-1`: the store cannot serve.
+/// Make the store ready at construction where it can be: a host store
+/// recovers as it opens, so the runs are recovered, the command log's tail
+/// replayed and any import done here, and a consumer's first call finds it
+/// serving.
+///
+/// Where it cannot — its FS provider is not up yet, as on bare metal, where
+/// the disk mounts only once the graph steps (nvme, then fat32) — the store
+/// is constructed anyway and recovers through its own steps. It is
+/// deferred-ready (`module_deferred_ready`): it signals Ready the first step
+/// it serves, and the kernel holds every module requiring its contracts
+/// until then (fluxor's contract-readiness gate), so no consumer meets it
+/// unready. Waiting here instead could never end on metal: the loader
+/// re-asks a pending construction without stepping the disk below it.
+///
+/// `0`: constructed (ready, or recovering through its steps; or not a
+/// provider); `-1`: the store cannot serve.
 #[cfg(feature = "store_provider")]
 unsafe fn provider_make_ready(worker: &mut WorkerState) -> i32 {
     worker.prov.pending = false;
@@ -3204,13 +3298,17 @@ unsafe fn provider_make_ready(worker: &mut WorkerState) -> i32 {
             && worker.disk_phase == DISK_PHASE_RECOVERING
             && worker.fs_storage.last_was_again()
         {
-            // The FS provider is not up yet: ask to be called again.
-            worker.prov.pending = true;
-            return 1;
+            // The FS provider is not up yet: recover through the steps.
+            let m =
+                b"[kvw] store recovering after construction (disk not up): Ready once it serves";
+            dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len());
+            return 0;
         }
     }
-    worker.prov.pending = true;
-    1
+    // Construction's share of the recovery is spent; the steps finish it.
+    let m = b"[kvw] store recovering after construction: Ready once it serves";
+    dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len());
+    0
 }
 
 /// The host store log import, a bounded slice per step, before the store
@@ -3564,6 +3662,17 @@ pub extern "C" fn module_provider_dispatch(
             return store_provider::ENOSYS;
         }
         worker.prov.m_calls = worker.prov.m_calls.wrapping_add(1);
+        let class = match op {
+            store_provider::OBJ_GET => 0,
+            store_provider::OBJ_RANGE_GET => 1,
+            store_provider::OBJ_PUT => 2,
+            store_provider::OBJ_DELETE => 3,
+            store_provider::NS_LIST => 4,
+            store_provider::NS_SUBSCRIBE => 5,
+            store_provider::NS_CHANGES => 6,
+            _ => 7,
+        };
+        worker.prov.m_ops[class] = worker.prov.m_ops[class].wrapping_add(1);
         if op == store_provider::NS_CAPS {
             return store_provider::NS_CAPS_SERVED;
         }
@@ -4063,9 +4172,53 @@ unsafe fn maybe_request_ts_lease(worker: &mut WorkerState) {
     let _ = (sys.channel_write)(worker.lease_request_out, frame.as_mut_ptr(), frame.len());
 }
 
+/// The store variant is deferred-ready: it is not `Ready` until its disk
+/// store serves, and the kernel holds back every module that requires a
+/// contract it provides until then (fluxor's contract-readiness gate). On
+/// Linux the store recovers at construction and is ready on its first step;
+/// on bare metal its disk mounts only once the graph steps, and a connector
+/// whose first call met `EAGAIN` would otherwise conclude the store refused
+/// it.
+///
+/// Ready means the DISK serves, not that the store has imported a host log
+/// through the replicated log: that import needs the consensus path, which
+/// is downstream of this module on its edges and so is held by the kernel's
+/// edge gate until this module is Ready. Waiting for the import here would
+/// deadlock the graph; calls meanwhile are answered `EAGAIN`, as before.
+#[cfg(feature = "store_provider")]
+#[no_mangle]
+#[link_section = ".text.module_deferred_ready"]
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
+
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
+    let rc = step(state);
+    #[cfg(feature = "store_provider")]
+    if rc == 0 && !state.is_null() {
+        // SAFETY: the kernel passes this module's own state.
+        let worker = unsafe { &mut *state.cast::<WorkerState>() };
+        // A worker that registered no contract gates nothing: Ready at once,
+        // so a configuration that serves no store never freezes the graph
+        // behind it (it says why in `[kvw] store provider=0 (...)`).
+        let serving = worker.state_store != STATE_STORE_DISK
+            || worker.disk_phase == DISK_PHASE_QUARANTINED
+            || store_serving(worker);
+        if !worker.prov.signalled && (!worker.prov.provides || serving) {
+            worker.prov.signalled = true;
+            if !worker.syscalls.is_null() {
+                let m = b"[kvw] store serving: Ready";
+                unsafe { dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len()) };
+            }
+            return 3;
+        }
+    }
+    rc
+}
+
+fn step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
@@ -4167,9 +4320,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let drain_us = now_us(worker).wrapping_sub(drain_t0);
         if drain_us >= DRAIN_LOG_US {
-            let mut buf = [0u8; 96];
+            let mut buf = [0u8; 160];
             let mut n = write_prefix(&mut buf, 0, b"[kvw] drain n=");
             n = write_dec(&mut buf, n, u64::from(drained));
+            n = write_prefix(&mut buf, n, b" msg=");
+            n = write_dec(&mut buf, n, u64::from(worker.last_msg));
+            n = write_prefix(&mut buf, n, b" op=");
+            n = write_dec(&mut buf, n, u64::from(worker.last_op));
             n = write_prefix(&mut buf, n, b" us=");
             n = write_dec(&mut buf, n, drain_us);
             n = write_prefix(&mut buf, n, b" spill=");
@@ -4620,6 +4777,14 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                         worker.disk_fence_steps = 0;
                         worker.disk_flush_completions =
                             worker.disk_flush_completions.wrapping_add(1);
+                        if worker.disk_capture_after_flush {
+                            // The capture that asked for this flush: the
+                            // manifest now names the applied position
+                            // the memtable held when it froze.
+                            worker.disk_capture_after_flush = false;
+                            worker.m_cap_emit = worker.m_cap_emit.wrapping_add(1);
+                            emit_snapshot_chunks(worker, &*worker.syscalls);
+                        }
                     }
                     Err(StoreError::Backpressure) => {
                         // Refused before any I/O: the run set is full,
@@ -4895,7 +5060,7 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     // ph=phase fw=flush_wanted ca=compact_active deg=degraded_steps
     // hard=hard_faults errno=last_errno mem=memtable runs=run_files
     // fa/fc/ff/fb=flush attempts/completions/failures/backpressure
-    let mut buf = [0u8; 320];
+    let mut buf = [0u8; 448];
     // `ss`/`rp` are the EFFECTIVE params — repeated on
     // every heartbeat so a capture that misses the init line still
     // proves which provider this worker actually selected.
@@ -4966,6 +5131,9 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     n = write_dec(&mut buf, n, op);
     n = write_prefix(&mut buf, n, b" bl=");
     n = write_dec(&mut buf, n, worker.disk_state.blocks_read.get());
+    //   hit = run blocks served from the block cache (no storage call)
+    n = write_prefix(&mut buf, n, b" hit=");
+    n = write_dec(&mut buf, n, worker.disk_state.block_cache.hits.get());
     n = write_prefix(&mut buf, n, b" sc=");
     n = write_dec(&mut buf, n, worker.disk_state.scans_opened.get());
     n = write_prefix(&mut buf, n, b" sk=");
@@ -4984,6 +5152,53 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     n = write_dec(&mut buf, n, worker.m_scan_retries_adopted);
     n = write_prefix(&mut buf, n, b" hr=");
     n = write_dec(&mut buf, n, worker.m_scan_hold_refusals);
+    //   rr   = the recover step refused at (0 = recovered; DiskState docs)
+    //   qe   = the FS errno at the last quarantine-class refusal logged
+    n = write_prefix(&mut buf, n, b" rr=");
+    n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_refusal));
+    n = write_prefix(&mut buf, n, b" qe=");
+    n = write_signed(&mut buf, n, worker.disk_quarantine_errno);
+    //   rm/rl/rf = recovery: the run a manifest named but the listing
+    //   lacked, runs listed, fallbacks to the other manifest slot
+    n = write_prefix(&mut buf, n, b" rm=");
+    n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_missing_id));
+    n = write_prefix(&mut buf, n, b" rl=");
+    n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_listed));
+    n = write_prefix(&mut buf, n, b" rf=");
+    n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_fallbacks));
+    //   ma/mb = each manifest slot at the last recovery: verdict | gen << 4
+    //   (7 valid, 6 CRC, 1 absent …); ra/rb = the highest run it names
+    n = write_prefix(&mut buf, n, b" ma=");
+    n = write_dec(
+        &mut buf,
+        n,
+        u64::from(worker.disk_state.manifest_seen[0].get()),
+    );
+    n = write_prefix(&mut buf, n, b" mb=");
+    n = write_dec(
+        &mut buf,
+        n,
+        u64::from(worker.disk_state.manifest_seen[1].get()),
+    );
+    n = write_prefix(&mut buf, n, b" ra=");
+    n = write_dec(
+        &mut buf,
+        n,
+        u64::from(worker.disk_state.manifest_runs[0].get()),
+    );
+    n = write_prefix(&mut buf, n, b" rb=");
+    n = write_dec(
+        &mut buf,
+        n,
+        u64::from(worker.disk_state.manifest_runs[1].get()),
+    );
+    //   cap  = snapshot captures: requests seen / flushes asked / markers emitted
+    n = write_prefix(&mut buf, n, b" cap=");
+    n = write_dec(&mut buf, n, u64::from(worker.m_cap_req));
+    n = write_prefix(&mut buf, n, b"/");
+    n = write_dec(&mut buf, n, u64::from(worker.m_cap_ask));
+    n = write_prefix(&mut buf, n, b"/");
+    n = write_dec(&mut buf, n, u64::from(worker.m_cap_emit));
     dev_log(sys, DISK_LOG_LEVEL, buf.as_ptr(), n);
 }
 
@@ -5105,6 +5320,9 @@ unsafe fn log_line(worker: &WorkerState, buf: &[u8], n: usize) {
 }
 
 unsafe fn log_disk_errno(worker: &mut WorkerState, prefix: &[u8]) {
+    // Kept for the heartbeat (`qe=`): the line itself is emitted once,
+    // at boot, before a rig's capture attaches.
+    worker.disk_quarantine_errno = worker.fs_storage.last_errno();
     if worker.syscalls.is_null() {
         return;
     }
@@ -5314,11 +5532,31 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
 
     match kind {
         MSG_APP_SNAPSHOT_REQUEST => {
+            worker.m_cap_req = worker.m_cap_req.wrapping_add(1);
             if worker.snapshot_export_out < 0 || worker.applied_index == 0 {
                 // Nothing replicated applied yet — there is no position
                 // we could honestly label a body with, so stay silent.
                 return;
             }
+            // The disk store's marker is labelled at the MANIFEST's
+            // applied position, which only a flush publish moves. An
+            // idle control plane writes too little to reach the flush
+            // watermark, so without this the manifest stays at 0 (or
+            // far behind), the marker is withheld (or stale), no
+            // snapshot ever lands, and the log is replayed whole at
+            // every boot. Ask for the flush now and answer when it
+            // publishes; an empty memtable has nothing to publish, so
+            // the marker stands at what the manifest already says.
+            if worker.state_store == STATE_STORE_DISK
+                && worker.disk_state.durable_applied_index < worker.applied_index
+                && worker.disk_state.mem_count > 0
+            {
+                worker.disk_flush_wanted = true;
+                worker.disk_capture_after_flush = true;
+                worker.m_cap_ask = worker.m_cap_ask.wrapping_add(1);
+                return;
+            }
+            worker.m_cap_emit = worker.m_cap_emit.wrapping_add(1);
             emit_snapshot_chunks(worker, sys);
         }
         MSG_APP_SNAPSHOT_SPAN_REQUEST => {
@@ -5426,10 +5664,17 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                 // DISK-RESIDENT marker: the body certifies that the
                 // state up to its applied position lives in THIS
                 // node's manifest-named runs. Adopt the local store
-                // (identity-checked) instead of destroying it. A node
-                // whose local store doesn't match fails CLOSED: applied
-                // stays 0 and the store is untouched — it must catch up
-                // from the leader, not fabricate state.
+                // (identity-checked) instead of destroying it — but only
+                // if the manifest recovery served covers that position.
+                // The log behind the marker is compacted, so a store
+                // recovered at an older generation (recovery serves the
+                // other manifest slot when the newer one's runs did not
+                // survive) cannot be brought forward by replay: adopting
+                // it would label it at the marker's index and skip the
+                // writes between. A node whose local store doesn't match
+                // fails CLOSED: applied stays 0 and the store is
+                // untouched — it must catch up from the leader, not
+                // fabricate state.
                 if worker.state_store == STATE_STORE_DISK
                     && total >= SNAP_HDR_LEN
                     && u32::from_le_bytes([
@@ -5450,9 +5695,11 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                         worker.import_buf[18],
                         worker.import_buf[19],
                     ]);
+                    let marker_index = le_u64(&worker.import_buf[8..16]);
                     let adopted = worker.disk_phase == DISK_PHASE_SERVING
                         && hdr_gen == worker.disk_state.range_generation
-                        && worker.disk_state.generation > 0;
+                        && worker.disk_state.generation > 0
+                        && marker_index <= worker.disk_state.durable_applied_index;
                     // The marker's clock frontier stands whether or not
                     // the local store is adopted: it is a fact about
                     // the log this node is following, and the records

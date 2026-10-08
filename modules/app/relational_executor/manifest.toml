@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The shared relational execution engine. Compiles typed relational
 # operations into bounded Lattice KV reads, ordered scans, and writes.

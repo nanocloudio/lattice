@@ -61,6 +61,10 @@ pub enum StorageError {
     AlreadyExists,
     /// Any I/O fault: short write, device error, revoked handle.
     IoFault,
+    /// The provider could not finish this call within its step budget and
+    /// continues it when asked again with the same arguments (fat32's
+    /// bounded directory scan). Ask again next step; nothing failed.
+    Again,
     /// A durability barrier could not be guaranteed. Distinct from
     /// `IoFault` so callers can surface "your data may not survive
     /// power loss" precisely.
