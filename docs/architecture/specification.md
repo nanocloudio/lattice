@@ -36,6 +36,22 @@ else is present-tense fact with its defining source file.
   same channel as the commands it orders against. No apply or read
   samples a local timer. Source:
   `modules/app/kv_state_worker/mod.rs`.
+- **WHOLE-ENVELOPE** — a module takes an envelope
+  (`[msg_type:u8][len:u16 LE][payload]`) off a channel only once the
+  whole of it is there. A channel with several producers is fanned in
+  by the kernel's byte-stream merge, which can deliver a frame over
+  several steps when the consumer is short of room; read header first,
+  such a frame would be lost and the rest of the stream misread. An
+  envelope longer than the reader's buffer is discarded whole, across
+  steps if it must be, and counted — never half-read. Every input is
+  read through one `Inbox` per channel. Source:
+  `modules/common/envelope.rs`.
+- **APPLY-ONCE** — the state worker applies each committed entry
+  exactly once, in log order: its commands arrive whole
+  (WHOLE-ENVELOPE), and it never installs a snapshot at or below its
+  applied position (see
+  [Snapshots and compaction](#snapshots-and-compaction)). Source:
+  `modules/app/kv_state_worker/mod.rs`.
 
 ## Terminology
 
@@ -206,15 +222,28 @@ Two consequences worth stating plainly:
 ## Snapshots and compaction
 
 Log snapshots and their transfer are the substrate's. The state
-worker implements the app side: on request it encodes its state and
-streams it in chunks; on install it accumulates chunks and replaces
-its state at the labelled applied position. Disk state stores answer
-with a small disk-resident marker (the store's on-disk runs are the
-snapshot); memory-store bodies are size-bound by the worker's
-transfer buffer, and an over-budget encode is refused, leaving the
-WAL authoritative (the ceilings are in the
-[limit register](limit_register.md)). Source:
+worker implements the app side: on request it encodes its state,
+labelled with its applied position, and streams it in chunks; on
+install it replaces its state with the body's, at the body's label.
+Disk state stores answer with a small disk-resident marker (the
+store's on-disk runs are the snapshot); memory-store bodies are
+size-bound by the worker's transfer buffer, and an over-budget encode
+is refused, leaving the WAL authoritative (the ceilings are in the
+[limit register](limit_register.md)). A replica the log can no
+longer catch up (it lost its disk, or fell behind the compacted log)
+is sent a portable copy of the leader's store instead: read as of
+the leader's applied position while writes go on, and streamed into
+the replica's store a chunk at a time. Source:
 `modules/app/kv_state_worker/mod.rs`.
+
+An install at or below the worker's applied position is never
+applied. The store already holds that state and the entries after
+it, and the substrate keeps its log past such a snapshot, so those
+entries are not delivered again: replacing the state would lose them,
+acknowledged writes among them. The worker drains the stream and
+acknowledges it, and the store stays as it stands. This happens
+whenever a leader sends a copy on a stale view of a follower's
+progress.
 
 A disk store's marker is labelled at its manifest's applied position,
 which only a flush publish moves, so a snapshot request that finds

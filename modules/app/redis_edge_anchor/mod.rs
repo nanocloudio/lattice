@@ -75,6 +75,10 @@ mod telemetry;
 #[path = "../../common/session_anchor.rs"]
 mod session_anchor;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use redis_codec::{
     enc_array_header, enc_bulk, enc_error, enc_integer, enc_null_bulk, enc_raw, enc_simple_str,
     eq_ascii_ci, itoa, parse_i64, parse_one, ArgView, Argv, Built, ParseStep,
@@ -635,6 +639,12 @@ struct AnchorState {
     pubsub_in2: i32,
     /// MSG_SESSION_RELOCATE from session_relocator.
     relocate_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    kv_inbox: Inbox,
+    pubsub_inbox: Inbox,
+    pubsub_inbox2: Inbox,
+    relocate_inbox: Inbox,
 
     listen_port: u16,
     phase: AnchorPhase,
@@ -672,7 +682,9 @@ struct AnchorState {
     step_ctr: u64,
 
     slots: [Slot; MAX_CONNS],
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// Outbound envelopes are built here; an inbound envelope is read
+    /// whole into it (header room, then the payload).
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
     /// Commands carried through the large-value layer, one envelope for
     /// their exchanges, and a reply waiting for a session.
     lg: [RLgSlot; RLG_SESSIONS],
@@ -759,6 +771,11 @@ impl AnchorState {
         self.pubsub_out2 = -1;
         self.pubsub_in2 = -1;
         self.relocate_in = -1;
+        self.net_inbox = Inbox::new();
+        self.kv_inbox = Inbox::new();
+        self.pubsub_inbox = Inbox::new();
+        self.pubsub_inbox2 = Inbox::new();
+        self.relocate_inbox = Inbox::new();
 
         self.listen_port = DEFAULT_LISTEN_PORT;
         self.phase = AnchorPhase::Init;
@@ -1520,17 +1537,16 @@ unsafe fn poll_pubsub_worker(anchor: &mut AnchorState, worker_idx: u8) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+    let inbox = if worker_idx == 0 {
+        &mut anchor.pubsub_inbox
+    } else {
+        &mut anchor.pubsub_inbox2
+    };
+    let Some((mt, len)) = read_envelope(inbox, &*sys, chan, &mut anchor.scratch) else {
         return false;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len == 0 || len > anchor.scratch.len() {
-        return len == 0;
-    }
-    if (((*sys).channel_read)(chan, anchor.scratch.as_mut_ptr(), len) as usize) < len {
-        return false;
+    };
+    if len == 0 {
+        return true;
     }
     if mt == MSG_PUBSUB_PUBLISHED {
         handle_published(anchor, len);
@@ -1736,20 +1752,16 @@ unsafe fn poll_relocate_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(anchor.relocate_in, hdr.as_mut_ptr(), 3) < 3 {
+    let Some((mt, len)) = read_envelope(
+        &mut anchor.relocate_inbox,
+        &*sys,
+        anchor.relocate_in,
+        &mut anchor.scratch,
+    ) else {
         return false;
-    }
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len == 0 || len > anchor.scratch.len() {
-        return len == 0;
-    }
-    if (((*sys).channel_read)(anchor.relocate_in, anchor.scratch.as_mut_ptr(), len) as usize) < len
-    {
-        return false;
-    }
+    };
     // MSG_SESSION_RELOCATE: [target_worker:1]
-    if hdr[0] == wire::MSG_SESSION_RELOCATE && len >= 1 {
+    if mt == wire::MSG_SESSION_RELOCATE && len >= 1 {
         let target = anchor.scratch[0];
         let _ = anchor.psa.relocate(target);
     }
@@ -1850,7 +1862,7 @@ fn forward_to_router(
         return Dispatch::Handled;
     }
     let total = 3 + payload_len;
-    if total > anchor.scratch.len() {
+    if total > SCRATCH_BUF_SIZE {
         let s = &mut anchor.slots[slot_idx];
         let _ = enc_error(&mut s.send_buf, &mut s.send_len, b"ERR scratch overflow");
         return Dispatch::Handled;
@@ -1942,22 +1954,20 @@ unsafe fn poll_kv_in(anchor: &mut AnchorState) -> bool {
 
 unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     let sys = anchor.syscalls;
-    let mut hdr = [0u8; 3];
-    let n = ((*sys).channel_read)(anchor.kv_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.kv_inbox,
+        &*sys,
+        anchor.kv_in,
+        &mut anchor.scratch,
+    ) else {
         return false;
-    }
-    if hdr[0] != MSG_KV_RESPONSE {
+    };
+    if msg_type != MSG_KV_RESPONSE {
         return false; // unknown envelope on kv_in
     }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // [corr:8][conn_id:1][result:1][revision:8][body_len:2]
     const RESP_HEAD: usize = 8 + 1 + 1 + 8 + 2;
-    if payload_len < RESP_HEAD || payload_len > anchor.scratch.len() {
-        return false;
-    }
-    let n2 = ((*sys).channel_read)(anchor.kv_in, anchor.scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < RESP_HEAD {
         return false;
     }
 
@@ -2453,17 +2463,19 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
         if poll <= 0 || (poll as u32) & POLL_IN == 0 {
             return false;
         }
-        let buf = anchor.scratch.as_mut_ptr();
-        let (msg_type, payload_len) = net_read_frame(&*sys, anchor.net_in, buf, SCRATCH_BUF_SIZE);
-        if msg_type == 0 && payload_len == 0 {
+        let Some((msg_type, payload_len)) = read_envelope(
+            &mut anchor.net_inbox,
+            &*sys,
+            anchor.net_in,
+            &mut anchor.scratch[..SCRATCH_BUF_SIZE],
+        ) else {
             return false;
-        }
+        };
         // Copy payload out of scratch so we can mutate slots without
         // aliasing scratch (the slot table and scratch share AnchorState).
         let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-        let copy_len = payload_len.min(SCRATCH_BUF_SIZE);
-        core::ptr::copy_nonoverlapping(buf.add(NET_FRAME_HDR), tmp.as_mut_ptr(), copy_len);
-        let payload = &tmp[..copy_len];
+        tmp[..payload_len].copy_from_slice(&anchor.scratch[..payload_len]);
+        let payload = &tmp[..payload_len];
 
         dispatch_net_frame(anchor, msg_type, payload);
         processed += 1;

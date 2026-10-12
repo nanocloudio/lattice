@@ -75,6 +75,10 @@ mod coord;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use coord::{Coordinator, Participant, Phase, Step, TransactionRecord, TxnOutcome, TxnStatus};
 use types::{
     KV_OP_PUT, KV_OP_TARGETED, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE,
@@ -114,6 +118,8 @@ struct CoordState {
     kv_in: i32,
     kv_out: i32,
     metrics_out: i32,
+    /// `kv_in`'s envelope reading (`common/envelope.rs`).
+    kv_inbox: Inbox,
 
     // ── Declaration ──────────────────────────────────────────────────
     mode: u8,
@@ -135,6 +141,8 @@ struct CoordState {
     // ── Dynamic mode (mode 2): cross-range txns submitted at runtime by
     //    relational_executor over `submit_in`, answered on `result_out` ──
     submit_in: i32,
+    /// `submit_in`'s envelope reading (`common/envelope.rs`).
+    submit_inbox: Inbox,
     result_out: i32,
     /// True while a dynamic transaction is in flight, so its terminal
     /// outcome is reported back to the submitter exactly once.
@@ -175,7 +183,9 @@ impl CoordState {
         self.kv_in = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
+        self.kv_inbox = Inbox::new();
         self.submit_in = -1;
+        self.submit_inbox = Inbox::new();
         self.result_out = -1;
         self.dyn_active = false;
         self.dyn_reported = false;
@@ -963,8 +973,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: sys_ptr non-null; `env` is module-owned storage.
     unsafe {
         let sys = &*sys_ptr;
-        let mut env = [0u8; ENV_BUF];
-        if let Some((msg, payload)) = read_one_envelope(sys, s.kv_in, &mut env) {
+        let mut env = [0u8; ENVELOPE_HDR + ENV_BUF];
+        if let Some((msg, len)) = read_envelope(&mut s.kv_inbox, sys, s.kv_in, &mut env) {
+            let payload = &env[..len];
             // MSG_KV_RESPONSE head: [corr:8][conn:1][result:1][rev:8][blen:2]
             // Log EVERY envelope, matched or not. "No reply arrived" and
             // "a reply arrived that we discarded" are different bugs and
@@ -1007,8 +1018,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // SAFETY: sys_ptr non-null; `env` module-owned.
         unsafe {
             let sys = &*sys_ptr;
-            let mut env = [0u8; ENV_BUF];
-            if let Some((msg, payload)) = read_one_envelope(sys, s.submit_in, &mut env) {
+            let mut env = [0u8; ENVELOPE_HDR + ENV_BUF];
+            if let Some((msg, len)) = read_envelope(&mut s.submit_inbox, sys, s.submit_in, &mut env)
+            {
+                let payload = &env[..len];
                 if msg == MSG_TXN_SUBMIT {
                     start_dynamic_txn(s, payload);
                 }
@@ -1070,36 +1083,4 @@ unsafe fn write_envelope(
     env[2] = ((payload_len >> 8) & 0xFF) as u8;
     let total = wire::ENVELOPE_HDR + payload_len;
     (sys.channel_write)(chan, env.as_mut_ptr(), total) == total as i32
-}
-
-/// Read one envelope from `chan`. Mirrors the supervisor's helper.
-///
-/// # Safety
-/// `sys` must be a live syscall table.
-unsafe fn read_one_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len > 0
-        && ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len
-    {
-        return None;
-    }
-    Some((hdr[0], &scratch[..payload_len]))
 }

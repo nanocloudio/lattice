@@ -59,6 +59,10 @@ mod session_worker;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use pubsub_core::SubTable;
 use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{worker_id, SessionId, CLASS_PUBSUB};
@@ -78,6 +82,8 @@ struct PubsubState {
     syscalls: *const SyscallTable,
 
     ctrl_in: i32,
+    /// `ctrl_in`'s envelope reading (`common/envelope.rs`).
+    ctrl_inbox: Inbox,
     ctrl_out: i32,
     messages_out: i32,
     metrics_out: i32,
@@ -91,7 +97,8 @@ struct PubsubState {
 
     subs: [SubTable; MAX_SESSIONS],
     sw: SessionWorker<MAX_SESSIONS>,
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 define_params! {
@@ -105,6 +112,7 @@ impl PubsubState {
     fn init(&mut self, syscalls: *const SyscallTable) {
         self.syscalls = syscalls;
         self.ctrl_in = -1;
+        self.ctrl_inbox = Inbox::new();
         self.ctrl_out = -1;
         self.messages_out = -1;
         self.metrics_out = -1;
@@ -120,34 +128,6 @@ impl PubsubState {
         }
         self.sw.init(worker_id(CLASS_PUBSUB, 0));
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> bool {
@@ -473,7 +453,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*sys_ptr;
-        if let Some((mt, len)) = read_envelope(sys, st.ctrl_in, &mut st.scratch) {
+        if let Some((mt, len)) = read_envelope(&mut st.ctrl_inbox, sys, st.ctrl_in, &mut st.scratch)
+        {
             let mut tmp = [0u8; SCRATCH_BUF_SIZE];
             tmp[..len].copy_from_slice(&st.scratch[..len]);
             if (0x70..=0x9F).contains(&mt) {

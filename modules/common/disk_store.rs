@@ -508,6 +508,12 @@ pub const MAX_MANIFEST_FILES: usize = 8;
 /// fault, never a truncation), so the bound is generous: it costs 4 KB of
 /// stack, once, at recovery.
 pub const MAX_LISTED_RUNS: usize = 1024;
+/// Orphans one overflowed recovery queues for deletion. The queue outlives
+/// a recovery attempt: a deleted the FS defers (E_AGAIN — on a large FAT32
+/// root an unlink's directory walk spans steps) is asked again by the next
+/// attempt BEFORE anything is listed, because a listing between would walk
+/// the same directory and the deferred unlink would never finish.
+pub const SWEEP_BATCH: usize = 128;
 
 // ── Snapshot stream format v1 ─────────────────────────────────────────
 
@@ -845,17 +851,21 @@ impl RunMeta {
     }
 }
 
-/// Blocks the version scan may LOAD from run files in one call before
-/// it pauses (`ScanProgress::paused`). This is the step bound for a
-/// walk whose length is otherwise proportional to the stored keyspan:
-/// a `(from, to]` window is answered by walking the whole span in key
-/// order and filtering by timestamp, so the records that qualify can
-/// be arbitrarily far apart.
+/// Blocks the version scan may CROSS in one call before it pauses
+/// (`ScanProgress::paused`): loaded from a run file or served by the
+/// block cache alike. This is the step bound for a walk whose length is
+/// otherwise proportional to the stored keyspan: a `(from, to]` window is
+/// answered by walking the whole span in key order and filtering by
+/// timestamp, so the records that qualify can be arbitrarily far apart.
+/// A cached block skips the storage call but not the copy, the CRC check
+/// and the record decode, so a walk over a cached run is bounded the
+/// same way — otherwise a run the cache holds whole would be walked in
+/// one call.
 ///
-/// Sized from the pi5 rig: a block is ONE speculative FS read (header,
-/// payload and CRC together, ~190 us on FAT32/NVMe), so two blocks is
-/// ~0.4 ms of I/O — comfortably inside the worker's 1.5 ms drain
-/// budget with the rest of the step's work. Resume is free in the
+/// Sized from the pi5 rig: a block from storage is ONE speculative FS
+/// read (header, payload and CRC together, ~190 us on FAT32/NVMe), so two
+/// blocks is ~0.4 ms of I/O — comfortably inside the worker's 1.5 ms
+/// drain budget with the rest of the step's work. Resume is free in the
 /// steady state (the merge is arena-resident and continues in place),
 /// so the budget is not paying a re-positioning tax; when the run set
 /// has changed underneath a paused scan the rebuild costs one indexed
@@ -868,6 +878,15 @@ pub const SCAN_STEP_BLOCKS: usize = 2;
 /// otherwise escape `SCAN_STEP_BLOCKS`: a full memtable is
 /// `MEMTABLE_MAX_ENTRIES` compares, tens of microseconds.
 pub const SCAN_STEP_RECORDS: u32 = MEMTABLE_MAX_ENTRIES as u32;
+
+/// Older versions of one key a current-value range walk passes over in a
+/// row before it seeks past the key. Retained history keeps every version
+/// of a key, newest first, so a key rewritten often (a node's lease) is a
+/// run of records the walk would read block by block only to skip; past
+/// this many the walk re-seeks every source through its sparse index to
+/// the key's last possible version. Below it the versions sit in the block
+/// already loaded and the seek would cost more than it saves.
+pub const SKIP_STALE_VERSIONS: usize = 4;
 
 /// Bytes of transcoded reply page the hosting engine may park across a
 /// pause (`kv_store::scan_versions_op`). One command reply buffer.
@@ -1024,12 +1043,27 @@ pub struct ScanPageKey {
 struct CaptureState {
     active: bool,
     header_sent: bool,
-    _pad: [u8; 2],
+    /// A TRANSFER capture (`transfer_begin`): a portable copy for another
+    /// replica, read as of `as_of` while writes go on — not the exclusive
+    /// local capture, which holds apply and flush off for its duration.
+    transfer: bool,
+    /// Transfer: the counting pass (the header states the total) is
+    /// under way; the emitting pass follows it.
+    counting: bool,
     range_generation: u32,
     applied_index: u64,
     /// Records emitted so far; also the resume-cursor value.
     next_ordinal: u64,
     total_entries: u64,
+    /// Transfer: the revision the copy is read as of — the store's
+    /// highest when it began. A version above it is a write applied
+    /// since, which the receiver replays from the log.
+    as_of: u64,
+    /// Transfer: the internal key a pass resumes AFTER (empty: the
+    /// start), so each step walks on from where the last one stopped
+    /// instead of from the first key.
+    resume_len: u32,
+    resume: [u8; MAX_ENCODED_KEY],
 }
 
 /// Multi-step snapshot install bookkeeping. `partial` stages one
@@ -1201,6 +1235,14 @@ pub struct DiskState {
     /// 5 orphan delete, 6 filter load, 7 unpublished-run delete, 8 the
     /// record walk. A quarantine with no errno is explained by this.
     pub recover_refusal: u32,
+    /// Orphan runs deleted by recoveries whose run listing overflowed.
+    /// Kept across recovery attempts, as the queue below is.
+    pub recover_swept: u32,
+    /// Orphans queued by an overflowed listing, `sweep_ids[sweep_at..sweep_count]`
+    /// still to delete.
+    pub sweep_ids: [u32; SWEEP_BATCH],
+    pub sweep_count: u16,
+    pub sweep_at: u16,
     /// The run a manifest named that the listing did not hold (`rm=`),
     /// how many runs the listing held (`rl=`), and how many times
     /// recovery served the OTHER manifest slot because the higher
@@ -1374,7 +1416,7 @@ impl DiskState {
     /// Is a snapshot capture or a REPLACE install holding the apply
     /// exclusion? Every write is refused (backpressure) until it ends.
     pub fn apply_excluded(&self) -> bool {
-        self.capture.active || self.install.active
+        (self.capture.active && !self.capture.transfer) || self.install.active
     }
 
     /// A compaction under way: `(its floor, the input ordinal it has
@@ -1829,26 +1871,37 @@ impl DiskState {
 // ── Run-block cache ───────────────────────────────────────────────────
 //
 // A run is immutable: a block at an offset of a run (id + digest) never
-// changes, so the last few blocks read may be kept and handed back
-// without a storage call. The call is what a lookup costs on the board —
-// ~0.7 ms per block on FAT32/NVMe — and a replicated write's bookkeeping
-// reads of a hot key are the same block over and over: 9–20 blocks per
-// write, 5–15 ms, past the step budget. Eight blocks is ~37 KiB of state
-// and covers a write's own reads.
+// changes, so blocks read may be kept and handed back without a storage
+// call. The call is what a lookup costs on the board — ~0.7 ms per block
+// on FAT32/NVMe, made inside the step of whichever module asked.
+//
+// The cache holds a store's hot read set, not one write's: a store with
+// history serves many hot keys spread over large runs — a node's lease,
+// every watcher's registration, the RBAC index. A few blocks cover one
+// write's own reads of a hot key and miss most of the rest; on a Pi 5
+// control plane eight blocks missed four reads in five, ~80 synchronous
+// storage calls a second, enough to run the store's readers past their
+// step deadline. 256 blocks is ~1.2 MiB of the store's ~7.8 MiB state.
+//
+// Keys are scanned apart from the blocks, so a lookup walks a few KiB
+// rather than every cached block. Eviction is CLOCK: a block served since
+// the hand last passed it is spared once, so a burst of one-off reads
+// does not flush the keys that are read over and over.
 
 /// Blocks the cache keeps.
-pub const BLOCK_CACHE_SLOTS: usize = 8;
+pub const BLOCK_CACHE_SLOTS: usize = 256;
 
-/// One cached block: the whole stored block (header, payload, CRC) as it
-/// was read and verified. `run_id == 0` is an empty slot.
+/// Which block a slot holds. `run_id == 0` is an empty slot.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct CachedBlock {
+struct CacheKey {
     run_id: u32,
     run_digest: u32,
     off: u64,
+    /// The stored length.
     len: u32,
-    buf: [u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
+    /// Served since the clock hand last passed: spared once.
+    referenced: u32,
 }
 
 /// The cache. Interior mutability through `UnsafeCell`, as `point` is
@@ -1856,8 +1909,12 @@ struct CachedBlock {
 /// re-enters, and the store is single-threaded.
 #[repr(C)]
 pub struct BlockCache {
-    slots: UnsafeCell<[CachedBlock; BLOCK_CACHE_SLOTS]>,
-    next: Cell<u8>,
+    keys: UnsafeCell<[CacheKey; BLOCK_CACHE_SLOTS]>,
+    /// Each slot's whole stored block (header, payload, CRC) as it was
+    /// read and verified.
+    bufs: UnsafeCell<[[u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD]; BLOCK_CACHE_SLOTS]>,
+    /// The clock hand: the next slot `put` considers.
+    hand: Cell<u16>,
     /// Blocks served from the cache (the `disk hb` reports it beside
     /// `bl`, the blocks that went to storage).
     pub hits: Cell<u64>,
@@ -1871,15 +1928,17 @@ impl BlockCache {
             return None;
         }
         // SAFETY: see the type; no other reference to the slots exists
-        // while this one does.
-        let slots = unsafe { &*self.slots.get() };
-        for s in slots.iter() {
-            if s.run_id == run_id && s.run_digest == run_digest && s.off == off {
-                let n = s.len as usize;
-                if n > dst.len() || n > s.buf.len() {
+        // while these do.
+        let keys = unsafe { &mut *self.keys.get() };
+        let bufs = unsafe { &*self.bufs.get() };
+        for (k, b) in keys.iter_mut().zip(bufs.iter()) {
+            if k.run_id == run_id && k.run_digest == run_digest && k.off == off {
+                let n = k.len as usize;
+                if n > dst.len() || n > b.len() {
                     return None;
                 }
-                dst[..n].copy_from_slice(&s.buf[..n]);
+                dst[..n].copy_from_slice(&b[..n]);
+                k.referenced = 1;
                 self.hits.set(self.hits.get().wrapping_add(1));
                 return Some(n);
             }
@@ -1887,22 +1946,55 @@ impl BlockCache {
         None
     }
 
-    /// Keep a verified block; the oldest slot goes.
+    /// Mark the block at `off` of run `(id, digest)` wanted, if cached,
+    /// without copying it: it was served from elsewhere (a scanner's held
+    /// block), and is as hot as one served from here.
+    fn touch(&self, run_id: u32, run_digest: u32, off: u64) {
+        if run_id == 0 {
+            return;
+        }
+        // SAFETY: as `get`.
+        let keys = unsafe { &mut *self.keys.get() };
+        for k in keys.iter_mut() {
+            if k.run_id == run_id && k.run_digest == run_digest && k.off == off {
+                k.referenced = 1;
+                return;
+            }
+        }
+    }
+
+    /// Keep a verified block in the first slot the clock hand finds empty
+    /// or unreferenced, sparing (and clearing) referenced ones on the way.
     fn put(&self, run_id: u32, run_digest: u32, off: u64, block: &[u8]) {
         if run_id == 0 || block.is_empty() {
             return;
         }
         // SAFETY: as `get`.
-        let slots = unsafe { &mut *self.slots.get() };
-        let i = (self.next.get() as usize) % BLOCK_CACHE_SLOTS;
-        let s = &mut slots[i];
-        let n = block.len().min(s.buf.len());
-        s.run_id = run_id;
-        s.run_digest = run_digest;
-        s.off = off;
-        s.len = n as u32;
-        s.buf[..n].copy_from_slice(&block[..n]);
-        self.next.set(((i + 1) % BLOCK_CACHE_SLOTS) as u8);
+        let keys = unsafe { &mut *self.keys.get() };
+        let bufs = unsafe { &mut *self.bufs.get() };
+        let mut i = (self.hand.get() as usize) % BLOCK_CACHE_SLOTS;
+        // Two passes at most: the first clears every reference it meets.
+        let mut tries = 0usize;
+        while tries < 2 * BLOCK_CACHE_SLOTS {
+            let k = &mut keys[i];
+            if k.run_id == 0 || k.referenced == 0 {
+                break;
+            }
+            k.referenced = 0;
+            i = (i + 1) % BLOCK_CACHE_SLOTS;
+            tries += 1;
+        }
+        let b = &mut bufs[i];
+        let n = block.len().min(b.len());
+        b[..n].copy_from_slice(&block[..n]);
+        keys[i] = CacheKey {
+            run_id,
+            run_digest,
+            off,
+            len: n as u32,
+            referenced: 0,
+        };
+        self.hand.set(((i + 1) % BLOCK_CACHE_SLOTS) as u16);
     }
 }
 
@@ -2125,6 +2217,10 @@ impl RunScan {
                 && self.held_off == self.next_block_off
             {
                 // The block is already here, verified when it was read.
+                // The cache still learns it was wanted: a repeat served
+                // from here never reaches `get`, and a slot the clock
+                // hand sees unreferenced is the next one evicted.
+                cache.touch(self.run_id, self.run_digest, self.next_block_off);
                 let payload_len = rd_u32(&self.buf, 0) as usize;
                 let block_end = self.next_block_off + (BLOCK_OVERHEAD + payload_len) as u64;
                 if payload_len == 0 || payload_len > BLOCK_MAX_PAYLOAD || block_end > self.data_end
@@ -2818,7 +2914,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     fn flush_step_guarded(&mut self, ignore_install: bool) -> Result<Progress, StoreError> {
         if !self.state.flush.active {
             if self.state.compact.active
-                || self.state.capture.active
+                || (self.state.capture.active && !self.state.capture.transfer)
                 || (self.state.install.active && !ignore_install)
             {
                 return Err(StoreError::Backpressure);
@@ -3246,8 +3342,21 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     pub fn recover(&mut self) -> Result<(), StoreError> {
         let range_gen = self.state.range_generation;
         let prepared = self.state.prepared;
+        let (swept, sweep_ids, sweep_count, sweep_at) = (
+            self.state.recover_swept,
+            self.state.sweep_ids,
+            self.state.sweep_count,
+            self.state.sweep_at,
+        );
         self.state.init();
         self.state.range_generation = range_gen;
+        self.state.recover_swept = swept;
+        self.state.sweep_ids = sweep_ids;
+        self.state.sweep_count = sweep_count;
+        self.state.sweep_at = sweep_at;
+        // A sweep an earlier attempt queued finishes before anything is
+        // listed (see SWEEP_BATCH).
+        self.drain_sweep()?;
         // Preallocation is a property of the FILESYSTEM, not of the
         // recovered logical state: re-creating the pair after every
         // recover would put a 159 ms create back on the boot path.
@@ -3267,10 +3376,25 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut man_clock = 0u64;
         let mut run_ids = [0u32; MAX_LISTED_RUNS];
         self.state.recover_refusal = 2;
-        let run_n = self
-            .storage
-            .list(FileKind::Run, &mut run_ids)
-            .map_err(map_storage)?;
+        let run_n = loop {
+            match self.storage.list(FileKind::Run, &mut run_ids) {
+                Ok(n) => break n,
+                // More runs than a listing holds: a store whose writes
+                // outran its retirements (2026-10-14, pi5-a: 13 009 run
+                // files, a write storm upstream). Quarantining here would
+                // make the orphans permanent, so the listed runs neither
+                // manifest slot names are deleted and the root listed
+                // again. A delete the FS defers (E_AGAIN on a large root)
+                // returns here, and the next recovery attempt continues.
+                Err(StorageError::Overflow) => {
+                    if self.queue_listed_orphans(&run_ids)? == 0 {
+                        return Err(StoreError::StorageFault);
+                    }
+                    self.drain_sweep()?;
+                }
+                Err(e) => return Err(map_storage(e)),
+            }
+        };
         self.state.recover_listed = run_n as u32;
         let run_ids = &run_ids[..run_n];
         let mut max_seen_id = 0u32;
@@ -3360,10 +3484,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.recover_refusal = 5;
             for &id in run_ids {
                 if !runs.iter().take(run_count).any(|m| m.id == id) {
-                    match self.storage.delete(FileKind::Run, id) {
-                        Ok(()) | Err(StorageError::NotFound) => {}
-                        Err(e) => return Err(map_storage(e)),
-                    }
+                    self.delete_orphan(id)?;
                 }
             }
             self.state.runs = runs;
@@ -3421,10 +3542,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             // run present was never published and is an orphan.
             self.state.recover_refusal = 7;
             for &id in run_ids {
-                match self.storage.delete(FileKind::Run, id) {
-                    Ok(()) | Err(StorageError::NotFound) => {}
-                    Err(e) => return Err(map_storage(e)),
-                }
+                self.delete_orphan(id)?;
             }
         }
         self.state.next_run_id = max_seen_id + 1;
@@ -3456,6 +3574,83 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.manifest_runs[i].set(top_run);
     }
 
+    /// Queue (up to SWEEP_BATCH of) the runs in `listed` that neither
+    /// manifest slot names; the count queued. A recovery whose run listing
+    /// overflowed calls it: the listing holds a full table of ids, and every
+    /// one a manifest does not reference is an orphan however many more
+    /// there are.
+    fn queue_listed_orphans(&mut self, listed: &[u32]) -> Result<usize, StoreError> {
+        let mut keep = [0u32; 2 * MAX_RUNS];
+        let mut kept = 0usize;
+        for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
+            if let Some((_, _, rc, rs, ..)) = self.read_manifest(slot)? {
+                for meta in rs.iter().take(rc) {
+                    if let Some(k) = keep.get_mut(kept) {
+                        *k = meta.id;
+                        kept += 1;
+                    }
+                }
+            }
+        }
+        let keep = keep.get(..kept).unwrap_or(&[]);
+        let mut n = 0usize;
+        for &id in listed {
+            if n == SWEEP_BATCH {
+                break;
+            }
+            if keep.contains(&id) {
+                continue;
+            }
+            if let Some(slot) = self.state.sweep_ids.get_mut(n) {
+                *slot = id;
+                n += 1;
+            }
+        }
+        self.state.sweep_count = n as u16;
+        self.state.sweep_at = 0;
+        Ok(n)
+    }
+
+    /// Delete one orphan run. One the FS defers is queued, so the next
+    /// recovery attempt asks for it again before listing (SWEEP_BATCH).
+    fn delete_orphan(&mut self, id: u32) -> Result<(), StoreError> {
+        match self.storage.delete(FileKind::Run, id) {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(e) => {
+                if let Some(slot) = self.state.sweep_ids.get_mut(0) {
+                    *slot = id;
+                    self.state.sweep_count = 1;
+                    self.state.sweep_at = 0;
+                }
+                Err(map_storage(e))
+            }
+        }
+    }
+
+    /// Delete the queued orphans in order. A delete that fails (E_AGAIN
+    /// included) returns with the queue where it stood, so the next
+    /// attempt asks for that same run first.
+    fn drain_sweep(&mut self) -> Result<(), StoreError> {
+        while self.state.sweep_at < self.state.sweep_count {
+            let id = self
+                .state
+                .sweep_ids
+                .get(usize::from(self.state.sweep_at))
+                .copied()
+                .unwrap_or(0);
+            match self.storage.delete(FileKind::Run, id) {
+                Ok(()) | Err(StorageError::NotFound) => {
+                    self.state.sweep_at += 1;
+                    self.state.recover_swept = self.state.recover_swept.wrapping_add(1);
+                }
+                Err(e) => return Err(map_storage(e)),
+            }
+        }
+        self.state.sweep_count = 0;
+        self.state.sweep_at = 0;
+        Ok(())
+    }
+
     /// Read + checksum-validate one manifest file. `Ok(None)` = the
     /// file is torn/corrupt (a recovery candidate to skip), `Err` = the
     /// backend itself failed.
@@ -3473,7 +3668,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// ordering information at all.
     #[allow(
         clippy::type_complexity,
-        reason = "single internal caller destructures in place; a named struct would outlive its one use"
+        reason = "two internal callers destructure in place; a named struct would outlive those uses"
     )]
     fn read_manifest(
         &self,
@@ -3660,9 +3855,176 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.mem_count = 0;
     }
 
-    /// Is a snapshot capture holding the apply/flush exclusion?
+    /// Is a snapshot capture holding the apply/flush exclusion? A
+    /// transfer capture holds neither (see [`Self::transfer_active`]).
     pub fn capture_active(&self) -> bool {
-        self.state.capture.active
+        self.state.capture.active && !self.state.capture.transfer
+    }
+
+    /// Is a transfer capture under way? It refuses no write; it holds
+    /// compaction off, so no version at or below its revision is
+    /// reclaimed while it reads.
+    pub fn transfer_active(&self) -> bool {
+        self.state.capture.active && self.state.capture.transfer
+    }
+
+    /// Begin a TRANSFER capture: a portable copy of the store for another
+    /// replica, labelled `applied_index` and read as of `as_of` — the
+    /// revision that position left the store at (the caller's: only it
+    /// knows where a log entry's writes end). Unlike the local capture it
+    /// excludes nothing but
+    /// compaction — writes are applied throughout, above the copy's
+    /// revision, and the receiver replays them from the log after it.
+    /// Stepped by [`Self::transfer_step`]; abandoned with
+    /// [`Self::transfer_abort`].
+    pub fn transfer_begin(&mut self, applied_index: u64, as_of: u64) -> Result<(), StoreError> {
+        if self.state.capture.active || self.state.install.active || self.state.compact.active {
+            return Err(StoreError::Backpressure);
+        }
+        if as_of > self.state.highest_revision {
+            return Err(StoreError::Malformed);
+        }
+        self.state.capture.active = true;
+        self.state.capture.transfer = true;
+        self.state.capture.counting = true;
+        self.state.capture.header_sent = false;
+        self.state.capture.range_generation = self.state.range_generation;
+        self.state.capture.applied_index = applied_index;
+        self.state.capture.next_ordinal = 0;
+        self.state.capture.total_entries = 0;
+        self.state.capture.as_of = as_of;
+        self.state.capture.resume_len = 0;
+        Ok(())
+    }
+
+    /// Abandon a transfer capture (the receiver went away, or the caller
+    /// starts over). Read-only: nothing on disk changes.
+    pub fn transfer_abort(&mut self) {
+        if self.state.capture.transfer {
+            self.state.capture.active = false;
+            self.state.capture.transfer = false;
+        }
+    }
+
+    /// One bounded step of a transfer capture: visits at most `budget`
+    /// merged records, resuming after the last one visited. The counting
+    /// pass writes nothing (`(0, InProgress)`); the emitting pass writes
+    /// the snapshot stream v1 — the header (stating the count), then the
+    /// records at or below the copy's revision, whole — into `out`, and
+    /// answers `Done` with the stream's last bytes. The stream installs
+    /// with [`StateStore::install`] like any other.
+    pub fn transfer_step(
+        &mut self,
+        out: &mut [u8],
+        budget: u32,
+    ) -> Result<(usize, Progress), StoreError> {
+        if !(self.state.capture.active && self.state.capture.transfer) {
+            return Err(StoreError::Malformed);
+        }
+        // A flush in flight has its records in two places at once; the
+        // walk waits for it to publish.
+        if self.state.flush.active {
+            return Err(StoreError::Backpressure);
+        }
+        let mut pos = 0usize;
+        if !self.state.capture.counting && !self.state.capture.header_sent {
+            if out.len() < SNAP_HDR_LEN {
+                return Err(StoreError::OutputTooSmall);
+            }
+            out[0..4].copy_from_slice(&SNAP_MAGIC.to_le_bytes());
+            out[4..6].copy_from_slice(&SNAP_FORMAT_VERSION.to_le_bytes());
+            out[6..8].copy_from_slice(&0u16.to_le_bytes());
+            out[8..16].copy_from_slice(&self.state.capture.applied_index.to_le_bytes());
+            out[16..20].copy_from_slice(&self.state.capture.range_generation.to_le_bytes());
+            out[20..24].copy_from_slice(&(self.state.capture.total_entries as u32).to_le_bytes());
+            out[24..32].copy_from_slice(&self.state.capture.as_of.to_le_bytes());
+            out[32..40].copy_from_slice(&self.state.compaction_floor.to_le_bytes());
+            out[SNAP_HDR_CLOCK_OFF..SNAP_HDR_LEN]
+                .copy_from_slice(&self.state.committed_clock_ms.to_le_bytes());
+            pos = SNAP_HDR_LEN;
+            self.state.capture.header_sent = true;
+        }
+        let as_of = self.state.capture.as_of;
+        let mut resume = [0u8; MAX_ENCODED_KEY];
+        let rl = self.state.capture.resume_len as usize;
+        resume[..rl].copy_from_slice(&self.state.capture.resume[..rl]);
+        // SAFETY: the state's merge, lent to this walk (see `point`): no
+        // point read runs inside a whole-store walk, nor one walk inside
+        // another, so nothing else holds it while this reference lives.
+        let m = unsafe { &mut *self.state.point.get() };
+        m.fill_filtered(self.state, &*self.storage, true, &resume[..rl], None)?;
+        let mut kbuf = [0u8; MAX_ENCODED_KEY];
+        let mut vbuf = [0u8; MAX_VALUE_LEN];
+        let mut visited = 0u32;
+        loop {
+            if visited >= budget {
+                return Ok((
+                    pos,
+                    Progress::InProgress {
+                        cursor: self.state.capture.next_ordinal,
+                    },
+                ));
+            }
+            let Some((klen, vlen)) =
+                m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
+            else {
+                if self.state.capture.counting {
+                    // Counted: the emitting pass starts from the first key.
+                    self.state.capture.counting = false;
+                    self.state.capture.resume_len = 0;
+                    return Ok((pos, Progress::InProgress { cursor: 0 }));
+                }
+                if self.state.capture.next_ordinal != self.state.capture.total_entries {
+                    // The set read as of the revision changed under the
+                    // walk — never by design; refuse rather than ship a
+                    // copy the receiver would reject at its end.
+                    self.transfer_abort();
+                    return Err(StoreError::Malformed);
+                }
+                self.state.capture.active = false;
+                self.state.capture.transfer = false;
+                return Ok((pos, Progress::Done));
+            };
+            // The bound is inclusive: the key last visited comes back first.
+            if rl > 0 && kbuf[..klen] == resume[..rl] {
+                continue;
+            }
+            visited += 1;
+            // A version newer than the copy's revision was applied since.
+            let at_or_below = klen >= internal_key::VERSION_SUFFIX_LEN && {
+                let ts_at = klen - internal_key::VERSION_SUFFIX_LEN;
+                let mut ts = [0u8; 8];
+                ts.copy_from_slice(&kbuf[ts_at..ts_at + 8]);
+                !u64::from_be_bytes(ts) <= as_of
+            };
+            if self.state.capture.counting {
+                if at_or_below {
+                    self.state.capture.total_entries += 1;
+                }
+            } else if at_or_below {
+                let need = RECORD_FIXED + klen + vlen;
+                if pos + need > out.len() {
+                    if pos == 0 {
+                        return Err(StoreError::OutputTooSmall);
+                    }
+                    // Not taken: the next step resumes before it.
+                    return Ok((
+                        pos,
+                        Progress::InProgress {
+                            cursor: self.state.capture.next_ordinal,
+                        },
+                    ));
+                }
+                out[pos..pos + 2].copy_from_slice(&(klen as u16).to_le_bytes());
+                out[pos + 2..pos + 6].copy_from_slice(&(vlen as u32).to_le_bytes());
+                out[pos + 6..pos + 6 + klen].copy_from_slice(&kbuf[..klen]);
+                out[pos + 6 + klen..pos + need].copy_from_slice(&vbuf[..vlen]);
+                pos += need;
+                self.state.capture.next_ordinal += 1;
+            }
+            self.state.capture.resume[..klen].copy_from_slice(&kbuf[..klen]);
+            self.state.capture.resume_len = klen as u32;
+        }
     }
 
     /// Is a REPLACE install holding the apply/flush exclusion?
@@ -3729,8 +4091,13 @@ impl<S: RunStorage> DiskStore<'_, S> {
         limit: usize,
         out: &mut [u8],
     ) -> Result<ScanProgress, StoreError> {
-        // Every block this call loads counts, positioning included.
-        let blocks0 = self.state.blocks_read.get();
+        // Every block this call crosses counts, positioning included —
+        // loaded from storage or served by the block cache alike.
+        let blocks0 = self
+            .state
+            .blocks_read
+            .get()
+            .wrapping_add(self.state.block_cache.hits.get());
         // No run holds a version above the durable high-water mark, so
         // a window that starts at or above it is answered from the
         // memtable alone — zero run I/O for a feed that is caught up
@@ -3877,7 +4244,12 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 // standing just past the last key consumed, so the next
                 // call continues in place.
                 if visited > 0
-                    && (mem.blocks_read.get().wrapping_sub(blocks0) >= SCAN_STEP_BLOCKS as u64
+                    && (mem
+                        .blocks_read
+                        .get()
+                        .wrapping_add(mem.cache.hits.get())
+                        .wrapping_sub(blocks0)
+                        >= SCAN_STEP_BLOCKS as u64
                         || visited >= SCAN_STEP_RECORDS)
                 {
                     return in_progress(scan, ordinal, emitted, pos, true);
@@ -3976,9 +4348,9 @@ impl<S: RunStorage> DiskStore<'_, S> {
             && rm.span_start[..rm.span_start_len as usize] == *span.start
             && rm.span_end[..rm.span_end_len as usize] == *span.end;
         let mut to_skip;
-        let bound_inclusive;
+        let mut bound_inclusive;
         let mut boundbuf = [0u8; MAX_ENCODED_KEY];
-        let bound_len;
+        let mut bound_len;
         // Per-key decision state, restored from the memo on a hit.
         let mut prefix = [0u8; MAX_ENCODED_KEY];
         let mut prefix_len = 0usize;
@@ -4036,26 +4408,14 @@ impl<S: RunStorage> DiskStore<'_, S> {
             rm.span_end[..span.end.len()].copy_from_slice(span.end);
             to_skip = resume_cursor;
         }
-        let bound = &boundbuf[..bound_len];
-
         // ── Walk ─────────────────────────────────────────────────
-        let DiskState {
-            range: rm,
-            order,
-            entries,
-            mem_count,
-            blocks_read,
-            block_cache,
-            ..
-        } = &mut *self.state;
-        let mem = MemView {
-            count: *mem_count as usize,
-            order,
-            entries,
-            blocks_read,
-            cache: block_cache,
-        };
-        rm.merge.mem_pos = mem.lower_bound(bound);
+        let storage = &*self.storage;
+        let (rm, src) = self.state.range_parts();
+        let mem = &src.mem;
+        rm.merge.mem_pos = mem.lower_bound(&boundbuf[..bound_len]);
+        // Older versions of the key last decided, pulled and passed over
+        // in a row (see `SKIP_STALE_VERSIONS`).
+        let mut stale = 0usize;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         let mut emitted = 0usize;
@@ -4069,7 +4429,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 rm.pending_klen = 0;
                 (kl, vl)
             } else {
-                let Some(next) = rm.merge.next(&mem, &*self.storage, &mut kbuf, &mut vbuf)? else {
+                let Some(next) = rm.merge.next(mem, storage, &mut kbuf, &mut vbuf)? else {
                     rm.valid = false;
                     return Ok(ScanProgress::done(emitted, pos));
                 };
@@ -4077,6 +4437,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
                     return Err(StoreError::StorageFault);
                 }
                 let k = &kbuf[..next.0];
+                let bound = &boundbuf[..bound_len];
                 if *k < *bound || (bound_inclusive && *k == *bound) {
                     continue; // the lazily opened sources' lead-in
                 }
@@ -4094,10 +4455,29 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 prefix[..plen].copy_from_slice(&kbuf[..plen]);
                 prefix_len = plen;
                 decided = false;
+                stale = 0;
             }
             let mut emit = true;
             if decided {
                 emit = false; // an older version of an already-decided key
+                stale += 1;
+                if stale >= SKIP_STALE_VERSIONS {
+                    // A key rewritten often keeps every retained version,
+                    // newest first, and a walk that pulls them one by one
+                    // to pass over them reads every block they fill — a
+                    // node's lease is dozens. Seek every source past this
+                    // key instead: its sparse index names the block, the
+                    // memtable its bound.
+                    boundbuf[..plen].copy_from_slice(&kbuf[..plen]);
+                    for b in &mut boundbuf[plen..plen + VERSION_SUFFIX_LEN] {
+                        *b = 0xFF;
+                    }
+                    bound_len = plen + VERSION_SUFFIX_LEN;
+                    bound_inclusive = true;
+                    rm.merge
+                        .open_lazy_in(&src, storage, true, &boundbuf[..bound_len])?;
+                    stale = 0;
+                }
             } else if key_timestamp(&kbuf[..klen]) > revn {
                 emit = false; // not yet visible at this revision
             } else {
@@ -4327,7 +4707,9 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
     /// Materialize one committed batch (format v1, module docs).
     /// Validate-then-apply: a `Malformed` batch mutates nothing.
     fn apply(&mut self, batch: &[u8]) -> Result<ApplyResult, StoreError> {
-        if self.state.install.active || self.state.capture.active {
+        // A transfer capture reads as of its revision: writes go on above it.
+        if self.state.install.active || (self.state.capture.active && !self.state.capture.transfer)
+        {
             return Err(StoreError::Backpressure);
         }
         if batch.len() < BATCH_HDR_LEN
@@ -4411,6 +4793,9 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         if self.state.install.active || self.state.compact.active || self.state.flush.active {
             return Err(StoreError::Backpressure);
         }
+        if self.state.capture.transfer {
+            return Err(StoreError::Backpressure);
+        }
         if !self.state.capture.active {
             if cursor != 0 {
                 return Err(StoreError::Malformed);
@@ -4437,7 +4822,11 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             self.state.capture = CaptureState {
                 active: true,
                 header_sent: false,
-                _pad: [0; 2],
+                transfer: false,
+                counting: false,
+                as_of: 0,
+                resume_len: 0,
+                resume: [0; MAX_ENCODED_KEY],
                 range_generation: request.range_generation,
                 applied_index: request.applied_index,
                 next_ordinal: 0,

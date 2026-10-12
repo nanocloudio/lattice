@@ -43,6 +43,10 @@ mod wire;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 const ENV_BUF: usize = 4096;
 /// Egress ports part0_out..part7_out.
 const MAX_LOCAL_PARTITIONS: usize = 8;
@@ -60,6 +64,8 @@ define_params! {
 struct DemuxState {
     syscalls: *const SyscallTable,
     tagged_in: i32,
+    /// `tagged_in`'s envelope reading (`common/envelope.rs`).
+    tagged_inbox: Inbox,
     outs: [i32; MAX_LOCAL_PARTITIONS],
     metrics_out: i32,
     n_partitions: u8,
@@ -73,6 +79,7 @@ impl DemuxState {
     fn init(&mut self, sys: *const SyscallTable) {
         self.syscalls = sys;
         self.tagged_in = -1;
+        self.tagged_inbox = Inbox::new();
         self.outs = [-1; MAX_LOCAL_PARTITIONS];
         self.metrics_out = -1;
         self.n_partitions = 2;
@@ -152,10 +159,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let sys = &*sys_ptr;
         for _ in 0..16 {
-            let mut scratch = [0u8; ENV_BUF];
-            let Some((msg, payload)) = read_one_envelope(sys, s.tagged_in, &mut scratch) else {
+            let mut scratch = [0u8; ENVELOPE_HDR + ENV_BUF];
+            let Some((msg, len)) =
+                read_envelope(&mut s.tagged_inbox, sys, s.tagged_in, &mut scratch)
+            else {
                 break;
             };
+            let payload = &scratch[..len];
             if payload.len() < 2 {
                 s.m_dropped = s.m_dropped.wrapping_add(1);
                 continue;
@@ -206,32 +216,4 @@ unsafe fn write_envelope(
     env[2] = ((payload_len >> 8) & 0xFF) as u8;
     let total = wire::ENVELOPE_HDR + payload_len;
     (sys.channel_write)(chan, env.as_mut_ptr(), total) == total as i32
-}
-
-unsafe fn read_one_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len > 0
-        && ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len
-    {
-        return None;
-    }
-    Some((hdr[0], &scratch[..payload_len]))
 }

@@ -108,6 +108,10 @@ mod telemetry;
 #[path = "../../common/command_log.rs"]
 mod command_log;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Chan, Inbox, ENVELOPE_HDR};
+
 #[cfg(feature = "store_provider")]
 #[path = "../../common/kv_large.rs"]
 mod kv_large;
@@ -144,11 +148,12 @@ use types::{
 use types::{KV_OP_COMPACT, KV_OP_ETCD_TXN, KV_OP_LEASE_REVOKE, KV_RESULT_ETCD_TXN};
 use wire::{
     APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_DURABLE,
-    MSG_APP_SNAPSHOT_INSTALLED, MSG_APP_SNAPSHOT_REQUEST, MSG_APP_SNAPSHOT_RESET,
-    MSG_APP_SNAPSHOT_SPAN_REQUEST, MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND,
-    MSG_LEASE_TICK, MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT,
-    MSG_TS_LEASE_REQUEST, MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT,
-    TS_LEASE_GRANT_WIRE_LEN,
+    MSG_APP_SNAPSHOT_EXPORT_CHUNK, MSG_APP_SNAPSHOT_EXPORT_REQUEST, MSG_APP_SNAPSHOT_INSTALLED,
+    MSG_APP_SNAPSHOT_REQUEST, MSG_APP_SNAPSHOT_RESET, MSG_APP_SNAPSHOT_SPAN_REQUEST,
+    MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_LEASE_TICK,
+    MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REQUEST,
+    MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
+    XFER_CHUNK_BODY,
 };
 
 #[path = "../../common/compaction_floor.rs"]
@@ -531,7 +536,7 @@ struct WorkerState {
     snapshot_export_out: i32,
     metrics_out: i32,
     expiry_out: i32,
-    /// Elastic-split install-complete ack (index 7); -1 unless wired.
+    /// Install-complete ack (index 7); -1 unless wired.
     install_ack_out: i32,
     /// Chunk sweeps this worker proposes (index 8); -1 unless wired.
     sweep_out: i32,
@@ -791,6 +796,9 @@ struct WorkerState {
     /// snapshot body is offered.
     applied_term: u64,
     applied_index: u64,
+    /// Origin entries the log committed that this store skipped as stale
+    /// or out of order (telemetry; `Duplicate` re-offers are not counted).
+    m_origin_skipped: u64,
     /// Times the command at the head of the channel waited for room
     /// (telemetry: a stalled apply shows here first).
     m_head_blocked: u64,
@@ -821,6 +829,45 @@ struct WorkerState {
     /// or on any gap/overflow.
     importing: bool,
     import_len: usize,
+    /// A PORTABLE install (another replica's export) streams chunk by
+    /// chunk into the disk store's REPLACE install rather than
+    /// accumulating in `import_buf`, which then holds only a chunk the
+    /// store has not taken yet (`import_pend_len` bytes at
+    /// `import_pend_off`, the last when `import_pend_done`).
+    import_stream: bool,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    commands_inbox: Inbox,
+    expire_inbox: Inbox,
+    durability_inbox: Inbox,
+    epoch_events_inbox: Inbox,
+    snapshot_import_inbox: Inbox,
+    /// An install at or below the applied position (nonzero: its index):
+    /// the store already holds that state and the entries after it, so
+    /// the stream is read and dropped, and acknowledged at its end.
+    import_covered: u64,
+    import_pend_len: usize,
+    import_pend_off: u64,
+    import_pend_done: bool,
+    /// The store revision the last applied-position marker left: where a
+    /// log entry's writes end. An export is read as of it, and begins only
+    /// while nothing past that marker is applied.
+    rev_at_applied: u64,
+    /// A portable export for another replica (`MSG_APP_SNAPSHOT_EXPORT_
+    /// REQUEST`), streamed a step at a time: `xfer_buf[xfer_pos..
+    /// xfer_len]` is what the store produced and the channel has not taken
+    /// yet; `xfer_off` the stream offset of `xfer_pos`.
+    xfer_active: bool,
+    xfer_begun: bool,
+    xfer_done: bool,
+    xfer_id: u32,
+    xfer_term: u64,
+    xfer_index: u64,
+    xfer_off: u64,
+    xfer_len: usize,
+    xfer_pos: usize,
+    xfer_since_ms: u64,
+    m_xfer_exports: u64,
+    m_xfer_installs: u64,
 
     // Telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
@@ -838,6 +885,7 @@ struct WorkerState {
     step_ctr: u64,
 
     import_buf: [u8; SNAPSHOT_BODY_MAX],
+    xfer_buf: [u8; SNAPSHOT_BODY_MAX],
 
     held_frame: [u8; HELD_FRAME_MAX],
 
@@ -913,6 +961,24 @@ impl WorkerState {
         self.metrics_out = -1;
         self.expiry_out = -1;
         self.install_ack_out = -1;
+        self.import_stream = false;
+        self.import_covered = 0;
+        self.commands_inbox = Inbox::new();
+        self.expire_inbox = Inbox::new();
+        self.durability_inbox = Inbox::new();
+        self.epoch_events_inbox = Inbox::new();
+        self.snapshot_import_inbox = Inbox::new();
+        self.import_pend_len = 0;
+        self.import_pend_off = 0;
+        self.import_pend_done = false;
+        self.rev_at_applied = 0;
+        self.xfer_active = false;
+        self.xfer_begun = false;
+        self.xfer_done = false;
+        self.xfer_len = 0;
+        self.xfer_pos = 0;
+        self.m_xfer_exports = 0;
+        self.m_xfer_installs = 0;
         self.sweep_out = -1;
         self.reply_stash_len = 0;
         self.sweep_wrap = 0;
@@ -938,6 +1004,7 @@ impl WorkerState {
         self.applied_term = 0;
         self.applied_index = 0;
         self.m_head_blocked = 0;
+        self.m_origin_skipped = 0;
         self.last_msg = 0;
         self.last_op = 0;
         self.published_applied_index = 0;
@@ -1250,11 +1317,20 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         return false;
     }
     let sys = &*sys_ptr;
-    let poll = (sys.channel_poll)(worker.commands_in, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+    // Nothing is read until the whole envelope is on the channel
+    // (`common/envelope.rs`); a write then waits there, unread, until the
+    // store has room for it: the channel stays FIFO, so nothing behind it
+    // (a later write, a clock tick, a position marker) passes it.
+    let mut frame = [0u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE];
+    let handle = worker.commands_in;
+    let Some((_, len)) = worker
+        .commands_inbox
+        .peek(&mut Chan { sys, handle }, &mut frame)
+    else {
         return false;
-    }
-    if worker.held_active && head_is_pausable(worker) {
+    };
+    let total = ENVELOPE_HDR + len;
+    if worker.held_active && frame_is_pausable(&frame[..total]) {
         // Another pausable command at the head while the slot is
         // taken. The common case is a RETRY of the held request — the
         // caller's phase timeout passed while the walk was still
@@ -1265,43 +1341,39 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         // behind it wait with it (the channel is FIFO), the price of a
         // single slot, paid only while two different version scans
         // overlap.
-        return adopt_retry(worker);
+        return adopt_retry(worker, &frame[ENVELOPE_HDR..total]);
     }
-    // A write waits on the channel, unread, until the store has room for
-    // it: the channel stays FIFO, so nothing behind it (a later write, a
-    // clock tick, a position marker) passes it.
-    if !head_admitted(worker) {
+    if !frame_admitted(worker, &frame[..total]) {
         worker.m_head_blocked = worker.m_head_blocked.wrapping_add(1);
         return false;
     }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(worker.commands_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    if !worker
+        .commands_inbox
+        .take(&mut Chan { sys, handle }, len, &mut frame)
+    {
         return false;
     }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    worker.last_msg = hdr[0];
-    if hdr[0] == MSG_APP_APPLIED_POS {
+    let kind = frame[0];
+    let payload = &frame[ENVELOPE_HDR..total];
+    worker.last_msg = kind;
+    if kind == MSG_APP_APPLIED_POS {
         // In-band applied-position marker from lattice_apply_bridge.
         // Arriving here means every command ahead of it on this
         // channel has already been applied to `store`.
-        if payload_len != 16 || payload_len > SCRATCH_BUF_SIZE {
-            return false;
+        if payload.len() != 16 {
+            return true;
         }
-        let mut pos = [0u8; 16];
-        if ((sys.channel_read)(worker.commands_in, pos.as_mut_ptr(), 16) as usize) < 16 {
-            return false;
-        }
-        let term = u64::from_le_bytes([
-            pos[0], pos[1], pos[2], pos[3], pos[4], pos[5], pos[6], pos[7],
-        ]);
-        let index = u64::from_le_bytes([
-            pos[8], pos[9], pos[10], pos[11], pos[12], pos[13], pos[14], pos[15],
-        ]);
+        let term = le_u64(&payload[..8]);
+        let index = le_u64(&payload[8..16]);
         // Monotonic — a stale marker after a restore must not rewind us.
         if index > worker.applied_index {
             worker.applied_term = term;
             worker.applied_index = index;
+            worker.rev_at_applied = if worker.state_store == STATE_STORE_DISK {
+                worker.disk_revision
+            } else {
+                worker.store.revision
+            };
             if worker.state_store == STATE_STORE_DISK {
                 // Stamp the store's pending applied position: every
                 // command ahead of this marker is in the memtable, so
@@ -1319,7 +1391,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         }
         return true;
     }
-    if hdr[0] == MSG_TS_LEASE_GRANT {
+    if kind == MSG_TS_LEASE_GRANT {
         // In-band replicated worker lease, forwarded by
         // lattice_apply_bridge in committed-log order:
         // `[corr_id:u64 = 0][TimestampLease:40]`. Arriving HERE, on the
@@ -1327,30 +1399,16 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         // exactly between the commands it was committed between, so
         // per-write timestamp assignment below is a pure function of
         // the log on every replica and every replay.
-        if payload_len != TS_LEASE_GRANT_WIRE_LEN || payload_len > SCRATCH_BUF_SIZE {
-            return false;
-        }
-        let mut grant = [0u8; TS_LEASE_GRANT_WIRE_LEN];
-        if ((sys.channel_read)(
-            worker.commands_in,
-            grant.as_mut_ptr(),
-            TS_LEASE_GRANT_WIRE_LEN,
-        ) as usize)
-            < TS_LEASE_GRANT_WIRE_LEN
-        {
-            return false;
+        if payload.len() != TS_LEASE_GRANT_WIRE_LEN {
+            return true;
         }
         // TimestampLease wire (mvcc.rs): version:u16 @0, payload_len:u16
         // @2, interval_start:u64 @12, interval_end:u64 @20 — offsets
         // within the 40-byte lease, which begins at byte 8 of the frame.
-        let lease = &grant[8..];
+        let lease = &payload[8..];
         let version = u16::from_le_bytes([lease[0], lease[1]]);
-        let start = u64::from_le_bytes([
-            lease[12], lease[13], lease[14], lease[15], lease[16], lease[17], lease[18], lease[19],
-        ]);
-        let end = u64::from_le_bytes([
-            lease[20], lease[21], lease[22], lease[23], lease[24], lease[25], lease[26], lease[27],
-        ]);
+        let start = le_u64(&lease[12..20]);
+        let end = le_u64(&lease[20..28]);
         // Adopt only forward: a well-formed successor lease always
         // starts at or above the previous one's end (allocator
         // succession), so anything else is a duplicate or corruption
@@ -1364,21 +1422,17 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         }
         return true;
     }
-    if hdr[0] == MSG_LEASE_TICK {
+    if kind == MSG_LEASE_TICK {
         // The authoritative clock, arriving on the SAME channel as the
         // commands it orders against: `[tick_ms:u64]`, proposed by
         // `ttl_scheduler` and delivered here only after it committed.
         // Reading it anywhere else — a local timer, a side channel —
         // would give each replica its own notion of now, which is the
         // one thing a replicated TTL cannot have.
-        if payload_len != 8 || payload_len > SCRATCH_BUF_SIZE {
-            return false;
+        if payload.len() != 8 {
+            return true;
         }
-        let mut tick = [0u8; 8];
-        if ((sys.channel_read)(worker.commands_in, tick.as_mut_ptr(), 8) as usize) < 8 {
-            return false;
-        }
-        let tick_ms = u64::from_le_bytes(tick);
+        let tick_ms = le_u64(payload);
         if tick_ms > worker.committed_now_ms {
             worker.committed_now_ms = tick_ms;
         }
@@ -1388,25 +1442,16 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         worker.disk_state.committed_clock_ms = worker.committed_now_ms;
         return true;
     }
-    if hdr[0] != MSG_KV_COMMAND {
-        return false;
-    }
     // MSG_KV_COMMAND head layout owned by wire::KvCommandHead — kpg +
     // the canonical identity the store is scoped to.
-    if !(wire::KvCommandHead::LEN..=SCRATCH_BUF_SIZE).contains(&payload_len) {
-        return false;
+    if kind != MSG_KV_COMMAND || payload.len() < wire::KvCommandHead::LEN {
+        return true;
     }
-    let mut in_buf = [0u8; SCRATCH_BUF_SIZE];
-    let n2 = (sys.channel_read)(worker.commands_in, in_buf.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return false;
-    }
-
-    match apply_command_frame(worker, &in_buf[..payload_len]) {
+    match apply_command_frame(worker, payload) {
         CmdOutcome::Answered(ok) => ok,
         CmdOutcome::Refused => false,
         CmdOutcome::Paused => {
-            hold_command(worker, &in_buf[..payload_len]);
+            hold_command(worker, payload);
             true
         }
     }
@@ -1815,11 +1860,48 @@ unsafe fn apply_origin_entry(worker: &mut WorkerState, head: &wire::KvCommandHea
         n = write_dec(&mut buf, n, u64::from(seq));
         log_line(worker, &buf, n);
     }
+    // A write the log committed that this store did not apply (stale or
+    // out of order for its origin) is invisible otherwise: named, up to a
+    // bound, so a replica that diverges says where.
+    if let origin::Applied::Skipped {
+        replica,
+        inc,
+        seq,
+        verdict,
+    } = a
+    {
+        if !matches!(verdict, origin::Verdict::Duplicate) {
+            worker.m_origin_skipped = worker.m_origin_skipped.wrapping_add(1);
+            if worker.m_origin_skipped <= ORIGIN_SKIP_LOG_MAX as u64 {
+                let mut buf = [0u8; 112];
+                let mut n = write_prefix(&mut buf, 0, b"[kvw] origin entry skipped ");
+                n = write_prefix(
+                    &mut buf,
+                    n,
+                    if matches!(verdict, origin::Verdict::Gap) {
+                        b"gap"
+                    } else {
+                        b"stale"
+                    },
+                );
+                n = write_prefix(&mut buf, n, b" replica=");
+                n = write_dec(&mut buf, n, u64::from(replica));
+                n = write_prefix(&mut buf, n, b" inc=");
+                n = write_dec(&mut buf, n, u64::from(inc));
+                n = write_prefix(&mut buf, n, b" seq=");
+                n = write_dec(&mut buf, n, u64::from(seq));
+                log_line(worker, &buf, n);
+            }
+        }
+    }
     #[cfg(feature = "store_provider")]
     if worker.prov.provides {
         store_provider::origin_applied(&mut *worker.prov.state, &a);
     }
 }
+
+/// Skipped origin entries logged by name; the rest are counted.
+const ORIGIN_SKIP_LOG_MAX: usize = 32;
 
 /// Fan what a command changed out on `mutations_out` as
 /// `MSG_WATCH_EVENT`s (the flat protocol keyspace's changes only: the
@@ -2172,32 +2254,28 @@ unsafe fn hold_command(worker: &mut WorkerState, cmd: &[u8]) {
     worker.m_scan_pauses = worker.m_scan_pauses.wrapping_add(1);
 }
 
-/// The frame at the channel head is pausable and the slot is taken:
-/// consume it if it is the held request re-issued (identical but for
-/// `corr_id`), replacing the held identity. Otherwise leave it.
-unsafe fn adopt_retry(worker: &mut WorkerState) -> bool {
-    let sys = &*worker.syscalls;
+/// The command at the channel head (`cand`, its payload, peeked whole) is
+/// pausable and the slot is taken: consume it if it is the held request
+/// re-issued (identical but for `corr_id`), replacing the held identity.
+/// Otherwise leave it.
+unsafe fn adopt_retry(worker: &mut WorkerState, cand: &[u8]) -> bool {
     const CORR: core::ops::Range<usize> = 0..8;
     let held_len = worker.held_len as usize;
-    let mut frame = [0u8; 3 + HELD_FRAME_MAX];
-    let n = (sys.channel_peek)(worker.commands_in, frame.as_mut_ptr(), 3 + held_len);
-    if n != (3 + held_len) as i32 {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([frame[1], frame[2]]) as usize;
-    let cand = &frame[3..3 + held_len];
     let held = &worker.held_frame[..held_len];
-    let same = payload_len == held_len && cand[CORR.end..] == held[CORR.end..];
-    if !same {
+    if cand.len() != held_len || cand[CORR.end..] != held[CORR.end..] {
         return false;
     }
     // Consume it (header + payload) and adopt its correlation.
-    let mut sink = [0u8; 3 + HELD_FRAME_MAX];
-    let got = (sys.channel_read)(worker.commands_in, sink.as_mut_ptr(), 3 + held_len);
-    if got != (3 + held_len) as i32 {
+    let sys = &*worker.syscalls;
+    let handle = worker.commands_in;
+    let mut sink = [0u8; ENVELOPE_HDR + HELD_FRAME_MAX];
+    if !worker
+        .commands_inbox
+        .take(&mut Chan { sys, handle }, held_len, &mut sink)
+    {
         return false;
     }
-    worker.held_frame[CORR].copy_from_slice(&sink[3 + CORR.start..3 + CORR.end]);
+    worker.held_frame[CORR].copy_from_slice(&cand[CORR]);
     worker.m_scan_retries_adopted = worker.m_scan_retries_adopted.wrapping_add(1);
     true
 }
@@ -2221,53 +2299,37 @@ unsafe fn drive_held_command(worker: &mut WorkerState) -> bool {
     true
 }
 
-/// Is the frame at the head of `commands` a command that may pause?
-/// Peeked, not read: while a paused command is held, its successor of
-/// the same kind stays on the channel — the channel is the spill
+/// Is `frame` (the whole envelope at the head of `commands`, peeked) a
+/// command that may pause? While a paused command is held, its successor
+/// of the same kind stays on the channel — the channel is the spill
 /// buffer — until the slot frees. Every other frame is admitted.
-unsafe fn head_is_pausable(worker: &mut WorkerState) -> bool {
-    let sys = &*worker.syscalls;
-    const PEEK: usize = 3 + wire::KvCommandHead::LEN;
-    let mut hdr = [0u8; PEEK];
-    let n = (sys.channel_peek)(worker.commands_in, hdr.as_mut_ptr(), PEEK);
-    if n < PEEK as i32 || hdr[0] != MSG_KV_COMMAND {
-        return false;
-    }
-    wire::KvCommandHead::decode(&hdr[3..]).is_some_and(|h| h.op == KV_OP_SCAN_VERSIONS)
+fn frame_is_pausable(frame: &[u8]) -> bool {
+    frame.first() == Some(&MSG_KV_COMMAND)
+        && frame
+            .get(ENVELOPE_HDR..)
+            .and_then(wire::KvCommandHead::decode)
+            .is_some_and(|h| h.op == KV_OP_SCAN_VERSIONS)
 }
 
-/// Is the frame at the head of `commands` admitted ([`admit`])? Peeked,
-/// not read. Anything but a well-formed command passes (it is read and
-/// handled, or refused, as before).
-unsafe fn head_admitted(worker: &mut WorkerState) -> bool {
-    // The memory store admits everything: no peek at all.
-    if worker.state_store != STATE_STORE_DISK {
+/// Is `frame` (the whole frame at the head of `commands`, peeked) admitted
+/// ([`admit`])? Anything but a well-formed write passes: it is read and
+/// handled, or refused, as before.
+unsafe fn frame_admitted(worker: &mut WorkerState, frame: &[u8]) -> bool {
+    // The memory store admits everything.
+    if worker.state_store != STATE_STORE_DISK || frame.first() != Some(&MSG_KV_COMMAND) {
         return true;
     }
-    let sys = &*worker.syscalls;
-    const HEAD: usize = 3 + wire::KvCommandHead::LEN;
-    let mut hdr = [0u8; HEAD];
-    let n = (sys.channel_peek)(worker.commands_in, hdr.as_mut_ptr(), HEAD);
-    if n < HEAD as i32 || hdr[0] != MSG_KV_COMMAND {
-        return true;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if !(wire::KvCommandHead::LEN..=SCRATCH_BUF_SIZE).contains(&payload_len) {
-        return true;
-    }
-    let Some(head) = wire::KvCommandHead::decode(&hdr[3..]) else {
+    let Some(head) = frame
+        .get(ENVELOPE_HDR..)
+        .and_then(wire::KvCommandHead::decode)
+    else {
         return true;
     };
-    // A read needs no room: the rest of the frame is not peeked.
+    // A read needs no room.
     if op_only_reads(head.op) {
         return true;
     }
-    let mut frame = [0u8; 3 + SCRATCH_BUF_SIZE];
-    let got = (sys.channel_peek)(worker.commands_in, frame.as_mut_ptr(), 3 + payload_len);
-    if got != (3 + payload_len) as i32 {
-        return true;
-    }
-    let body_off = 3 + wire::KvCommandHead::LEN;
+    let body_off = ENVELOPE_HDR + wire::KvCommandHead::LEN;
     let body = frame
         .get(body_off..body_off + head.body_len as usize)
         .unwrap_or(&[]);
@@ -3122,7 +3184,7 @@ const PROVIDER_HB_STEPS: u64 = 5000;
 #[cfg(feature = "store_provider")]
 unsafe fn provider_heartbeat(worker: &WorkerState) {
     let p = &worker.prov;
-    let mut buf = [0u8; 320];
+    let mut buf = [0u8; 384];
     let mut n = write_prefix(&mut buf, 0, b"[kvw] store hb calls=");
     n = write_dec(&mut buf, n, p.m_calls);
     n = write_prefix(&mut buf, n, b" not_serving=");
@@ -3175,11 +3237,23 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
         n = write_dec(&mut buf, n, u64::from(r.reg_seen));
         n = write_prefix(&mut buf, n, b" rmiss=");
         n = write_dec(&mut buf, n, u64::from(r.reg_miss));
+        n = write_prefix(&mut buf, n, b" ch=");
+        n = write_dec(&mut buf, n, u64::from(r.chunks_held));
+        n = write_prefix(&mut buf, n, b"/");
+        n = write_dec(&mut buf, n, u64::from(r.chunks_offered));
+        n = write_prefix(&mut buf, n, b" chref=");
+        n = write_dec(&mut buf, n, u64::from(r.chunk_refused));
+        n = write_prefix(&mut buf, n, b" chidle=");
+        n = write_dec(&mut buf, n, u64::from(r.chunk_idle));
     }
     n = write_prefix(&mut buf, n, b" ai=");
     n = write_dec(&mut buf, n, worker.applied_index);
     n = write_prefix(&mut buf, n, b" hblk=");
     n = write_dec(&mut buf, n, worker.m_head_blocked);
+    n = write_prefix(&mut buf, n, b" big=");
+    n = write_dec(&mut buf, n, u64::from(worker.commands_inbox.oversize));
+    n = write_prefix(&mut buf, n, b" oskip=");
+    n = write_dec(&mut buf, n, worker.m_origin_skipped);
     log_line(worker, &buf, n);
 }
 
@@ -4076,23 +4150,11 @@ unsafe fn drain_expire(worker: &mut WorkerState) {
     }
     let sys = &*worker.syscalls;
     if worker.expire_in >= 0 {
-        let poll = (sys.channel_poll)(worker.expire_in, POLL_IN);
-        if poll > 0 && (poll as u32) & POLL_IN != 0 {
-            let mut hdr = [0u8; 3];
-            if (sys.channel_read)(worker.expire_in, hdr.as_mut_ptr(), 3) < 3 {
-                return;
-            }
-            let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-            let mut body = [0u8; 32];
-            if payload_len > body.len() {
-                return;
-            }
-            if payload_len > 0
-                && ((sys.channel_read)(worker.expire_in, body.as_mut_ptr(), payload_len) as usize)
-                    < payload_len
-            {
-                return;
-            }
+        let mut env = [0u8; ENVELOPE_HDR + 32];
+        if let Some((_, payload_len)) =
+            read_envelope(&mut worker.expire_inbox, sys, worker.expire_in, &mut env)
+        {
+            let body = &env[..payload_len];
             if worker.state_store == STATE_STORE_DISK {
                 // The disk provider reclaims through compaction.
                 return;
@@ -4240,6 +4302,7 @@ fn step(state: *mut u8) -> i32 {
         }
         drain_epoch_events(worker);
         drain_snapshot_ctl(worker);
+        export_step(worker);
         drain_gc_floor(worker);
         drain_expire(worker);
         drive_expiry_resume(worker);
@@ -5166,6 +5229,9 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_listed));
     n = write_prefix(&mut buf, n, b" rf=");
     n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_fallbacks));
+    //   sw = orphan runs a recovery deleted because its listing overflowed
+    n = write_prefix(&mut buf, n, b" sw=");
+    n = write_dec(&mut buf, n, u64::from(worker.disk_state.recover_swept));
     //   ma/mb = each manifest slot at the last recovery: verdict | gen << 4
     //   (7 valid, 6 CRC, 1 absent …); ra/rb = the highest run it names
     n = write_prefix(&mut buf, n, b" ma=");
@@ -5351,25 +5417,16 @@ unsafe fn drain_gc_floor(worker: &mut WorkerState) {
         return;
     }
     let sys = &*sys_ptr;
-    let poll = (sys.channel_poll)(worker.durability_in, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+    let mut buf = [0u8; ENVELOPE_HDR + 128];
+    let Some((kind, payload_len)) = read_envelope(
+        &mut worker.durability_inbox,
+        sys,
+        worker.durability_in,
+        &mut buf,
+    ) else {
         return;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(worker.durability_in, hdr.as_mut_ptr(), 3) < 3 {
-        return;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len == 0 || payload_len > 128 {
-        return;
-    }
-    let mut buf = [0u8; 128];
-    if ((sys.channel_read)(worker.durability_in, buf.as_mut_ptr(), payload_len) as usize)
-        < payload_len
-    {
-        return;
-    }
-    if hdr[0] != MSG_GC_FLOOR_COMMITTED || payload_len != GC_FLOOR_WIRE_LEN {
+    };
+    if kind != MSG_GC_FLOOR_COMMITTED || payload_len != GC_FLOOR_WIRE_LEN {
         return; // other durability traffic, or a malformed record
     }
     let Some(rec) = GcFloorRecord::decode(&buf[..GC_FLOOR_WIRE_LEN]) else {
@@ -5444,25 +5501,16 @@ unsafe fn drain_epoch_events(worker: &mut WorkerState) {
         return;
     }
     let sys = &*sys_ptr;
-    let poll = (sys.channel_poll)(worker.epoch_events_in, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+    let mut buf = [0u8; ENVELOPE_HDR + 64];
+    let Some((kind, payload_len)) = read_envelope(
+        &mut worker.epoch_events_inbox,
+        sys,
+        worker.epoch_events_in,
+        &mut buf,
+    ) else {
         return;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(worker.epoch_events_in, hdr.as_mut_ptr(), 3) < 3 {
-        return;
-    }
-    if hdr[0] != MSG_PLACEMENT_EPOCH_EVENT {
-        return;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if !(7..=64).contains(&payload_len) {
-        return;
-    }
-    let mut buf = [0u8; 64];
-    if ((sys.channel_read)(worker.epoch_events_in, buf.as_mut_ptr(), payload_len) as usize)
-        < payload_len
-    {
+    };
+    if kind != MSG_PLACEMENT_EPOCH_EVENT || payload_len < 7 {
         return;
     }
     let new_epoch = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
@@ -5505,28 +5553,24 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
         return;
     }
     let sys = &*sys_ptr;
-    let poll = (sys.channel_poll)(worker.snapshot_import_in, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+    // A portable chunk the store refused for now is retried before the
+    // next is read: the channel holds the rest of the stream meanwhile.
+    if worker.import_pend_len > 0 && !install_pending(worker, sys) {
         return;
     }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(worker.snapshot_import_in, hdr.as_mut_ptr(), 3) < 3 {
-        return;
-    }
-    let kind = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if !(16..=SCRATCH_BUF_SIZE).contains(&payload_len) {
-        return;
-    }
-    if ((sys.channel_read)(
+    let mut env = [0u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE];
+    let Some((kind, payload_len)) = read_envelope(
+        &mut worker.snapshot_import_inbox,
+        sys,
         worker.snapshot_import_in,
-        worker.scratch.as_mut_ptr(),
-        payload_len,
-    ) as usize)
-        < payload_len
-    {
+        &mut env,
+    ) else {
+        return;
+    };
+    if payload_len < 16 {
         return;
     }
+    worker.scratch[..payload_len].copy_from_slice(&env[..payload_len]);
     let term = le_u64(&worker.scratch[0..8]);
     let index = le_u64(&worker.scratch[8..16]);
 
@@ -5592,7 +5636,50 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             };
             emit_span_snapshot_chunks(worker, sys, &start[..sl], &end[..el]);
         }
+        MSG_APP_SNAPSHOT_EXPORT_REQUEST => {
+            if worker.snapshot_export_out < 0 || payload_len < 20 {
+                return;
+            }
+            // A new ask supersedes one under way: its peer gave up on it.
+            export_abort(worker);
+            worker.xfer_id = u32::from_le_bytes([
+                worker.scratch[16],
+                worker.scratch[17],
+                worker.scratch[18],
+                worker.scratch[19],
+            ]);
+            worker.xfer_active = true;
+            worker.xfer_begun = false;
+            worker.xfer_since_ms = dev_millis(sys);
+        }
         MSG_APP_SNAPSHOT_RESET => {
+            // A snapshot at or below the applied position is state this
+            // store already holds, and more: raft keeps its log past such
+            // an install (it is covered by its own log), so the entries
+            // after the snapshot are never delivered again. Installed, it
+            // would rewind the store below them and lose them. The store
+            // is left as it stands; the stream is drained and
+            // acknowledged, so the hand-off completes.
+            if !worker.importing && worker.applied_index != 0 && index <= worker.applied_index {
+                worker.import_covered = index;
+                let mut buf = [0u8; 96];
+                let mut n = write_prefix(&mut buf, 0, b"[kvw] install covered: index=");
+                n = write_dec(&mut buf, n, index);
+                n = write_prefix(&mut buf, n, b" applied=");
+                n = write_dec(&mut buf, n, worker.applied_index);
+                log_line(worker, &buf, n);
+                return;
+            }
+            worker.import_covered = 0;
+            // A new install supersedes a portable one still streaming.
+            if worker.import_stream {
+                if worker.state_store == STATE_STORE_DISK {
+                    let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+                    store.abort_fences();
+                }
+                worker.import_stream = false;
+                worker.import_pend_len = 0;
+            }
             if worker.state_store == STATE_STORE_DISK {
                 if worker.disk_phase != DISK_PHASE_SERVING {
                     return; // fail closed: not safe to install yet
@@ -5630,12 +5717,53 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             }
         }
         MSG_APP_SNAPSHOT_CHUNK => {
+            if worker.import_covered != 0 && index == worker.import_covered {
+                if payload_len >= APP_SNAPSHOT_HDR && worker.scratch[24] != 0 {
+                    worker.import_covered = 0;
+                    ack_install(worker, index);
+                }
+                return;
+            }
             if !worker.importing || payload_len < APP_SNAPSHOT_HDR {
                 return;
             }
             let offset = le_u64(&worker.scratch[16..24]) as usize;
             let done = worker.scratch[24] != 0;
             let body_len = payload_len - APP_SNAPSHOT_HDR;
+            // A disk store's own body is a DISK-RESIDENT marker (header
+            // only); anything else is a portable copy, which streams
+            // straight into the store's REPLACE install.
+            if worker.state_store == STATE_STORE_DISK && offset == 0 && !worker.import_stream {
+                let b = &worker.scratch[APP_SNAPSHOT_HDR..payload_len];
+                let marker = b.len() >= 8
+                    && u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == SNAP_MAGIC
+                    && u16::from_le_bytes([b[6], b[7]]) & SNAP_FLAG_DISK_RESIDENT != 0;
+                if !marker {
+                    worker.import_stream = true;
+                    worker.import_len = 0;
+                }
+            }
+            if worker.import_stream {
+                if body_len > SNAPSHOT_BODY_MAX {
+                    import_stream_fail(worker);
+                    return;
+                }
+                worker.import_buf[..body_len]
+                    .copy_from_slice(&worker.scratch[APP_SNAPSHOT_HDR..payload_len]);
+                worker.import_pend_len = body_len;
+                worker.import_pend_off = offset as u64;
+                worker.import_pend_done = done;
+                if body_len == 0 && !done {
+                    worker.import_pend_len = 0;
+                    return;
+                }
+                // An empty last chunk still ends the stream.
+                if body_len == 0 {
+                    worker.import_pend_len = usize::MAX;
+                }
+                install_pending(worker, sys);
+                return;
+            }
             // Strict in-order accumulation; a gap aborts the install.
             if offset != worker.import_len || offset + body_len > SNAPSHOT_BODY_MAX {
                 worker.importing = false;
@@ -5809,19 +5937,7 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                     // are decided in its origin record.
                     #[cfg(feature = "store_provider")]
                     provider_resync(worker);
-                    // Elastic split: tell an orchestrator the install is
-                    // resident, so an elastic-split cutover gates on the
-                    // span actually landing rather than a wall-clock guess.
-                    // Unwired (index 7 < 0) in every graph but the split.
-                    if worker.install_ack_out >= 0 {
-                        let mut ack = [0u8; 3 + 10];
-                        ack[0] = MSG_APP_SNAPSHOT_INSTALLED;
-                        ack[1] = 10;
-                        ack[2] = 0;
-                        ack[3..5].copy_from_slice(&worker.partition_id.to_le_bytes());
-                        ack[5..13].copy_from_slice(&worker.applied_index.to_le_bytes());
-                        (sys.channel_write)(worker.install_ack_out, ack.as_mut_ptr(), 13);
-                    }
+                    ack_install(worker, worker.applied_index);
                 } else {
                     // The failed install left the store EMPTY (both
                     // providers guarantee this), so there is no partial
@@ -5835,6 +5951,278 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             }
         }
         _ => {}
+    }
+}
+
+/// Hand the pending portable chunk to the store's REPLACE install. False
+/// while the store refuses it for now (`Backpressure`: a flush or a
+/// compaction still running) — it stays pending and nothing more is read.
+/// On the last chunk the install is the RESET's position, as a marker
+/// adopted is; any failure leaves the store EMPTY and claims nothing.
+unsafe fn install_pending(worker: &mut WorkerState, sys: &SyscallTable) -> bool {
+    let len = if worker.import_pend_len == usize::MAX {
+        0
+    } else {
+        worker.import_pend_len
+    };
+    let off = worker.import_pend_off;
+    let last = worker.import_pend_done;
+    if off == 0 {
+        // Every manifest the install's flushes publish carries the
+        // snapshot's position, not the store's before the RESET.
+        worker.disk_state.pending_applied_index = worker.applied_index;
+        worker.disk_state.pending_applied_term = worker.applied_term;
+    }
+    let req = SnapshotRequest {
+        applied_index: worker.applied_index,
+        range_generation: worker.disk_state.range_generation,
+    };
+    let outcome = {
+        let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+        store.install(
+            req,
+            SnapshotChunk {
+                offset: off,
+                data: &worker.import_buf[..len],
+                last,
+            },
+        )
+    };
+    match outcome {
+        Err(StoreError::Backpressure) => false,
+        Ok(Progress::InProgress { .. }) => {
+            worker.import_pend_len = 0;
+            // A stream that lands chunk after chunk is progress, not a
+            // fence starving the store (the watchdog's case).
+            worker.disk_fence_steps = 0;
+            true
+        }
+        Ok(Progress::Done) => {
+            worker.import_pend_len = 0;
+            worker.import_stream = false;
+            worker.importing = false;
+            worker.disk_fence_steps = 0;
+            if worker.disk_state.committed_clock_ms > worker.committed_now_ms {
+                worker.committed_now_ms = worker.disk_state.committed_clock_ms;
+            }
+            // The state is the RESET's position; the log resumes after it,
+            // each command recomputing the revision it had on the leader.
+            worker.disk_revision = worker.disk_state.highest_revision;
+            worker.disk_replay_floor = worker.disk_state.highest_revision;
+            worker.rev_at_applied = worker.disk_revision;
+            worker.m_xfer_installs = worker.m_xfer_installs.wrapping_add(1);
+            resume_expiry_service(worker);
+            #[cfg(feature = "store_provider")]
+            provider_resync(worker);
+            dev_log(
+                sys,
+                2,
+                b"[kvw] portable snapshot installed".as_ptr(),
+                b"[kvw] portable snapshot installed".len(),
+            );
+            ack_install(worker, worker.applied_index);
+            true
+        }
+        Err(_) => {
+            import_stream_fail(worker);
+            true
+        }
+    }
+}
+
+/// A portable install that cannot complete: the store is EMPTY (REPLACE),
+/// so nothing of the snapshot's position is claimed; the sender's next
+/// RESET starts over.
+unsafe fn import_stream_fail(worker: &mut WorkerState) {
+    {
+        let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+        store.abort_fences();
+    }
+    worker.import_stream = false;
+    worker.importing = false;
+    worker.import_pend_len = 0;
+    worker.applied_term = 0;
+    worker.applied_index = 0;
+    if !worker.syscalls.is_null() {
+        let sys = &*worker.syscalls;
+        dev_log(
+            sys,
+            1,
+            b"[kvw] portable snapshot refused".as_ptr(),
+            b"[kvw] portable snapshot refused".len(),
+        );
+    }
+}
+
+/// How long an export may go without the channel taking a byte before it
+/// is abandoned (its peer is gone; the hold it keeps on compaction must
+/// not outlive it).
+const XFER_IDLE_MS: u64 = 30_000;
+/// Merged records one export step visits.
+const XFER_STEP_RECORDS: u32 = 64;
+
+/// Say the store holds the state of the install at `index`: what lets
+/// durability tell raft the install landed, and an elastic split's
+/// cutover gate on the span arriving.
+unsafe fn ack_install(worker: &mut WorkerState, index: u64) {
+    if worker.install_ack_out < 0 || worker.syscalls.is_null() {
+        return;
+    }
+    let mut ack = [0u8; 3 + 10];
+    ack[0] = MSG_APP_SNAPSHOT_INSTALLED;
+    ack[1] = 10;
+    ack[3..5].copy_from_slice(&worker.partition_id.to_le_bytes());
+    ack[5..13].copy_from_slice(&index.to_le_bytes());
+    ((*worker.syscalls).channel_write)(worker.install_ack_out, ack.as_mut_ptr(), 13);
+}
+
+/// Abandon the export under way, if any.
+unsafe fn export_abort(worker: &mut WorkerState) {
+    if worker.xfer_active && worker.xfer_begun && worker.state_store == STATE_STORE_DISK {
+        let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+        store.transfer_abort();
+    }
+    worker.xfer_active = false;
+    worker.xfer_begun = false;
+    worker.xfer_done = false;
+    worker.xfer_len = 0;
+    worker.xfer_pos = 0;
+}
+
+/// One step of a portable export: begin it once the worker stands at an
+/// entry boundary, then hand the store's stream out in
+/// `XFER_CHUNK_BODY`-sized `MSG_APP_SNAPSHOT_EXPORT_CHUNK`s for as long as
+/// the channel takes them, a bounded walk at a time. Writes go on
+/// throughout: the copy is read as of the position it is labelled with.
+unsafe fn export_step(worker: &mut WorkerState) {
+    if !worker.xfer_active || worker.syscalls.is_null() {
+        return;
+    }
+    let sys = &*worker.syscalls;
+    let now = dev_millis(sys);
+    if now.saturating_sub(worker.xfer_since_ms) > XFER_IDLE_MS {
+        export_abort(worker);
+        dev_log(
+            sys,
+            1,
+            b"[kvw] export abandoned: not taken".as_ptr(),
+            b"[kvw] export abandoned: not taken".len(),
+        );
+        return;
+    }
+    if !worker.xfer_begun {
+        // Labelled where the worker stands; begun only while nothing past
+        // that marker is applied, so the copy and its label agree.
+        let rev_now = if worker.state_store == STATE_STORE_DISK {
+            worker.disk_revision
+        } else {
+            worker.store.revision
+        };
+        if worker.applied_index == 0 || rev_now != worker.rev_at_applied {
+            return;
+        }
+        worker.xfer_term = worker.applied_term;
+        worker.xfer_index = worker.applied_index;
+        worker.xfer_off = 0;
+        worker.xfer_len = 0;
+        worker.xfer_pos = 0;
+        worker.xfer_done = false;
+        if worker.state_store == STATE_STORE_DISK {
+            let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+            if store
+                .transfer_begin(worker.applied_index, worker.rev_at_applied)
+                .is_err()
+            {
+                return;
+            }
+        } else {
+            // The memory store's copy is one encode (bounded, as its own
+            // snapshot body is).
+            match worker
+                .store
+                .snapshot_encode(&mut worker.xfer_buf, worker.committed_now_ms)
+            {
+                Some(n) => {
+                    worker.xfer_len = n;
+                    worker.xfer_done = true;
+                }
+                None => {
+                    export_abort(worker);
+                    dev_log(
+                        sys,
+                        1,
+                        b"[kvw] export over budget".as_ptr(),
+                        b"[kvw] export over budget".len(),
+                    );
+                    return;
+                }
+            }
+        }
+        worker.xfer_begun = true;
+        worker.m_xfer_exports = worker.m_xfer_exports.wrapping_add(1);
+    }
+    for _ in 0..8 {
+        if worker.xfer_pos < worker.xfer_len
+            || (worker.xfer_done && worker.xfer_pos == worker.xfer_len)
+        {
+            let chunk = (worker.xfer_len - worker.xfer_pos).min(XFER_CHUNK_BODY);
+            let last = worker.xfer_done && worker.xfer_pos + chunk == worker.xfer_len;
+            let payload = APP_SNAPSHOT_HDR + chunk;
+            let mut frame = [0u8; 3 + APP_SNAPSHOT_HDR + XFER_CHUNK_BODY];
+            frame[0] = MSG_APP_SNAPSHOT_EXPORT_CHUNK;
+            frame[1..3].copy_from_slice(&(payload as u16).to_le_bytes());
+            frame[3..11].copy_from_slice(&worker.xfer_term.to_le_bytes());
+            frame[11..19].copy_from_slice(&worker.xfer_index.to_le_bytes());
+            frame[19..27].copy_from_slice(&worker.xfer_off.to_le_bytes());
+            frame[27] = u8::from(last);
+            frame[28..31].copy_from_slice(&worker.xfer_id.to_le_bytes()[..3]);
+            let p = worker.xfer_pos;
+            frame[31..31 + chunk].copy_from_slice(&worker.xfer_buf[p..p + chunk]);
+            if (sys.channel_write)(worker.snapshot_export_out, frame.as_mut_ptr(), 3 + payload)
+                != (3 + payload) as i32
+            {
+                return; // the channel is full: the same chunk next step
+            }
+            worker.xfer_since_ms = now;
+            worker.xfer_pos += chunk;
+            worker.xfer_off += chunk as u64;
+            if last {
+                worker.xfer_active = false;
+                worker.xfer_begun = false;
+                return;
+            }
+            continue;
+        }
+        // Refill from the store's stream.
+        worker.xfer_pos = 0;
+        worker.xfer_len = 0;
+        let res = {
+            let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+            store.transfer_step(&mut worker.xfer_buf, XFER_STEP_RECORDS)
+        };
+        match res {
+            Ok((n, Progress::Done)) => {
+                worker.xfer_len = n;
+                worker.xfer_done = true;
+            }
+            Ok((n, Progress::InProgress { .. })) => {
+                worker.xfer_len = n;
+                if n == 0 {
+                    return; // the counting pass: a bounded walk per step
+                }
+            }
+            Err(StoreError::Backpressure) => return,
+            Err(_) => {
+                export_abort(worker);
+                dev_log(
+                    sys,
+                    1,
+                    b"[kvw] export failed".as_ptr(),
+                    b"[kvw] export failed".len(),
+                );
+                return;
+            }
+        }
     }
 }
 

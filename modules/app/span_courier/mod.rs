@@ -57,8 +57,12 @@ mod authority;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Chan, Inbox, ENVELOPE_HDR};
+
 use abi::contracts::net::net_proto::{
-    conn_id, connected_parts, error_parts, CMD_BIND as NET_CMD_BIND,
+    conn_id, connected_parts, error_parts, RequesterTag, CMD_BIND as NET_CMD_BIND,
     CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
     MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND, MSG_CLOSED as NET_MSG_CLOSED,
     MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
@@ -111,12 +115,15 @@ struct CourierState {
     local_in: i32,
     local_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    local_inbox: Inbox,
 
     mode: u8,
     authority: Authority,
     listen_port: u16,
     /// Requester tag on every dial; `MSG_CONNECTED` / `MSG_ERROR` echo it.
-    tag: u8,
+    tag: RequesterTag,
 
     bound: u8,
     connected: u8,
@@ -144,6 +151,8 @@ impl CourierState {
         self.local_in = -1;
         self.local_out = -1;
         self.metrics_out = -1;
+        self.net_inbox = Inbox::new();
+        self.local_inbox = Inbox::new();
         self.mode = MODE_SHIP;
         self.authority = Authority::empty();
         self.listen_port = 7400;
@@ -223,53 +232,6 @@ unsafe fn deliver_stream(s: &mut CourierState, sys: &SyscallTable, bytes: &[u8])
         s.rasm.copy_within(flen..have, 0);
         s.rasm_len = (have - flen) as u32;
     }
-}
-
-/// One attempt to read a raw envelope (header INCLUDED) from `chan`.
-enum RawRead {
-    /// Nothing readable.
-    Empty,
-    /// A complete envelope of this many bytes is in the buffer.
-    Frame(usize),
-    /// An envelope was consumed but cannot be carried (oversize, or the
-    /// channel delivered fewer payload bytes than the header promised).
-    /// The payload was drained so the channel stays frame-aligned; the
-    /// caller counts the drop.
-    Dropped,
-}
-
-/// Read one raw envelope (header INCLUDED) from `chan` into `buf`. An
-/// envelope larger than `buf` is consumed and discarded WHOLE rather
-/// than left half-read to desynchronise every frame after it.
-unsafe fn read_envelope_raw(sys: &SyscallTable, chan: i32, buf: &mut [u8]) -> RawRead {
-    if chan < 0 {
-        return RawRead::Empty;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return RawRead::Empty;
-    }
-    if (sys.channel_read)(chan, buf.as_mut_ptr(), ENV_HDR) < ENV_HDR as i32 {
-        return RawRead::Empty;
-    }
-    let plen = u16::from_le_bytes([buf[1], buf[2]]) as usize;
-    if ENV_HDR + plen > buf.len() {
-        // Drain the payload in buffer-sized bites and drop it whole.
-        let mut left = plen;
-        while left > 0 {
-            let take = left.min(buf.len());
-            let n = (sys.channel_read)(chan, buf.as_mut_ptr(), take);
-            if n <= 0 {
-                break;
-            }
-            left -= (n as usize).min(left);
-        }
-        return RawRead::Dropped;
-    }
-    if plen > 0 && ((sys.channel_read)(chan, buf.as_mut_ptr().add(ENV_HDR), plen) as usize) < plen {
-        return RawRead::Dropped;
-    }
-    RawRead::Frame(ENV_HDR + plen)
 }
 
 #[no_mangle]
@@ -379,24 +341,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // Drain NET events.
     for _ in 0..64 {
-        let (msg, plen) = unsafe {
-            let poll = (sys.channel_poll)(s.net_in, POLL_IN);
-            if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-                break;
-            }
-            net_read_frame(sys, s.net_in, s.nbuf.as_mut_ptr(), NET_BUF)
-        };
-        if msg == 0 {
+        // The payload lands at `nbuf[..plen]`.
+        let Some((msg, plen)) =
+            (unsafe { read_envelope(&mut s.net_inbox, sys, s.net_in, &mut s.nbuf) })
+        else {
             break;
-        }
-        let payload_start = ENV_HDR;
+        };
         match msg {
             NET_MSG_CONNECTED => {
                 // Claim only our own dial: the NET provider fans
                 // `net_out` to every consumer, and the tag says whose
                 // connection this is.
                 let claimed = if plen >= CONN_ID_LEN {
-                    let (cid, tag) = connected_parts(&s.nbuf[payload_start..payload_start + plen]);
+                    let (cid, tag) = connected_parts(&s.nbuf[..plen]);
                     (tag == s.tag || tag == REQUESTER_TAG_NONE).then_some(cid)
                 } else {
                     None
@@ -435,10 +392,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // connections accepted on OUR listener — everything else
                 // (the data anchor's clients) is someone else's traffic.
                 if s.mode == MODE_RECEIVE && plen >= 4 {
-                    let local_port =
-                        u16::from_le_bytes([s.nbuf[payload_start + 2], s.nbuf[payload_start + 3]]);
+                    let local_port = u16::from_le_bytes([s.nbuf[2], s.nbuf[3]]);
                     if local_port == s.listen_port {
-                        s.conn_id = conn_id(&s.nbuf[payload_start..payload_start + plen]);
+                        s.conn_id = conn_id(&s.nbuf[..plen]);
                         s.connected = 1;
                         s.rasm_len = 0;
                         unsafe { dev_log(sys, 3, b"[courier] accept".as_ptr(), 16) };
@@ -447,21 +403,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             NET_MSG_DATA => {
                 if plen > CONN_ID_LEN {
-                    let same = conn_id(&s.nbuf[payload_start..payload_start + plen]) == s.conn_id;
+                    let same = conn_id(&s.nbuf[..plen]) == s.conn_id;
                     if same && s.connected == 1 {
                         let mut data = [0u8; NET_BUF];
                         let dl = plen - CONN_ID_LEN;
-                        data[..dl].copy_from_slice(
-                            &s.nbuf[payload_start + CONN_ID_LEN..payload_start + plen],
-                        );
+                        data[..dl].copy_from_slice(&s.nbuf[CONN_ID_LEN..plen]);
                         unsafe { deliver_stream(s, sys, &data[..dl]) };
                     }
                 }
             }
             NET_MSG_CLOSED => {
-                if s.connected == 1
-                    && plen >= CONN_ID_LEN
-                    && conn_id(&s.nbuf[payload_start..payload_start + plen]) == s.conn_id
+                if s.connected == 1 && plen >= CONN_ID_LEN && conn_id(&s.nbuf[..plen]) == s.conn_id
                 {
                     s.connected = 0;
                     s.conn_id = 0;
@@ -473,8 +425,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // alone; an untagged one names an established
                 // connection by conn id.
                 if plen > CONN_ID_LEN {
-                    let (cid, _errno, tag) =
-                        error_parts(&s.nbuf[payload_start..payload_start + plen]);
+                    let (cid, _errno, tag) = error_parts(&s.nbuf[..plen]);
                     let ours = if s.connected == 1 {
                         tag == REQUESTER_TAG_NONE && cid == s.conn_id
                     } else {
@@ -494,15 +445,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // Drain local envelopes toward the peer.
     for _ in 0..16 {
+        // The whole envelope, header included, is what the peer is sent:
+        // look at it in `frame`, then take it. An envelope longer than
+        // `frame` is discarded whole and counted as dropped.
         let mut frame = [0u8; FRAME_MAX];
-        let flen = match unsafe { read_envelope_raw(sys, s.local_in, &mut frame) } {
-            RawRead::Empty => break,
-            RawRead::Dropped => {
-                s.m_dropped = s.m_dropped.wrapping_add(1);
-                continue;
-            }
-            RawRead::Frame(n) => n,
+        let mut chan = Chan {
+            sys,
+            handle: s.local_in,
         };
+        let oversize = s.local_inbox.oversize;
+        let peeked = s.local_inbox.peek(&mut chan, &mut frame);
+        let discarded = s.local_inbox.oversize.wrapping_sub(oversize);
+        s.m_dropped = s.m_dropped.wrapping_add(discarded as u64);
+        let Some((_, plen)) = peeked else {
+            break;
+        };
+        if !s.local_inbox.take(&mut chan, plen, &mut frame) {
+            break;
+        }
+        let flen = ENVELOPE_HDR + plen;
         if s.connected == 1 {
             if unsafe { tcp_send_raw(sys, s.net_out, s.conn_id, &mut s.nbuf, &frame[..flen]) } {
                 s.m_shipped = s.m_shipped.wrapping_add(1);

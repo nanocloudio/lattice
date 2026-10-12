@@ -67,6 +67,10 @@ mod partition_map;
 #[path = "../../common/txn.rs"]
 mod txn;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use collections::InflightTable;
 use partition_map::{
     HashSlotMap, KeyspaceRouting, OrderedRangeMap, RoutingKind, SlotBinding, MSG_MAP_UPDATE,
@@ -91,6 +95,27 @@ const SCRATCH_BUF_SIZE: usize = wire::KV_REQUEST_PAYLOAD_MAX;
 /// builds one (its 8192-byte scratch), re-headed as `MSG_KV_RESPONSE`.
 /// Commands stay bounded by [`SCRATCH_BUF_SIZE`].
 const REPLY_BUF_SIZE: usize = 8320;
+
+/// The request ingresses' slots in `ingress_inboxes`, one per port
+/// `drain_ingress` reads.
+const INGRESS_ETCD: usize = 0;
+const INGRESS_REDIS: usize = 1;
+const INGRESS_MEMCACHED: usize = 2;
+const INGRESS_MEMCACHED_UDP: usize = 3;
+const INGRESS_INTERNAL_WATCH: usize = 4;
+const INGRESS_INTERNAL_SQL: usize = 5;
+const INGRESS_INTERNAL_LIFECYCLE: usize = 6;
+const INGRESS_INTERNAL_JOB: usize = 7;
+const INGRESS_INTERNAL_DATA: usize = 8;
+const INGRESS_PORTS: usize = 9;
+
+/// The largest envelope on `gateway_reject_in`: `gateway/surface.rs::
+/// send_response` builds each one in a 256-byte frame.
+const GATEWAY_RESPONSE_FRAME: usize = 256;
+
+/// The largest payload taken on `read_release_in`: a read grant (16 bytes),
+/// a `CLIENT_REJECT_INTERNAL` or a write ack (18 bytes) all fit.
+const READ_RELEASE_PAYLOAD_MAX: usize = 64;
 
 /// Inflight table capacity. Tunable later via params.
 const MAX_INFLIGHT: usize = 256;
@@ -1390,6 +1415,14 @@ struct RouterState {
     /// where the local gateway is always the leader and never rejects.
     gateway_reject_in: i32,
 
+    /// Each input's envelope reading (`common/envelope.rs`). The
+    /// request ingresses are indexed by `INGRESS_*`.
+    ingress_inboxes: [Inbox; INGRESS_PORTS],
+    kv_inbox: Inbox,
+    read_release_inbox: Inbox,
+    map_update_inbox: Inbox,
+    gateway_reject_inbox: Inbox,
+
     /// Cross-partition transaction helping. See
     /// `maybe_start_help`. Each slot is one in-flight help: read the
     /// home record from its partition, and if it holds a DECISION,
@@ -1607,6 +1640,11 @@ impl RouterState {
         self.internal_job_in = -1;
         self.internal_data_in = -1;
         self.gateway_reject_in = -1;
+        self.ingress_inboxes = [Inbox::new(); INGRESS_PORTS];
+        self.kv_inbox = Inbox::new();
+        self.read_release_inbox = Inbox::new();
+        self.map_update_inbox = Inbox::new();
+        self.gateway_reject_inbox = Inbox::new();
         for h in &mut self.helps {
             h.in_use = false;
         }
@@ -1657,41 +1695,6 @@ impl RouterState {
 }
 
 // ── Ingress drain ──────────────────────────────────────────────────────
-
-/// Read one envelope from `chan` into `scratch`. Returns
-/// `Some((msg_type, payload_slice))` on a complete envelope, else
-/// `None`. `payload_slice` borrows `scratch`.
-unsafe fn read_one_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len == 0 {
-        return Some((msg_type, &scratch[..0]));
-    }
-    if payload_len > scratch.len() {
-        return None;
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, &scratch[..payload_len]))
-}
 
 /// Write a 3-byte-framed envelope to `chan` from `scratch[..total]`.
 /// Returns true on success.
@@ -1777,7 +1780,12 @@ unsafe fn write_envelope_maybe_tagged(
 
 /// Drain one MSG_KV_REQUEST from a given ingress port. Returns true
 /// if something was processed.
-unsafe fn drain_ingress(router: &mut RouterState, ingress_chan: i32, protocol: u8) -> bool {
+unsafe fn drain_ingress(
+    router: &mut RouterState,
+    ingress_chan: i32,
+    inbox: usize,
+    protocol: u8,
+) -> bool {
     if ingress_chan < 0 {
         return false;
     }
@@ -1790,27 +1798,21 @@ unsafe fn drain_ingress(router: &mut RouterState, ingress_chan: i32, protocol: u
     // router's `scratch` field is reserved for outbound writes; doing
     // both at the same time would alias).
     let sys = &*sys_ptr;
-    let poll = (sys.channel_poll)(ingress_chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+    let mut in_buf = [0u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE];
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut router.ingress_inboxes[inbox % INGRESS_PORTS],
+        sys,
+        ingress_chan,
+        &mut in_buf,
+    ) else {
         return false;
+    };
+    if msg_type != MSG_KV_REQUEST {
+        return false; // unexpected envelope: consumed and dropped
     }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(ingress_chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return false;
-    }
-    if hdr[0] != MSG_KV_REQUEST {
-        return false; // unexpected envelope; consume and drop the header
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // MSG_KV_REQUEST head = [corr:8][proto:1][tenant:4][conn:1][cons:1][op:1][body_len:2] = 18
     const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
-    if !(REQ_HEAD..=SCRATCH_BUF_SIZE).contains(&payload_len) {
-        return false;
-    }
-    let mut in_buf = [0u8; SCRATCH_BUF_SIZE];
-    let n2 = (sys.channel_read)(ingress_chan, in_buf.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < REQ_HEAD {
         return false;
     }
     let req = &in_buf[..payload_len];
@@ -2996,38 +2998,21 @@ unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
     // Bounded: a burst of rejects (a pipelined client on a follower)
     // must not starve the ingress drains this shares a step with.
     for _ in 0..16 {
-        let poll = (sys.channel_poll)(router.gateway_reject_in, POLL_IN);
-        if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-            break;
-        }
         // `gateway/surface.rs::send_response` framing: one envelope per
         // response, `[msg_type:u8][len:u16 LE]`, around the conn-tagged
         // wire frame
         //   [conn_id:u16 LE][msg_type:u8][len:u16 LE][payload…]
         // Lattice conn ids are u8-ranged, so the u16 narrows losslessly.
-        let mut env = [0u8; 3];
-        if (sys.channel_read)(router.gateway_reject_in, env.as_mut_ptr(), 3) < 3 {
+        // The buffer holds the gateway's largest response frame whole.
+        let mut body = [0u8; GATEWAY_RESPONSE_FRAME];
+        let Some((_, take)) = read_envelope(
+            &mut router.gateway_reject_inbox,
+            sys,
+            router.gateway_reject_in,
+            &mut body,
+        ) else {
             break;
-        }
-        let body_len = u16::from_le_bytes([env[1], env[2]]) as usize;
-        let mut body = [0u8; 5 + 64];
-        let take = body_len.min(body.len());
-        if take > 0
-            && ((sys.channel_read)(router.gateway_reject_in, body.as_mut_ptr(), take) as usize)
-                < take
-        {
-            break;
-        }
-        // A response past what a reject carries: the rest is drained.
-        let mut rest = body_len - take;
-        while rest > 0 {
-            let mut sink = [0u8; 64];
-            let n = rest.min(sink.len());
-            if ((sys.channel_read)(router.gateway_reject_in, sink.as_mut_ptr(), n) as usize) < n {
-                break;
-            }
-            rest -= n;
-        }
+        };
         progressed = true;
         if take < 5 {
             continue;
@@ -3367,23 +3352,16 @@ unsafe fn drain_read_release(router: &mut RouterState) {
     }
     let sys = &*sys_ptr;
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(router.read_release_in, POLL_IN);
-        if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+        let mut body = [0u8; ENVELOPE_HDR + READ_RELEASE_PAYLOAD_MAX];
+        let Some((msg_type, take)) = read_envelope(
+            &mut router.read_release_inbox,
+            sys,
+            router.read_release_in,
+            &mut body,
+        ) else {
             break;
-        }
-        let mut hdr = [0u8; 3];
-        if (sys.channel_read)(router.read_release_in, hdr.as_mut_ptr(), 3) < 3 {
-            break;
-        }
-        let plen = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        let mut body = [0u8; 64];
-        let take = plen.min(body.len());
-        if take > 0
-            && ((sys.channel_read)(router.read_release_in, body.as_mut_ptr(), take) as usize) < take
-        {
-            break;
-        }
-        match hdr[0] {
+        };
+        match msg_type {
             MSG_CLIENT_READ_RESPONSE | MSG_CLIENT_REJECT_INTERNAL if take >= 8 => {
                 let corr = u64::from_le_bytes([
                     body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
@@ -3410,7 +3388,7 @@ unsafe fn drain_read_release(router: &mut RouterState) {
                 let applied = router.worker_applied_index;
                 for p in router.pending_lin.iter_mut() {
                     if p.state == LIN_AWAITING && p.corr_id == corr {
-                        if hdr[0] == MSG_CLIENT_READ_RESPONSE {
+                        if msg_type == MSG_CLIENT_READ_RESPONSE {
                             p.state = LIN_FENCED;
                             p.fence_index = explicit_index.unwrap_or_else(|| {
                                 applied[p.fence_partition as usize % MAX_TRACKED_RANGES]
@@ -3504,32 +3482,33 @@ unsafe fn drain_map_update(router: &mut RouterState) {
     }
     let sys = &*sys_ptr;
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(router.map_update_in, POLL_IN);
-        if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-            return;
+        let mut buf = [0u8; ENVELOPE_HDR + MAP_UPDATE_DRAIN_BUF];
+        let oversize_before = router.map_update_inbox.oversize;
+        let read = read_envelope(
+            &mut router.map_update_inbox,
+            sys,
+            router.map_update_in,
+            &mut buf,
+        );
+        // An envelope too long for `buf` is discarded whole by the inbox;
+        // it is a dropped frame like any other invalid one.
+        let oversize = router
+            .map_update_inbox
+            .oversize
+            .wrapping_sub(oversize_before);
+        if oversize > 0 {
+            note_map_update_drops(router, sys, oversize as u64);
         }
-        let mut hdr = [0u8; 3];
-        if (sys.channel_read)(router.map_update_in, hdr.as_mut_ptr(), 3) < 3 {
+        let Some((msg_type, plen)) = read else {
             return;
-        }
-        let plen = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        let mut buf = [0u8; MAP_UPDATE_DRAIN_BUF];
-        let take = plen.min(buf.len());
-        if take > 0
-            && ((sys.channel_read)(router.map_update_in, buf.as_mut_ptr(), take) as usize) < take
-        {
-            return;
-        }
-        // Oversize (plen > buf: body truncated → length check fails),
-        // wrong envelope type, a frame kind that doesn't match the
+        };
+        // Wrong envelope type, a frame kind that doesn't match the
         // declared routing mode, or an invalid frame all land here.
         // The frame KIND is the envelope type byte, never sniffed from
         // the payload (the declared-not-inferred rule).
-        let applied = if take != plen {
-            None
-        } else if hdr[0] == MSG_MAP_UPDATE && router.routing_mode == ROUTING_MODE_FENCED {
+        let applied = if msg_type == MSG_MAP_UPDATE && router.routing_mode == ROUTING_MODE_FENCED {
             router.slot_map.apply_update(&buf[..plen])
-        } else if hdr[0] == partition_map::MSG_SPAN_BARRIER
+        } else if msg_type == partition_map::MSG_SPAN_BARRIER
             && router.routing_mode == ROUTING_MODE_ORDERED
         {
             match partition_map::SpanBarrier::decode(&buf[..plen]) {
@@ -3556,7 +3535,7 @@ unsafe fn drain_map_update(router: &mut RouterState) {
                 }
                 _ => None,
             }
-        } else if hdr[0] == MSG_RANGE_MAP_UPDATE && router.routing_mode == ROUTING_MODE_ORDERED {
+        } else if msg_type == MSG_RANGE_MAP_UPDATE && router.routing_mode == ROUTING_MODE_ORDERED {
             match router.range_map.apply_full_update(&buf[..plen]) {
                 Some(max_generation) => {
                     // A replaced map retires every outstanding scan
@@ -3587,15 +3566,18 @@ unsafe fn drain_map_update(router: &mut RouterState) {
                     router.keyspace_routing.map_generation = max_generation;
                 }
             }
-            None => {
-                router.m_map_update_drops = router.m_map_update_drops.wrapping_add(1);
-                if router.logged_map_update_drop == 0 {
-                    router.logged_map_update_drop = 1;
-                    let msg = b"[router] map_update frame dropped (bad version/frame)";
-                    dev_log(sys, 3, msg.as_ptr(), msg.len());
-                }
-            }
+            None => note_map_update_drops(router, sys, 1),
         }
+    }
+}
+
+/// Count `n` dropped `map_update` frames; the first drop is logged.
+unsafe fn note_map_update_drops(router: &mut RouterState, sys: &SyscallTable, n: u64) {
+    router.m_map_update_drops = router.m_map_update_drops.wrapping_add(n);
+    if router.logged_map_update_drop == 0 {
+        router.logged_map_update_drop = 1;
+        let msg = b"[router] map_update frame dropped (bad version/frame)";
+        dev_log(sys, 3, msg.as_ptr(), msg.len());
     }
 }
 
@@ -3607,29 +3589,20 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
         return false;
     }
     let sys = &*sys_ptr;
-    let poll = (sys.channel_poll)(router.kv_in, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+    let mut in_buf = [0u8; ENVELOPE_HDR + REPLY_BUF_SIZE];
+    let Some((msg_type, payload_len)) =
+        read_envelope(&mut router.kv_inbox, sys, router.kv_in, &mut in_buf)
+    else {
         return false;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(router.kv_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return false;
-    }
-    if hdr[0] == MSG_APP_APPLIED_POS {
+    };
+    if msg_type == MSG_APP_APPLIED_POS {
         // The worker's applied position: `[partition_id:u16][term:u64]
         // [index:u64]`. This is the applied-index half of the
-        // linearizable-read fence — see `LIN_FENCED`. Consume the payload
-        // rather than returning early on the header, or the next read
-        // starts mid-message.
-        let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+        // linearizable-read fence — see `LIN_FENCED`.
         if payload_len != 18 {
             return false;
         }
-        let mut pos = [0u8; 18];
-        if ((sys.channel_read)(router.kv_in, pos.as_mut_ptr(), 18) as usize) < 18 {
-            return false;
-        }
+        let pos = &in_buf[..18];
         let partition = u16::from_le_bytes([pos[0], pos[1]]) as usize % MAX_TRACKED_RANGES;
         let term = u64::from_le_bytes([
             pos[2], pos[3], pos[4], pos[5], pos[6], pos[7], pos[8], pos[9],
@@ -3650,17 +3623,11 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
         }
         return true;
     }
-    if hdr[0] != MSG_KV_APPLIED {
+    if msg_type != MSG_KV_APPLIED {
         return false;
     }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // MSG_KV_APPLIED head layout owned by wire::KvAppliedHead.
-    if !(wire::KvAppliedHead::LEN..=REPLY_BUF_SIZE).contains(&payload_len) {
-        return false;
-    }
-    let mut in_buf = [0u8; REPLY_BUF_SIZE];
-    let n2 = (sys.channel_read)(router.kv_in, in_buf.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < wire::KvAppliedHead::LEN {
         return false;
     }
 
@@ -4090,19 +4057,50 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 budget -= 1;
                 continue;
             }
-            let a = drain_ingress(router, router.etcd_in, PROTO_ETCD);
-            let b = drain_ingress(router, router.redis_in, PROTO_REDIS);
-            let c = drain_ingress(router, router.memcached_in, PROTO_MEMCACHED);
-            let d = drain_ingress(router, router.memcached_udp_in, PROTO_MEMCACHED_UDP);
-            let f = drain_ingress(router, router.internal_watch_in, PROTO_INTERNAL_WATCH);
-            let g = drain_ingress(router, router.internal_sql_in, PROTO_INTERNAL_SQL);
+            let a = drain_ingress(router, router.etcd_in, INGRESS_ETCD, PROTO_ETCD);
+            let b = drain_ingress(router, router.redis_in, INGRESS_REDIS, PROTO_REDIS);
+            let c = drain_ingress(
+                router,
+                router.memcached_in,
+                INGRESS_MEMCACHED,
+                PROTO_MEMCACHED,
+            );
+            let d = drain_ingress(
+                router,
+                router.memcached_udp_in,
+                INGRESS_MEMCACHED_UDP,
+                PROTO_MEMCACHED_UDP,
+            );
+            let f = drain_ingress(
+                router,
+                router.internal_watch_in,
+                INGRESS_INTERNAL_WATCH,
+                PROTO_INTERNAL_WATCH,
+            );
+            let g = drain_ingress(
+                router,
+                router.internal_sql_in,
+                INGRESS_INTERNAL_SQL,
+                PROTO_INTERNAL_SQL,
+            );
             let h = drain_ingress(
                 router,
                 router.internal_lifecycle_in,
+                INGRESS_INTERNAL_LIFECYCLE,
                 types::PROTO_INTERNAL_LIFECYCLE,
             );
-            let i = drain_ingress(router, router.internal_job_in, types::PROTO_INTERNAL_JOB);
-            let j = drain_ingress(router, router.internal_data_in, types::PROTO_INTERNAL_DATA);
+            let i = drain_ingress(
+                router,
+                router.internal_job_in,
+                INGRESS_INTERNAL_JOB,
+                types::PROTO_INTERNAL_JOB,
+            );
+            let j = drain_ingress(
+                router,
+                router.internal_data_in,
+                INGRESS_INTERNAL_DATA,
+                types::PROTO_INTERNAL_DATA,
+            );
             let k = drain_gateway_rejects(router);
             let e = replies_clear && drain_kv_in(router);
             a || b || c || d || e || f || g || h || i || j || k

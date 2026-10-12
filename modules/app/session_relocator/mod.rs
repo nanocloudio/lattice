@@ -51,6 +51,10 @@ mod session_core;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use session_core::placement_event_epoch;
 use wire::{MSG_PLACEMENT_EPOCH_EVENT, MSG_SESSION_RELOCATE};
 
@@ -62,6 +66,9 @@ struct RelocatorState {
 
     epoch_events_in: i32,
     cmd_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    epoch_events_inbox: Inbox,
+    cmd_inbox: Inbox,
     relocate_out: i32,
     metrics_out: i32,
 
@@ -81,7 +88,8 @@ struct RelocatorState {
     fire_after_steps: u64,
     fired: bool,
 
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 define_params! {
@@ -101,6 +109,8 @@ impl RelocatorState {
         self.syscalls = syscalls;
         self.epoch_events_in = -1;
         self.cmd_in = -1;
+        self.epoch_events_inbox = Inbox::new();
+        self.cmd_inbox = Inbox::new();
         self.relocate_out = -1;
         self.metrics_out = -1;
         self.next_target = 1;
@@ -110,34 +120,6 @@ impl RelocatorState {
         self.fire_after_steps = 0;
         self.fired = false;
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
 }
 
 fn emit_relocate(st: &mut RelocatorState, target: u8) {
@@ -217,7 +199,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys = &*sys_ptr;
 
-        if let Some((mt, len)) = read_envelope(sys, st.epoch_events_in, &mut st.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut st.epoch_events_inbox,
+            sys,
+            st.epoch_events_in,
+            &mut st.scratch,
+        ) {
             if mt == MSG_PLACEMENT_EPOCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&st.scratch[..len]);
@@ -230,7 +217,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, st.cmd_in, &mut st.scratch) {
+        if let Some((mt, len)) = read_envelope(&mut st.cmd_inbox, sys, st.cmd_in, &mut st.scratch) {
             // Operator-driven drain: the command names the target worker.
             if mt == MSG_SESSION_RELOCATE && len >= 1 {
                 let target = st.scratch[0];

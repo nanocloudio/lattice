@@ -85,6 +85,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
 include!("../../common/scram_core.rs");
 include!("../../common/mongo_core.rs");
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox};
+
 #[path = "../../common/authority.rs"]
 mod authority;
 use authority::{Authority, PORT_MONGO};
@@ -95,7 +99,7 @@ use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 use abi::contracts::net::net_proto::{
-    conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
+    conn_id, connected_parts, error_parts, RequesterTag, CMD_CLOSE as NET_CMD_CLOSE,
     CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
     MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
@@ -124,6 +128,8 @@ const RETRY_MAX_MS: u64 = 30_000;
 struct MongoState {
     syscalls: *const SyscallTable,
     net_in: i32,
+    /// The transport input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
     net_out: i32,
     request_in: i32,
     status_out: i32,
@@ -139,7 +145,7 @@ struct MongoState {
 
     phase: MPhase,
     conn_id: u16,
-    tag: u8,
+    tag: RequesterTag,
     req_id: i32,
     conversation_id: i32,
     started_ms: u64,
@@ -263,6 +269,7 @@ pub extern "C" fn module_new(
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
         s.net_in = in_chan;
+        s.net_inbox = Inbox::new();
         s.net_out = out_chan;
         s.request_in = dev_channel_port(sys, 0, 1);
         s.status_out = dev_channel_port(sys, 1, 1);
@@ -573,12 +580,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
                 }
-                let (msg, plen) = net_read_frame(sys, s.net_in, s.nbuf.as_mut_ptr(), NET_BUF);
-                if msg == 0 {
+                let Some((msg, plen)) = read_envelope(&mut s.net_inbox, sys, s.net_in, &mut s.nbuf)
+                else {
                     break;
-                }
-                let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
-                let pl = core::slice::from_raw_parts(payload, plen.min(NET_BUF - NET_FRAME_HDR));
+                };
+                let payload = s.nbuf.as_ptr();
+                let pl = core::slice::from_raw_parts(payload, plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == MPhase::Connecting => {
                         if plen >= CONN_ID_LEN {

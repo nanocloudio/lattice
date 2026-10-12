@@ -46,10 +46,16 @@ use auth_table::{decide, AuthTable, PrincipalEntry, MAX_PRINCIPALS};
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 #[repr(C)]
 struct AuthState {
     syscalls: *const SyscallTable,
     in_chan: i32,
+    /// The input's envelope reading (`common/envelope.rs`).
+    in_inbox: Inbox,
     out_chan: i32,
     // Dedicated `metrics` output port (output index 3), discovered in
     // module_new; -1 when unwired.
@@ -67,6 +73,7 @@ impl AuthState {
     fn init(&mut self, sys: *const SyscallTable) {
         self.syscalls = sys;
         self.in_chan = -1;
+        self.in_inbox = Inbox::new();
         self.out_chan = -1;
         self.metrics_out = -1;
         self._pad = 0;
@@ -76,34 +83,6 @@ impl AuthState {
         self.step_ctr = 0;
         self.table.init();
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), len);
-    if (n2 as usize) < len {
-        return None;
-    }
-    Some((mt, len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, mt: u8, body: &[u8]) -> bool {
@@ -171,9 +150,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if sys.is_null() {
         return 0;
     }
-    let mut scratch = [0u8; 256];
+    let mut scratch = [0u8; ENVELOPE_HDR + 256];
     unsafe {
-        if let Some((mt, len)) = read_envelope(&*sys, s.in_chan, &mut scratch) {
+        if let Some((mt, len)) = read_envelope(&mut s.in_inbox, &*sys, s.in_chan, &mut scratch) {
             if mt == MSG_AUTH_REQUEST && len >= 7 {
                 let protocol = scratch[0];
                 let _tenant = u32::from_le_bytes([scratch[1], scratch[2], scratch[3], scratch[4]]);

@@ -46,6 +46,10 @@ use quota_bucket::{consume, refill_all, QuotaTable};
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 #[repr(C)]
 struct QuotaState {
     syscalls: *const SyscallTable,
@@ -55,6 +59,8 @@ struct QuotaState {
     // module_new; -1 when unwired.
     metrics_out: i32,
     _pad: i32,
+    /// The input's envelope reading (`common/envelope.rs`).
+    in_inbox: Inbox,
     // Module-scope counters (ids follow manifest `[observability] metrics`).
     m_checks: u64,
     m_throttles: u64,
@@ -70,38 +76,13 @@ impl QuotaState {
         self.out_chan = -1;
         self.metrics_out = -1;
         self._pad = 0;
+        self.in_inbox = Inbox::new();
         self.m_checks = 0;
         self.m_throttles = 0;
         self.m_disconnects = 0;
         self.step_ctr = 0;
         self.table.init();
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
-        return None;
-    }
-    Some((mt, len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, mt: u8, body: &[u8]) -> bool {
@@ -167,9 +148,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if sys.is_null() {
         return 0;
     }
-    let mut scratch = [0u8; 64];
+    let mut scratch = [0u8; ENVELOPE_HDR + 64];
     unsafe {
-        if let Some((mt, len)) = read_envelope(&*sys, s.in_chan, &mut scratch) {
+        if let Some((mt, len)) = read_envelope(&mut s.in_inbox, &*sys, s.in_chan, &mut scratch) {
             if mt == MSG_QUOTA_TICK && len >= 6 {
                 let tenant = u32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
                 let cost = u16::from_le_bytes([scratch[4], scratch[5]]);

@@ -72,6 +72,10 @@ mod session_worker;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{placement_event_epoch, worker_id, SessionId, CLASS_WATCH};
 use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
@@ -100,6 +104,11 @@ struct RegistryState {
     mutations_in: i32,
     progress_in: i32,
     epoch_events_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    ctrl_inbox: Inbox,
+    mutations_inbox: Inbox,
+    progress_inbox: Inbox,
+    epoch_events_inbox: Inbox,
     // Outputs (manifest order: ctrl_out[0], replay_plan[1],
     // retention[2], events_out[3], metrics[4])
     ctrl_out: i32,
@@ -121,7 +130,8 @@ struct RegistryState {
 
     hub: WatchHub,
     sw: SessionWorker<MAX_WATCHES>,
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 define_params! {
@@ -141,6 +151,10 @@ impl RegistryState {
         self.mutations_in = -1;
         self.progress_in = -1;
         self.epoch_events_in = -1;
+        self.ctrl_inbox = Inbox::new();
+        self.mutations_inbox = Inbox::new();
+        self.progress_inbox = Inbox::new();
+        self.epoch_events_inbox = Inbox::new();
         self.ctrl_out = -1;
         self.replay_plan_out = -1;
         self.retention_out = -1;
@@ -156,34 +170,6 @@ impl RegistryState {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
-}
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> bool {
     if chan < 0 || payload.len() > u16::MAX as usize {
@@ -663,7 +649,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Drain at most one envelope per input per tick; the
         // scheduler ticks again to drain more.
-        if let Some((mt, len)) = read_envelope(sys, reg.ctrl_in, &mut reg.scratch) {
+        if let Some((mt, len)) =
+            read_envelope(&mut reg.ctrl_inbox, sys, reg.ctrl_in, &mut reg.scratch)
+        {
             let mut tmp = [0u8; SCRATCH_BUF_SIZE];
             tmp[..len].copy_from_slice(&reg.scratch[..len]);
             if (0x70..=0x9F).contains(&mt) {
@@ -672,21 +660,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 handle_ctrl(reg, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, reg.mutations_in, &mut reg.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut reg.mutations_inbox,
+            sys,
+            reg.mutations_in,
+            &mut reg.scratch,
+        ) {
             if mt == MSG_WATCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&reg.scratch[..len]);
                 handle_mutation(reg, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, reg.progress_in, &mut reg.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut reg.progress_inbox,
+            sys,
+            reg.progress_in,
+            &mut reg.scratch,
+        ) {
             if mt == MSG_WATCH_PROGRESS {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&reg.scratch[..len]);
                 handle_progress_ack(reg, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, reg.epoch_events_in, &mut reg.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut reg.epoch_events_inbox,
+            sys,
+            reg.epoch_events_in,
+            &mut reg.scratch,
+        ) {
             if mt == MSG_PLACEMENT_EPOCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&reg.scratch[..len]);

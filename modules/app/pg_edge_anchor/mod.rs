@@ -74,6 +74,10 @@ mod pg;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use abi::contracts::net::net_proto::{
     conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
     CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
@@ -182,6 +186,9 @@ struct AnchorState {
     sql_out: i32,
     sql_in: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    sql_inbox: Inbox,
 
     phase: u8,
     server_conn_id: u16,
@@ -202,7 +209,8 @@ struct AnchorState {
     m_net_errors: u64,
     step_ctr: u64,
 
-    scratch: [u8; SCRATCH_BUF],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF],
 }
 
 define_params! {
@@ -232,6 +240,8 @@ impl AnchorState {
         self.sql_out = -1;
         self.sql_in = -1;
         self.metrics_out = -1;
+        self.net_inbox = Inbox::new();
+        self.sql_inbox = Inbox::new();
         self.phase = PHASE_INIT;
         self.server_conn_id = 0;
         self.listen_port = DEFAULT_LISTEN_PORT;
@@ -453,7 +463,7 @@ fn forward_statement(anchor: &mut AnchorState, idx: usize, sql: &[u8]) {
                 anchor.sql_out,
                 MSG_SQL_REQUEST,
                 &payload[..n],
-                &mut anchor.scratch,
+                &mut anchor.scratch[..SCRATCH_BUF],
             )
     };
     if sent {
@@ -844,31 +854,6 @@ fn row_finish(slot: &mut Slot) {
 
 // ── Channel helpers ───────────────────────────────────────────────────
 
-unsafe fn envelope_read(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((hdr[0], 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
-        return None;
-    }
-    Some((hdr[0], len))
-}
-
 unsafe fn envelope_write(
     sys: &SyscallTable,
     chan: i32,
@@ -1122,7 +1107,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Executor replies first: they unblock busy slots, and a slot that
         // finished this step can then parse the next pipelined statement.
-        if let Some((mt, len)) = envelope_read(sys, anchor.sql_in, &mut anchor.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut anchor.sql_inbox,
+            sys,
+            anchor.sql_in,
+            &mut anchor.scratch,
+        ) {
             if mt == MSG_SQL_RESPONSE {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&anchor.scratch[..len]);
@@ -1143,13 +1133,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // One net frame per step keeps the step bounded; the scheduler
         // calls back immediately while work remains.
-        let buf = anchor.scratch.as_mut_ptr();
-        let (msg_type, payload_len) = net_read_frame(sys, anchor.net_in, buf, SCRATCH_BUF);
-        if msg_type != 0 || payload_len != 0 {
+        if let Some((msg_type, len)) = read_envelope(
+            &mut anchor.net_inbox,
+            sys,
+            anchor.net_in,
+            &mut anchor.scratch[..SCRATCH_BUF],
+        ) {
             let mut tmp = [0u8; SCRATCH_BUF];
-            let copy = payload_len.min(SCRATCH_BUF);
-            core::ptr::copy_nonoverlapping(buf.add(NET_FRAME_HDR), tmp.as_mut_ptr(), copy);
-            dispatch_net(anchor, msg_type, &tmp[..copy]);
+            tmp[..len].copy_from_slice(&anchor.scratch[..len]);
+            dispatch_net(anchor, msg_type, &tmp[..len]);
         }
 
         flush_slots(anchor);

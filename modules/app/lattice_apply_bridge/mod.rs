@@ -39,6 +39,10 @@ mod types;
 #[path = "../../common/wire.rs"]
 mod wire;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
@@ -73,7 +77,10 @@ const PEND_RECORD: u8 = 2;
 
 #[repr(C)]
 struct BridgeState {
-    rd: ReadStats,
+    /// The committed stream's envelope reading (`common/envelope.rs`); an
+    /// entry longer than the scratch is discarded whole and counted
+    /// (`rd_big=` on the heartbeat).
+    committed_inbox: Inbox,
     syscalls: *const SyscallTable,
     committed_in: i32,
     kv_out: i32,
@@ -175,79 +182,8 @@ impl BridgeState {
         self.pend_len = 0;
         self.pend_term = 0;
         self.pend_index = 0;
-        self.rd = ReadStats {
-            hdr_short: 0,
-            oversize: 0,
-            body_short: 0,
-            last_rc: 0,
-            last_len: 0,
-        };
+        self.committed_inbox = Inbox::new();
     }
-}
-
-/// Why reads gave up (telemetry, on the heartbeat): a header read short,
-/// a frame longer than the scratch (drained and dropped), a body read
-/// short — and the last rc and length seen. Any of them on a ring that
-/// stays full is a stalled apply path.
-#[derive(Clone, Copy)]
-struct ReadStats {
-    hdr_short: u32,
-    oversize: u32,
-    body_short: u32,
-    last_rc: i32,
-    last_len: u32,
-}
-
-unsafe fn read_envelope(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &mut [u8],
-    st: &mut ReadStats,
-) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let rc = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if rc < 3 {
-        st.hdr_short = st.hdr_short.wrapping_add(1);
-        st.last_rc = rc;
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        // Drain the frame whole: left half-read, its payload would be
-        // parsed as the next frame's header and desynchronise every
-        // frame after it.
-        st.oversize = st.oversize.wrapping_add(1);
-        st.last_len = len as u32;
-        let mut left = len;
-        while left > 0 {
-            let take = left.min(scratch.len());
-            let rc = (sys.channel_read)(chan, scratch.as_mut_ptr(), take);
-            if rc <= 0 {
-                break;
-            }
-            left -= (rc as usize).min(left);
-        }
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    let rc = (sys.channel_read)(chan, scratch.as_mut_ptr(), len);
-    if (rc as usize) < len || rc < 0 {
-        st.body_short = st.body_short.wrapping_add(1);
-        st.last_rc = rc;
-        st.last_len = len as u32;
-        return None;
-    }
-    Some((mt, len))
 }
 
 unsafe fn write_envelope(
@@ -426,16 +362,12 @@ unsafe fn heartbeat(s: &BridgeState) {
     n = dec(&mut b, n, u64::from(s.pend_need_records));
     n = lit(&mut b, n, b" idx=");
     n = dec(&mut b, n, s.pend_index);
-    n = lit(&mut b, n, b" rd_hdr=");
-    n = dec(&mut b, n, u64::from(s.rd.hdr_short));
+    n = lit(&mut b, n, b" gaps=");
+    n = dec(&mut b, n, s.gaps);
+    n = lit(&mut b, n, b" untagged=");
+    n = dec(&mut b, n, s.untagged);
     n = lit(&mut b, n, b" rd_big=");
-    n = dec(&mut b, n, u64::from(s.rd.oversize));
-    n = lit(&mut b, n, b" rd_body=");
-    n = dec(&mut b, n, u64::from(s.rd.body_short));
-    n = lit(&mut b, n, b" rc=");
-    n = dec(&mut b, n, u64::from(s.rd.last_rc.unsigned_abs()));
-    n = lit(&mut b, n, b" rlen=");
-    n = dec(&mut b, n, u64::from(s.rd.last_len));
+    n = dec(&mut b, n, u64::from(s.committed_inbox.oversize));
     dev_log(&*s.syscalls, 3, b.as_ptr(), n);
 }
 
@@ -461,12 +393,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.pend_kind != PEND_NONE && unsafe { !flush_pending(s) } {
             break;
         }
-        let mut scratch = [0u8; SCRATCH];
-        let (mt, len) =
-            match unsafe { read_envelope(&*sys, s.committed_in, &mut scratch, &mut s.rd) } {
-                Some(p) => p,
-                None => break,
-            };
+        let mut scratch = [0u8; ENVELOPE_HDR + SCRATCH];
+        let (mt, len) = match unsafe {
+            read_envelope(&mut s.committed_inbox, &*sys, s.committed_in, &mut scratch)
+        } {
+            Some(p) => p,
+            None => break,
+        };
         if mt != MSG_COMMITTED_ENTRY || len < COMMITTED_HEADER_LEN {
             processed += 1;
             continue;

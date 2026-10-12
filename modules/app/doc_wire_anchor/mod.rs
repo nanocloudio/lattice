@@ -54,6 +54,10 @@ mod doc_exec;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use abi::contracts::net::net_proto::{
     conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
     CONN_ID_LEN, MAX_CMD_DATA, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
@@ -120,6 +124,9 @@ struct AnchorState {
     exec_in: i32,
     exec_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    exec_inbox: Inbox,
     listen_port: u16,
     /// Frames carry the JSON document wire rather than the canonical one.
     json: bool,
@@ -477,41 +484,6 @@ unsafe fn on_net(a: &mut AnchorState, msg: u8, p: &[u8]) {
     }
 }
 
-unsafe fn read_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    buf: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let n = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if n > buf.len() {
-        let mut left = n;
-        let mut sink = [0u8; 256];
-        while left > 0 {
-            let take = left.min(sink.len());
-            if ((sys.channel_read)(chan, sink.as_mut_ptr(), take) as usize) < take {
-                break;
-            }
-            left -= take;
-        }
-        return None;
-    }
-    if n > 0 && ((sys.channel_read)(chan, buf.as_mut_ptr(), n) as usize) < n {
-        return None;
-    }
-    Some((hdr[0], &buf[..n]))
-}
-
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
@@ -540,6 +512,8 @@ pub extern "C" fn module_new(
     let sys_ptr = syscalls.cast::<SyscallTable>();
     let a = unsafe { &mut *state.cast::<AnchorState>() };
     a.syscalls = sys_ptr;
+    a.net_inbox = Inbox::new();
+    a.exec_inbox = Inbox::new();
     a.listen_port = DEFAULT_LISTEN_PORT;
     a.phase = PHASE_INIT;
     for s in a.slots.iter_mut() {
@@ -593,10 +567,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if !net_room(a) {
                 break;
             }
-            let mut buf = [0u8; RECV_BUF];
-            let Some((msg, p)) = read_envelope(sys, a.net_in, &mut buf) else {
+            let mut buf = [0u8; ENVELOPE_HDR + RECV_BUF];
+            let Some((msg, len)) = read_envelope(&mut a.net_inbox, sys, a.net_in, &mut buf) else {
                 break;
             };
+            let p = &buf[..len];
             on_net(a, msg, p);
         }
         // A held answer part first; nothing more is read until it goes.
@@ -612,10 +587,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if a.down_hold_len > 0 {
                 break;
             }
-            let mut buf = [0u8; DOC_RESPONSE_MAX];
-            let Some((msg, p)) = read_envelope(sys, a.exec_in, &mut buf) else {
+            let mut buf = [0u8; ENVELOPE_HDR + DOC_RESPONSE_MAX];
+            let Some((msg, len)) = read_envelope(&mut a.exec_inbox, sys, a.exec_in, &mut buf)
+            else {
                 break;
             };
+            let p = &buf[..len];
             if msg == MSG_DOC_RESPONSE || msg == MSG_JSON_DOC_RESPONSE {
                 on_answer(a, p);
             } else if msg == wire::MSG_PART && !on_answer_part(a, p) {

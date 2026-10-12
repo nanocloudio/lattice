@@ -19,7 +19,7 @@
 )]
 pub mod net_proto;
 
-use net_proto::{write_connect_to, Target, SOCK_TYPE_STREAM};
+use net_proto::{write_connect_to, RequesterTag, Target, SOCK_TYPE_STREAM};
 
 /// Longest authority a connector keeps. A 63-byte label with a port,
 /// or a bracketed IPv6 literal with a port, fits; a longer name is
@@ -105,7 +105,7 @@ impl Authority {
     /// Compose the `CMD_CONNECT_TO` payload for this authority into
     /// `buf`, tagged with `tag` when given. `0` when the authority was
     /// never adopted or `buf` cannot hold the record.
-    pub fn connect_record(&self, buf: &mut [u8], tag: Option<u8>) -> usize {
+    pub fn connect_record(&self, buf: &mut [u8], tag: Option<RequesterTag>) -> usize {
         if !self.is_set() {
             return 0;
         }

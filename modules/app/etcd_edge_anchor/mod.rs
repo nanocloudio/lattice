@@ -83,6 +83,10 @@ mod telemetry;
 #[path = "../../common/session_anchor.rs"]
 mod session_anchor;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use etcd_codec::{
     build_grpc_trailers_block, build_lease_grant_response, build_lease_keepalive_response,
     build_lease_revoke_response, build_put_response, build_range_response,
@@ -906,6 +910,17 @@ struct AnchorState {
     relocate_in: i32,
     /// `MSG_LEASE_REVOKE` from the lease manager: a lease ended.
     lease_revoke_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    routed_inbox: Inbox,
+    watch_inbox: Inbox,
+    lease_inbox: Inbox,
+    lease_sess0_inbox: Inbox,
+    lease_sess1_inbox: Inbox,
+    watch_sess0_inbox: Inbox,
+    watch_sess1_inbox: Inbox,
+    relocate_inbox: Inbox,
+    lease_revoke_inbox: Inbox,
     /// Leases that ended (expired or revoked) whose keys the store has
     /// yet to delete, a ring served one `KV_OP_LEASE_REVOKE` at a time;
     /// `lease_end_corr` is the one in flight (0 = none).
@@ -960,10 +975,14 @@ struct AnchorState {
     step_ctr: u64,
 
     slots: [Slot; MAX_CONNS],
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// Outbound frames are built in `scratch[..SCRATCH_BUF_SIZE]`; an
+    /// inbound envelope is read whole into it (header room, then the
+    /// payload).
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
     /// One KV reply as the router forwards it: a worker answer up to its
-    /// full 8192 bytes, re-headed.
-    reply: [u8; REPLY_BUF_SIZE],
+    /// full 8192 bytes, re-headed. Read whole: header room, then the
+    /// payload.
+    reply: [u8; ENVELOPE_HDR + REPLY_BUF_SIZE],
     hpack_scratch: [u8; HPACK_SCRATCH_LEN],
     /// Scratch arena for the currently-parsed HTTP/2 frame body.
     /// Lives in the kernel-allocated state rather than on the stack
@@ -1008,6 +1027,16 @@ impl AnchorState {
         self.watch_sess1_in = -1;
         self.relocate_in = -1;
         self.lease_revoke_in = -1;
+        self.net_inbox = Inbox::new();
+        self.routed_inbox = Inbox::new();
+        self.watch_inbox = Inbox::new();
+        self.lease_inbox = Inbox::new();
+        self.lease_sess0_inbox = Inbox::new();
+        self.lease_sess1_inbox = Inbox::new();
+        self.watch_sess0_inbox = Inbox::new();
+        self.watch_sess1_inbox = Inbox::new();
+        self.relocate_inbox = Inbox::new();
+        self.lease_revoke_inbox = Inbox::new();
         self.lease_end = [0; LEASE_END_QUEUE];
         self.lease_end_head = 0;
         self.lease_end_len = 0;
@@ -1233,7 +1262,7 @@ fn sc_begin(anchor: &mut AnchorState, msg: u8, app_id: u64) -> usize {
     let sid = mint_session_id(&anchor.anchor_id, app_id);
     anchor.scratch[0] = msg;
     // len patched by sc_finish
-    let hdr = sc::put_session_header(&mut anchor.scratch[3..], &sid, FIRST_EPOCH);
+    let hdr = sc::put_session_header(&mut anchor.scratch[3..SCRATCH_BUF_SIZE], &sid, FIRST_EPOCH);
     3 + hdr
 }
 
@@ -1245,7 +1274,7 @@ fn sc_finish(anchor: &mut AnchorState, chan: i32, end: usize) -> bool {
     anchor.scratch[1] = (body_len & 0xFF) as u8;
     anchor.scratch[2] = ((body_len >> 8) & 0xFF) as u8;
     let sys = anchor.syscalls;
-    if sys.is_null() || chan < 0 || end > anchor.scratch.len() {
+    if sys.is_null() || chan < 0 || end > SCRATCH_BUF_SIZE {
         return false;
     }
     unsafe { ((*sys).channel_write)(chan, anchor.scratch.as_mut_ptr(), end) == end as i32 }
@@ -2237,10 +2266,9 @@ fn dispatch_kv(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     // starting at offset (3 + 18) = 21. build_kv_op_body decodes the
     // request body (which is in the stream's body_buf) into that
     // region of scratch.
-    const ENVELOPE_HDR: usize = 3;
     const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
     let op_body_start = ENVELOPE_HDR + REQ_HEAD;
-    if op_body_start > anchor.scratch.len() {
+    if op_body_start > SCRATCH_BUF_SIZE {
         send_grpc_error(anchor, slot_idx, stream_id, 13);
         anchor.slots[slot_idx].free_stream(strm);
         return;
@@ -2249,7 +2277,7 @@ fn dispatch_kv(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     // at op_body_start, plus an immutable slice into the stream's
     // body_buf. Use split-mut via field-disjoint borrows.
     let kv_result = {
-        let scratch_tail = &mut anchor.scratch[op_body_start..];
+        let scratch_tail = &mut anchor.scratch[op_body_start..SCRATCH_BUF_SIZE];
         let request_body = &anchor.slots[slot_idx].streams[strm].body_buf[..body_len];
         build_kv_op_body(method, request_body, scratch_tail)
     };
@@ -2272,7 +2300,7 @@ fn dispatch_kv(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
 
     let payload_len = REQ_HEAD + op_body_len;
     let total = ENVELOPE_HDR + payload_len;
-    if total > anchor.scratch.len() {
+    if total > SCRATCH_BUF_SIZE {
         send_grpc_error(anchor, slot_idx, stream_id, 13);
         anchor.slots[slot_idx].free_stream(strm);
         return;
@@ -3587,20 +3615,15 @@ unsafe fn poll_lease_revoke(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(anchor.lease_revoke_in, hdr.as_mut_ptr(), 3) < 3 {
+    let Some((mt, len)) = read_envelope(
+        &mut anchor.lease_revoke_inbox,
+        &*sys,
+        anchor.lease_revoke_in,
+        &mut anchor.scratch,
+    ) else {
         return false;
-    }
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len == 0 || len > anchor.scratch.len() {
-        return len == 0;
-    }
-    if (((*sys).channel_read)(anchor.lease_revoke_in, anchor.scratch.as_mut_ptr(), len) as usize)
-        < len
-    {
-        return false;
-    }
-    if hdr[0] != MSG_LEASE_REVOKE || len < 8 {
+    };
+    if mt != MSG_LEASE_REVOKE || len < 8 {
         return true;
     }
     let mut b = [0u8; 8];
@@ -3680,21 +3703,19 @@ unsafe fn poll_routed_in(anchor: &mut AnchorState) -> bool {
         return false;
     }
 
-    let mut hdr = [0u8; 3];
-    let n = ((*sys).channel_read)(anchor.routed_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.routed_inbox,
+        &*sys,
+        anchor.routed_in,
+        &mut anchor.reply,
+    ) else {
+        return false;
+    };
+    if msg_type != MSG_KV_RESPONSE {
         return false;
     }
-    if hdr[0] != MSG_KV_RESPONSE {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     const RESP_HEAD: usize = 8 + 1 + 1 + 8 + 2;
-    if payload_len < RESP_HEAD || payload_len > anchor.reply.len() {
-        return false;
-    }
-    let n2 = ((*sys).channel_read)(anchor.routed_in, anchor.reply.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < RESP_HEAD {
         return false;
     }
 
@@ -4296,7 +4317,7 @@ fn send_snapshot_message(anchor: &mut AnchorState, blob: &[u8], remaining: u64) 
     let ids = anchor.header_ids();
     let rev = anchor.snap.rev as i64;
     let len = {
-        let scratch = &mut anchor.scratch[..];
+        let scratch = &mut anchor.scratch[..SCRATCH_BUF_SIZE];
         let mut off = 0usize;
         let proto = &mut scratch[GRPC_FRAME_HEADER_LEN..];
         let built =
@@ -5432,17 +5453,16 @@ unsafe fn poll_lease_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+    let inbox = if worker_idx == 0 {
+        &mut anchor.lease_sess0_inbox
+    } else {
+        &mut anchor.lease_sess1_inbox
+    };
+    let Some((mt, len)) = read_envelope(inbox, &*sys, chan, &mut anchor.scratch) else {
         return false;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len == 0 || len > anchor.scratch.len() {
-        return len == 0;
-    }
-    if (((*sys).channel_read)(chan, anchor.scratch.as_mut_ptr(), len) as usize) < len {
-        return false;
+    };
+    if len == 0 {
+        return true;
     }
     if (0x70..=0x9F).contains(&mt) {
         let mut tmp = [0u8; SCRATCH_BUF_SIZE];
@@ -5473,17 +5493,16 @@ unsafe fn poll_watch_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
+    let inbox = if worker_idx == 0 {
+        &mut anchor.watch_sess0_inbox
+    } else {
+        &mut anchor.watch_sess1_inbox
+    };
+    let Some((mt, len)) = read_envelope(inbox, &*sys, chan, &mut anchor.scratch) else {
         return false;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len == 0 || len > anchor.scratch.len() {
-        return len == 0;
-    }
-    if (((*sys).channel_read)(chan, anchor.scratch.as_mut_ptr(), len) as usize) < len {
-        return false;
+    };
+    if len == 0 {
+        return true;
     }
     if (0x70..=0x9F).contains(&mt) {
         let mut tmp = [0u8; SCRATCH_BUF_SIZE];
@@ -5507,19 +5526,15 @@ unsafe fn poll_relocate_lease(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(anchor.relocate_in, hdr.as_mut_ptr(), 3) < 3 {
+    let Some((mt, len)) = read_envelope(
+        &mut anchor.relocate_inbox,
+        &*sys,
+        anchor.relocate_in,
+        &mut anchor.scratch,
+    ) else {
         return false;
-    }
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len == 0 || len > anchor.scratch.len() {
-        return len == 0;
-    }
-    if (((*sys).channel_read)(anchor.relocate_in, anchor.scratch.as_mut_ptr(), len) as usize) < len
-    {
-        return false;
-    }
-    if hdr[0] == wire::MSG_SESSION_RELOCATE && len >= 1 {
+    };
+    if mt == wire::MSG_SESSION_RELOCATE && len >= 1 {
         let target = anchor.scratch[0];
         let _ = anchor.lsa.relocate(target);
         let _ = anchor.wsa.relocate(target);
@@ -5566,23 +5581,21 @@ unsafe fn poll_lease_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    let n = ((*sys).channel_read)(anchor.lease_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.lease_inbox,
+        &*sys,
+        anchor.lease_in,
+        &mut anchor.scratch,
+    ) else {
+        return false;
+    };
+    if msg_type != MSG_LEASE_STATE {
         return false;
     }
-    if hdr[0] != MSG_LEASE_STATE {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // MSG_LEASE_STATE: [session_id:16][epoch:4][lease_id:8][status:1]
     //                  [ttl_ms:4][granted:8][deadline:8] = 49 bytes.
     const LEASE_STATE_LEN: usize = sc::SESSION_HEADER + 8 + 1 + 4 + 8 + 8;
-    if payload_len < LEASE_STATE_LEN || payload_len > anchor.scratch.len() {
-        return false;
-    }
-    let n2 = ((*sys).channel_read)(anchor.lease_in, anchor.scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < LEASE_STATE_LEN {
         return false;
     }
 
@@ -5717,7 +5730,7 @@ fn write_lease_response_frames(
     let ids = anchor.header_ids();
     let rev = anchor.last_rev.max(1);
     let data_len = {
-        let scratch = &mut anchor.scratch[..];
+        let scratch = &mut anchor.scratch[..SCRATCH_BUF_SIZE];
         // Reserve the 5-byte gRPC message header; encode the protobuf
         // body, then back-patch the length prefix.
         if scratch.len() < GRPC_FRAME_HEADER_LEN {
@@ -6317,22 +6330,20 @@ unsafe fn poll_watch_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    let n = ((*sys).channel_read)(anchor.watch_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.watch_inbox,
+        &*sys,
+        anchor.watch_in,
+        &mut anchor.reply,
+    ) else {
+        return false;
+    };
+    if msg_type != MSG_WATCH_FRAME {
         return false;
     }
-    if hdr[0] != MSG_WATCH_FRAME {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // Min envelope: 8 watch_id + 2 kpg + 8 rev + 1 op + 2 klen + 2 vlen = 23
     const MIN_WATCH_FRAME_LEN: usize = 8 + 2 + 8 + 1 + 2 + 2;
-    if payload_len < MIN_WATCH_FRAME_LEN || payload_len > anchor.reply.len() {
-        return false;
-    }
-    let n2 = ((*sys).channel_read)(anchor.watch_in, anchor.reply.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < MIN_WATCH_FRAME_LEN {
         return false;
     }
 
@@ -6411,7 +6422,8 @@ unsafe fn poll_watch_in(anchor: &mut AnchorState) -> bool {
     // replaced: fetched first, then the event is delivered whole.
     let prev_manifest = anchor
         .reply
-        .get(value_off + value_len + 24)
+        .get(..payload_len)
+        .and_then(|p| p.get(value_off + value_len + 24))
         .is_some_and(|&m| m == types::JOURNAL_PREV_MANIFEST);
     if op_byte == types::KV_OP_PUT_MANIFEST || prev_manifest {
         wlg_begin(anchor, payload_len);
@@ -6515,21 +6527,22 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let buf = anchor.scratch.as_mut_ptr();
-    let (msg_type, payload_len) = net_read_frame(&*sys, anchor.net_in, buf, SCRATCH_BUF_SIZE);
-    if msg_type == 0 && payload_len == 0 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.net_inbox,
+        &*sys,
+        anchor.net_in,
+        &mut anchor.scratch[..SCRATCH_BUF_SIZE],
+    ) else {
         return false;
-    }
-    // The NET frame payload sits in anchor.scratch starting at
-    // offset NET_FRAME_HDR. Extract the small metadata (u16 LE
-    // conn_id, optional data) before dispatching — we copy bytes
-    // we still need into the slot's recv_buf so scratch is free
-    // for downstream NET_CMD_SEND framing.
-    let payload_start = NET_FRAME_HDR;
-    let payload_end = (payload_start + payload_len).min(anchor.scratch.len());
+    };
+    // The NET frame payload sits at anchor.scratch[..payload_len].
+    // Extract the small metadata (u16 LE conn_id, optional data)
+    // before dispatching — we copy bytes we still need into the
+    // slot's recv_buf so scratch is free for downstream NET_CMD_SEND
+    // framing.
     // Leading conn id (u16 LE) of the frame, when present.
-    let frame_conn = if payload_end - payload_start >= CONN_ID_LEN {
-        Some(conn_id(&anchor.scratch[payload_start..payload_end]))
+    let frame_conn = if payload_len >= CONN_ID_LEN {
+        Some(conn_id(&anchor.scratch[..payload_len]))
     } else {
         None
     };
@@ -6539,10 +6552,7 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
             // Multi-anchor: BOUND payload is `[conn:u16 LE][port:2 LE]`.
             // Only claim the listener whose port matches ours.
             if anchor.phase == AnchorPhase::WaitBound && payload_len >= 4 {
-                let port = u16::from_le_bytes([
-                    anchor.scratch[payload_start + 2],
-                    anchor.scratch[payload_start + 3],
-                ]);
+                let port = u16::from_le_bytes([anchor.scratch[2], anchor.scratch[3]]);
                 if port == anchor.listen_port {
                     anchor.server_conn_id = frame_conn.unwrap_or(SLOT_FREE);
                     anchor.phase = AnchorPhase::Listening;
@@ -6559,10 +6569,7 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
             // local_port at payload[2..4]; see redis/memcache anchors
             // for rationale.
             if payload_len >= 4 {
-                let port = u16::from_le_bytes([
-                    anchor.scratch[payload_start + 2],
-                    anchor.scratch[payload_start + 3],
-                ]);
+                let port = u16::from_le_bytes([anchor.scratch[2], anchor.scratch[3]]);
                 if port != anchor.listen_port {
                     return true;
                 }
@@ -6586,8 +6593,8 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
                 let Some(conn_id) = frame_conn else {
                     return true;
                 };
-                let data_start = payload_start + CONN_ID_LEN;
-                let data_end = payload_end;
+                let data_start = CONN_ID_LEN;
+                let data_end = payload_len;
                 if let Some(idx) = anchor.find_slot(conn_id) {
                     // Move data from scratch into the slot's recv_buf
                     // before doing anything else (scratch is needed
@@ -6646,7 +6653,7 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) -> bool {
 /// infer through field projection in some call shapes.
 fn split_borrow(anchor: &mut AnchorState) -> (&[u8], &mut [Slot; MAX_CONNS]) {
     let scratch_ptr = anchor.scratch.as_ptr();
-    let scratch_len = anchor.scratch.len();
+    let scratch_len = SCRATCH_BUF_SIZE;
     // SAFETY: We re-borrow `scratch` as shared from a raw pointer
     // taken before reborrowing `slots` as exclusive. The two fields
     // are disjoint memory regions on `AnchorState`, so this is sound

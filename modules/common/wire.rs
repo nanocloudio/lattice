@@ -758,6 +758,28 @@ pub const MSG_APP_SNAPSHOT_DURABLE: u8 = 0x5B;
 /// Payload: `[partition_id:u16 LE][applied_index:u64 LE]`.
 pub const MSG_APP_SNAPSHOT_INSTALLED: u8 = 0x5C;
 
+/// durability → app: export a PORTABLE copy of the state for another
+/// replica's install (clustor-defined, mirrored). Payload:
+/// `[term:u64 LE][index:u64 LE][xfer_id:u32 LE]` — `term`/`index` are the
+/// leader's ask, informational: the copy is labelled where the app is.
+/// Unlike `MSG_APP_SNAPSHOT_REQUEST` (the local capture, which a disk store
+/// answers with a marker valid only for itself) the answer carries the
+/// state, streamed: `MSG_APP_SNAPSHOT_EXPORT_CHUNK`s at increasing offsets
+/// until one marked done.
+pub const MSG_APP_SNAPSHOT_EXPORT_REQUEST: u8 = 0x5D;
+
+/// app → durability: one chunk of a portable export, the 28-byte
+/// `APP_SNAPSHOT_HDR` (`[term][index][offset:u64][done:u8]` + 3 bytes
+/// carrying the request's `xfer_id`, low 24 bits) then at most
+/// `XFER_CHUNK_BODY` bytes. `term`/`index` label the copy: the position the
+/// app had applied when it began (committed by construction).
+pub const MSG_APP_SNAPSHOT_EXPORT_CHUNK: u8 = 0x5E;
+
+/// The most body one export chunk carries — what one install frame on the
+/// peer link carries whole (clustor's carry bound), so durability relays
+/// chunk for frame.
+pub const XFER_CHUNK_BODY: usize = 2048;
+
 /// `MSG_APP_SNAPSHOT_CHUNK` fixed header size; body follows.
 pub const APP_SNAPSHOT_HDR: usize = 28;
 

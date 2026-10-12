@@ -58,6 +58,10 @@ mod sql_exec;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use sql_exec::relational::{
     self, IndexDescriptor, LogicalType, ObjectKind, TableDescriptor, Value,
 };
@@ -99,6 +103,8 @@ const S_CLEANUP: u8 = 8; // job-cursor delete in flight
 struct BfState {
     syscalls: *const SyscallTable,
     kv_in: i32,
+    /// `kv_in`'s envelope reading (`common/envelope.rs`).
+    kv_inbox: Inbox,
     kv_out: i32,
     metrics_out: i32,
 
@@ -129,6 +135,7 @@ impl BfState {
     fn init(&mut self, sys: *const SyscallTable) {
         self.syscalls = sys;
         self.kv_in = -1;
+        self.kv_inbox = Inbox::new();
         self.kv_out = -1;
         self.metrics_out = -1;
         self.state = S_IDLE;
@@ -691,8 +698,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     unsafe {
         let sys = &*sys_ptr;
-        let mut env = [0u8; ENV_BUF];
-        if let Some((msg, payload)) = read_one_envelope(sys, bf.kv_in, &mut env) {
+        let mut env = [0u8; ENVELOPE_HDR + ENV_BUF];
+        if let Some((msg, len)) = read_envelope(&mut bf.kv_inbox, sys, bf.kv_in, &mut env) {
+            let payload = &env[..len];
             if msg == MSG_KV_RESPONSE && payload.len() >= 20 {
                 let corr = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
                 let result = payload[9];
@@ -739,32 +747,4 @@ unsafe fn write_envelope(
     env[2] = ((payload_len >> 8) & 0xFF) as u8;
     let total = wire::ENVELOPE_HDR + payload_len;
     (sys.channel_write)(chan, env.as_mut_ptr(), total) == total as i32
-}
-
-unsafe fn read_one_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len > 0
-        && ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len
-    {
-        return None;
-    }
-    Some((hdr[0], &scratch[..payload_len]))
 }

@@ -77,6 +77,10 @@ use doc_buf::DocBuf;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox};
+
 use doc_catalog::DescriptorWriter;
 use doc_exec::*;
 use doc_json::*;
@@ -224,6 +228,9 @@ struct DialectState {
     resp_out: i32,
     exec_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    req_inbox: Inbox,
+    exec_inbox: Inbox,
     params_bad: u8,
     /// The schema as the collection states it: `rv=<rv_path>;` first when
     /// the graph names one, then the `schema` param.
@@ -298,38 +305,6 @@ const ARENA_BYTES: usize =
 declare_module_arena_bytes!(ARENA_BYTES);
 
 // ── Channels ─────────────────────────────────────────────────────────
-
-/// One envelope from `chan` into `buf`: its type and payload length.
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, buf: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; wire::ENVELOPE_HDR];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), wire::ENVELOPE_HDR) < wire::ENVELOPE_HDR as i32 {
-        return None;
-    }
-    let n = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if n > buf.len() {
-        let mut sink = [0u8; 256];
-        let mut left = n;
-        while left > 0 {
-            let k = left.min(sink.len());
-            if (sys.channel_read)(chan, sink.as_mut_ptr(), k) <= 0 {
-                break;
-            }
-            left -= k;
-        }
-        return None;
-    }
-    if n > 0 && ((sys.channel_read)(chan, buf.as_mut_ptr(), n) as usize) < n {
-        return None;
-    }
-    Some((hdr[0], n))
-}
 
 /// Send `msg` (at `buf[ENVELOPE_HDR..ENVELOPE_HDR + len]`) on `chan`: one
 /// envelope when it fits a frame, else the next of its parts. `true` when
@@ -1402,7 +1377,7 @@ fn bookmark_due(st: &mut DialectState) {
     }
 }
 
-/// One envelope from the executor.
+/// One envelope from the executor, its payload at `env[..n]`.
 fn on_exec(st: &mut DialectState, msg: u8, n: usize) {
     let DialectState {
         env,
@@ -1411,8 +1386,8 @@ fn on_exec(st: &mut DialectState, msg: u8, n: usize) {
         eans_len,
         ..
     } = st;
-    let at = wire::ENVELOPE_HDR;
-    let payload = env.get(at..at + n).unwrap_or(&[]);
+    let payload = env.get(..n).unwrap_or(&[]);
+    let n = payload.len();
     let whole = match msg {
         MSG_DOC_RESPONSE => {
             eans_parts.reset();
@@ -1446,7 +1421,8 @@ enum Arrival {
     TooLarge,
 }
 
-/// One envelope from the client (read only while idle).
+/// One envelope from the client, its payload at `env[..n]` (read only
+/// while idle).
 fn on_client(st: &mut DialectState, msg: u8, n: usize) {
     let arrival = {
         let DialectState {
@@ -1456,8 +1432,8 @@ fn on_client(st: &mut DialectState, msg: u8, n: usize) {
             jreq_len,
             ..
         } = st;
-        let at = wire::ENVELOPE_HDR;
-        let payload = env.get(at..at + n).unwrap_or(&[]);
+        let payload = env.get(..n).unwrap_or(&[]);
+        let n = payload.len();
         match msg {
             MSG_JSON_DOC_REQUEST => {
                 jreq_parts.reset();
@@ -1536,6 +1512,8 @@ pub extern "C" fn module_new(
     let st = unsafe { &mut *state.cast::<DialectState>() };
     // The state arrives zeroed; set what is not zero.
     st.syscalls = syscalls.cast::<SyscallTable>();
+    st.req_inbox = Inbox::new();
+    st.exec_inbox = Inbox::new();
     // inputs: req_in[0], exec_in[1]; outputs: resp_out[0], exec_out[1], metrics[2]
     st.req_in = in_chan;
     st.resp_out = out_chan;
@@ -1661,14 +1639,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             break;
         }
         let got = {
-            let DialectState { exec_in, env, .. } = st;
-            unsafe {
-                read_envelope(
-                    sys,
-                    *exec_in,
-                    env.get_mut(wire::ENVELOPE_HDR..).unwrap_or(&mut []),
-                )
-            }
+            let DialectState {
+                exec_in,
+                exec_inbox,
+                env,
+                ..
+            } = st;
+            unsafe { read_envelope(exec_inbox, sys, *exec_in, env) }
         };
         let Some((msg, n)) = got else {
             break;
@@ -1689,14 +1666,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             break;
         }
         let got = {
-            let DialectState { req_in, env, .. } = st;
-            unsafe {
-                read_envelope(
-                    sys,
-                    *req_in,
-                    env.get_mut(wire::ENVELOPE_HDR..).unwrap_or(&mut []),
-                )
-            }
+            let DialectState {
+                req_in,
+                req_inbox,
+                env,
+                ..
+            } = st;
+            unsafe { read_envelope(req_inbox, sys, *req_in, env) }
         };
         let Some((msg, n)) = got else {
             break;

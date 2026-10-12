@@ -50,10 +50,16 @@ use metrics_rollup::{encode_snapshot, record_delta, MetricsTable};
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 #[repr(C)]
 struct MetricsState {
     syscalls: *const SyscallTable,
     in_chan: i32,
+    /// The input's envelope reading (`common/envelope.rs`).
+    in_inbox: Inbox,
     out_chan: i32,
     // Dedicated `metrics` output port (output index 2), discovered in
     // module_new; -1 when unwired. Distinct from the app-metric rollup
@@ -71,6 +77,7 @@ impl MetricsState {
     fn init(&mut self, sys: *const SyscallTable) {
         self.syscalls = sys;
         self.in_chan = -1;
+        self.in_inbox = Inbox::new();
         self.out_chan = -1;
         self.metrics_out = -1;
         self.tick_since_snapshot = 0;
@@ -79,32 +86,6 @@ impl MetricsState {
         self.step_ctr = 0;
         self.table.init();
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
-        return None;
-    }
-    Some((mt, len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, mt: u8, body: &[u8]) -> bool {
@@ -173,9 +154,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if sys.is_null() {
         return 0;
     }
-    let mut scratch = [0u8; 64];
+    let mut scratch = [0u8; ENVELOPE_HDR + 64];
     unsafe {
-        if let Some((mt, len)) = read_envelope(&*sys, s.in_chan, &mut scratch) {
+        if let Some((mt, len)) = read_envelope(&mut s.in_inbox, &*sys, s.in_chan, &mut scratch) {
             if mt == MSG_METRIC_DELTA && len >= 6 {
                 let proto = scratch[0];
                 let op = scratch[1];

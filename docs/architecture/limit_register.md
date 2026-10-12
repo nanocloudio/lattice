@@ -36,7 +36,7 @@ big     | feature = "big"
 | Document id key | Semantic | `MAX_DOCUMENT_ID_KEY` | modules/common/models.rs | 1024 | A policy: MongoDB's historical index-key limit; Kubernetes' longest object id (namespace + name) is about a third of it. A longer id is refused before a key is built. |
 | In-memory physical-key slot | Shape | `MAX_KEY_LEN` | modules/common/kv_store.rs | 2584 | Derived: the 12-byte identity, a keyspace, and the longest model key (a document index entry at `MAX_DOCUMENT_ID_KEY`, worst-case escaped); a contract test holds it to the derivation. A longer composed key is rejected; what one replicated write carries is the consensus entry's bound. |
 | In-memory value bytes | Shape | `MAX_VALUE_LEN` | modules/common/kv_store.rs | 4096 | Rejects the operation. |
-| State-worker scratch | Capacity | `SCRATCH_BUF_SIZE` | modules/app/kv_state_worker/mod.rs | 8192 | Rejects an over-budget frame or memory snapshot export; the WAL remains authoritative. |
+| State-worker scratch | Capacity | `SCRATCH_BUF_SIZE` | modules/app/kv_state_worker/mod.rs | 8192 | A command frame whose payload is longer is discarded whole (never half-read) and counted; an over-budget memory snapshot export is refused, the WAL remaining authoritative. |
 | App-snapshot body | Shape | `SNAPSHOT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as 8164 bytes (`SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`); this binds before Clustor's 16384-byte snapshot body. |
 | Worker answer body | Shape | `RESULT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as `SCRATCH_BUF_SIZE` less the `MSG_KV_APPLIED` envelope (8151 bytes): the store answers into exactly what can be sent, so no answer is ever built that would go unsent. |
 | Snapshot chunk | Pacing | `SNAPSHOT_CHUNK_MAX` | modules/app/kv_state_worker/mod.rs | 4096 | Streams another chunk; does not cap total disk-state size. |
@@ -45,14 +45,16 @@ big     | feature = "big"
 | Disk value record | Shape | `MAX_VALUE_LEN` | modules/common/disk_store.rs | — | Derived as 4150 bytes to include metadata around the 4096-byte public value. |
 | Memtable entries | Capacity | `MEMTABLE_MAX_ENTRIES` | modules/common/disk_store.rs | 512 | Backpressures mutation while flush catches up. |
 | Memtable flush watermark | Pacing | `MEMTABLE_FLUSH_WATERMARK` | modules/common/disk_store.rs | 384 | Starts flush early; not a refusal ceiling. |
-| Run-block cache | Capacity | `BLOCK_CACHE_SLOTS` | modules/common/disk_store.rs | 8 | Blocks of immutable runs kept for re-reads (~37 KiB of state); covers a replicated write's own bookkeeping reads. |
-| Version-scan blocks per step | Pacing | `SCAN_STEP_BLOCKS` | modules/common/disk_store.rs | 2 | The walk pauses holding its position; the worker re-drives it next step. Bounds run-file I/O per step, not the window. |
+| Run-block cache | Capacity | `BLOCK_CACHE_SLOTS` | modules/common/disk_store.rs | 256 | Blocks of immutable runs kept for re-reads (~1.2 MiB of state, CLOCK eviction): a store-with-history's hot read set. A miss costs one storage call; a version scan counts cached blocks toward its step budget like loaded ones. |
+| Version-scan blocks per step | Pacing | `SCAN_STEP_BLOCKS` | modules/common/disk_store.rs | 2 | Blocks crossed per call, from storage or the block cache alike; the walk pauses holding its position and the worker re-drives it next step. Bounds work per step, not the window. |
 | Version-scan records per step | Pacing | `SCAN_STEP_RECORDS` | modules/common/disk_store.rs | — | Derived as `MEMTABLE_MAX_ENTRIES` (512); bounds the memtable-resident part of a walk, which loads no blocks. |
+| Range walk stale-version skip | Pacing | `SKIP_STALE_VERSIONS` | modules/common/disk_store.rs | 4 | Older versions of one key a current-value range walk passes over in a row before it seeks every source past the key through its sparse index; below it the versions share the loaded block. |
 | Parked version-scan page | Capacity | `SCAN_PAGE_MAX` | modules/common/disk_store.rs | 8192 | The reply prefix kept across a pause. The engine caps every page at this budget, so a park can never be refused; the cap therefore bounds one command's reply, not a refusal path. |
 | Version-scan entry shrink | Shape | `VERSIONS_TRANSCODE_SLACK` | modules/common/kv_store.rs | 6 | The least a reply entry is smaller than its raw record; the engine sizes each store request by it, so a record the store hands over always fits the page (an overflow record is stashed against the held ordinal, so the cursor never runs ahead of the caller). |
 | Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held; the request times out upstream and is re-issued. Only `KV_OP_SCAN_VERSIONS` pauses, and its frame is bounded well under this. |
 | Command-log answer room | Shape | `CLOG_OUT_MAX` | modules/app/kv_state_worker/mod.rs | 65536 | The largest answer room an op is applied with (a store-provider call's); a logged op replays with the room it first had, capped here. |
 | Imported host-log record | Shape | `IMPORT_RECORD_MAX` | modules/app/kv_state_worker/mod.rs | 3149824 | One record of a fluxor host `store.log` being imported (`kv_state_worker_store`): the largest object (3 MiB) and its key. A larger record stops the import and quarantines the store rather than skip it. |
+| Skipped origin entries named | Pacing | `ORIGIN_SKIP_LOG_MAX` | modules/app/kv_state_worker/mod.rs | 32 | Origin entries a replica skips as stale or out of order are logged by name up to this many; the rest are counted (`oskip=` on the store heartbeat), so a diverging replica says where without flooding the log. |
 | Immutable runs | Capacity | `MAX_RUNS` | modules/common/disk_store.rs | 16 | Backpressures until compaction frees a run slot. |
 | Manifest files | Capacity | `MAX_MANIFEST_FILES` | modules/common/disk_store.rs | 8 | Bounds retained manifest generations; rotation/reclamation must keep pace. |
 | Runs returned by listing | Capacity | `MAX_LISTED_RUNS` | modules/common/disk_store.rs | 1024 | Rejects/flags an inventory that cannot be represented; never silently truncates authoritative run state. Sized for the orphans a crash can leave of undrained retirements (recovery deletes them only if it can list them); 4 KB of stack, once, at recovery. |
@@ -86,6 +88,8 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 | Linearizable-read response bytes | Shape | `LIN_READ_BUF` | modules/app/kv_request_router/mod.rs | 300 | Oversize read state cannot use the linearizable fast path. |
 | Held migration operations | Capacity | `HOLD_SLOTS` | modules/app/kv_request_router/mod.rs | 48 | Rejects busy when migration hold space is exhausted. |
 | Migration help operations | Capacity | `HELP_SLOTS` | modules/app/kv_request_router/mod.rs | 8 | Defers help; increases convergence latency. |
+| Read-release payload | Shape | `READ_RELEASE_PAYLOAD_MAX` | modules/app/kv_request_router/mod.rs | 64 | The largest payload taken on `read_release_in` (a read grant, an internal reject or a write ack, all under 20 bytes); a longer envelope is discarded whole and counted. |
+| Gateway response frame | Shape | `GATEWAY_RESPONSE_FRAME` | modules/app/kv_request_router/mod.rs | 256 | The largest envelope on `gateway_reject_in`, the gateway's own response frame; every reject it sends is taken whole. |
 | Migration help key | Shape | `HELP_KEY_MAX` | modules/app/kv_request_router/mod.rs | 64 | Cannot represent larger keys on this path despite the store accepting user keys through 244 bytes. |
 | Encoded range-map parameter | Shape | `RANGE_MAP_PARAM_MAX` | modules/app/kv_request_router/mod.rs | 2048 | Rejects an oversized map update. |
 | Tracked ranges for router metrics | Observability | `MAX_TRACKED_RANGES` | modules/app/kv_request_router/mod.rs | 8 | Additional ranges still route but lose per-range telemetry; this is not a data-plane topology limit. |
@@ -531,14 +535,16 @@ MAX_ENCODED_KEY | modules/common/disk_store.rs | -
 MAX_VALUE_LEN | modules/common/disk_store.rs | -
 MEMTABLE_MAX_ENTRIES | modules/common/disk_store.rs | 512
 MEMTABLE_FLUSH_WATERMARK | modules/common/disk_store.rs | 384
-BLOCK_CACHE_SLOTS | modules/common/disk_store.rs | 8
+BLOCK_CACHE_SLOTS | modules/common/disk_store.rs | 256
 SCAN_STEP_BLOCKS | modules/common/disk_store.rs | 2
 SCAN_STEP_RECORDS | modules/common/disk_store.rs | -
+SKIP_STALE_VERSIONS | modules/common/disk_store.rs | 4
 SCAN_PAGE_MAX | modules/common/disk_store.rs | 8192
 VERSIONS_TRANSCODE_SLACK | modules/common/kv_store.rs | 6
 HELD_FRAME_MAX | modules/app/kv_state_worker/mod.rs | 1024
 CLOG_OUT_MAX | modules/app/kv_state_worker/mod.rs | 65536
 IMPORT_RECORD_MAX | modules/app/kv_state_worker/mod.rs | 3149824
+ORIGIN_SKIP_LOG_MAX | modules/app/kv_state_worker/mod.rs | 32
 MAX_RUNS | modules/common/disk_store.rs | 16
 MAX_MANIFEST_FILES | modules/common/disk_store.rs | 8
 MAX_LISTED_RUNS | modules/common/disk_store.rs | 1024
@@ -561,6 +567,8 @@ LIN_READ_SLOTS | modules/app/kv_request_router/mod.rs | 32
 LIN_READ_BUF | modules/app/kv_request_router/mod.rs | 300
 HOLD_SLOTS | modules/app/kv_request_router/mod.rs | 48
 HELP_SLOTS | modules/app/kv_request_router/mod.rs | 8
+READ_RELEASE_PAYLOAD_MAX | modules/app/kv_request_router/mod.rs | 64
+GATEWAY_RESPONSE_FRAME | modules/app/kv_request_router/mod.rs | 256
 HELP_KEY_MAX | modules/app/kv_request_router/mod.rs | 64
 RANGE_MAP_PARAM_MAX | modules/app/kv_request_router/mod.rs | 2048
 MAX_TRACKED_RANGES | modules/app/kv_request_router/mod.rs | 8

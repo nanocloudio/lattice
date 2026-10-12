@@ -80,6 +80,10 @@ use mvcc::{TimestampLease, LEASE_WIRE_LEN, MSG_TS_LEASE};
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 /// Steps between GC-floor evaluations. The floor is a slow control
 /// loop — proposing on every step would put a consensus round trip in
 /// the way of every claim update for no benefit.
@@ -135,6 +139,12 @@ struct CompState {
     lease_floor_in: i32,
     claims_in: i32,
     gc_committed_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    in_inbox: Inbox,
+    watch_floor_inbox: Inbox,
+    lease_floor_inbox: Inbox,
+    claims_inbox: Inbox,
+    gc_committed_inbox: Inbox,
     logged_hw: bool,
     logged_claim: bool,
     logged_prop: bool,
@@ -172,6 +182,11 @@ impl CompState {
         self.lease_floor_in = -1;
         self.claims_in = -1;
         self.gc_committed_in = -1;
+        self.in_inbox = Inbox::new();
+        self.watch_floor_inbox = Inbox::new();
+        self.lease_floor_inbox = Inbox::new();
+        self.claims_inbox = Inbox::new();
+        self.gc_committed_inbox = Inbox::new();
         self.logged_hw = false;
         self.logged_claim = false;
         self.logged_prop = false;
@@ -193,32 +208,6 @@ impl CompState {
         self.table.init();
         self.claims.init(DEFAULT_REQUIRED_SOURCES);
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
-        return None;
-    }
-    Some((mt, len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, mt: u8, body: &[u8]) -> bool {
@@ -443,19 +432,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if sys.is_null() {
         return 0;
     }
-    let mut scratch = [0u8; SCRATCH];
+    let mut scratch = [0u8; ENVELOPE_HDR + SCRATCH];
     unsafe {
         let sysr = &*sys;
         // One envelope per wired input per step — bounded work, and no
         // input can starve another.
-        for chan in [
-            s.in_chan,
-            s.watch_floor_in,
-            s.lease_floor_in,
-            s.claims_in,
-            s.gc_committed_in,
-        ] {
-            if let Some((mt, len)) = read_envelope(sysr, chan, &mut scratch) {
+        for input in 0..5 {
+            let (chan, inbox) = match input {
+                0 => (s.in_chan, &mut s.in_inbox),
+                1 => (s.watch_floor_in, &mut s.watch_floor_inbox),
+                2 => (s.lease_floor_in, &mut s.lease_floor_inbox),
+                3 => (s.claims_in, &mut s.claims_inbox),
+                _ => (s.gc_committed_in, &mut s.gc_committed_inbox),
+            };
+            if let Some((mt, len)) = read_envelope(inbox, sysr, chan, &mut scratch) {
                 handle(s, sysr, mt, &scratch[..len]);
             }
         }

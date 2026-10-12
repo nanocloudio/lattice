@@ -175,13 +175,13 @@ index = 6
 direction = "output"
 content_type = "OctetStream"
 
-# Install-complete ack. After a snapshot chunk stream finishes
-# installing (a span copy for an elastic split, or any snapshot
-# install), the worker emits MSG_APP_SNAPSHOT_INSTALLED
-# `[partition_id:u16][applied_index:u64]` here so an orchestrator can
-# gate cutover on the span actually being resident. Unwired (index 7 =
-# -1) in every graph but the elastic split, so it costs nothing
-# elsewhere.
+# Install-complete ack: MSG_APP_SNAPSHOT_INSTALLED
+# `[partition_id:u16][index:u64]` once the store holds an install's
+# state — installed, or already held (an install at or below the
+# applied position is drained, not applied). Wired to clustor's
+# `durability.app_install_ack`, which tells raft a peer install landed
+# only on it, and in an elastic split to the orchestrator, whose
+# cutover gates on the span being resident. Unwired, it costs nothing.
 [[ports]]
 name = "install_ack_out"
 index = 7

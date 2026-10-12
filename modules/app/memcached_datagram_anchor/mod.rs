@@ -64,6 +64,10 @@ mod collections;
 #[path = "../../common/memcached_codec.rs"]
 mod memcached_codec;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use collections::InflightTable;
 use memcached_codec::{
     encode_reply, eq_ascii_ci, find_crlf, parse_line, parse_u32_dec, token_bytes, Line, MemOp,
@@ -136,6 +140,9 @@ struct AnchorState {
     routed_in: i32,
     kv_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    dgram_inbox: Inbox,
+    routed_inbox: Inbox,
 
     bind_phase: BindPhase,
     ep_id: u8,
@@ -172,6 +179,8 @@ impl AnchorState {
         self.routed_in = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
+        self.dgram_inbox = Inbox::new();
+        self.routed_inbox = Inbox::new();
         self.bind_phase = BindPhase::Init;
         self.ep_id = 0xFF;
         self.local_port = 0;
@@ -197,27 +206,6 @@ impl AnchorState {
 }
 
 // ── Channel helpers ──────────────────────────────────────────────────
-
-unsafe fn channel_read_frame(sys: &SyscallTable, chan: i32, buf: &mut [u8]) -> Option<(u8, usize)> {
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    if payload_len > buf.len() {
-        return None;
-    }
-    let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
-}
 
 unsafe fn channel_write_frame(
     sys: &SyscallTable,
@@ -276,11 +264,12 @@ unsafe fn drain_dgram_in(anchor: &mut AnchorState) -> bool {
     }
     // Read into recv buffer (separate from scratch so request parsing
     // and outbound envelope build don't alias).
-    let mut local = [0u8; RECV_BUF];
-    let (msg_type, plen) = match channel_read_frame(sys, anchor.dgram_in, &mut local) {
-        Some(p) => p,
-        None => return false,
-    };
+    let mut local = [0u8; ENVELOPE_HDR + RECV_BUF];
+    let (msg_type, plen) =
+        match read_envelope(&mut anchor.dgram_inbox, sys, anchor.dgram_in, &mut local) {
+            Some(p) => p,
+            None => return false,
+        };
     match msg_type {
         DG_MSG_BOUND => {
             // Payload: [ep_id:1][local_port:u16 LE]
@@ -545,23 +534,19 @@ unsafe fn drain_routed_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(anchor.routed_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    // An envelope read whole: header room, then the payload.
+    let mut buf = [0u8; ENVELOPE_HDR + SCRATCH];
+    let Some((msg_type, payload_len)) =
+        read_envelope(&mut anchor.routed_inbox, sys, anchor.routed_in, &mut buf)
+    else {
+        return false;
+    };
+    if msg_type != MSG_KV_RESPONSE {
         return false;
     }
-    if hdr[0] != MSG_KV_RESPONSE {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // MSG_KV_RESPONSE head: [corr:8][conn:1][result:1][rev:8][body_len:2] = 20
     const HEAD: usize = 8 + 1 + 1 + 8 + 2;
-    if payload_len < HEAD || payload_len > anchor.scratch.len() {
-        return false;
-    }
-    let mut buf = [0u8; SCRATCH];
-    let n2 = (sys.channel_read)(anchor.routed_in, buf.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < HEAD {
         return false;
     }
     let resp = &buf[..payload_len];

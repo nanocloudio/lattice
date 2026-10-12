@@ -104,6 +104,10 @@ use mvcc::{
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 /// Requests held while an advance commits. Fixed; overflow is a typed
 /// reject, never a grow.
 const HOLD_CAPACITY: usize = 32;
@@ -137,6 +141,9 @@ struct AllocState {
     committed_in: i32,
     propose_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    request_inbox: Inbox,
+    committed_inbox: Inbox,
 
     // ── params ──
     allocator_id: u32,
@@ -189,6 +196,8 @@ impl AllocState {
         self.committed_in = -1;
         self.propose_out = -1;
         self.metrics_out = -1;
+        self.request_inbox = Inbox::new();
+        self.committed_inbox = Inbox::new();
         self.allocator_id = 1;
         self.advance_chunk = DEFAULT_ADVANCE_CHUNK as u32;
         self.auto_grant_to = 0;
@@ -272,32 +281,6 @@ define_params! {
     // 1 = wrap proposals for gateway.client_requests (see AllocState).
     6, propose_wrap, u32, 0
         => |s, d, len| { s.propose_wrap = p_u32(d, len, 0, 0); };
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
-        return None;
-    }
-    Some((mt, len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, mt: u8, body: &[u8]) -> bool {
@@ -627,8 +610,9 @@ unsafe fn drain_one_held(s: &mut AllocState, sys: &SyscallTable) -> bool {
 /// Fold one committed record into the reserve. This is the only path
 /// that advances the durable high water.
 unsafe fn pump_committed(s: &mut AllocState, sys: &SyscallTable) -> bool {
-    let mut scratch = [0u8; SCRATCH];
-    let Some((mt, len)) = read_envelope(sys, s.committed_in, &mut scratch) else {
+    let mut scratch = [0u8; ENVELOPE_HDR + SCRATCH];
+    let Some((mt, len)) = read_envelope(&mut s.committed_inbox, sys, s.committed_in, &mut scratch)
+    else {
         return false;
     };
     if mt == MSG_WAL_REPLAY_COMPLETE {
@@ -654,8 +638,9 @@ unsafe fn pump_committed(s: &mut AllocState, sys: &SyscallTable) -> bool {
 
 /// Accept one new lease request.
 unsafe fn pump_request(s: &mut AllocState, sys: &SyscallTable) -> bool {
-    let mut scratch = [0u8; SCRATCH];
-    let Some((mt, len)) = read_envelope(sys, s.request_in, &mut scratch) else {
+    let mut scratch = [0u8; ENVELOPE_HDR + SCRATCH];
+    let Some((mt, len)) = read_envelope(&mut s.request_inbox, sys, s.request_in, &mut scratch)
+    else {
         return false;
     };
     if mt != MSG_TS_LEASE_REQUEST || len != LEASE_REQUEST_WIRE_LEN {

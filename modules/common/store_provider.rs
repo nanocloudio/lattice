@@ -522,6 +522,10 @@ impl Provider {
             reg_sent: r.reg_sent,
             reg_seen: r.reg_seen,
             reg_miss: r.reg_miss,
+            chunks_held: r.chunks.iter().filter(|c| c.used).count() as u32,
+            chunks_offered: r.chunks.iter().filter(|c| c.used && c.offered).count() as u32,
+            chunk_refused: r.chunk_refused,
+            chunk_idle: r.step.wrapping_sub(r.chunk_progress_at),
         }
     }
 }
@@ -544,6 +548,12 @@ pub struct ReplicaReport {
     pub reg_sent: u32,
     pub reg_seen: u32,
     pub reg_miss: u32,
+    /// The upload's chunks in flight, and of them those offered; chunk
+    /// applies this replica saw refused; steps since one last applied.
+    pub chunks_held: u32,
+    pub chunks_offered: u32,
+    pub chunk_refused: u32,
+    pub chunk_idle: u32,
 }
 
 impl Default for Provider {
@@ -2148,6 +2158,8 @@ struct Replication {
     reg_sent: u32,
     reg_seen: u32,
     reg_miss: u32,
+    /// This replica's chunk applies the store refused (telemetry).
+    chunk_refused: u32,
     /// The seq the next write takes (`u32::MAX`: none left in this
     /// incarnation).
     next_seq: u32,
@@ -2183,6 +2195,7 @@ const NO_REPLICATION: Replication = Replication {
     reg_sent: 0,
     reg_seen: 0,
     reg_miss: 0,
+    chunk_refused: 0,
     next_seq: 0,
     hwm: 0,
     step: 0,
@@ -2600,6 +2613,9 @@ pub fn origin_applied(pv: &mut Provider, a: &origin::Applied) {
                     rep.chunk_progress_at = rep.step;
                 }
             }
+        }
+        origin::Applied::Chunk { replica, .. } if replica == rep.replica => {
+            rep.chunk_refused = rep.chunk_refused.wrapping_add(1);
         }
         origin::Applied::Skipped {
             replica,

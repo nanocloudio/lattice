@@ -67,6 +67,10 @@ mod wire;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use wire::{MSG_APP_SNAPSHOT_INSTALLED, MSG_APP_SNAPSHOT_SPAN_REQUEST};
 
 /// Envelope type for a full range-map publication on the router's
@@ -134,6 +138,8 @@ struct DriverState {
     syscalls: *const SyscallTable,
     snap_ctl_out: i32,
     ack_in: i32,
+    /// The ack input's envelope reading (`common/envelope.rs`).
+    ack_inbox: Inbox,
     ack_seen: u8,
     map_out: i32,
     metrics_out: i32,
@@ -170,6 +176,7 @@ impl DriverState {
         self.syscalls = sys;
         self.snap_ctl_out = -1;
         self.ack_in = -1;
+        self.ack_inbox = Inbox::new();
         self.ack_seen = 0;
         self.map_out = -1;
         self.metrics_out = -1;
@@ -221,35 +228,6 @@ fn hex_decode(hex: &[u8], hlen: u16, out: &mut [u8]) -> Option<usize> {
         out[i] = (hex_nibble(hex[i * 2])? << 4) | hex_nibble(hex[i * 2 + 1])?;
     }
     Some(n)
-}
-
-/// Read one envelope `[msg][len][payload]` from `chan`, or None.
-unsafe fn read_one_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len > 0
-        && ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len
-    {
-        return None;
-    }
-    Some((hdr[0], &scratch[..payload_len]))
 }
 
 /// Send `[msg_type][len][payload]` on `chan`; payload staged at
@@ -446,8 +424,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if (s.phase == P_COPY1 || s.phase == P_COPY2) && s.ack_in >= 0 {
         unsafe {
             let sys = &*sys_ptr;
-            let mut env = [0u8; 64];
-            if let Some((msg, _payload)) = read_one_envelope(sys, s.ack_in, &mut env) {
+            let mut env = [0u8; ENVELOPE_HDR + 64];
+            if let Some((msg, _len)) = read_envelope(&mut s.ack_inbox, sys, s.ack_in, &mut env) {
                 if msg == MSG_APP_SNAPSHOT_INSTALLED {
                     acked = true;
                 }

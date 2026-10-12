@@ -50,6 +50,10 @@ mod hex_core;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use cdc_feed::exchange::RECORD_MAX;
 use cdc_feed::wire::{FenceTail, MSG_KV_RESPONSE};
 use cdc_feed::{FeedCore, FeedIo, KEY_MAX, SCRATCH};
@@ -65,6 +69,8 @@ struct PumpState {
     request_out: i32,
     retention_out: i32,
     metrics_out: i32,
+    /// `kv_in`'s envelope reading (`common/envelope.rs`).
+    kv_inbox: Inbox,
     step_ctr: u64,
     /// One response record read from the sink.
     resp: [u8; RECORD_MAX],
@@ -205,34 +211,6 @@ define_params! {
         => |s, d, len| { s.core.page_limit = p_u32(d, len, 0, 16) as u16; };
 }
 
-// ── Channel helpers ───────────────────────────────────────────────────
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let mt = hdr[0];
-    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if len > scratch.len() {
-        return None;
-    }
-    if len == 0 {
-        return Some((mt, 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), len) as usize) < len {
-        return None;
-    }
-    Some((mt, len))
-}
-
 // ── module ABI ────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -268,6 +246,7 @@ pub extern "C" fn module_new(
         let sys = &*syscalls.cast::<SyscallTable>();
         s.syscalls = sys;
         s.step_ctr = 0;
+        s.kv_inbox = Inbox::new();
         s.core.init();
         s.kv_in = in_chan;
         s.kv_out = out_chan;
@@ -325,8 +304,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // 2. Drain the KV response (one outstanding at a time).
     {
-        let mut buf = [0u8; SCRATCH];
-        if let Some((mt, len)) = unsafe { read_envelope(sys, s.kv_in, &mut buf) } {
+        let mut buf = [0u8; ENVELOPE_HDR + SCRATCH];
+        if let Some((mt, len)) = unsafe { read_envelope(&mut s.kv_inbox, sys, s.kv_in, &mut buf) } {
             if mt == MSG_KV_RESPONSE && len >= 20 {
                 let corr = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
                 let result = buf[9];
@@ -336,7 +315,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // Fence tail: the commit frontier rides every
                     // response.
                     let tail_at = 20 + blen;
-                    let frontier = buf
+                    let frontier = buf[..len]
                         .get(tail_at..tail_at + FenceTail::LEN)
                         .and_then(FenceTail::decode)
                         .map_or(0, |t| t.commit_frontier);

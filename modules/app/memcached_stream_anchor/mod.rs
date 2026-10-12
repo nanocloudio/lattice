@@ -71,6 +71,10 @@ mod collections;
 #[path = "../../common/memcached_codec.rs"]
 mod memcached_codec;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use memcached_codec::{
     append, append_decimal_u64, encode_reply, eq_ascii_ci, find_crlf, itoa_i64, itoa_u64,
     parse_i64_dec, parse_line, parse_u32_dec, token_bytes, Line, MemOp, Token, MAX_TOKENS,
@@ -216,6 +220,9 @@ struct AnchorState {
     kv_out: i32,
     metrics_out: i32,
     routed_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    kv_inbox: Inbox,
     listen_port: u16,
     phase: AnchorPhase,
     _pad0: u8,
@@ -235,7 +242,9 @@ struct AnchorState {
     step_ctr: u64,
     inflight: InflightTable<InflightVal, MAX_INFLIGHT>,
     slots: [Slot; MAX_CONNS],
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// Outbound envelopes are built here; an inbound envelope is read
+    /// whole into it (header room, then the payload).
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 impl AnchorState {
@@ -247,6 +256,8 @@ impl AnchorState {
         self.kv_out = -1;
         self.metrics_out = -1;
         self.routed_in = -1;
+        self.net_inbox = Inbox::new();
+        self.kv_inbox = Inbox::new();
         self.listen_port = DEFAULT_LISTEN_PORT;
         self.phase = AnchorPhase::Init;
         self._pad0 = 0;
@@ -401,7 +412,7 @@ unsafe fn send_envelope(
         return false;
     }
     let total = 3 + payload_len;
-    if total > anchor.scratch.len() {
+    if total > SCRATCH_BUF_SIZE {
         return false;
     }
 
@@ -942,21 +953,19 @@ unsafe fn poll_kv_in(anchor: &mut AnchorState) {
 
 unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     let sys = anchor.syscalls;
-    let mut hdr = [0u8; 3];
-    let n = ((*sys).channel_read)(anchor.kv_in, hdr.as_mut_ptr(), 3);
-    if n < 3 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.kv_inbox,
+        &*sys,
+        anchor.kv_in,
+        &mut anchor.scratch,
+    ) else {
+        return false;
+    };
+    if msg_type != MSG_KV_RESPONSE {
         return false;
     }
-    if hdr[0] != MSG_KV_RESPONSE {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     const RESP_HEAD: usize = 8 + 1 + 1 + 8 + 2;
-    if payload_len < RESP_HEAD || payload_len > anchor.scratch.len() {
-        return false;
-    }
-    let n2 = ((*sys).channel_read)(anchor.kv_in, anchor.scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
+    if payload_len < RESP_HEAD {
         return false;
     }
     let p = &anchor.scratch[..payload_len];
@@ -1035,15 +1044,17 @@ unsafe fn poll_net_in(anchor: &mut AnchorState) {
         if poll <= 0 || (poll as u32) & POLL_IN == 0 {
             return;
         }
-        let buf = anchor.scratch.as_mut_ptr();
-        let (msg_type, payload_len) = net_read_frame(&*sys, anchor.net_in, buf, SCRATCH_BUF_SIZE);
-        if msg_type == 0 && payload_len == 0 {
+        let Some((msg_type, payload_len)) = read_envelope(
+            &mut anchor.net_inbox,
+            &*sys,
+            anchor.net_in,
+            &mut anchor.scratch[..SCRATCH_BUF_SIZE],
+        ) else {
             return;
-        }
+        };
         let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-        let copy_len = payload_len.min(SCRATCH_BUF_SIZE);
-        core::ptr::copy_nonoverlapping(buf.add(NET_FRAME_HDR), tmp.as_mut_ptr(), copy_len);
-        let payload = &tmp[..copy_len];
+        tmp[..payload_len].copy_from_slice(&anchor.scratch[..payload_len]);
+        let payload = &tmp[..payload_len];
 
         dispatch_net_frame(anchor, msg_type, payload);
         processed += 1;

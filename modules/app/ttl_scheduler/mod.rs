@@ -59,6 +59,10 @@ mod ttl_scheduler;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use ttl_scheduler::{ExpiryEntry, TtlQueue, EXPIRY_KIND_KV, EXPIRY_KIND_LEASE};
 use wire::{MSG_LEASE_CTRL, MSG_LEASE_TICK, MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER};
 
@@ -88,6 +92,10 @@ struct TtlState {
     tick_in: i32,
     lease_deadlines_in: i32,
     kv_expiry_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    tick_inbox: Inbox,
+    lease_deadlines_inbox: Inbox,
+    kv_expiry_inbox: Inbox,
     expire_out: i32,
     tick_out: i32,
     metrics_out: i32,
@@ -127,7 +135,8 @@ struct TtlState {
     step_ctr: u64,
 
     queue: TtlQueue<QUEUE_CAP>,
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 impl TtlState {
@@ -136,6 +145,9 @@ impl TtlState {
         self.tick_in = -1;
         self.lease_deadlines_in = -1;
         self.kv_expiry_in = -1;
+        self.tick_inbox = Inbox::new();
+        self.lease_deadlines_inbox = Inbox::new();
+        self.kv_expiry_inbox = Inbox::new();
         self.expire_out = -1;
         self.tick_out = -1;
         self.metrics_out = -1;
@@ -235,34 +247,6 @@ unsafe fn maybe_propose_tick(sched: &mut TtlState) {
         sched.last_propose_ms = now;
         sched.proposed_ms = value;
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> bool {
@@ -502,21 +486,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*sys_ptr;
-        if let Some((mt, len)) = read_envelope(sys, sched.tick_in, &mut sched.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut sched.tick_inbox,
+            sys,
+            sched.tick_in,
+            &mut sched.scratch,
+        ) {
             if mt == MSG_LEASE_TICK {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&sched.scratch[..len]);
                 handle_tick(sched, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, sched.lease_deadlines_in, &mut sched.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut sched.lease_deadlines_inbox,
+            sys,
+            sched.lease_deadlines_in,
+            &mut sched.scratch,
+        ) {
             if mt == MSG_LEASE_CTRL {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&sched.scratch[..len]);
                 handle_lease_deadline(sched, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, sched.kv_expiry_in, &mut sched.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut sched.kv_expiry_inbox,
+            sys,
+            sched.kv_expiry_in,
+            &mut sched.scratch,
+        ) {
             let mut tmp = [0u8; SCRATCH_BUF_SIZE];
             tmp[..len].copy_from_slice(&sched.scratch[..len]);
             if mt == MSG_TTL_REGISTER {

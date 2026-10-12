@@ -75,6 +75,10 @@ mod mongo;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use abi::contracts::net::net_proto::{
     conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
     CONN_ID_LEN, MAX_CMD_DATA, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
@@ -216,6 +220,9 @@ struct AnchorState {
     exec_in: i32,
     exec_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    exec_inbox: Inbox,
 
     listen_port: u16,
     phase: u8,
@@ -1835,6 +1842,8 @@ pub extern "C" fn module_new(
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
     // The state arrives zeroed; set what is not zero.
     anchor.syscalls = sys_ptr;
+    anchor.net_inbox = Inbox::new();
+    anchor.exec_inbox = Inbox::new();
     anchor.listen_port = DEFAULT_LISTEN_PORT;
     anchor.phase = PHASE_INIT;
     anchor.server_conn_id = SLOT_FREE;
@@ -1887,16 +1896,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let sys = &*sys_ptr;
         for _ in 0..8 {
-            let mut env = [0u8; RECV_BUF + 16];
-            let Some((msg, payload)) = read_one_envelope(sys, anchor.net_in, &mut env) else {
+            let mut env = [0u8; ENVELOPE_HDR + RECV_BUF + 16];
+            let Some((msg, len)) =
+                read_envelope(&mut anchor.net_inbox, sys, anchor.net_in, &mut env)
+            else {
                 break;
             };
-            dispatch_net(anchor, msg, payload);
+            dispatch_net(anchor, msg, &env[..len]);
         }
-        let mut env = [0u8; DOC_RESPONSE_MAX];
-        if let Some((msg, payload)) = read_one_envelope(sys, anchor.exec_in, &mut env) {
+        let mut env = [0u8; ENVELOPE_HDR + DOC_RESPONSE_MAX];
+        if let Some((msg, len)) =
+            read_envelope(&mut anchor.exec_inbox, sys, anchor.exec_in, &mut env)
+        {
             if msg == MSG_DOC_RESPONSE {
-                on_doc_response(anchor, payload);
+                on_doc_response(anchor, &env[..len]);
             }
         }
     }
@@ -1961,41 +1974,4 @@ unsafe fn write_envelope(
     env[2] = ((payload_len >> 8) & 0xFF) as u8;
     let total = wire::ENVELOPE_HDR + payload_len;
     (sys.channel_write)(chan, env.as_mut_ptr(), total) == total as i32
-}
-
-unsafe fn read_one_envelope<'a>(
-    sys: &SyscallTable,
-    chan: i32,
-    scratch: &'a mut [u8],
-) -> Option<(u8, &'a [u8])> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), 3) < 3 {
-        return None;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        let mut left = payload_len;
-        let mut sink = [0u8; 256];
-        while left > 0 {
-            let take = left.min(sink.len());
-            if ((sys.channel_read)(chan, sink.as_mut_ptr(), take) as usize) < take {
-                break;
-            }
-            left -= take;
-        }
-        return None;
-    }
-    if payload_len > 0
-        && ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len
-    {
-        return None;
-    }
-    Some((hdr[0], &scratch[..payload_len]))
 }

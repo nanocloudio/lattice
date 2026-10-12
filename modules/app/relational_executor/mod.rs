@@ -90,6 +90,10 @@ use sql_exec::sql_core;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use sql_core::relational::{
     self, ColumnDescriptor, LogicalType, ObjectKind, TableDescriptor, Value, MAX_COLUMNS,
     MAX_KEY_COLUMNS, MAX_PRIMARY_KEY_LEN, MAX_ROW_BYTES,
@@ -402,6 +406,11 @@ struct ExecState {
     /// (unwired) in single-range compositions, where a cross-range INSERT
     /// is refused rather than coordinated.
     txn_result_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    pg_inbox: Inbox,
+    mysql_inbox: Inbox,
+    kv_inbox: Inbox,
+    txn_result_inbox: Inbox,
     // Outputs: pg_out[0], mysql_out[1], kv_out[2], metrics[3], txn_submit_out[4]
     pg_out: i32,
     mysql_out: i32,
@@ -648,7 +657,8 @@ struct ExecState {
     /// the watchdog can never fire.
     timer_fd: i32,
 
-    scratch: [u8; SCRATCH_BUF],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF],
     resp: [u8; RESP_BUF],
     env: [u8; RESP_BUF + wire::ENVELOPE_HDR],
 }
@@ -660,6 +670,10 @@ impl ExecState {
         self.mysql_in = -1;
         self.kv_in = -1;
         self.txn_result_in = -1;
+        self.pg_inbox = Inbox::new();
+        self.mysql_inbox = Inbox::new();
+        self.kv_inbox = Inbox::new();
+        self.txn_result_inbox = Inbox::new();
         self.pg_out = -1;
         self.mysql_out = -1;
         self.kv_out = -1;
@@ -751,32 +765,6 @@ impl ExecState {
 }
 
 // ── Channel helpers ───────────────────────────────────────────────────
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; wire::ENVELOPE_HDR];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), wire::ENVELOPE_HDR) < wire::ENVELOPE_HDR as i32 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    if ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
-}
 
 /// Write one envelope. `env` is caller-supplied because the payloads
 /// here are far too large for a stack buffer inside a module step.
@@ -5844,7 +5832,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // KV replies first: they advance the statement in flight, and
         // draining them before accepting new work keeps the queue from
         // filling behind a job that was ready to finish.
-        if let Some((mt, len)) = read_envelope(sys, exec.kv_in, &mut exec.scratch) {
+        if let Some((mt, len)) =
+            read_envelope(&mut exec.kv_inbox, sys, exec.kv_in, &mut exec.scratch)
+        {
             if mt == MSG_KV_RESPONSE {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
@@ -5854,7 +5844,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Cross-range 2PC outcome from txn_coordinator (only wired in a
         // two-range relational graph; -1 elsewhere and skipped).
         if exec.txn_result_in >= 0 {
-            if let Some((mt, len)) = read_envelope(sys, exec.txn_result_in, &mut exec.scratch) {
+            if let Some((mt, len)) = read_envelope(
+                &mut exec.txn_result_inbox,
+                sys,
+                exec.txn_result_in,
+                &mut exec.scratch,
+            ) {
                 if mt == MSG_TXN_SUBMIT_RESULT {
                     let mut tmp = [0u8; SCRATCH_BUF];
                     tmp[..len].copy_from_slice(&exec.scratch[..len]);
@@ -5862,14 +5857,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, exec.pg_in, &mut exec.scratch) {
+        if let Some((mt, len)) =
+            read_envelope(&mut exec.pg_inbox, sys, exec.pg_in, &mut exec.scratch)
+        {
             if mt == MSG_SQL_REQUEST {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
                 on_sql_request(exec, false, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, exec.mysql_in, &mut exec.scratch) {
+        if let Some((mt, len)) =
+            read_envelope(&mut exec.mysql_inbox, sys, exec.mysql_in, &mut exec.scratch)
+        {
             if mt == MSG_SQL_REQUEST {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);

@@ -64,6 +64,10 @@ mod telemetry;
 #[path = "../../common/watch_replay.rs"]
 mod watch_replay;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use types::{
     KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS, KV_RESULT_COMPACTED, KV_RESULT_KVS, KV_RESULT_VERSIONS,
     PROTO_INTERNAL_WATCH, VERSIONS_FLAG_META,
@@ -115,6 +119,10 @@ struct FanoutState {
     events_in: i32,
     replay_plan_in: i32,
     kv_in: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    events_inbox: Inbox,
+    replay_plan_inbox: Inbox,
+    kv_inbox: Inbox,
     frames_out: i32,
     progress_out: i32,
     kv_out: i32,
@@ -174,7 +182,8 @@ struct FanoutState {
     m_replays_unserviceable: u64,
     step_ctr: u64,
 
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 impl FanoutState {
@@ -183,6 +192,9 @@ impl FanoutState {
         self.events_in = -1;
         self.replay_plan_in = -1;
         self.kv_in = -1;
+        self.events_inbox = Inbox::new();
+        self.replay_plan_inbox = Inbox::new();
+        self.kv_inbox = Inbox::new();
         self.frames_out = -1;
         self.progress_out = -1;
         self.kv_out = -1;
@@ -205,34 +217,6 @@ impl FanoutState {
         self.m_replays_unserviceable = 0;
         self.step_ctr = 0;
     }
-}
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return None;
-    }
-    let msg_type = hdr[0];
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        return None;
-    }
-    if payload_len == 0 {
-        return Some((msg_type, 0));
-    }
-    let n2 = (sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len);
-    if (n2 as usize) < payload_len {
-        return None;
-    }
-    Some((msg_type, payload_len))
 }
 
 unsafe fn write_envelope(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> bool {
@@ -878,21 +862,33 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*sys_ptr;
-        if let Some((mt, len)) = read_envelope(sys, fanout.events_in, &mut fanout.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut fanout.events_inbox,
+            sys,
+            fanout.events_in,
+            &mut fanout.scratch,
+        ) {
             if mt == MSG_WATCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&fanout.scratch[..len]);
                 handle_event(fanout, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, fanout.replay_plan_in, &mut fanout.scratch) {
+        if let Some((mt, len)) = read_envelope(
+            &mut fanout.replay_plan_inbox,
+            sys,
+            fanout.replay_plan_in,
+            &mut fanout.scratch,
+        ) {
             if mt == MSG_WATCH_REPLAY_PLAN {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&fanout.scratch[..len]);
                 handle_replay_plan(fanout, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(sys, fanout.kv_in, &mut fanout.scratch) {
+        if let Some((mt, len)) =
+            read_envelope(&mut fanout.kv_inbox, sys, fanout.kv_in, &mut fanout.scratch)
+        {
             if mt == MSG_KV_RESPONSE {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&fanout.scratch[..len]);

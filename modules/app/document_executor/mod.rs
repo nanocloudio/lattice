@@ -112,6 +112,10 @@ use doc_exec::doc_fields;
 #[path = "../../common/telemetry.rs"]
 mod telemetry;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use doc_exec::doc_catalog::{
     self, catalog_name_key, catalog_names_prefix, catalog_seq_key, set_descriptor_id,
     set_index_ids, Descriptor, DescriptorWriter, FORM_TEXT, GEN_NOW, MAX_DESCRIPTOR_LEN,
@@ -328,6 +332,10 @@ struct ExecState {
     d_out: [i32; 2],
     kv_in: i32,
     kv_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    d_inbox: [Inbox; 2],
+    kv_inbox: Inbox,
+    changes_inbox: Inbox,
     metrics_out: i32,
     timer_fd: i32,
     inflight_since_ms: u64,
@@ -445,7 +453,8 @@ struct ExecState {
     resp: DocBuf<RESP_BUF>,
 
     env: DocBuf<ENV_BUF>,
-    scratch: [u8; SCRATCH_BUF],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF],
 
     // ── The large-value layer (`kv_large.rs`) ──
     /// The request as the executor wrote it (held while its chunks go
@@ -514,41 +523,6 @@ impl ExecState {
 }
 
 // ── Envelope I/O ──────────────────────────────────────────────────────
-
-unsafe fn read_envelope(sys: &SyscallTable, chan: i32, scratch: &mut [u8]) -> Option<(u8, usize)> {
-    if chan < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(chan, POLL_IN);
-    if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-        return None;
-    }
-    let mut hdr = [0u8; wire::ENVELOPE_HDR];
-    if (sys.channel_read)(chan, hdr.as_mut_ptr(), wire::ENVELOPE_HDR) < wire::ENVELOPE_HDR as i32 {
-        return None;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-    if payload_len > scratch.len() {
-        // Drain what cannot be held so the channel does not wedge on it;
-        // the sender's watchdog answers the lost request.
-        let mut sink = [0u8; 256];
-        let mut left = payload_len;
-        while left > 0 {
-            let n = left.min(sink.len());
-            if (sys.channel_read)(chan, sink.as_mut_ptr(), n) <= 0 {
-                break;
-            }
-            left -= n;
-        }
-        return None;
-    }
-    if payload_len > 0
-        && ((sys.channel_read)(chan, scratch.as_mut_ptr(), payload_len) as usize) < payload_len
-    {
-        return None;
-    }
-    Some((hdr[0], payload_len))
-}
 
 unsafe fn write_envelope(
     sys: &SyscallTable,
@@ -995,21 +969,27 @@ fn follow_cancel(exec: &mut ExecState, src: u8, corr: u64, conn: u8) {
 /// else to do, the next marked watch is read from its cursor.
 unsafe fn follow_step(exec: &mut ExecState, sys: &SyscallTable) {
     for _ in 0..16 {
-        let Some((mt, len)) = read_envelope(sys, exec.changes_in, &mut exec.scratch) else {
+        let Some((mt, len)) = read_envelope(
+            &mut exec.changes_inbox,
+            sys,
+            exec.changes_in,
+            &mut exec.scratch,
+        ) else {
             break;
         };
         if mt != wire::MSG_WATCH_EVENT {
             continue;
         }
-        // `[kpg:2][rev:8][op:1][klen:2][key]…`
-        let Some(kl) = exec
-            .scratch
+        // `[kpg:2][rev:8][op:1][klen:2][key]…`; an event whose key runs
+        // past its payload is malformed, not a shorter key.
+        let event = exec.scratch.get(..len).unwrap_or(&[]);
+        let Some(kl) = event
             .get(11..13)
             .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
         else {
             continue;
         };
-        let Some(key) = exec.scratch.get(13..(13 + kl).min(len)) else {
+        let Some(key) = event.get(13..13 + kl) else {
             continue;
         };
         for f in exec.follows.iter_mut() {
@@ -5612,6 +5592,9 @@ pub extern "C" fn module_new(
     exec.lg_read = false;
     exec.queue_len = 0;
     exec.kv_corr = 0;
+    exec.d_inbox = [Inbox::new(); 2];
+    exec.kv_inbox = Inbox::new();
+    exec.changes_inbox = Inbox::new();
     // inputs:  dialect_in[0], dialect2_in[1], kv_in[2]
     // outputs: dialect_out[0], dialect2_out[1], kv_out[2], metrics[3]
     exec.d_in[0] = in_chan;
@@ -5688,7 +5671,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // An answer still leaving goes first; then KV replies, which
         // advance the job in flight.
         flush_answer(exec);
-        if let Some((mt, len)) = read_envelope(sys, exec.kv_in, &mut exec.scratch) {
+        if let Some((mt, len)) =
+            read_envelope(&mut exec.kv_inbox, sys, exec.kv_in, &mut exec.scratch)
+        {
             if mt == MSG_KV_RESPONSE {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
@@ -5698,7 +5683,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         start_queued(exec);
         for src in 0..2u8 {
             let chan = exec.d_in[src as usize];
-            if let Some((mt, len)) = read_envelope(sys, chan, &mut exec.scratch) {
+            if let Some((mt, len)) = read_envelope(
+                &mut exec.d_inbox[src as usize],
+                sys,
+                chan,
+                &mut exec.scratch,
+            ) {
                 if mt == MSG_DOC_REQUEST {
                     let mut tmp = [0u8; DOC_REQUEST_MAX];
                     if len <= tmp.len() {

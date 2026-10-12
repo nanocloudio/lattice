@@ -101,8 +101,12 @@ mod data_surface;
 #[path = "../../common/authority.rs"]
 mod authority;
 
+#[path = "../../common/envelope.rs"]
+mod envelope;
+use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+
 use abi::contracts::net::net_proto::{
-    conn_id, connected_parts, error_parts, CMD_CLOSE as NET_CMD_CLOSE,
+    conn_id, connected_parts, error_parts, RequesterTag, CMD_CLOSE as NET_CMD_CLOSE,
     CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX, CONN_ID_LEN,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
     MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
@@ -230,6 +234,9 @@ struct ClientState {
     kv_in: i32,
     kv_out: i32,
     metrics_out: i32,
+    /// Each input's envelope reading (`common/envelope.rs`).
+    net_inbox: Inbox,
+    kv_inbox: Inbox,
 
     /// The configured storage peers; peer 0 is required, the others
     /// exist iff configured.
@@ -237,7 +244,7 @@ struct ClientState {
     /// Index of the peer currently dialled (0..3).
     peer_idx: u8,
     /// Requester tag on every dial; `MSG_CONNECTED` / `MSG_ERROR` echo it.
-    tag: u8,
+    tag: RequesterTag,
     /// Consecutive MUTATION refusals with `UnavailableAuthority`.
     /// Rotation evidence — see the handler in `handle_response_frame`.
     authority_refusals: u8,
@@ -283,7 +290,8 @@ struct ClientState {
     m_rotations: u64,
     step_ctr: u64,
 
-    scratch: [u8; SCRATCH_BUF_SIZE],
+    /// An envelope read whole: header room, then the payload.
+    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
 impl ClientState {
@@ -294,6 +302,8 @@ impl ClientState {
         self.kv_in = -1;
         self.kv_out = -1;
         self.metrics_out = -1;
+        self.net_inbox = Inbox::new();
+        self.kv_inbox = Inbox::new();
         self.peers = [Authority::empty(), Authority::empty(), Authority::empty()];
         self.peer_idx = 0;
         self.tag = 0;
@@ -481,23 +491,21 @@ unsafe fn poll_kv_in(client: &mut ClientState) -> bool {
 
 unsafe fn handle_kv_request(client: &mut ClientState) -> bool {
     let sys = client.syscalls;
-    let mut hdr = [0u8; 3];
-    if ((*sys).channel_read)(client.kv_in, hdr.as_mut_ptr(), 3) < 3 {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut client.kv_inbox,
+        &*sys,
+        client.kv_in,
+        &mut client.scratch,
+    ) else {
+        return false;
+    };
+    if msg_type != MSG_KV_REQUEST {
+        diag(client, b"[data_cli] mt?", msg_type, 0);
         return false;
     }
-    if hdr[0] != MSG_KV_REQUEST {
-        diag(client, b"[data_cli] mt?", hdr[0], 0);
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
     // [corr:8][proto:1][tenant:4][conn:1][cons:1][op:1][body_len:2] = 18
     const REQ_HEAD: usize = 18;
-    if !(REQ_HEAD..=SCRATCH_BUF_SIZE).contains(&payload_len) {
-        return false;
-    }
-    if (((*sys).channel_read)(client.kv_in, client.scratch.as_mut_ptr(), payload_len) as usize)
-        < payload_len
-    {
+    if payload_len < REQ_HEAD {
         return false;
     }
 
@@ -996,15 +1004,17 @@ unsafe fn poll_net_in(client: &mut ClientState) -> bool {
         if poll <= 0 || (poll as u32) & POLL_IN == 0 {
             return false;
         }
-        let buf = client.scratch.as_mut_ptr();
-        let (msg_type, payload_len) = net_read_frame(&*sys, client.net_in, buf, SCRATCH_BUF_SIZE);
-        if msg_type == 0 && payload_len == 0 {
+        let Some((msg_type, payload_len)) = read_envelope(
+            &mut client.net_inbox,
+            &*sys,
+            client.net_in,
+            &mut client.scratch[..SCRATCH_BUF_SIZE],
+        ) else {
             return false;
-        }
+        };
         let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-        let copy_len = payload_len.min(SCRATCH_BUF_SIZE);
-        core::ptr::copy_nonoverlapping(buf.add(NET_FRAME_HDR), tmp.as_mut_ptr(), copy_len);
-        dispatch_net_frame(client, msg_type, &tmp[..copy_len]);
+        tmp[..payload_len].copy_from_slice(&client.scratch[..payload_len]);
+        dispatch_net_frame(client, msg_type, &tmp[..payload_len]);
         processed += 1;
     }
     true
