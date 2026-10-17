@@ -46,6 +46,11 @@
 //! so a fence query (`QUERY_OP`, which both contracts carry and which
 //! reaches the provider with its tag stripped) names one thing.
 //!
+//! Fault injection (TEST ONLY, off unless configured): [`Provider::
+//! fault_read_eagain_every`] makes the provider answer reads `EAGAIN` the
+//! way a board's store does while its device is busy, so a Linux E2E can
+//! prove its consumers never read "not yet" as absence. See [`Fault`].
+//!
 //! Mounted beside `types.rs`, `kv_large.rs`, `doc_tree.rs` and `origin.rs`
 //! (reached as `super::…`).
 //! No allocation and no panic path: the worker twin that mounts it is a
@@ -411,7 +416,55 @@ pub struct Provider {
     /// keyed by the caller and the request's bytes as a replica keys its
     /// writes, so asking again is a second look at the same write.
     local: LocalWrite,
+    /// Injected read waits (test only; off unless configured).
+    fault: Fault,
 }
+
+/// TEST-ONLY fault injection: reads answered `EAGAIN`, as a board's store
+/// answers them while its device is busy with a write.
+///
+/// With `every = N` (N >= 2), one step of the store in N is BUSY: from the
+/// worker's step that opens it ([`Provider::fault_step`], every Nth) to its
+/// next, every read the provider is asked — `GET`, `HEAD`, `RANGE_GET`,
+/// `LIST`, `CHANGES` and a `SUBSCRIBE` with an initial listing, by any
+/// module — answers `EAGAIN`, as the board's store answers every read while
+/// its device is taken by a write. A read answered so has moved nothing: no
+/// handle is opened, none is closed (a `RANGE_GET`'s handle stays valid, at
+/// the offset it was asked), no page is written, no fence is written, no
+/// subscription is registered, and nothing else of the provider's state
+/// changes. So a busy step is invisible to a consumer that keeps the
+/// contract — it holds the read and asks again on a later step — and fatal
+/// to one that reads `EAGAIN` as absent, empty or failed (a NotFound for a
+/// key it has just written), or asks again inside the same step (it spins:
+/// the step stays busy until the worker steps, which it never does while
+/// the spinner holds the core).
+///
+/// Whole steps, not every Nth read: every module meets the wait alike (a
+/// read count would land on whichever modules step late in the order, every
+/// step, and starve them), and N - 1 steps in N are clear, so a pass that
+/// restarts from its first read still gets through. Writes, `CLOSE`, the
+/// fence query and `CAPS` are never faulted: a write has its own "not yet"
+/// (`EINPROGRESS`) and `EAGAIN` on a write means an etag was lost.
+/// Deterministic: busy steps are the worker's step count modulo N, from the
+/// knob's setting. `every = 1` would make every step busy and never let a
+/// read through: refused. 0 is off.
+#[derive(Clone, Copy)]
+struct Fault {
+    every: u32,
+    /// The worker's steps since the knob was set.
+    steps: u32,
+    /// This step is busy: every read answers `EAGAIN`.
+    busy: bool,
+    /// Reads answered `EAGAIN` by injection (telemetry).
+    injected: u32,
+}
+
+const NO_FAULT: Fault = Fault {
+    every: 0,
+    steps: 0,
+    busy: false,
+    injected: 0,
+};
 
 /// See [`Provider::local`].
 #[derive(Clone, Copy)]
@@ -445,7 +498,56 @@ impl Provider {
             rep: NO_REPLICATION,
             scope: NO_SCOPE,
             local: NO_LOCAL_WRITE,
+            fault: NO_FAULT,
         }
+    }
+
+    /// TEST ONLY: make one store step in `every` busy, every read in it
+    /// answered `EAGAIN` (see [`Fault`]). 0 is off; 1 is refused (`false`,
+    /// and off): every step would be busy.
+    pub fn fault_read_eagain_every(&mut self, every: u32) -> bool {
+        self.fault = NO_FAULT;
+        if every == 1 {
+            return false;
+        }
+        self.fault.every = every;
+        true
+    }
+
+    /// The worker has stepped: the next step is busy or clear.
+    pub fn fault_step(&mut self) {
+        let f = &mut self.fault;
+        if f.every != 0 {
+            f.steps = f.steps.wrapping_add(1);
+            f.busy = f.steps.is_multiple_of(f.every);
+        }
+    }
+
+    /// Reads answered `EAGAIN` by injection, and whether it is on.
+    pub fn fault_injected(&self) -> (bool, u32) {
+        (self.fault.every != 0, self.fault.injected)
+    }
+
+    /// Whether this read is answered `EAGAIN` by injection: the step is
+    /// busy.
+    fn fault_read(&mut self, op: u32, a: &[u8]) -> bool {
+        let f = &mut self.fault;
+        if !f.busy {
+            return false;
+        }
+        let read = match op {
+            OBJ_GET | OBJ_HEAD | OBJ_RANGE_GET | NS_LIST | NS_CHANGES => true,
+            // Only a subscription with an initial listing reads the store.
+            NS_SUBSCRIBE => field16(a, &mut 0)
+                .map(|p| 2 + p.len() + 4)
+                .and_then(|at| a.get(at))
+                .is_some_and(|fl| fl & 1 != 0),
+            _ => false,
+        };
+        if read {
+            f.injected = f.injected.wrapping_add(1);
+        }
+        read
     }
 
     /// Empty a provider where it lies: it is integers and flags, and all
@@ -3054,6 +3156,10 @@ pub unsafe fn dispatch<B: Backend>(
         raw
     };
     let slot = slot_of(handle);
+    // Injected read waits (test only): answered before anything moves.
+    if pv.fault_read(op, a) {
+        return EAGAIN;
+    }
     // Every read but a slot's own passes through the cache.
     if !matches!(
         op,

@@ -340,6 +340,20 @@ version scan 2 run blocks/step, watch replay 32, backup 24, CDC 16, index
 backfill 16, range copy 16, SQL scan 64, SQL delete 32, and lease revoke 32. A pacing loop that cannot be rescheduled
 is a correctness bug, not merely a performance issue.
 
+## Test-only fault injection
+
+Not a bound, and never set in a shipped graph: `kv_state_worker_store`'s
+`fault_read_eagain_every: N` param (id 20, default 0 = off) makes one store
+step in N busy — from that worker step to its next, every read the provider
+is asked (`GET`, `HEAD`, `RANGE_GET`, `LIST`, `CHANGES`, an initial-listing
+`SUBSCRIBE`), by any module, answers `EAGAIN` with nothing moved: a board
+store whose device is taken by a write, reproduced on Linux
+(`store_provider::Fault`). `N = 1` is refused (every step busy). Enabled,
+the worker logs `[kvw] FAULT INJECTION ON (test only)` at construction and
+counts injected waits on its store heartbeat (`fault=`).
+`tools/ci/no_fault_injection.sh` fails CI if any tracked graph outside
+`tests/` sets it.
+
 ## Composition and scaling consequences
 
 - Single-node log mode avoids inter-node transport and consensus latency but
@@ -500,6 +514,7 @@ checked.
 | Ro Stall Limit | Pacing | `RO_STALL_LIMIT` | modules/app/redis_edge_anchor/mod.rs | — | Read-only stall ticks before the anchor reconnects its link. |
 | Ttl Resume Budget | Pacing | `TTL_RESUME_BUDGET` | modules/app/kv_state_worker/mod.rs | 32 | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Wedge Budget | Pacing | `WEDGE_BUDGET` | modules/common/cdc_feed.rs | — | Consecutive wedge retries before a feed reports STALLED. |
+| Held read range ask | Pacing | `RANGE_ASK_MAX` | modules/common/held_read.rs | — | The most one `RANGE_GET` of a held whole-value read asks for; the read asks again for the rest, in the same step unless the store answers `EAGAIN` (then on a later one, same handle, same offset). |
 
 ### Module topology bounds
 
@@ -847,6 +862,7 @@ SESSION_REQ_MAX | modules/app/doc_json_dialect/mod.rs | 1024
 SEND_BUF | modules/app/doc_wire_anchor/mod.rs | -
 NET_CHUNK | modules/app/doc_wire_anchor/mod.rs | -
 KV_REQUEST_PAYLOAD_MAX | modules/common/wire.rs | 4160
+RANGE_ASK_MAX | modules/common/held_read.rs | -
 ```
 
 ## Exempt names

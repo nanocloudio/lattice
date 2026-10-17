@@ -486,6 +486,19 @@ define_params! {
                 s.selector = abi::kernel_abi::provider_selector::hash(src);
             }
         };
+
+    // TEST ONLY — never in a shipped graph. kv_state_worker_store's store
+    // provider makes one store step in N busy: from that worker step to its
+    // next, every read it is asked (GET, HEAD, RANGE_GET, LIST, CHANGES, an
+    // initial-listing SUBSCRIBE) answers EAGAIN with nothing moved — the
+    // board's store while its device is taken by a write, reproduced on
+    // Linux so an E2E proves its consumers hold a read that waits rather
+    // than read it as absent (`store_provider::Fault`). 0 (default): off.
+    // 1: refused (every step busy), and off. Ignored by kv_state_worker (no
+    // provider). Logged at construction as `[kvw] FAULT INJECTION ON …` and
+    // counted on `[kvw] store hb … fault=`.
+    20, fault_read_eagain_every, u32, 0
+        => |s, d, len| { s.fault_read_eagain_every = p_u32(d, len, 0, 0); };
 }
 
 /// Steps between chunk sweeps while writes may have queued chunk work.
@@ -913,6 +926,8 @@ struct WorkerState {
     scoped_len: u16,
     /// `provider_selector::hash(volume)`, or 0: the default provider.
     selector: u32,
+    /// TEST ONLY: the store provider's injected read waits (param 20).
+    fault_read_eagain_every: u32,
 
     /// `command_log` param, and the log's life: off, replaying its tail
     /// after recovery, or live (every applied op logged).
@@ -3560,6 +3575,19 @@ unsafe fn provider_new(worker: &mut WorkerState) {
                 }
             }
         }
+        if p.provides && worker.fault_read_eagain_every != 0 {
+            let every = worker.fault_read_eagain_every;
+            let on = (*p.state).fault_read_eagain_every(every);
+            let mut m = [0u8; 128];
+            let what: &[u8] = if on {
+                b"[kvw] FAULT INJECTION ON (test only): one store step in N busy, every read EAGAIN, N="
+            } else {
+                b"[kvw] fault injection REFUSED (N=1: every step busy) N="
+            };
+            let mut k = write_prefix(&mut m, 0, what);
+            k = write_dec(&mut m, k, u64::from(every));
+            dev_log(sys, 1, m.as_ptr(), k);
+        }
         if p.provides && worker.import_path_len > 0 {
             p.import_buf = (sys.heap_alloc)(IMPORT_RECORD_MAX as u32);
             p.provides = !p.import_buf.is_null();
@@ -3676,6 +3704,11 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
         n = write_dec(&mut buf, n, u64::from(pv.m_told));
         n = write_prefix(&mut buf, n, b" ev_refused=");
         n = write_dec(&mut buf, n, u64::from(pv.m_refused));
+        let (fault_on, injected) = pv.fault_injected();
+        if fault_on {
+            n = write_prefix(&mut buf, n, b" fault=");
+            n = write_dec(&mut buf, n, u64::from(injected));
+        }
     }
     n = write_prefix(&mut buf, n, b" ops=");
     for (i, c) in p.m_ops.iter().enumerate() {
@@ -4788,6 +4821,15 @@ pub extern "C" fn module_deferred_ready() -> u32 {
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
+    #[cfg(feature = "store_provider")]
+    if !state.is_null() {
+        // SAFETY: the kernel passes this module's own state.
+        let worker = unsafe { &mut *state.cast::<WorkerState>() };
+        if worker.prov.provides && !worker.prov.state.is_null() {
+            // An injected read wait (test only) lasts until this step.
+            unsafe { (*worker.prov.state).fault_step() };
+        }
+    }
     let rc = step(state);
     #[cfg(feature = "store_provider")]
     if rc == 0 && !state.is_null() {

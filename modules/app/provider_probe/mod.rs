@@ -26,6 +26,10 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+#[path = "../../common/held_read.rs"]
+mod held_read;
+use held_read::{HeldRead, Read};
+
 const OBJ_PUT: u32 = 0x1420;
 const OBJ_GET: u32 = 0x1421;
 const OBJ_RANGE_GET: u32 = 0x1423;
@@ -34,6 +38,9 @@ const NS_LIST: u32 = 0x1302;
 const NS_CHANGES: u32 = 0x1307;
 const EINPROGRESS: i32 = -36;
 const ENXIO: i32 = -6;
+/// A read's "not yet": the store answers it later, and nothing may be
+/// concluded from it (never absent, never empty, never short).
+const EAGAIN: i32 = -11;
 
 /// What a write answered: decided, or not yet (ask again).
 enum WriteAnswer {
@@ -106,6 +113,15 @@ struct ProbeState {
     /// The key count at the last check, and the change count last read.
     keys_seen: i32,
     changes_seen: i32,
+    /// A check a read made wait, resumed next step rather than at the next
+    /// `VERIFY_EVERY`: what it has read so far, and the large value read it
+    /// holds (for node `read_node`).
+    resume: bool,
+    pass_keys: i32,
+    keys_done: bool,
+    changes_done: bool,
+    read_node: u8,
+    read: HeldRead,
 }
 
 /// Nodes whose large values are read back, at most.
@@ -221,33 +237,9 @@ unsafe fn put(
     write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p))
 }
 
-/// Read `key` whole into `dst`: its length, `ENXIO` when absent.
-unsafe fn get(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> i32 {
-    let mut karg = [0u8; KEY_CAP];
-    karg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, karg.as_mut_ptr(), key.len());
-    if h < 0 {
-        return h;
-    }
-    let mut got = 0usize;
-    loop {
-        let mut rarg = [0u8; 20];
-        rarg[0..8].copy_from_slice(&(got as u64).to_le_bytes());
-        let room = dst.len() - got;
-        rarg[8..12].copy_from_slice(&(room.min(1 << 20) as u32).to_le_bytes());
-        rarg[12..20].copy_from_slice(&(dst.as_mut_ptr().add(got) as u64).to_le_bytes());
-        let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
-        if n <= 0 || got + n as usize >= dst.len() {
-            if n > 0 {
-                got += n as usize;
-            }
-            break;
-        }
-        got += n as usize;
-    }
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
-    got as i32
+/// The module's `provider_call`, as a held read calls it.
+fn caller(sys: &SyscallTable) -> impl FnMut(i32, u32, &mut [u8]) -> i32 + '_ {
+    move |h, op, arg: &mut [u8]| unsafe { (sys.provider_call)(h, op, arg.as_mut_ptr(), arg.len()) }
 }
 
 /// The keys under `prefix` (one LIST page into `page`), or a negative
@@ -394,18 +386,29 @@ unsafe fn step_big(s: &mut ProbeState, sys: &SyscallTable) {
 }
 
 /// Every node's large value that is present, read back whole: how many
-/// were.
-unsafe fn big_values_whole(s: &mut ProbeState, sys: &SyscallTable, page: &mut [u8]) -> u32 {
-    let mut whole = 0u32;
-    s.wrong = 0;
-    for m in 0..s.nodes.min(MAX_NODES as u8) {
+/// were, or `None` while a read waits (it is held, and this pass resumes at
+/// its node next step).
+unsafe fn big_values_whole(s: &mut ProbeState, sys: &SyscallTable, page: &mut [u8]) -> Option<u32> {
+    let nodes = s.nodes.min(MAX_NODES as u8);
+    let first = if s.read.held() { s.read_node } else { 0 };
+    if first == 0 {
+        s.wrong = 0;
+    }
+    let mut call = caller(sys);
+    for m in first..nodes {
         if s.whole & (1 << m) != 0 {
-            whole += 1;
             continue;
         }
         let mut key = [0u8; KEY_CAP];
         let kn = big_key(&mut key, m);
-        let n = get(sys, &key[..kn], page);
+        let n = match s.read.step(&mut call, &mut key[..kn], page) {
+            Read::Pending => {
+                s.read_node = m;
+                return None;
+            }
+            Read::Done(n) => n as i32,
+            Read::Failed(e) => e,
+        };
         s.reads[m as usize] = n;
         if n != s.big as i32 {
             continue;
@@ -415,34 +418,56 @@ unsafe fn big_values_whole(s: &mut ProbeState, sys: &SyscallTable, page: &mut [u
             .enumerate()
             .all(|(i, b)| *b == big_byte(m, i))
         {
-            whole += 1;
             s.whole |= 1 << m;
         } else {
             s.wrong |= 1 << m;
         }
     }
-    whole
+    Some((s.whole & ((1u16 << nodes) - 1) as u8).count_ones())
 }
 
 unsafe fn step_verify(s: &mut ProbeState, sys: &SyscallTable) {
-    if !s.step.is_multiple_of(VERIFY_EVERY) || s.page.is_null() {
+    if (!s.resume && !s.step.is_multiple_of(VERIFY_EVERY)) || s.page.is_null() {
         return;
     }
+    // A read that answers EAGAIN decides nothing: the check is held where
+    // it stopped (what it has read kept) and resumed next step.
+    s.resume = true;
     let page = core::slice::from_raw_parts_mut(s.page, PAGE.max(s.big as usize));
-    let keys = count_keys(sys, b"/probe/", page);
+    if !s.keys_done {
+        let keys = count_keys(sys, b"/probe/", page);
+        if keys == EAGAIN {
+            return;
+        }
+        s.pass_keys = keys;
+        s.keys_done = true;
+    }
+    let keys = s.pass_keys;
     // Every change since the first revision: a write applied twice is a
     // key with two. A read of the whole history is the costliest call
     // here, so it is made once the keys have stopped arriving.
-    if keys == s.keys_seen && keys > 0 {
-        s.changes_seen = count_changes(sys, b"/probe/", 1, page);
+    if !s.changes_done && keys == s.keys_seen && keys > 0 {
+        let changes = count_changes(sys, b"/probe/", 1, page);
+        if changes == EAGAIN {
+            return;
+        }
+        s.changes_seen = changes;
     }
-    s.keys_seen = keys;
-    let changes = s.changes_seen;
+    s.changes_done = true;
     let whole = if s.big > 0 {
-        big_values_whole(s, sys, page)
+        match big_values_whole(s, sys, page) {
+            Some(w) => w,
+            None => return,
+        }
     } else {
         0
     };
+    // The check is whole: the next starts afresh.
+    s.resume = false;
+    s.keys_done = false;
+    s.changes_done = false;
+    s.keys_seen = keys;
+    let changes = s.changes_seen;
     // Logged when anything it reports has changed.
     let mut now =
         (u64::from(keys as u32) << 32) ^ u64::from(changes as u32) ^ (u64::from(whole) << 20);

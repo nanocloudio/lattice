@@ -93,7 +93,9 @@ unused_imports)."""
 #   2. host_crates.sh — with no root workspace, nothing else fmt/clippy/builds
 #      the three standalone tools/* crates, and the wire_lint / telemetry_guard
 #      catalog gates would never run.
-scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh"]
+#   3. no_fault_injection.sh — the store provider's test-only fault knob
+#      (`fault_read_eagain_every`) is set by no graph outside tests/.
+scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh", "tools/ci/no_fault_injection.sh"]
 
 [ci.templates]
 # Lattice's graph configs use `__SELF_ID__` / `__LISTEN_PORT__` /

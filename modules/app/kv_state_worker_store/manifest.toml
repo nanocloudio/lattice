@@ -28,6 +28,26 @@ provides         = ["storage.object", "storage.namespace"]
 # prefix answers in the graph's names; one on a broader prefix sees the
 # store's. A scope it cannot keep registers no contract.
 #
+# ⚠ TEST-ONLY FAULT INJECTION — never in a shipped graph.
+# `fault_read_eagain_every: N` (param 20, default 0 = off) makes one step
+# of the store in N BUSY: from that worker step to its next, every read the
+# provider is asked (GET, HEAD, RANGE_GET, LIST, CHANGES, an initial-listing
+# SUBSCRIBE), by any module, answers EAGAIN with nothing moved — no handle
+# opened or closed, no page or fence written. That is the board's store
+# while its device is taken by a write, reproduced on Linux, so an E2E
+# proves its consumers hold a read that waits (storage.object "Reads: EAGAIN
+# means ask again") rather than read it as absent, empty or failed, and
+# never re-ask inside a step (the step stays busy: a spinner wedges). Whole
+# steps, so every module meets the wait alike and N - 1 steps in N are
+# clear. Writes, CLOSE, the fence query and CAPS are never faulted.
+# Deterministic (busy steps are the worker's step count modulo N). N = 1 is
+# refused (every step busy) and logged. On: `[kvw] FAULT INJECTION ON (test
+# only): one store step in N busy, every read EAGAIN, N=<N>` at
+# construction, and `fault=<injected>` on `[kvw] store hb`.
+# tools/ci/no_fault_injection.sh fails CI on any graph outside tests/ that
+# sets it; see docs/architecture/limit_register.md "Test-only fault
+# injection".
+#
 # A separate module TYPE, not a variant of kv_state_worker: only a graph
 # that makes lattice its store carries the provider's heap (the provider,
 # its read slots and subscriptions, and a 4 MiB value cache). Ports,
