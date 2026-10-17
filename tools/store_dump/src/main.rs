@@ -83,6 +83,11 @@ impl RunStorage for DirStorage {
         io(f.write_all(data))
     }
 
+    fn fsync_name(&mut self, _kind: FileKind, _id: u32) -> Result<(), StorageError> {
+        // A scratch copy: nothing here needs to survive.
+        Ok(())
+    }
+
     fn fsync(&mut self, _kind: FileKind, _id: u32) -> Result<(), StorageError> {
         // A scratch copy: nothing here needs to survive.
         Ok(())

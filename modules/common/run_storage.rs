@@ -19,18 +19,32 @@
 //!
 //! Contract rules:
 //!
-//! - Every operation is synchronous *at this layer* and bounded: one
-//!   create/delete, one contiguous append, one contiguous read, one
-//!   durability barrier. No operation may be internally retried into
-//!   an unbounded loop by the backend.
+//! - Every operation is bounded and NEVER waits on the device. It
+//!   answers now — a result or an error — or [`StorageError::Again`]:
+//!   "not decided now; ask THE SAME call again on a later step". The
+//!   same call means the same method with the same `(kind, id)`, the
+//!   same offset and the same data bytes (`append`/`write_at`), and for
+//!   `list` the same output slice with the entries already placed in it
+//!   left intact. The backend keeps whatever the call had moved —
+//!   bytes already written, an operation the device has taken, a
+//!   directory walk part-way — and the repeated ask continues it from
+//!   there. Nothing is ever restarted by an `Again`, and a backend never
+//!   loops inside one call waiting for the device: the device only
+//!   progresses between steps.
+//! - A caller that gets `Again` keeps its own position (it did NOT
+//!   advance past the call) and asks again later. A caller that asks
+//!   something else instead abandons the call: anything it had moved is
+//!   left where it lies (torn bytes in an unpublished file, which
+//!   recovery collects), and no durability is implied for it.
 //! - Fail closed. A backend must never report success for work it did
 //!   not durably perform; `fsync` in particular must return
 //!   `NotDurable` rather than silently no-op when the barrier cannot
-//!   be guaranteed.
-//! - `append` is all-or-error from the caller's perspective, but the
-//!   provider is written to tolerate torn physical tails after a
-//!   crash: recovery validates checksums and discards unreferenced
-//!   files rather than trusting append atomicity.
+//!   be guaranteed, and answers `Ok` only once the bytes are on media.
+//! - `append` / `write_at` are all-or-error from the caller's
+//!   perspective (`Ok` = every byte accepted), but the provider is
+//!   written to tolerate torn physical tails after a crash: recovery
+//!   validates checksums and discards unreferenced files rather than
+//!   trusting append atomicity.
 
 #![allow(
     dead_code,
@@ -61,9 +75,12 @@ pub enum StorageError {
     AlreadyExists,
     /// Any I/O fault: short write, device error, revoked handle.
     IoFault,
-    /// The provider could not finish this call within its step budget and
-    /// continues it when asked again with the same arguments (fat32's
-    /// bounded directory scan). Ask again next step; nothing failed.
+    /// Not decided now: the device is busy, the bytes are not cached
+    /// yet, the provider is still mounting, or the device has taken the
+    /// operation and not finished it. Ask THE SAME call again on a later
+    /// step (see the module docs); whatever it had moved is kept and the
+    /// ask continues it. Never a failure, never end-of-data, never
+    /// absence.
     Again,
     /// A durability barrier could not be guaranteed. Distinct from
     /// `IoFault` so callers can surface "your data may not survive
@@ -121,12 +138,15 @@ pub trait RunStorage {
 
     /// Append `data` at the end of the file. All-or-error: on `Ok` the
     /// backend has accepted every byte (durability still requires
-    /// `fsync`); on `Err` the caller must treat the file as torn and
-    /// unusable until recovery revalidates it.
+    /// `fsync`); on `Again` some prefix may have been accepted and the
+    /// same append asked again continues after it; on any other `Err`
+    /// the caller must treat the file as torn and unusable until
+    /// recovery revalidates it.
     fn append(&mut self, kind: FileKind, id: u32, data: &[u8]) -> Result<(), StorageError>;
 
     /// Durability barrier: on `Ok` every previously appended byte of
-    /// this file (and its directory entry) survives power loss.
+    /// this file (and its recorded size) survives power loss. `Again`
+    /// proves nothing: ask again until it answers.
     fn fsync(&mut self, kind: FileKind, id: u32) -> Result<(), StorageError>;
 
     /// Does this backend implement a genuinely non-blocking
@@ -143,11 +163,13 @@ pub trait RunStorage {
     }
 
     /// Open a durability fence over this file and return a ticket
-    /// WITHOUT waiting for it to complete.
+    /// WITHOUT waiting for it to complete. `Again` = no fence was
+    /// opened yet; ask again.
     ///
-    /// The default performs the synchronous barrier and returns a
-    /// ticket that `fsync_poll` will immediately call `Durable` — the
-    /// transparent fallback for backends with no async tier.
+    /// The default performs the barrier and returns a ticket that
+    /// `fsync_poll` will immediately call `Durable` — the transparent
+    /// fallback for backends with no async tier (its `Again` is the
+    /// barrier's own).
     fn fsync_submit(&mut self, kind: FileKind, id: u32) -> Result<FsyncTicket, StorageError> {
         self.fsync(kind, id)?;
         Ok(0)
@@ -188,9 +210,11 @@ pub trait RunStorage {
     ) -> Result<(), StorageError>;
 
     /// Read up to `out.len()` bytes at `offset`. Returns the byte
-    /// count actually read; `0` means at-or-past end of file. Short
-    /// reads are legal at EOF only — callers use `Ok(0)` to probe for
-    /// file end and otherwise loop to fill.
+    /// count actually read, which may be short ANYWHERE (the rest is not
+    /// cached yet); `Ok(0)` means at-or-past end of file and nothing
+    /// else. `Again` means no byte was read (the backend has started
+    /// fetching them). Callers advance by what moved and ask for the
+    /// rest; a read moves no state, so asking again is always safe.
     fn read_at(
         &self,
         kind: FileKind,
@@ -199,12 +223,24 @@ pub trait RunStorage {
         out: &mut [u8],
     ) -> Result<usize, StorageError>;
 
+    /// Name-durability barrier: on `Ok` the directory entry for
+    /// (kind, id) — its creation, or its removal, whichever was done last
+    /// — survives power loss. `fsync` does NOT publish a name: a file
+    /// created, written and fsynced can still vanish whole in a power cut
+    /// until this answers. Anything durable that depends on a file being
+    /// FOUND (a manifest naming a run, an answer resting on a log
+    /// segment) waits for it. `Again` proves nothing: ask again.
+    fn fsync_name(&mut self, kind: FileKind, id: u32) -> Result<(), StorageError>;
+
     /// Delete the (kind, id) file. Deleting a missing file is
-    /// `NotFound` — callers that tolerate it say so explicitly.
+    /// `NotFound` — callers that tolerate it say so explicitly. `Again`
+    /// = asked again, the same delete continues.
     fn delete(&mut self, kind: FileKind, id: u32) -> Result<(), StorageError>;
 
     /// Enumerate existing file ids of `kind` into `out` (order
     /// unspecified). Returns the count, or `Overflow` if `out` cannot
-    /// hold every id — never a silent truncation.
+    /// hold every id — never a silent truncation. On `Again` the walk
+    /// stands part-way, with what it found already in `out`: ask again
+    /// with the same `out`, untouched, and the walk continues.
     fn list(&self, kind: FileKind, out: &mut [u32]) -> Result<usize, StorageError>;
 }

@@ -935,6 +935,56 @@ struct WorkerState {
     /// state, so a replay holds them while it applies).
     clog_buf: *mut u8,
     clog_out: *mut u8,
+    /// The command scope ([`apply_to_store`]): the outermost apply of a
+    /// command (or an origin entry's several) marks where the memtable
+    /// and these worker fields stood, so a command its device made wait is
+    /// undone whole and applied again on a later step.
+    scope_depth: u8,
+    scope_waited: bool,
+    scope_mark: kv_store::disk_store::ApplyMark,
+    scope_revision: u64,
+    scope_catalog: u64,
+    scope_lease_next: u64,
+    scope_stamped: u64,
+    scope_unstamped: u64,
+    /// A channel command applied whose command-log record is pending: its
+    /// reply waits in `reply_stash` and its frame at the channel's head
+    /// until the log settles ([`finish_logged_command`]); then its
+    /// mutations are published (`clog_hold_publish`), the reply sent and
+    /// the frame taken.
+    clog_hold: bool,
+    clog_hold_publish: bool,
+    clog_hold_op: u8,
+    clog_hold_result: u8,
+    clog_hold_kpg: u16,
+    clog_hold_revision: u64,
+    clog_hold_answer_at: usize,
+    clog_hold_answer_len: usize,
+    /// Commands undone and asked again because the device made them wait,
+    /// and maintenance actions that waited on the device (each asked again
+    /// where it stood).
+    m_cmd_waits: u64,
+    disk_io_waits: u64,
+    /// The import's end is applied and waits for the command log to hold
+    /// its record durably before the import is recorded done.
+    import_end_pending: bool,
+    /// An origin entry's watch events, held until the entry can no longer
+    /// be undone ([`apply_origin_entry`]): the journal its TXN left, the
+    /// TXN, its result and answer. Published at the entry's end, or
+    /// dropped with the entry if a device wait undoes it — a watcher never
+    /// hears of a write that was taken back.
+    ev_held: bool,
+    ev_journal: kv_store::EventJournal,
+    ev_txn: [u8; SCRATCH_BUF_SIZE],
+    ev_txn_len: usize,
+    ev_answer: [u8; ORIGIN_ANSWER_ROOM],
+    ev_answer_len: usize,
+    ev_result: u8,
+    ev_kpg: u16,
+    ev_revision: u64,
+    /// A second write's events in one entry (origin.rs writes once per
+    /// entry, so never): counted, and published with the entry's end.
+    m_ev_second: u64,
 
     /// One `MSG_WATCH_EVENT` envelope as the journal frames it.
     event_buf: [u8; 3 + wire::WATCH_EVENT_MAX],
@@ -1159,6 +1209,13 @@ unsafe fn drive_command_log(worker: &mut WorkerState) {
                     worker.clog_replay = command_log::Replay::new();
                     worker.clog_phase = CLOG_REPLAYING;
                 }
+                // The device deferred the listing or a header read: asked
+                // again next step (the listing continues where it stood).
+                Err(command_log::LogError::Storage(
+                    kv_store::disk_store::run_storage::StorageError::Again,
+                )) => {
+                    worker.disk_io_waits = worker.disk_io_waits.wrapping_add(1);
+                }
                 Err(_) => {
                     log_disk_errno(
                         worker,
@@ -1174,9 +1231,23 @@ unsafe fn drive_command_log(worker: &mut WorkerState) {
                 // at construction (the log is on only if they were).
                 let buf =
                     core::slice::from_raw_parts_mut(worker.clog_buf, command_log::PAYLOAD_MAX);
+                // Where the replay stands before this record: a record the
+                // device makes wait — its read, or its op's — is read and
+                // applied again from here next step.
+                let at = worker.clog_replay;
                 let next = worker
                     .clog_replay
                     .next(&worker.clog, &worker.fs_storage, buf);
+                if matches!(
+                    next,
+                    Err(command_log::LogError::Storage(
+                        kv_store::disk_store::run_storage::StorageError::Again
+                    ))
+                ) {
+                    worker.clog_replay = at;
+                    worker.disk_io_waits = worker.disk_io_waits.wrapping_add(1);
+                    return;
+                }
                 let rec = match next {
                     Ok(Some(r)) => r,
                     Ok(None) => {
@@ -1213,6 +1284,11 @@ unsafe fn drive_command_log(worker: &mut WorkerState) {
                     return;
                 }
                 let a = apply_to_store(worker, op, identity, consistency, commit_ts, body, out);
+                if a.waited {
+                    // Undone whole: the same record next step.
+                    worker.clog_replay = at;
+                    return;
+                }
                 if a.paused || worker.disk_phase != DISK_PHASE_SERVING {
                     // A logged op never pauses (only reads do); a fault
                     // has quarantined the store.
@@ -1222,6 +1298,13 @@ unsafe fn drive_command_log(worker: &mut WorkerState) {
             }
         }
         _ => {
+            // A record the log took and the device has not finished with
+            // is asked on every step, so an answer waiting on it (a held
+            // reply, a store write answered EINPROGRESS) is released as
+            // soon as the device allows, whether or not anyone asks.
+            if !settle_log(worker) {
+                return;
+            }
             retain_history(worker);
             let durable = worker.disk_state.durable_highest_revision;
             if durable > worker.clog_reclaimed
@@ -1347,6 +1430,30 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         worker.m_head_blocked = worker.m_head_blocked.wrapping_add(1);
         return false;
     }
+    if frame[0] == MSG_KV_COMMAND && len >= wire::KvCommandHead::LEN {
+        // A command is applied from the peeked copy and taken off the
+        // channel only once it has been: one the device made wait (undone
+        // whole) stays at the head and is applied again next step, and so
+        // does one whose reply waits for the command log — nothing behind
+        // either passes it.
+        let outcome = apply_command_frame(worker, &frame[ENVELOPE_HDR..total]);
+        match outcome {
+            CmdOutcome::Waited | CmdOutcome::Logged => return false,
+            CmdOutcome::Paused => hold_command(worker, &frame[ENVELOPE_HDR..total]),
+            CmdOutcome::Answered(_) | CmdOutcome::Refused => {}
+        }
+        if !worker
+            .commands_inbox
+            .take(&mut Chan { sys, handle }, len, &mut frame)
+        {
+            return false;
+        }
+        return match outcome {
+            CmdOutcome::Answered(ok) => ok,
+            CmdOutcome::Paused => true,
+            _ => false,
+        };
+    }
     if !worker
         .commands_inbox
         .take(&mut Chan { sys, handle }, len, &mut frame)
@@ -1444,17 +1551,11 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
     }
     // MSG_KV_COMMAND head layout owned by wire::KvCommandHead — kpg +
     // the canonical identity the store is scoped to.
-    if kind != MSG_KV_COMMAND || payload.len() < wire::KvCommandHead::LEN {
-        return true;
-    }
-    match apply_command_frame(worker, payload) {
-        CmdOutcome::Answered(ok) => ok,
-        CmdOutcome::Refused => false,
-        CmdOutcome::Paused => {
-            hold_command(worker, payload);
-            true
-        }
-    }
+    // Anything else — a command frame too short for its head among it —
+    // is taken and passed over, as it always was. (A whole command is
+    // applied above, before it is taken.)
+    let _ = payload;
+    true
 }
 
 /// Keep the reply in `scratch[..total]` until `responses` has room.
@@ -1476,6 +1577,9 @@ fn stash_reply(worker: &mut WorkerState, total: usize) -> bool {
 
 /// Write a waiting reply: whether none waits now.
 unsafe fn flush_reply(worker: &mut WorkerState) -> bool {
+    if !finish_logged_command(worker) {
+        return false;
+    }
     let len = worker.reply_stash_len;
     if len == 0 {
         return true;
@@ -1490,6 +1594,76 @@ unsafe fn flush_reply(worker: &mut WorkerState) -> bool {
         return true;
     }
     false
+}
+
+/// Finish a channel command whose reply waits for the command log
+/// ([`CmdOutcome::Logged`]): once the log holds its record where it was
+/// asked to (written, and durable), its mutations are published and its
+/// frame taken off the channel; the stashed reply then goes as any stashed
+/// reply does. `false` while it waits. A log that cannot take the record
+/// stops the store, and the reply is never sent.
+unsafe fn finish_logged_command(worker: &mut WorkerState) -> bool {
+    if !worker.clog_hold {
+        return true;
+    }
+    if !settle_log(worker) {
+        if worker.disk_phase == DISK_PHASE_QUARANTINED {
+            worker.reply_stash_len = 0;
+            worker.clog_hold = false;
+        }
+        return false;
+    }
+    let sys_ptr = worker.syscalls;
+    if sys_ptr.is_null() || worker.commands_in < 0 {
+        return false;
+    }
+    let sys = &*sys_ptr;
+    let handle = worker.commands_in;
+    let mut frame = [0u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE];
+    let Some((_, len)) = worker
+        .commands_inbox
+        .peek(&mut Chan { sys, handle }, &mut frame)
+    else {
+        return false;
+    };
+    let total = ENVELOPE_HDR + len;
+    if worker.clog_hold_publish {
+        worker.clog_hold_publish = false;
+        let payload = frame.get(ENVELOPE_HDR..total).unwrap_or(&[]);
+        if let Some(head) = wire::KvCommandHead::decode(payload) {
+            let body_at = wire::KvCommandHead::LEN;
+            let body = payload
+                .get(body_at..body_at + head.body_len as usize)
+                .unwrap_or(&[]);
+            let mut answer = [0u8; SCRATCH_BUF_SIZE];
+            let at = worker.clog_hold_answer_at;
+            let n = worker.clog_hold_answer_len.min(SCRATCH_BUF_SIZE);
+            for (d, b) in answer
+                .iter_mut()
+                .zip(worker.reply_stash.iter().skip(at))
+                .take(n)
+            {
+                *d = *b;
+            }
+            publish_mutations(
+                worker,
+                worker.clog_hold_op,
+                worker.clog_hold_kpg,
+                worker.clog_hold_result,
+                worker.clog_hold_revision,
+                body,
+                answer.get(..n).unwrap_or(&[]),
+            );
+        }
+    }
+    if !worker
+        .commands_inbox
+        .take(&mut Chan { sys, handle }, len, &mut frame)
+    {
+        return false;
+    }
+    worker.clog_hold = false;
+    true
 }
 
 /// The revision the store has reached.
@@ -1595,6 +1769,14 @@ enum CmdOutcome {
     /// step budget mid-reply and the provider holds its position. The
     /// frame must be re-applied, byte for byte, on a later step.
     Paused,
+    /// The device made the command wait and it was undone whole: nothing
+    /// was answered. The frame stays where it is (at the channel's head)
+    /// and is applied again on a later step; nothing behind it passes it.
+    Waited,
+    /// Applied, and its reply stashed until the command log has its
+    /// record where it was asked to be ([`finish_logged_command`]). The
+    /// frame stays at the channel's head meanwhile.
+    Logged,
 }
 
 /// Apply one `MSG_KV_COMMAND` frame (`wire::KvCommandHead` + op body)
@@ -1633,7 +1815,9 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
             | types::KV_OP_ORIGIN_IMPORT
             | types::KV_OP_ORIGIN_CHUNK
     ) {
-        apply_origin_entry(worker, &head, body);
+        if !apply_origin_entry(worker, &head, body) {
+            return CmdOutcome::Waited;
+        }
         return CmdOutcome::Answered(true);
     }
 
@@ -1653,6 +1837,8 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
             paused: false,
             busy: false,
             changed: false,
+            waited: false,
+            logging: false,
         }
     } else {
         apply_to_store(
@@ -1667,6 +1853,9 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
     };
     if applied.paused {
         return CmdOutcome::Paused;
+    }
+    if applied.waited {
+        return CmdOutcome::Waited;
     }
     let (result, result_body_len, result_revision) =
         (applied.result, applied.len, applied.revision);
@@ -1758,6 +1947,24 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
     if worker.responses_out < 0 {
         return CmdOutcome::Refused;
     }
+    if applied.logging {
+        // The op stands but its log record is not yet where it must be
+        // before anyone is answered: the reply waits in the stash, its
+        // mutations wait to be published, and the frame waits at the
+        // channel's head, until the log settles.
+        if !stash_reply(worker, total) {
+            return CmdOutcome::Refused;
+        }
+        worker.clog_hold = true;
+        worker.clog_hold_publish = id_database == 0 && id_keyspace == 0;
+        worker.clog_hold_op = op;
+        worker.clog_hold_kpg = kpg_id;
+        worker.clog_hold_result = result;
+        worker.clog_hold_revision = result_revision;
+        worker.clog_hold_answer_at = 3 + wire::KvAppliedHead::LEN;
+        worker.clog_hold_answer_len = result_body_len;
+        return CmdOutcome::Logged;
+    }
     let n = (sys.channel_write)(worker.responses_out, worker.scratch.as_mut_ptr(), total);
     let ok = n == total as i32 || stash_reply(worker, total);
 
@@ -1811,17 +2018,34 @@ impl origin::Store for OriginStore<'_> {
 
     fn wrote(&mut self, txn: &[u8], result: u8, answer: &[u8]) {
         let revision = store_revision(self.worker);
+        let w = &mut *self.worker;
+        if w.scope_depth > 0 && w.state_store == STATE_STORE_DISK {
+            // Inside the entry's undo scope: held, published only once
+            // the entry stands (`apply_origin_entry`).
+            if w.ev_held {
+                w.m_ev_second = w.m_ev_second.wrapping_add(1);
+                return;
+            }
+            w.ev_held = true;
+            w.ev_journal.buf = w.events.buf;
+            w.ev_journal.len = w.events.len;
+            w.ev_journal.overflow = w.events.overflow;
+            w.ev_txn_len = txn.len().min(SCRATCH_BUF_SIZE);
+            for (d, b) in w.ev_txn.iter_mut().zip(txn.iter()) {
+                *d = *b;
+            }
+            w.ev_answer_len = answer.len().min(ORIGIN_ANSWER_ROOM);
+            for (d, b) in w.ev_answer.iter_mut().zip(answer.iter()) {
+                *d = *b;
+            }
+            w.ev_result = result;
+            w.ev_kpg = self.kpg_id;
+            w.ev_revision = revision;
+            return;
+        }
         // SAFETY: the worker's own state and channels.
         unsafe {
-            publish_mutations(
-                self.worker,
-                KV_OP_TXN,
-                self.kpg_id,
-                result,
-                revision,
-                txn,
-                answer,
-            );
+            publish_mutations(w, KV_OP_TXN, self.kpg_id, result, revision, txn, answer);
         }
     }
 }
@@ -1829,8 +2053,20 @@ impl origin::Store for OriginStore<'_> {
 /// Apply an origin entry (`common/origin.rs`) and tell this worker's store
 /// provider what it came to. A store failing one is said: the replica can
 /// no longer follow the log faithfully.
-unsafe fn apply_origin_entry(worker: &mut WorkerState, head: &wire::KvCommandHead, body: &[u8]) {
-    let mut answer = [0u8; 512];
+unsafe fn apply_origin_entry(
+    worker: &mut WorkerState,
+    head: &wire::KvCommandHead,
+    body: &[u8],
+) -> bool {
+    let mut answer = [0u8; ORIGIN_ANSWER_ROOM];
+    // The entry's several applies are one command: a wait in any of them
+    // undoes the entry whole, and the same entry is applied again later.
+    let outer = worker.state_store == STATE_STORE_DISK && worker.scope_depth == 0;
+    if outer {
+        scope_begin(worker);
+        worker.ev_held = false;
+    }
+    worker.scope_depth = worker.scope_depth.saturating_add(1);
     let a = origin::apply_entry(
         &mut OriginStore {
             worker: &mut *worker,
@@ -1841,6 +2077,20 @@ unsafe fn apply_origin_entry(worker: &mut WorkerState, head: &wire::KvCommandHea
         body,
         &mut answer,
     );
+    worker.scope_depth = worker.scope_depth.saturating_sub(1);
+    if outer && worker.scope_waited {
+        let undone = scope_end(worker, Applied::waited(worker.disk_revision));
+        if undone.waited {
+            // Taken back whole: so are the events it would have published.
+            worker.ev_held = false;
+            return false;
+        }
+    }
+    if outer {
+        // The entry stands: nothing can take it back now, so its events
+        // go out.
+        publish_held_events(worker);
+    }
     if matches!(a, origin::Applied::Faulted | origin::Applied::Refused) {
         let (replica, inc, seq) = origin::split(head.corr_id);
         let mut buf = [0u8; 112];
@@ -1898,7 +2148,34 @@ unsafe fn apply_origin_entry(worker: &mut WorkerState, head: &wire::KvCommandHea
     if worker.prov.provides {
         store_provider::origin_applied(&mut *worker.prov.state, &a);
     }
+    true
 }
+
+/// Publish an origin entry's held watch events (see `WorkerState::ev_held`).
+unsafe fn publish_held_events(worker: &mut WorkerState) {
+    if !worker.ev_held {
+        return;
+    }
+    worker.ev_held = false;
+    worker.events.buf = worker.ev_journal.buf;
+    worker.events.len = worker.ev_journal.len;
+    worker.events.overflow = worker.ev_journal.overflow;
+    let txn = worker.ev_txn;
+    let answer = worker.ev_answer;
+    let (tl, al) = (worker.ev_txn_len, worker.ev_answer_len);
+    publish_mutations(
+        worker,
+        KV_OP_TXN,
+        worker.ev_kpg,
+        worker.ev_result,
+        worker.ev_revision,
+        txn.get(..tl).unwrap_or(&[]),
+        answer.get(..al).unwrap_or(&[]),
+    );
+}
+
+/// The answer room an origin entry's apply has.
+const ORIGIN_ANSWER_ROOM: usize = 512;
 
 /// Skipped origin entries logged by name; the rest are counted.
 const ORIGIN_SKIP_LOG_MAX: usize = 32;
@@ -1949,13 +2226,162 @@ struct Applied {
     busy: bool,
     /// The store's revision moved (a write may have queued chunk work).
     changed: bool,
+    /// The device made the op wait (a storage read or write answered
+    /// `Again`): it was undone whole — nothing of it stands — and is to be
+    /// applied again, unchanged, on a later step. Nothing is answered.
+    waited: bool,
+    /// Applied, and its command-log record is the log's but not yet where
+    /// it was asked to be (written, and durable): the answer waits for
+    /// `CommandLog::settle`.
+    logging: bool,
+}
+
+impl Applied {
+    /// Undone for a device wait (see `waited`).
+    fn waited(revision: u64) -> Self {
+        Applied {
+            result: types::KV_RESULT_INTERNAL,
+            len: 0,
+            revision,
+            paused: false,
+            busy: true,
+            changed: false,
+            waited: true,
+            logging: false,
+        }
+    }
 }
 
 /// Apply one op to the store under `identity`: the one place a command,
 /// and every call the store provider makes, reaches the store. Stamps
 /// the commit timestamp, keeps the catalog generation, counts, and
 /// accounts for disk faults, exactly as it always has for commands.
+///
+/// No storage call waits on the device, so an op's read (or the write
+/// that makes it room) may be answered "not now". Such an op is undone
+/// WHOLE — the records it added, the revision, the timestamp it took,
+/// the catalog generation — and answered `waited`: nothing of it stands,
+/// nothing is answered, and the caller applies the same op again, from
+/// the start, on a later step, by when the device has fetched what the
+/// op was waiting for (the block cache keeps every block already read).
+/// The outermost apply of a command is the scope the undo covers; an
+/// origin entry's several applies share one ([`scope_begin`]).
+///
+/// A mutating op is not applied while the command log holds a record
+/// the device has not finished with: it waits (`waited`) for the log.
 unsafe fn apply_to_store(
+    worker: &mut WorkerState,
+    op: u8,
+    identity: (u32, u32, u32),
+    consistency: u8,
+    head_commit_ts: u64,
+    body: &[u8],
+    out: &mut [u8],
+) -> Applied {
+    if worker.state_store != STATE_STORE_DISK {
+        return apply_to_store_once(worker, op, identity, consistency, head_commit_ts, body, out);
+    }
+    if worker.clog_phase == CLOG_LIVE && !op_only_reads(op) && !settle_log(worker) {
+        return Applied::waited(store_revision(worker));
+    }
+    let outer = worker.scope_depth == 0;
+    if outer {
+        scope_begin(worker);
+    }
+    worker.scope_depth = worker.scope_depth.saturating_add(1);
+    let a = if worker.scope_waited {
+        // An earlier apply of this command waited: the command is undone
+        // at its end, and this part of it is not applied at all.
+        Applied::waited(store_revision(worker))
+    } else {
+        apply_to_store_once(worker, op, identity, consistency, head_commit_ts, body, out)
+    };
+    worker.scope_depth = worker.scope_depth.saturating_sub(1);
+    if outer {
+        return scope_end(worker, a);
+    }
+    a
+}
+
+/// Open a command scope: mark where the store and the worker fields an
+/// undo restores stand.
+unsafe fn scope_begin(worker: &mut WorkerState) {
+    worker.scope_waited = false;
+    worker.scope_mark = worker.disk_state.apply_mark();
+    worker.scope_revision = worker.disk_revision;
+    worker.scope_catalog = worker.catalog_generation;
+    worker.scope_lease_next = worker.ts_lease_next;
+    worker.scope_stamped = worker.m_ts_stamped;
+    worker.scope_unstamped = worker.m_ts_unstamped;
+}
+
+/// Close a command scope: a command the device made wait is undone to
+/// the mark and answered `waited`. One that cannot be undone (a record
+/// overwritten in place, or a flushed prefix released, since the mark) is
+/// not half kept and answered: the store fails closed, as an op the log
+/// could not take does.
+unsafe fn scope_end(worker: &mut WorkerState, a: Applied) -> Applied {
+    if !worker.scope_waited {
+        return a;
+    }
+    worker.scope_waited = false;
+    worker.m_cmd_waits = worker.m_cmd_waits.wrapping_add(1);
+    let mark = worker.scope_mark;
+    if worker.disk_state.undo_to(&mark) {
+        worker.disk_revision = worker.scope_revision;
+        worker.catalog_generation = worker.scope_catalog;
+        worker.ts_lease_next = worker.scope_lease_next;
+        worker.m_ts_stamped = worker.scope_stamped;
+        worker.m_ts_unstamped = worker.scope_unstamped;
+        worker.events.clear();
+        return Applied::waited(worker.disk_revision);
+    }
+    log_disk_errno(
+        worker,
+        b"[kvw] a command the device made wait could not be undone, QUARANTINE errno=",
+    );
+    worker.disk_phase = DISK_PHASE_QUARANTINED;
+    Applied {
+        result: types::KV_RESULT_INTERNAL,
+        len: 0,
+        revision: worker.disk_revision,
+        paused: false,
+        busy: false,
+        changed: false,
+        waited: false,
+        logging: false,
+    }
+}
+
+/// Ask the command log's pending record on: `true` once nothing is
+/// pending. A log that cannot take the record (a storage fault) stops the
+/// store — the op it records is applied and must never be answered.
+unsafe fn settle_log(worker: &mut WorkerState) -> bool {
+    // A stopped store's log took a record it could not keep: nothing it
+    // holds is ever answered as kept (the failed record is gone from the
+    // log, so "nothing pending" would be a lie).
+    if worker.disk_phase == DISK_PHASE_QUARANTINED {
+        return false;
+    }
+    if !worker.clog.pending() {
+        return true;
+    }
+    match worker.clog.settle(&mut worker.fs_storage) {
+        Ok(()) => true,
+        Err(command_log::LogError::Pending) => false,
+        Err(_) => {
+            log_disk_errno(
+                worker,
+                b"[kvw] command log append failed, QUARANTINE errno=",
+            );
+            worker.disk_phase = DISK_PHASE_QUARANTINED;
+            false
+        }
+    }
+}
+
+/// [`apply_to_store`] for one op, inside its scope.
+unsafe fn apply_to_store_once(
     worker: &mut WorkerState,
     op: u8,
     identity: (u32, u32, u32),
@@ -2033,6 +2459,7 @@ unsafe fn apply_to_store(
     }
     let revision_before = store_revision(worker);
     let mut busy = false;
+    let mut logging = false;
     // ONE semantic engine (`kv_store::apply_mat_ctx`), provider selected
     // at graph construction: the interpreter is identical on both arms —
     // only the physical materializer differs.
@@ -2047,6 +2474,7 @@ unsafe fn apply_to_store(
         };
         (types::KV_RESULT_RESERVED, 0, rev)
     } else if worker.state_store == STATE_STORE_DISK {
+        let agains0 = worker.fs_storage.agains();
         let store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
         let mut mat = DiskMaterializer::new(store, worker.disk_revision, worker.disk_replay_floor);
         mat.flush_wanted = worker.disk_flush_wanted;
@@ -2075,7 +2503,16 @@ unsafe fn apply_to_store(
                 paused: true,
                 busy: false,
                 changed: false,
+                waited: false,
+                logging: false,
             };
+        }
+        if (mat_fault || mat_backpressure) && worker.fs_storage.agains() != agains0 {
+            // The device made the op wait: not a fault, and not a write
+            // refused part-way. The scope undoes it whole (`scope_end`)
+            // and the caller applies it again later.
+            worker.scope_waited = true;
+            return Applied::waited(worker.disk_revision);
         }
         busy = mat_backpressure;
         // An op wrote more versions than its bound said it could: the
@@ -2200,6 +2637,18 @@ unsafe fn apply_to_store(
         }
         match appended {
             Ok(()) => worker.clog_appends = worker.clog_appends.wrapping_add(1),
+            // Taken: the log holds the record and finishes it on later
+            // steps. The op stands; its answer waits for the log.
+            Err(command_log::LogError::Pending) => {
+                worker.clog_appends = worker.clog_appends.wrapping_add(1);
+                logging = true;
+            }
+            // Another record still pending (the gate in `apply_to_store`
+            // makes this unreachable): the op is undone and asked again.
+            Err(command_log::LogError::Busy) => {
+                worker.scope_waited = true;
+                return Applied::waited(worker.disk_revision);
+            }
             Err(_) => {
                 log_disk_errno(
                     worker,
@@ -2231,6 +2680,8 @@ unsafe fn apply_to_store(
         paused: false,
         busy,
         changed: store_revision(worker) != revision_before,
+        waited: false,
+        logging,
     }
 }
 
@@ -2293,8 +2744,12 @@ unsafe fn drive_held_command(worker: &mut WorkerState) -> bool {
     let mut frame = [0u8; HELD_FRAME_MAX];
     frame[..len].copy_from_slice(&worker.held_frame[..len]);
     match apply_command_frame(worker, &frame[..len]) {
-        CmdOutcome::Paused => {}
-        CmdOutcome::Answered(_) | CmdOutcome::Refused => worker.held_active = false,
+        // Still paging, or the device made this slice wait: held, and
+        // re-driven next step.
+        CmdOutcome::Paused | CmdOutcome::Waited => {}
+        CmdOutcome::Answered(_) | CmdOutcome::Refused | CmdOutcome::Logged => {
+            worker.held_active = false;
+        }
     }
     true
 }
@@ -2885,11 +3340,23 @@ impl store_provider::Backend for WorkerBackend<'_> {
                 }
                 disk_maintenance(w);
                 rounds += 1;
+                if w.disk_state.io_wait {
+                    // The making of room waits on the device, which moves
+                    // only between steps: asking again inside this call
+                    // cannot help. The caller asks again.
+                    w.prov.busy = true;
+                    return (types::KV_RESULT_INTERNAL, 0);
+                }
             }
             let a = apply_to_store(w, op, (0, 0, 0), consistency, 0, body, out);
-            w.prov.busy = a.busy;
+            w.prov.busy = a.busy || a.waited;
             if a.paused {
                 return (KV_RESULT_PAUSED, 0);
+            }
+            if a.waited {
+                // Undone whole: the caller asks again (EINPROGRESS for a
+                // write, EAGAIN for a read).
+                return (types::KV_RESULT_INTERNAL, 0);
             }
             if a.changed {
                 w.sweep_armed = true;
@@ -2937,6 +3404,12 @@ impl store_provider::Backend for WorkerBackend<'_> {
 
     fn busy(&self) -> bool {
         self.worker.prov.busy
+    }
+
+    fn log_pending(&mut self) -> bool {
+        // SAFETY: the worker's own state and syscalls, inside a provider
+        // call (no step of this module is running).
+        unsafe { !settle_log(self.worker) }
     }
 
     fn write(&mut self, chan: i32, bytes: &[u8]) -> i32 {
@@ -3331,6 +3804,10 @@ unsafe fn provider_make_ready(worker: &mut WorkerState) -> i32 {
         if worker.disk_phase == DISK_PHASE_QUARANTINED {
             return -1;
         }
+        // The device moves only between steps: once it has made a round
+        // wait, more rounds inside this call cannot help, and the steps
+        // carry on from where this one stood.
+        let agains0 = worker.fs_storage.agains();
         if store_serving(worker) {
             if worker.prov.import_phase == IMPORT_NONE {
                 let m = b"[kvw] store ready at construction";
@@ -3363,18 +3840,19 @@ unsafe fn provider_make_ready(worker: &mut WorkerState) -> i32 {
             if !worker.disk_flush_active && !worker.disk_compact_active {
                 drain_retirements_now(worker);
             }
+            if worker.fs_storage.agains() != agains0 {
+                let m = b"[kvw] store importing after construction (disk waits): Ready once done";
+                dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len());
+                return 0;
+            }
             continue;
         }
-        let phase = worker.disk_phase;
         disk_maintenance(worker);
         drive_command_log(worker);
-        if phase == DISK_PHASE_RECOVERING
-            && worker.disk_phase == DISK_PHASE_RECOVERING
-            && worker.fs_storage.last_was_again()
-        {
-            // The FS provider is not up yet: recover through the steps.
-            let m =
-                b"[kvw] store recovering after construction (disk not up): Ready once it serves";
+        if worker.fs_storage.agains() != agains0 {
+            // The FS provider is not up yet, or its device makes recovery
+            // wait: recover through the steps.
+            let m = b"[kvw] store recovering after construction (disk waits): Ready once it serves";
             dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len());
             return 0;
         }
@@ -3505,12 +3983,31 @@ unsafe fn import_slice(
             Ok(n) => n,
             // No log at all: nothing to import.
             Err(kv_store::disk_store::run_storage::StorageError::NotFound) => 0,
+            // Not read yet: the same record next step.
+            Err(kv_store::disk_store::run_storage::StorageError::Again) => return,
             Err(_) => {
                 log_disk_errno(worker, b"[kvw] import read failed, QUARANTINE errno=");
                 worker.disk_phase = DISK_PHASE_QUARANTINED;
                 return;
             }
         };
+        // A short read is what the provider had cached, not the log's end:
+        // read on (each read moves bytes, finds the end, or waits).
+        let mut got = got;
+        while got > 0 && got < head.len() {
+            let more = head.get_mut(got..).unwrap_or(&mut []);
+            match worker.fs_storage.read_path(path, at + got as u64, more) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                // Not read yet: the same record next step.
+                Err(kv_store::disk_store::run_storage::StorageError::Again) => return,
+                Err(_) => {
+                    log_disk_errno(worker, b"[kvw] import read failed, QUARANTINE errno=");
+                    worker.disk_phase = DISK_PHASE_QUARANTINED;
+                    return;
+                }
+            }
+        }
         let rec = if got == head.len() {
             store_provider::store_log_head(&head)
         } else {
@@ -3537,8 +4034,11 @@ unsafe fn import_slice(
             let from = at + (store_provider::STORE_LOG_HEAD + filled) as u64;
             let rest = body.get_mut(filled..).unwrap_or(&mut []);
             match worker.fs_storage.read_path(path, from, rest) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => filled += n,
+                // Not read yet: the same record next step, from its head.
+                Err(kv_store::disk_store::run_storage::StorageError::Again) => return,
+                Err(_) => break,
             }
         }
         if filled < body.len() {
@@ -3604,8 +4104,37 @@ unsafe fn import_slice(
 /// it, and serve.
 #[cfg(feature = "store_provider")]
 unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consistency: u8) {
-    worker.prov.import_phase = IMPORT_NONE;
     worker.clog_defer = false;
+    if worker.import_end_pending {
+        // The end's record is applied; it is recorded once the log holds
+        // it durably.
+        if !settle_log(worker) {
+            return;
+        }
+        worker.import_end_pending = false;
+        worker.prov.import_phase = IMPORT_NONE;
+        worker.prov.import_marked = true;
+        import_logged(worker);
+        return;
+    }
+    // What was imported is durable before its end is recorded. A fence
+    // the device has not finished is asked again next step, the import
+    // standing at its end meanwhile.
+    if worker.sweep_wrap == 0 && worker.clog_phase == CLOG_LIVE {
+        match worker.clog.sync(&mut worker.fs_storage) {
+            Ok(()) => {}
+            Err(command_log::LogError::Pending) => return,
+            Err(_) => {
+                log_disk_errno(
+                    worker,
+                    b"[kvw] import could not make itself durable, QUARANTINE errno=",
+                );
+                worker.disk_phase = DISK_PHASE_QUARANTINED;
+                return;
+            }
+        }
+    }
+    worker.prov.import_phase = IMPORT_NONE;
     // A replica's marker applied with each record it imported.
     if worker.sweep_wrap != 0 {
         if worker.prov.import_n > 0 {
@@ -3614,15 +4143,6 @@ unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consisten
         return;
     }
     if worker.prov.import_n == 0 && worker.prov.import_marked {
-        return;
-    }
-    // What was imported is durable before its end is recorded.
-    if worker.clog_phase == CLOG_LIVE && worker.clog.sync(&mut worker.fs_storage).is_err() {
-        log_disk_errno(
-            worker,
-            b"[kvw] import could not make itself durable, QUARANTINE errno=",
-        );
-        worker.disk_phase = DISK_PHASE_QUARANTINED;
         return;
     }
     let k = origin::IMPORTED_KEY;
@@ -3656,12 +4176,23 @@ unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consisten
         body.get(..at).unwrap_or(&[]),
         &mut ans,
     );
+    if a.waited {
+        // Undone: the end is recorded on a later step.
+        worker.prov.import_phase = IMPORT_RUN;
+        return;
+    }
     if a.result != KV_RESULT_OK {
         log_disk_errno(
             worker,
             b"[kvw] import could not record its end, QUARANTINE errno=",
         );
         worker.disk_phase = DISK_PHASE_QUARANTINED;
+        return;
+    }
+    if a.logging {
+        // Recorded once the log holds the end's record durably.
+        worker.import_end_pending = true;
+        worker.prov.import_phase = IMPORT_RUN;
         return;
     }
     worker.prov.import_marked = true;
@@ -4541,22 +5072,37 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                     match store.prepare_step() {
                         Ok(Progress::Done) => {}
                         Ok(Progress::InProgress { .. }) => return,
+                        // The device could not take the slot's action now
+                        // (or is still mounting): asked again next step,
+                        // where it stands.
+                        Err(StoreError::Backpressure) => {
+                            worker.disk_io_waits = worker.disk_io_waits.wrapping_add(1);
+                            worker.disk_degraded_steps =
+                                worker.disk_degraded_steps.saturating_add(1);
+                            return;
+                        }
                         Err(_) => {
                             worker.disk_degraded_steps =
                                 worker.disk_degraded_steps.saturating_add(1);
-                            if !worker.fs_storage.last_was_transient() {
-                                log_disk_errno(worker, b"[kvw] disk QUARANTINE prepare errno=");
-                                worker.disk_phase = DISK_PHASE_QUARANTINED;
-                            }
+                            log_disk_errno(worker, b"[kvw] disk QUARANTINE prepare errno=");
+                            worker.disk_phase = DISK_PHASE_QUARANTINED;
                             return;
                         }
                     }
                 }
             }
-            let recovered = {
+            // One bounded slice of recovery per step; a storage call the
+            // device cannot take now is asked again next step, recovery
+            // standing exactly where it was (its listing, the run being
+            // verified, the delete in flight).
+            let outcome = {
                 let mut store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
-                store.recover().is_ok()
+                store.recover_step()
             };
+            if matches!(outcome, Ok(Progress::InProgress { .. })) {
+                return;
+            }
+            let recovered = matches!(outcome, Ok(Progress::Done));
             if recovered {
                 // Replay idempotence: seed the clock for a
                 // FULL replay — the WAL re-feeds the committed stream
@@ -4591,15 +5137,17 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                     let sys = &*worker.syscalls;
                     dev_log(sys, 2, b"[kvw] disk recover ok".as_ptr(), 21);
                 }
-            } else if !worker.fs_storage.last_was_transient() {
+            } else if outcome == Err(StoreError::Backpressure) {
+                // The device (or a provider still mounting) made recovery
+                // wait: stay in RECOVERING; the next step continues it.
+                // Counted, so a provider that never comes up is visible in
+                // the periodic degraded line rather than looking like a
+                // silent idle module.
+                worker.disk_io_waits = worker.disk_io_waits.wrapping_add(1);
+                worker.disk_degraded_steps = worker.disk_degraded_steps.saturating_add(1);
+            } else {
                 log_disk_errno(worker, b"[kvw] disk QUARANTINE recover errno=");
                 worker.disk_phase = DISK_PHASE_QUARANTINED;
-            } else {
-                // E_AGAIN: stay in RECOVERING and retry next step. Count
-                // it so a provider that never finishes initialising is
-                // visible in the periodic degraded line rather than
-                // looking like a silent idle module.
-                worker.disk_degraded_steps = worker.disk_degraded_steps.saturating_add(1);
             }
         }
         DISK_PHASE_SERVING => {
@@ -4698,6 +5246,19 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                         worker.disk_hard_faults = 0;
                         worker.disk_fence_steps = 0;
                     }
+                    // The device could not take the merge's storage action
+                    // now (its block device is busy — the WAL's writes
+                    // share it — or the provider is still mounting). The
+                    // merge stands exactly where it was and the next step
+                    // asks the same action again: nothing is restarted.
+                    // A wait is the device's pace, not a stalled fence.
+                    Err(StoreError::Backpressure)
+                        if worker.disk_state.io_wait
+                            && worker.disk_state.compaction_in_flight().is_some() =>
+                    {
+                        worker.disk_io_waits = worker.disk_io_waits.wrapping_add(1);
+                        worker.disk_fence_steps = 0;
+                    }
                     // Busy (snapshot/install in flight): retry later.
                     //
                     // Counted, because this is the worst silent stall
@@ -4710,17 +5271,6 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                     Err(StoreError::Backpressure) => {
                         worker.disk_flush_backpressure =
                             worker.disk_flush_backpressure.wrapping_add(1);
-                        worker.disk_degraded_steps = worker.disk_degraded_steps.saturating_add(1);
-                    }
-                    Err(_) if worker.fs_storage.last_was_transient() => {
-                        // Transient FS backpressure (E_AGAIN: the FS
-                        // provider is still initialising, or the block
-                        // device it sits on is busy — the WAL's async
-                        // writes share that device). The WAL's wait
-                        // idiom, not a fault: restart this compaction
-                        // from scratch on a later step. Nothing durable
-                        // changed — compaction publishes last.
-                        worker.disk_compact_active = false;
                         worker.disk_degraded_steps = worker.disk_degraded_steps.saturating_add(1);
                     }
                     Err(_) => {
@@ -4815,6 +5365,15 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                     worker.disk_fence_steps = 0;
                     return; // one bounded storage action per step
                 }
+                if outcome == Err(StoreError::Backpressure) && worker.disk_state.flush_active() {
+                    // The device could not take the flush's storage action
+                    // now. The flush stands where it was — its run file,
+                    // its blocks, its fence — and the next step asks the
+                    // same action again; nothing is written twice and
+                    // nothing restarts, however long the device takes.
+                    worker.disk_io_waits = worker.disk_io_waits.wrapping_add(1);
+                    return;
+                }
                 worker.disk_flush_active = false;
                 {
                     let ms = now_ms(worker).wrapping_sub(worker.disk_flush_t0);
@@ -4874,13 +5433,6 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                             // a reason to destroy history.
                             worker.disk_compact_floor = worker.disk_state.compaction_floor;
                         }
-                    }
-                    Err(_) if worker.fs_storage.last_was_transient() => {
-                        // Transient FS backpressure — retry the flush
-                        // next step. `flush_inner` re-derives the same
-                        // run id and `create_fresh` clears the orphan
-                        // left by this attempt, so the retry is clean.
-                        worker.disk_degraded_steps = worker.disk_degraded_steps.saturating_add(1);
                     }
                     Err(_) => {
                         // Hard fault. A failed flush publishes nothing:
@@ -5157,6 +5709,15 @@ unsafe fn disk_observe(worker: &mut WorkerState) {
     n = write_dec(&mut buf, n, worker.disk_flush_backpressure);
     n = write_prefix(&mut buf, n, b" cf=");
     n = write_dec(&mut buf, n, worker.disk_cmd_flush_faults);
+    // Device waits: storage actions asked again where they stood (iow),
+    // `Again` answers from the FS provider (ag), and commands undone and
+    // applied again (cw).
+    n = write_prefix(&mut buf, n, b" iow=");
+    n = write_dec(&mut buf, n, worker.disk_io_waits);
+    n = write_prefix(&mut buf, n, b" ag=");
+    n = write_dec(&mut buf, n, worker.fs_storage.agains());
+    n = write_prefix(&mut buf, n, b" cw=");
+    n = write_dec(&mut buf, n, worker.m_cmd_waits);
     // The committed GC floor — 0 means no floor has ever
     // committed, i.e. the reclamation loop is NOT running.
     n = write_prefix(&mut buf, n, b" gcf=");
@@ -5883,14 +6444,23 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                     let outcome = {
                         let mut store =
                             DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
-                        store.install(
+                        let r = store.install(
                             req,
                             SnapshotChunk {
                                 offset: 0,
                                 data: &worker.import_buf[..total],
                                 last: true,
                             },
-                        )
+                        );
+                        if r == Err(StoreError::Backpressure) && store.install_active() {
+                            // One-shot: nothing asks this chunk again, so an
+                            // install the device made wait part-way is
+                            // abandoned — EMPTY, as every failed install
+                            // leaves the store — and the snapshot is asked
+                            // for again.
+                            store.abort_fences();
+                        }
+                        r
                     };
                     if matches!(outcome, Ok(Progress::Done)) {
                         // `install` adopted the header's frontier into

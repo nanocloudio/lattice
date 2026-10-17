@@ -2463,8 +2463,17 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
             self.backpressure = true;
             return false;
         }
-        match self.store.flush() {
+        // Driven only as far as it goes without waiting on the device: a
+        // storage action the device cannot take now, or a fence still
+        // pending, is backpressure too — the flush (or merge) stays in
+        // flight and the maintenance steps finish it. Never a spin: the
+        // device moves only between steps.
+        match self.store.flush_drive() {
             Ok(()) => true,
+            Err(StoreError::Backpressure) if self.store.flush_in_progress() => {
+                self.backpressure = true;
+                false
+            }
             Err(StoreError::Backpressure) => {
                 // The run set is full: merge. A compaction already under
                 // way (maintenance's, at a committed floor) is the one
@@ -2479,6 +2488,12 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
                     match self.store.compact(floor, cursor) {
                         Ok(Progress::Done) => break,
                         Ok(Progress::InProgress { cursor: c }) => {
+                            if self.store.state.io_wait {
+                                // A fence the device has not made durable
+                                // yet: the merge finishes on later steps.
+                                self.backpressure = true;
+                                return false;
+                            }
                             cursor = c;
                             steps += 1;
                             if steps > DISK_COMPACT_STEP_CAP {
@@ -2486,14 +2501,22 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
                                 return false;
                             }
                         }
+                        Err(StoreError::Backpressure) if self.store.state.io_wait => {
+                            self.backpressure = true;
+                            return false;
+                        }
                         Err(_) => {
                             self.fault = true;
                             return false;
                         }
                     }
                 }
-                match self.store.flush() {
+                match self.store.flush_drive() {
                     Ok(()) => true,
+                    Err(StoreError::Backpressure) if self.store.state.io_wait => {
+                        self.backpressure = true;
+                        false
+                    }
                     Err(_) => {
                         self.fault = true;
                         false

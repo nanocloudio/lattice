@@ -45,6 +45,21 @@
 //! seeded at that start. Once a flush publishes `H`, every segment before
 //! the newest one starting at or below `H` is no longer needed.
 //!
+//! ## Asking again
+//!
+//! No storage call waits on the device: any of them may answer `Again`
+//! (see `run_storage.rs`). The log is therefore a step machine. An append
+//! STAGES its record whole — header, fixed fields and body, in the log's
+//! own buffer — and then writes it as one storage append (and, when
+//! durable, fences it); a rotation is a fence of the segment being
+//! closed, a create, a header append, a header fence and the new name's
+//! publication (`fsync_name`). Whichever action
+//! the device cannot take now stands, and [`CommandLog::settle`] (or the
+//! next append) asks it again — the storage continues the bytes it already
+//! took. [`LogError::Pending`] says the record is the log's and is not yet
+//! where it was asked to be: the op it records must not be answered until
+//! `settle` says so. While a record is pending the log takes no other.
+//!
 //! Mounted beside `kv_store` (reached as `super::kv_store::disk_store`).
 
 use super::kv_store::disk_store::run_storage::{FileKind, RunStorage, StorageError};
@@ -78,6 +93,12 @@ pub enum LogError {
     Full,
     /// An op larger than [`BODY_MAX`].
     TooLarge,
+    /// The record is taken (staged) but not yet written, or not yet
+    /// durable when asked to be: [`CommandLog::settle`] on a later step
+    /// finishes it. Not a failure — the op it records waits for it.
+    Pending,
+    /// A record is pending: this one is not taken. Settle, then ask again.
+    Busy,
 }
 
 impl From<StorageError> for LogError {
@@ -85,6 +106,30 @@ impl From<StorageError> for LogError {
         LogError::Storage(e)
     }
 }
+
+/// What the log is doing for the record in flight (`CommandLog::stage`).
+const IDLE: u8 = 0;
+/// Rotation: fencing the segment being closed.
+const ROT_SYNC: u8 = 1;
+/// Rotation: creating the new segment.
+const ROT_CREATE: u8 = 2;
+/// Rotation: its header.
+const ROT_HEADER: u8 = 3;
+/// Rotation: fencing the header.
+const ROT_FENCE: u8 = 4;
+/// The staged record: its one append.
+const REC_WRITE: u8 = 5;
+/// The staged record: its fence (a durable append).
+const REC_FENCE: u8 = 6;
+/// `sync`: fencing the newest segment's records.
+const SYNC_FENCE: u8 = 7;
+/// Rotation: publishing the new segment's NAME, so no record — and no
+/// answer resting on one — lands in a segment a power cut could lose
+/// whole by name.
+const ROT_NAME: u8 = 8;
+
+/// A whole staged record: its head and payload.
+pub const STAGED_MAX: usize = RECORD_HEAD + PAYLOAD_MAX;
 
 /// One logged op, as it ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +204,22 @@ pub struct CommandLog {
     /// The newest segment holds records not yet made durable (appended
     /// with `durable` false — a bulk load's, synced at its end).
     dirty: bool,
+    /// The action in flight (`IDLE` when none).
+    stage: u8,
+    /// The staged record is to be made durable.
+    rec_durable: bool,
+    /// The segment a rotation in flight opens: `(id, start, prev_end)`.
+    rot: (u32, u64, u64),
+    /// The staged record's length in `staged`.
+    staged_len: usize,
+    staged: [u8; STAGED_MAX],
+    /// Recovery's listing, kept across asks: `listed` entries, once
+    /// `have_list` (the zeroed log has none).
+    ids: [u32; SEGMENTS],
+    listed: usize,
+    have_list: bool,
+    /// Segment headers recovery has read (of the sorted listing).
+    hdr_at: usize,
 }
 
 impl Default for CommandLog {
@@ -175,6 +236,15 @@ impl CommandLog {
             len: 0,
             open: false,
             dirty: false,
+            stage: IDLE,
+            rec_durable: false,
+            rot: (0, 0, 0),
+            staged_len: 0,
+            staged: [0u8; STAGED_MAX],
+            ids: [0u32; SEGMENTS],
+            listed: 0,
+            have_list: false,
+            hdr_at: 0,
         }
     }
 
@@ -189,44 +259,146 @@ impl CommandLog {
             .map_or(1, |s| s.0.wrapping_add(1).max(1))
     }
 
-    /// Open a new segment starting at revision `start`.
+    /// Is a record (or a rotation, or a sync) part-way? While it is, the
+    /// op it records is not to be answered, and the log takes no other
+    /// record ([`LogError::Busy`]).
+    pub fn pending(&self) -> bool {
+        self.stage != IDLE
+    }
+
+    /// Ask the action in flight again: `Ok` once nothing is pending (the
+    /// staged record written, and fenced when asked to be),
+    /// `Err(Pending)` while the device still cannot take it, any other
+    /// error as the storage gave it — the segment is then closed (its tail
+    /// may be torn; the next segment states where it stops).
+    pub fn settle<S: RunStorage>(&mut self, s: &mut S) -> Result<(), LogError> {
+        loop {
+            let step = match self.stage {
+                IDLE => return Ok(()),
+                ROT_SYNC | SYNC_FENCE => self
+                    .newest_id()
+                    .map_or(Ok(()), |id| s.fsync(FileKind::Log, id)),
+                ROT_CREATE => match s.create(FileKind::Log, self.rot.0) {
+                    // A create the provider decided while nobody was
+                    // asking: the file is there, and empty.
+                    Ok(()) | Err(StorageError::AlreadyExists) => Ok(()),
+                    Err(e) => Err(e),
+                },
+                ROT_HEADER => s.append(FileKind::Log, self.rot.0, &header(self.rot.1, self.rot.2)),
+                ROT_FENCE => s.fsync(FileKind::Log, self.rot.0),
+                ROT_NAME => s.fsync_name(FileKind::Log, self.rot.0),
+                REC_WRITE => match self.newest_id() {
+                    Some(id) => s.append(
+                        FileKind::Log,
+                        id,
+                        self.staged.get(..self.staged_len).unwrap_or(&[]),
+                    ),
+                    None => Err(StorageError::IoFault),
+                },
+                _ => self
+                    .newest_id()
+                    .map_or(Ok(()), |id| s.fsync(FileKind::Log, id)),
+            };
+            match step {
+                Ok(()) => self.advance(),
+                Err(StorageError::Again) => return Err(LogError::Pending),
+                Err(e) => {
+                    // Nothing is appended after a torn tail: the segment
+                    // closes, and what was staged is dropped with it.
+                    self.open = false;
+                    self.stage = IDLE;
+                    self.staged_len = 0;
+                    return Err(LogError::Storage(e));
+                }
+            }
+        }
+    }
+
+    /// The action in flight has landed: on to the next.
+    fn advance(&mut self) {
+        self.stage = match self.stage {
+            ROT_SYNC => {
+                self.dirty = false;
+                ROT_CREATE
+            }
+            ROT_CREATE => ROT_HEADER,
+            ROT_HEADER => ROT_FENCE,
+            ROT_FENCE => ROT_NAME,
+            ROT_NAME => {
+                if let Some(slot) = self.segs.get_mut(self.count) {
+                    *slot = self.rot;
+                }
+                self.count += 1;
+                self.len = HEADER_LEN as u64;
+                self.open = true;
+                if self.staged_len > 0 {
+                    REC_WRITE
+                } else {
+                    IDLE
+                }
+            }
+            REC_WRITE => {
+                self.len += self.staged_len as u64;
+                self.staged_len = 0;
+                if self.rec_durable {
+                    REC_FENCE
+                } else {
+                    self.dirty = true;
+                    IDLE
+                }
+            }
+            REC_FENCE | SYNC_FENCE => {
+                self.dirty = false;
+                IDLE
+            }
+            _ => IDLE,
+        };
+    }
+
+    fn newest_id(&self) -> Option<u32> {
+        self.segments().last().map(|seg| seg.0)
+    }
+
+    /// Open a new segment starting at revision `start`: `Ok` once it is
+    /// open, `Err(Pending)` while the device takes it (settle), or the
+    /// refusal.
     pub fn rotate<S: RunStorage>(&mut self, s: &mut S, start: u64) -> Result<(), LogError> {
+        if self.stage != IDLE {
+            return Err(LogError::Busy);
+        }
+        self.begin_rotate(start)?;
+        self.settle(s)
+    }
+
+    /// Stage a rotation to a segment starting at `start`.
+    fn begin_rotate(&mut self, start: u64) -> Result<(), LogError> {
         if self.count == SEGMENTS {
             return Err(LogError::Full);
         }
-        // The segment being closed is made durable first: nothing after it
-        // may be durable while it is not.
-        self.sync(s)?;
         let id = self.next_id();
         // Where the segment this one follows stops: its length (or where a
         // replay found its torn tail).
         let prev_end = if self.count == 0 { 0 } else { self.len };
-        s.create(FileKind::Log, id)?;
-        s.append(FileKind::Log, id, &header(start, prev_end))?;
-        s.fsync(FileKind::Log, id)?;
-        if let Some(slot) = self.segs.get_mut(self.count) {
-            *slot = (id, start, prev_end);
-        }
-        self.count += 1;
-        self.len = HEADER_LEN as u64;
-        self.open = true;
+        self.rot = (id, start, prev_end);
+        // The segment being closed is made durable first: nothing after it
+        // may be durable while it is not.
+        self.stage = if self.dirty { ROT_SYNC } else { ROT_CREATE };
         Ok(())
     }
 
-    /// Make every record appended so far durable.
+    /// Make every record appended so far durable: `Ok` once it is,
+    /// `Err(Pending)` while the fence is outstanding (settle).
     pub fn sync<S: RunStorage>(&mut self, s: &mut S) -> Result<(), LogError> {
-        if !self.dirty {
+        if self.stage != IDLE {
+            // Whatever is in flight finishes first; a durable record's own
+            // fence covers everything before it.
+            self.settle(s)?;
+        }
+        if !self.dirty || self.newest_id().is_none() {
             return Ok(());
         }
-        let Some(&(id, _, _)) = self.segments().last() else {
-            return Ok(());
-        };
-        if let Err(e) = s.fsync(FileKind::Log, id) {
-            self.open = false;
-            return Err(LogError::Storage(e));
-        }
-        self.dirty = false;
-        Ok(())
+        self.stage = SYNC_FENCE;
+        self.settle(s)
     }
 
     /// Append `r` and — `durable` — make it (and everything before it)
@@ -236,6 +408,11 @@ impl CommandLog {
     /// memtable at: a freeze since the segment opened, or a full segment,
     /// opens a new one first (starting there), so a segment's ops all ran
     /// at or after its start.
+    ///
+    /// `Err(Pending)`: the record is taken — staged in the log — and the
+    /// device has not finished with it; the op must not be answered until
+    /// [`CommandLog::settle`] answers `Ok`. `Err(Busy)`: an earlier record
+    /// is still pending, and this one is NOT taken.
     pub fn append<S: RunStorage>(
         &mut self,
         s: &mut S,
@@ -244,6 +421,9 @@ impl CommandLog {
         frozen: u64,
         durable: bool,
     ) -> Result<(), LogError> {
+        if self.stage != IDLE {
+            return Err(LogError::Busy);
+        }
         if r.body.len() > BODY_MAX {
             return Err(LogError::TooLarge);
         }
@@ -252,45 +432,32 @@ impl CommandLog {
             None => true,
             Some(st) => !self.open || frozen > st || self.len >= SEGMENT_BYTES,
         };
+        // Stage the record whole: from here it is the log's, and every
+        // ask of its append is the same bytes.
+        let f = fixed(r);
+        let crc = crc32_finish(crc32_update(crc32_update(CRC32_INIT, &f), r.body));
+        let len = (PAYLOAD_FIXED + r.body.len()) as u32;
+        let mut at = 0usize;
+        put(&mut self.staged, &mut at, &len.to_le_bytes());
+        put(&mut self.staged, &mut at, &crc.to_le_bytes());
+        put(&mut self.staged, &mut at, &f);
+        put(&mut self.staged, &mut at, r.body);
+        self.staged_len = at;
+        self.rec_durable = durable;
         if rotate {
             let at = if frozen > start.unwrap_or(0) && frozen <= revision {
                 frozen
             } else {
                 revision
             };
-            self.rotate(s, at)?;
+            if let Err(e) = self.begin_rotate(at) {
+                self.staged_len = 0;
+                return Err(e);
+            }
+        } else {
+            self.stage = REC_WRITE;
         }
-        let Some(&(id, _, _)) = self.segments().last() else {
-            return Err(LogError::Corrupt);
-        };
-        let f = fixed(r);
-        let crc = crc32_finish(crc32_update(crc32_update(CRC32_INIT, &f), r.body));
-        let len = (PAYLOAD_FIXED + r.body.len()) as u32;
-        let mut head = [0u8; RECORD_HEAD];
-        let mut at = 0usize;
-        put(&mut head, &mut at, &len.to_le_bytes());
-        put(&mut head, &mut at, &crc.to_le_bytes());
-        // Once any byte of a record is out, the segment is closed on a
-        // failure: its tail may be torn, and nothing is appended after a
-        // torn tail.
-        let written = s
-            .append(FileKind::Log, id, &head)
-            .and_then(|()| s.append(FileKind::Log, id, &f))
-            .and_then(|()| s.append(FileKind::Log, id, r.body))
-            .and_then(|()| {
-                if durable {
-                    s.fsync(FileKind::Log, id)
-                } else {
-                    Ok(())
-                }
-            });
-        if let Err(e) = written {
-            self.open = false;
-            return Err(LogError::Storage(e));
-        }
-        self.dirty = !durable;
-        self.len += (RECORD_HEAD as u64) + u64::from(len);
-        Ok(())
+        self.settle(s)
     }
 
     /// A replay ended at `end` in the newest segment: the next segment
@@ -351,32 +518,61 @@ impl CommandLog {
     /// that are dropped. `Ok(None)`: no log (a new store, or one that never
     /// logged); `Ok(Some(start))`: replay from [`Replay::new`] with the
     /// revision clock seeded at `start`.
+    ///
+    /// `Err(Storage(Again))`: the device deferred a listing or a read; ask
+    /// again — the listing is kept and continues, the reads are made again.
     pub fn recover<S: RunStorage>(
         &mut self,
         s: &mut S,
         high: u64,
     ) -> Result<Option<u64>, LogError> {
-        let mut ids = [0u32; SEGMENTS];
-        let n = match s.list(FileKind::Log, &mut ids) {
-            Ok(n) => n,
-            Err(StorageError::Overflow) => return Err(LogError::Full),
-            Err(e) => return Err(LogError::Storage(e)),
-        };
-        let ids = ids.get_mut(..n).unwrap_or(&mut []);
-        // Insertion sort: a handful of ids, and `sort_unstable` brings a
-        // panic path a module image cannot link.
-        for i in 1..ids.len() {
-            let mut j = i;
-            while j > 0 && ids.get(j - 1) > ids.get(j) {
-                ids.swap(j - 1, j);
-                j -= 1;
+        let r = self.recover_listed(s, high);
+        if r != Err(LogError::Storage(StorageError::Again)) {
+            self.have_list = false;
+        }
+        r
+    }
+
+    fn recover_listed<S: RunStorage>(
+        &mut self,
+        s: &mut S,
+        high: u64,
+    ) -> Result<Option<u64>, LogError> {
+        // The listing continues into the same buffer when the FS answers
+        // part-way (`Again`), and is not walked again once it is whole.
+        if !self.have_list {
+            match s.list(FileKind::Log, &mut self.ids) {
+                Ok(n) => {
+                    let n = n.min(SEGMENTS);
+                    // Insertion sort: a handful of ids, and `sort_unstable`
+                    // brings a panic path a module image cannot link.
+                    let ids = self.ids.get_mut(..n).unwrap_or(&mut []);
+                    for i in 1..ids.len() {
+                        let mut j = i;
+                        while j > 0 && ids.get(j - 1) > ids.get(j) {
+                            ids.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                    self.listed = n;
+                    self.have_list = true;
+                    self.count = 0;
+                    self.hdr_at = 0;
+                }
+                Err(StorageError::Overflow) => return Err(LogError::Full),
+                Err(e) => return Err(LogError::Storage(e)),
             }
         }
+        let n = self.listed;
+        let ids = self.ids;
+        let ids = ids.get(..n).unwrap_or(&[]);
         let newest = ids.last().copied().unwrap_or(0);
-        self.count = 0;
-        for &id in ids.iter() {
+        // Each header is read once: one the device defers is asked again
+        // from where the reading stands (`hdr_at`).
+        while let Some(&id) = ids.get(self.hdr_at) {
             let mut h = [0u8; HEADER_LEN];
-            let got = s.read_at(FileKind::Log, id, 0, &mut h)?;
+            let got = read_full(s, id, 0, &mut h)?;
+            self.hdr_at += 1;
             let ok = got == HEADER_LEN
                 && rd32(&h, 0) == Some(SEGMENT_MAGIC)
                 && h.get(4..6) == Some(&SEGMENT_VERSION.to_le_bytes()[..])
@@ -397,6 +593,7 @@ impl CommandLog {
         }
         self.open = false;
         self.len = 0;
+        self.stage = IDLE;
         if self.count == 0 {
             return Ok(None);
         }

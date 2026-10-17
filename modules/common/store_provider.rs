@@ -206,8 +206,15 @@ pub trait Backend {
     /// Whether an answered write is on non-volatile media.
     fn durable(&self) -> bool;
     /// Whether the last write was refused for now (the store is making
-    /// room): the caller asks again.
+    /// room, or its device made the op wait): the caller asks again.
     fn busy(&self) -> bool;
+    /// Whether the store's own log holds a record the device has not
+    /// finished with — not yet written, or not yet durable — after asking
+    /// it on once more. A write whose record that is must not be answered
+    /// as decided until this says `false`.
+    fn log_pending(&mut self) -> bool {
+        false
+    }
     /// Write `bytes` to channel `chan`, whole or not at all: the count
     /// written, or negative.
     fn write(&mut self, chan: i32, bytes: &[u8]) -> i32;
@@ -399,7 +406,29 @@ pub struct Provider {
     rep: Replication,
     /// This node's private records (a replica's).
     scope: Scope,
+    /// A single store's write that has applied but whose record its own
+    /// log has not made durable yet: answered `EINPROGRESS` until it is,
+    /// keyed by the caller and the request's bytes as a replica keys its
+    /// writes, so asking again is a second look at the same write.
+    local: LocalWrite,
 }
+
+/// See [`Provider::local`].
+#[derive(Clone, Copy)]
+struct LocalWrite {
+    active: bool,
+    /// The decision (0, or the errno), and the revision a success is at.
+    rc: i32,
+    rev: u64,
+    id: Hash,
+}
+
+const NO_LOCAL_WRITE: LocalWrite = LocalWrite {
+    active: false,
+    rc: 0,
+    rev: 0,
+    id: [0u8; HASH_LEN],
+};
 
 impl Provider {
     pub const fn new() -> Self {
@@ -415,6 +444,7 @@ impl Provider {
             cache_at: 0,
             rep: NO_REPLICATION,
             scope: NO_SCOPE,
+            local: NO_LOCAL_WRITE,
         }
     }
 
@@ -765,6 +795,11 @@ fn read<B: Backend>(
 ) -> Result<(u8, usize), i32> {
     let req = bufs.req.get(..len).ok_or(EINVAL)?;
     let (r, n) = run(b, op, req, bufs.ans);
+    if r != KV_RESULT_PAUSED && b.busy() {
+        // The device made the read wait: not now — the caller asks again
+        // with the same request.
+        return Err(EAGAIN);
+    }
     let ans = bufs.ans.get(..n).ok_or(ERROR)?;
     if !Expander::wants(op, r) {
         copy(bufs.cache, ans);
@@ -779,7 +814,7 @@ fn read<B: Backend>(
                 let (cr, cn) =
                     b.apply(kv_large::FETCH_OP, &kv_large::chunk_request(&h), &mut chunk);
                 if cr != KV_RESULT_OK {
-                    return Err(ERROR);
+                    return Err(if b.busy() { EAGAIN } else { ERROR });
                 }
                 ex.take(chunk.get(..cn).ok_or(ERROR)?, bufs.cache)
                     .map_err(|_| ERROR)?;
@@ -1064,14 +1099,69 @@ fn obj_put<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
     if b.replicated() {
         return replicated_write(pv, b, &w);
     }
-    match put_value(pv, b, bufs, w.key, w.value.unwrap_or(&[]), w.pre, w.rev) {
-        Err(e) => e,
-        Ok(()) => {
-            // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
-            unsafe { write_fence(write_fence_kind(b), b.revision(), w.fence_ptr, w.fence_cap) };
-            0
+    local_write(pv, b, &w, |pv, b| {
+        put_value(pv, b, bufs, w.key, w.value.unwrap_or(&[]), w.pre, w.rev)
+    })
+}
+
+/// A single store's write: decided in the call — and answered so once the
+/// store's own log holds its record durably. A write whose record the
+/// device has not made durable yet is answered `EINPROGRESS` and kept
+/// (with its decision); the same request asked again is answered from it
+/// once the log is durable, never applied a second time. Another write
+/// asked meanwhile is not taken (`EINPROGRESS`: asked again, taken then).
+fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B) -> Result<(), i32>>(
+    pv: &mut Provider,
+    b: &mut B,
+    w: &WriteArgs<'_>,
+    apply: F,
+) -> i32 {
+    let id = write_id(&b.caller(), w);
+    if pv.local.active {
+        if b.log_pending() {
+            return EINPROGRESS;
         }
+        let x = pv.local;
+        if x.id == id {
+            pv.local.active = false;
+            if x.rc == 0 {
+                // SAFETY: the contract names `fence_cap` bytes at
+                // `fence_ptr`.
+                unsafe { write_fence(write_fence_kind(b), x.rev, w.fence_ptr, w.fence_cap) };
+            }
+            return x.rc;
+        }
+        // Its caller stopped asking: the write stands (it is in the log),
+        // only the answer goes uncollected.
+        pv.local.active = false;
     }
+    if b.log_pending() {
+        // The log is finishing another record; nothing is applied now.
+        return EINPROGRESS;
+    }
+    let rc = match apply(pv, b) {
+        Err(e) => e,
+        Ok(()) => 0,
+    };
+    if rc == EINPROGRESS {
+        // Not taken: the store is making room, or its device made the
+        // write wait (and it was undone). Asked again, it is taken then.
+        return EINPROGRESS;
+    }
+    if b.log_pending() {
+        pv.local = LocalWrite {
+            active: true,
+            rc,
+            rev: b.revision(),
+            id,
+        };
+        return EINPROGRESS;
+    }
+    if rc == 0 {
+        // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
+        unsafe { write_fence(write_fence_kind(b), b.revision(), w.fence_ptr, w.fence_cap) };
+    }
+    rc
 }
 
 /// Put `value` at `key` under a precondition (`pre`, and the revision an
@@ -1179,14 +1269,9 @@ fn obj_delete<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: 
     if b.replicated() {
         return replicated_write(pv, b, &w);
     }
-    match delete_key(pv, b, bufs, w.key, w.pre, w.rev) {
-        Err(e) => e,
-        Ok(()) => {
-            // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
-            unsafe { write_fence(write_fence_kind(b), b.revision(), w.fence_ptr, w.fence_cap) };
-            0
-        }
-    }
+    local_write(pv, b, &w, |pv, b| {
+        delete_key(pv, b, bufs, w.key, w.pre, w.rev)
+    })
 }
 
 /// Read `key` now, expanded: `(mod revision, value offset in the cache,

@@ -460,6 +460,9 @@ pub const MAX_RECORD_LEN: usize = RECORD_FIXED + MAX_ENCODED_KEY + MAX_VALUE_LEN
 pub const BLOCK_TARGET: usize = 4096;
 /// `[payload_len:4][record_count:4]` before + `[crc:4]` after payload.
 pub const BLOCK_OVERHEAD: usize = 12;
+/// The `[payload_len:4][record_count:4]` header in front of a block's
+/// payload.
+const BLOCK_HDR: usize = 8;
 /// A single record may exceed `BLOCK_TARGET`; payload is bounded by
 /// the larger of the two.
 pub const BLOCK_MAX_PAYLOAD: usize = if BLOCK_TARGET > MAX_RECORD_LEN {
@@ -566,6 +569,44 @@ pub const COMPACT_STEP_RECORDS: u64 = 32;
 /// safe to re-tune later without a format break.
 pub const FLUSH_STEP_RECORDS: u32 = 32;
 
+/// Records the recovery walk (rebuilding `highest_revision`) visits per
+/// `recover_step`; it resumes at the key it reached. Before recovery was
+/// stepped the whole walk ran inside one call — on a warm cache the
+/// whole store in one module step.
+pub const RECOVER_WALK_RECORDS: u32 = 512;
+
+/// 4 KiB chunks of a run recovery verifies per `recover_step` (256 KiB);
+/// the CRC and position carry across steps.
+pub const VERIFY_STEP_CHUNKS: u32 = 64;
+
+// ── Recovery phases (`RecoverState::phase`) ───────────────────────────
+/// Not started (or finished): the next `recover_step` begins afresh.
+const REC_IDLE: u8 = 0;
+/// Finishing a sweep an earlier attempt queued.
+const REC_SWEEP: u8 = 1;
+/// Listing the run files.
+const REC_LIST: u8 = 2;
+/// The listing overflowed: queueing the unreferenced listed runs.
+const REC_OVERFLOW: u8 = 3;
+/// Choosing the manifest slot.
+const REC_SELECT: u8 = 4;
+/// Verifying the chosen slot's runs.
+const REC_VERIFY: u8 = 5;
+/// Deleting the runs no manifest names.
+const REC_ORPHANS: u8 = 6;
+/// Loading each run's filter and index.
+const REC_FILTERS: u8 = 7;
+/// Walking the records for the revision high-water.
+const REC_WALK: u8 = 8;
+
+// `RecoverState::vstage`: a run's verification.
+/// Its header (and minimum length).
+const VERIFY_HEADER: u8 = 0;
+/// The rolling CRC over its body.
+const VERIFY_BODY: u8 = 1;
+/// The stored CRC, the exact end, the footer framing.
+const VERIFY_TAIL: u8 = 2;
+
 // ── Flush tail phases ─────────────────────────────────────────────────
 //
 // The tail of a flush is a state machine, not a straight line, because
@@ -607,6 +648,55 @@ const COMPACT_PHASE_RUN_SYNC: u8 = 1;
 const COMPACT_PHASE_MAN_WRITE: u8 = 2;
 /// Manifest durability fence outstanding.
 const COMPACT_PHASE_MAN_SYNC: u8 = 3;
+
+// Stages inside a phase. Every stage is ONE storage action that may
+// answer `Again`; a stage that does is asked again, as it stands, on a
+// later step — the phase and stage stay where they are, and nothing
+// already done is done twice. The phase numbers above stay what
+// diagnostics and tests read; the stages are the finer position.
+//
+// `FLUSH_PHASE_RECORDS` / `COMPACT_PHASE_MERGE`:
+/// Create the output run file (`create_fresh`).
+const STAGE_CREATE: u8 = 0;
+/// Append the run header.
+const STAGE_HEADER: u8 = 1;
+/// Records / merge into blocks.
+const STAGE_BODY: u8 = 2;
+// `FLUSH_PHASE_RECORDS` (after the body) / `COMPACT_PHASE_FOOTER`:
+/// Append the footer, part by part (`part`: 0 head, 1 bloom, 2 index,
+/// 3 file CRC).
+const STAGE_FOOTER: u8 = 3;
+/// Submit the run's durability fence.
+const STAGE_RUN_SUBMIT: u8 = 4;
+// `*_PHASE_MAN_WRITE`:
+/// Write the manifest slot in place.
+const STAGE_MAN_WRITE: u8 = 0;
+/// Submit its durability fence.
+const STAGE_MAN_SUBMIT: u8 = 1;
+/// (first, after the run's fence) Publish the run's NAME durably: a
+/// manifest may name only a run a power cut cannot lose by name.
+const STAGE_RUN_NAME: u8 = 2;
+// `*_PHASE_MAN_SYNC`:
+/// Poll the manifest's fence.
+const STAGE_MAN_POLL: u8 = 0;
+/// Fenced; publish the slot's name when this publish created the slot.
+const STAGE_MAN_NAME: u8 = 1;
+/// `prep_stage`: a manifest slot being prepared is created, then
+/// zero-filled, then fenced.
+const PREP_CREATE: u8 = 0;
+const PREP_ZERO: u8 = 1;
+const PREP_SYNC: u8 = 2;
+/// … and its name published.
+const PREP_NAME: u8 = 3;
+/// `InstallState::destroy`: listing then deleting the manifests, then
+/// the runs (0 = done).
+const DESTROY_LIST_MAN: u8 = 1;
+const DESTROY_DEL_MAN: u8 = 2;
+const DESTROY_LIST_RUN: u8 = 3;
+/// … with the manifests' removal published between (slot A, then B).
+const DESTROY_NAME_A: u8 = 5;
+const DESTROY_NAME_B: u8 = 6;
+const DESTROY_DEL_RUN: u8 = 4;
 
 // ── CRC32 (IEEE, poly 0xEDB88320) ─────────────────────────────────────
 //
@@ -774,6 +864,15 @@ fn map_storage(e: StorageError) -> StoreError {
         // Not a fault: the provider continues the call next step.
         StorageError::Again => StoreError::Backpressure,
         _ => StoreError::StorageFault,
+    }
+}
+
+/// A manifest slot's bit in `DiskState::slot_unnamed`.
+fn slot_bit(slot: u32) -> u8 {
+    if slot == MANIFEST_SLOT_A {
+        1
+    } else {
+        2
     }
 }
 
@@ -1073,7 +1172,13 @@ struct CaptureState {
 struct InstallState {
     active: bool,
     header_done: bool,
-    _pad: [u8; 2],
+    /// `DESTROY_*`: the local files are being removed before the stream
+    /// is taken (0 once they are).
+    destroy: u8,
+    _pad: u8,
+    /// The listing being deleted, and how far.
+    destroy_n: u32,
+    destroy_at: u32,
     range_generation: u32,
     applied_index: u64,
     expected_offset: u64,
@@ -1099,7 +1204,9 @@ struct CompactState {
     /// `COMPACT_PHASE_*` — the same fenced tail as a flush, for the
     /// same reason (see `FLUSH_PHASE_*`).
     phase: u8,
-    _pad: [u8; 2],
+    /// `STAGE_*` within the phase, and the footer part being appended.
+    stage: u8,
+    part: u8,
     ticket: FsyncTicket,
     pending_gen: u32,
     pending_slot: u32,
@@ -1144,6 +1251,79 @@ struct CompactState {
     carry_prefix: [u8; MAX_ENCODED_KEY],
 }
 
+/// What a manifest says (format v1, module docs): its generation, the
+/// runs it names, and the positions it records.
+#[derive(Clone, Copy)]
+struct ManifestBody<'a> {
+    generation: u32,
+    runs: &'a [RunMeta],
+    floor: u64,
+    applied_index: u64,
+    applied_term: u64,
+    highest_revision: u64,
+    committed_clock_ms: u64,
+}
+
+/// A memtable position to undo a command to ([`DiskState::apply_mark`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplyMark {
+    mem_count: u32,
+    overwrites: u32,
+    releases: u32,
+    highest_revision: u64,
+    compact_revision: u64,
+}
+
+/// Recovery as a resumable walk: every storage call it makes may answer
+/// `Again`, and recovery is then asked again where it stood — the run
+/// listing continues into the same buffer, a run's verification from the
+/// byte it reached, the orphan deletes from the one in flight. Nothing a
+/// step established is redone.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RecoverState {
+    /// `REC_*` (`REC_IDLE`: not started, or finished).
+    phase: u8,
+    /// `verify_run`'s check within a run (`VERIFY_*`).
+    vstage: u8,
+    /// A slot was refused because its runs did not validate
+    /// (`bad_slot` names it); a winner was chosen (`winner_*`).
+    has_bad: bool,
+    has_winner: bool,
+    /// Runs the listing held.
+    listed: u32,
+    /// Position within the phase: the run verified, the orphan deleted,
+    /// the filter loaded.
+    idx: u32,
+    bad_slot: u32,
+    bad_gen: u32,
+    bad_rr: u32,
+    winner_gen: u32,
+    winner_slot: u32,
+    run_count: u32,
+    max_seen_id: u32,
+    /// `verify_run`'s rolling CRC and the byte it has reached.
+    vcrc: u32,
+    _pad: u32,
+    voff: u64,
+    floor: u64,
+    applied_index: u64,
+    applied_term: u64,
+    man_revision: u64,
+    man_clock: u64,
+    /// The record walk's high-water so far, and the key it reached.
+    highest: u64,
+    walk_started: bool,
+    _pad2: u8,
+    walk_key_len: u16,
+    _pad3: u32,
+    runs: [RunMeta; MAX_RUNS],
+    walk_key: [u8; MAX_ENCODED_KEY],
+    /// The run listing: kept here, not on the stack, because a listing
+    /// the FS answers part-way is continued into the same buffer.
+    ids: [u32; MAX_LISTED_RUNS],
+}
+
 /// Multi-step flush bookkeeping.
 ///
 /// Unlike `CompactState` this DOES carry the partial block buffer
@@ -1167,7 +1347,9 @@ struct FlushState {
     /// its two durability barriers are submit/poll fences that span
     /// steps; see `flush_step`.
     phase: u8,
-    _pad: [u8; 2],
+    /// `STAGE_*` within the phase, and the footer part being appended.
+    stage: u8,
+    part: u8,
     /// Outstanding fence ticket for the current phase.
     ticket: FsyncTicket,
     /// Manifest generation being published.
@@ -1271,7 +1453,16 @@ pub struct DiskState {
     /// slot B. Driven one slot per `prepare_step` so the one-off
     /// creates never land in the same scheduler step.
     pub prepared: u8,
-    _pad: u32,
+    /// Where the slot being prepared stands (`PREP_*`).
+    prep_stage: u8,
+    /// The last flush, compaction or recovery step ended waiting on the
+    /// device — a storage `Again`, or a fence not yet durable. Asking
+    /// again within the same step cannot progress; the caller asks on a
+    /// later one. (`flush`, the host-test driver, ignores it.)
+    pub io_wait: bool,
+    /// Manifest slots (bit 0 A, bit 1 B) a publish had to create (the
+    /// fail-safe in `manifest_write`) whose name is not yet published.
+    slot_unnamed: u8,
     pub highest_revision: u64,
     pub compaction_floor: u64,
     /// The revision a Compact command (etcd's) has retired history
@@ -1322,6 +1513,14 @@ pub struct DiskState {
     /// orphans, which recovery already collects.
     pub retire_ids: [u32; MAX_RUNS],
     pub retire_count: u8,
+    /// Retired runs left as orphans for recovery because the queue was
+    /// full and their delete could not be taken at adoption.
+    pub retire_orphaned: u32,
+    /// Memtable records overwritten in place, and flushed prefixes
+    /// released, since `init` (monotonic): what [`DiskState::undo_to`]
+    /// checks a mark against.
+    overwrites: u32,
+    releases: u32,
     pub runs: [RunMeta; MAX_RUNS],
     /// Per-run Bloom filters, index-aligned with `runs[0..run_count]`
     /// (newest first). Shifted in lockstep with `runs` on publish, so a
@@ -1380,6 +1579,8 @@ pub struct DiskState {
     compact: CompactState,
     install: InstallState,
     flush: FlushState,
+    /// Recovery's position across steps ([`DiskStore::recover_step`]).
+    rec: RecoverState,
     scan: ScanState,
     range: RangeMemo,
     /// The point read's merge, kept between reads: positioned in place
@@ -1466,6 +1667,62 @@ impl DiskState {
         // No block held: an id may name another file after a reset.
         *self.point.get_mut() = Merge::idle();
         self.memo_valid = false;
+    }
+
+    /// Where the memtable stands before a command is applied: a command
+    /// whose storage read the device deferred is undone to here and
+    /// applied again, whole, on a later step ([`Self::undo_to`]).
+    pub fn apply_mark(&self) -> ApplyMark {
+        ApplyMark {
+            mem_count: self.mem_count,
+            overwrites: self.overwrites,
+            releases: self.releases,
+            highest_revision: self.highest_revision,
+            compact_revision: self.compact_revision,
+        }
+    }
+
+    /// Undo every write since `mark` — the records a command added — so
+    /// the command can be applied again from the start once the device
+    /// has the bytes its reads were waiting for. `true` when undone;
+    /// `false` when it cannot be (a record was overwritten in place, or a
+    /// flushed prefix was released, since the mark): the caller then
+    /// fails closed exactly as it would have on the fault.
+    ///
+    /// A flush that started during the command froze the command's own
+    /// records into its prefix: it is abandoned (nothing it wrote is
+    /// published; its run is an orphan, and the next flush re-derives the
+    /// same id).
+    pub fn undo_to(&mut self, mark: &ApplyMark) -> bool {
+        if self.overwrites != mark.overwrites
+            || self.releases != mark.releases
+            || self.mem_count < mark.mem_count
+        {
+            return false;
+        }
+        if self.flush.active && self.flush.freeze_count > mark.mem_count {
+            self.flush.active = false;
+            self.flush.phase = FLUSH_PHASE_RECORDS;
+            self.flush.stage = STAGE_CREATE;
+        }
+        let count = self.mem_count as usize;
+        let keep = mark.mem_count;
+        let mut w = 0usize;
+        for r in 0..count.min(MEMTABLE_MAX_ENTRIES) {
+            let slot = self.order[r];
+            if u32::from(slot) < keep {
+                self.order[w] = slot;
+                w += 1;
+            }
+        }
+        self.mem_count = keep;
+        self.highest_revision = mark.highest_revision;
+        self.compact_revision = mark.compact_revision;
+        // The single-command memo may describe a record just removed. The
+        // walk memos are key-exact and re-derive their memtable position
+        // on every call, so they stand.
+        self.memo_valid = false;
+        true
     }
 
     /// Forget the range-scan position. The next page walks from the
@@ -1787,6 +2044,7 @@ impl DiskState {
     /// the tail of a step that has just done real I/O, not a new
     /// unbounded action.
     fn release_flushed(&mut self, freeze: u32) {
+        self.releases = self.releases.wrapping_add(1);
         let count = self.mem_count as usize;
         let freeze = (freeze as usize).min(count);
         if freeze == count {
@@ -1845,6 +2103,7 @@ impl DiskState {
             if self.flush.active && (self.order[pos] as u32) < self.flush.freeze_count {
                 self.flush.active = false;
             }
+            self.overwrites = self.overwrites.wrapping_add(1);
             let e = &mut self.entries[self.order[pos] as usize];
             e.value_len = value.len() as u32;
             e.value[..value.len()].copy_from_slice(value);
@@ -2248,6 +2507,12 @@ impl RunScan {
                 return Err(StoreError::StorageFault);
             }
             self.held_run = 0;
+            // The record in hand has been consumed: until the next block
+            // is in, the scan holds none. A read the device defers leaves
+            // it exactly so — positioned before `next_block_off` with no
+            // current record — and the same `next` asked again loads that
+            // block (`Merge::next` does so before choosing a head).
+            self.has_cur = false;
             // The cache first: a block it holds was verified when it
             // was read, and costs no storage call now.
             let cached = cache.get(
@@ -2566,6 +2831,17 @@ impl Merge {
         key_out: &mut [u8],
         val_out: &mut [u8],
     ) -> Result<Option<(usize, usize)>, StoreError> {
+        // Step 0: a source whose advance last time could not load its
+        // next block (the device deferred the read) loads it now, before
+        // any head is chosen — so a deferred read never lets a later key
+        // jump ahead of the records that block holds, and a record is
+        // never emitted twice or skipped. An `Err` here emits nothing.
+        for rs in self.runs.iter_mut().take(self.run_count) {
+            if !rs.has_cur && !rs.exhausted {
+                rs.next(storage, mem.cache)?;
+                mem.add_blocks(rs.take_blocks());
+            }
+        }
         // Step 1: pick the smallest head. Priority on ties: memtable,
         // then runs newest-first (runs[0] is newest).
         let mut winner: Option<usize> = None; // 0 = memtable, 1+i = run i
@@ -2612,9 +2888,18 @@ impl Merge {
         {
             self.mem_pos += 1;
         }
+        //
+        // The winner is already in `key_out`/`val_out` and the sources
+        // are past it, so a block load the device defers here does not
+        // fail this call: that source is left holding no record, and the
+        // next call loads its block first (step 0). Only a real fault —
+        // a block that does not verify — ends the walk.
         for rs in self.runs.iter_mut().take(self.run_count) {
             if rs.has_cur && rs.cur_key() == &key_out[..klen] {
-                rs.next(storage, mem.cache)?;
+                match rs.next(storage, mem.cache) {
+                    Ok(_) | Err(StoreError::Backpressure) => {}
+                    Err(e) => return Err(e),
+                }
                 mem.add_blocks(rs.take_blocks());
             }
         }
@@ -2646,83 +2931,108 @@ fn write_run_header<S: RunStorage>(
     Ok(())
 }
 
-/// Append one complete block; returns the block's file offset.
+/// Append one complete block, framed in place: `framed` holds the
+/// block's payload at `[BLOCK_HDR..BLOCK_HDR + payload_len]` and room for
+/// its header before and its CRC after; both are filled here and the
+/// whole block goes out as ONE append. One call, so a block either lands
+/// whole (`Ok`) or is asked again as it stands (`Backpressure` from a
+/// storage `Again`: the backend continues the bytes it already took, and
+/// `crc_state`/`file_len` move only on `Ok`). Returns the block's file
+/// offset.
 fn write_run_block<S: RunStorage>(
     storage: &mut S,
     id: u32,
-    payload: &[u8],
+    framed: &mut [u8],
+    payload_len: usize,
     rec_count: u32,
     crc_state: &mut u32,
     file_len: &mut u64,
 ) -> Result<u64, StoreError> {
     let off = *file_len;
-    let mut hdr = [0u8; 8];
-    hdr[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    hdr[4..8].copy_from_slice(&rec_count.to_le_bytes());
-    let crc = crc32(payload).to_le_bytes();
+    let total = BLOCK_OVERHEAD + payload_len;
+    let Some(block) = framed.get_mut(..total) else {
+        return Err(StoreError::StorageFault);
+    };
+    let crc = crc32(block.get(BLOCK_HDR..BLOCK_HDR + payload_len).unwrap_or(&[]));
+    copy_at(block, 0, &(payload_len as u32).to_le_bytes());
+    copy_at(block, 4, &rec_count.to_le_bytes());
+    copy_at(block, BLOCK_HDR + payload_len, &crc.to_le_bytes());
     storage
-        .append(FileKind::Run, id, &hdr)
+        .append(FileKind::Run, id, block)
         .map_err(map_storage)?;
-    storage
-        .append(FileKind::Run, id, payload)
-        .map_err(map_storage)?;
-    storage
-        .append(FileKind::Run, id, &crc)
-        .map_err(map_storage)?;
-    *crc_state = crc32_update(*crc_state, &hdr);
-    *crc_state = crc32_update(*crc_state, payload);
-    *crc_state = crc32_update(*crc_state, &crc);
-    *file_len += (BLOCK_OVERHEAD + payload.len()) as u64;
+    *crc_state = crc32_update(*crc_state, block);
+    *file_len += total as u64;
     Ok(off)
 }
 
-/// Append the footer (closing the rolling CRC) and return the run's
-/// final `(file_len, file_crc)`.
+/// The footer's parts, appended in order under the run's rolling CRC.
+const FOOTER_PARTS: u8 = 4;
+
+/// Append footer part `part` (0 the head fields, 1 the Bloom filter, 2
+/// the sparse index, 3 the file CRC) and fold it into `crc_state` — the
+/// file CRC itself is the finished state, and folds nothing. One append
+/// per part, each asked again as it stands on `Backpressure`, so no
+/// footer-sized buffer (21 KiB with the index) sits on the stack and no
+/// part is ever appended twice.
 #[expect(
     clippy::too_many_arguments,
     reason = "plain writer helper: every argument is one footer field; bundling them into a struct would only rename the call site"
 )]
-fn write_run_footer<S: RunStorage>(
+fn write_run_footer_part<S: RunStorage>(
     storage: &mut S,
     id: u32,
+    part: u8,
     record_count: u32,
     block_count: u32,
     smallest_off: u64,
     largest_off: u64,
     bloom: &[u8; BLOOM_BYTES],
     index: &[u8; RUN_INDEX_BYTES],
-    mut crc_state: u32,
-    file_len: u64,
-) -> Result<(u64, u32), StoreError> {
-    let mut head = [0u8; RUN_FOOTER_BLOOM_OFF];
-    head[0..4].copy_from_slice(&RUN_FOOTER_MAGIC.to_le_bytes());
-    head[4..8].copy_from_slice(&record_count.to_le_bytes());
-    head[8..12].copy_from_slice(&block_count.to_le_bytes());
-    head[12..20].copy_from_slice(&smallest_off.to_le_bytes());
-    head[20..28].copy_from_slice(&largest_off.to_le_bytes());
-    // The filter is PERSISTED rather than rebuilt at recovery. Rebuilding
-    // would mean a full record scan of every run at startup — up to 16
-    // runs of ~35 KB each — which is exactly the class of unbounded
-    // boot-path work this whole effort has been removing. Persisting
-    // costs one bounded 1 KiB read per run instead. It needs no
-    // checksum of its own: it sits inside the region the footer's
-    // `file_crc` already covers, so a corrupt filter fails the same
-    // whole-file validation that a corrupt block does, and
-    // `verify_run` rejects the run before the filter is ever consulted.
-    //
-    // Appended piece by piece under the one rolling CRC, so no footer-
-    // sized buffer (21 KiB with the index) sits on the stack.
-    for part in [&head[..], &bloom[..], &index[..]] {
-        storage
-            .append(FileKind::Run, id, part)
-            .map_err(map_storage)?;
-        crc_state = crc32_update(crc_state, part);
+    crc_state: &mut u32,
+) -> Result<(), StoreError> {
+    match part {
+        0 => {
+            let mut head = [0u8; RUN_FOOTER_BLOOM_OFF];
+            copy_at(&mut head, 0, &RUN_FOOTER_MAGIC.to_le_bytes());
+            copy_at(&mut head, 4, &record_count.to_le_bytes());
+            copy_at(&mut head, 8, &block_count.to_le_bytes());
+            copy_at(&mut head, 12, &smallest_off.to_le_bytes());
+            copy_at(&mut head, 20, &largest_off.to_le_bytes());
+            storage
+                .append(FileKind::Run, id, &head)
+                .map_err(map_storage)?;
+            *crc_state = crc32_update(*crc_state, &head);
+        }
+        // The filter is PERSISTED rather than rebuilt at recovery.
+        // Rebuilding would mean a full record scan of every run at
+        // startup — up to 16 runs of ~35 KB each — which is exactly the
+        // class of unbounded boot-path work this whole effort has been
+        // removing. Persisting costs one bounded 1 KiB read per run
+        // instead. It needs no checksum of its own: it sits inside the
+        // region the footer's `file_crc` already covers, so a corrupt
+        // filter fails the same whole-file validation that a corrupt
+        // block does, and `verify_run` rejects the run before the filter
+        // is ever consulted.
+        1 => {
+            storage
+                .append(FileKind::Run, id, bloom)
+                .map_err(map_storage)?;
+            *crc_state = crc32_update(*crc_state, bloom);
+        }
+        2 => {
+            storage
+                .append(FileKind::Run, id, index)
+                .map_err(map_storage)?;
+            *crc_state = crc32_update(*crc_state, index);
+        }
+        _ => {
+            let file_crc = crc32_finish(*crc_state);
+            storage
+                .append(FileKind::Run, id, &file_crc.to_le_bytes())
+                .map_err(map_storage)?;
+        }
     }
-    let file_crc = crc32_finish(crc_state);
-    storage
-        .append(FileKind::Run, id, &file_crc.to_le_bytes())
-        .map_err(map_storage)?;
-    Ok((file_len + RUN_FOOTER_LEN as u64, file_crc))
+    Ok(())
 }
 
 // ── The provider ──────────────────────────────────────────────────────
@@ -2743,16 +3053,16 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// Serialise a manifest into `buf`, returning its length. The bytes
     /// are format v1 exactly as before — this is a pure extraction so
     /// the sync and submit/poll publishers cannot drift apart.
-    fn encode_manifest(
-        buf: &mut [u8; MANIFEST_MAX_LEN],
-        new_gen: u32,
-        runs: &[RunMeta],
-        floor: u64,
-        applied_index: u64,
-        applied_term: u64,
-        highest_revision: u64,
-        committed_clock_ms: u64,
-    ) -> usize {
+    fn encode_manifest(buf: &mut [u8; MANIFEST_MAX_LEN], m: &ManifestBody<'_>) -> usize {
+        let ManifestBody {
+            generation: new_gen,
+            runs,
+            floor,
+            applied_index,
+            applied_term,
+            highest_revision,
+            committed_clock_ms,
+        } = *m;
         buf[0..4].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         buf[4..6].copy_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
         buf[6..8].copy_from_slice(&internal_key::KEY_FORMAT_VERSION.to_le_bytes());
@@ -2785,74 +3095,111 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         MANIFEST_SLOT_LEN
     }
 
-    /// Write the manifest bytes into the already-created file and
-    /// SUBMIT its durability fence, returning the ticket without
-    /// waiting.
-    fn manifest_write_submit(
+    /// Write the manifest bytes into the already-created slot file, in
+    /// place at offset 0. The bytes are a pure function of the arguments,
+    /// so the write asked again after `Backpressure` (a storage `Again`)
+    /// is the same write, which the backend continues.
+    fn manifest_write(
         storage: &mut S,
         slot: u32,
-        new_gen: u32,
-        runs: &[RunMeta],
-        floor: u64,
-        applied_index: u64,
-        applied_term: u64,
-        highest_revision: u64,
-        committed_clock_ms: u64,
-    ) -> Result<FsyncTicket, StoreError> {
+        m: &ManifestBody<'_>,
+    ) -> Result<bool, StoreError> {
         let mut buf = [0u8; MANIFEST_MAX_LEN];
-        let p = Self::encode_manifest(
-            &mut buf,
-            new_gen,
-            runs,
-            floor,
-            applied_index,
-            applied_term,
-            highest_revision,
-            committed_clock_ms,
-        );
+        let p = Self::encode_manifest(&mut buf, m);
+        let bytes = buf.get(..p).unwrap_or(&[]);
         // IN PLACE, at offset 0, into a file that already exists at its
         // final size. No create, no unlink, no directory enumeration.
-        match storage.write_at(FileKind::Manifest, slot, 0, &buf[..p]) {
-            Ok(()) => {}
+        match storage.write_at(FileKind::Manifest, slot, 0, bytes) {
+            Ok(()) => Ok(false),
             Err(StorageError::NotFound) => {
                 // FAIL-SAFE, not the expected path. `prepare_step` runs
                 // during RECOVERING and creates both slots before this
-                // store ever serves, so on a real device this arm is
-                // dead. It exists so a caller that skipped preparation
-                // still produces a CORRECT store rather than a silently
-                // unpublishable one — at the cost of one create, which
-                // is precisely the 159 ms this design removes. If this
-                // ever fires on hardware, the boot path is wrong.
-                Self::manifest_slot_prepare(storage, slot)?;
+                // store ever serves (and an install, which deletes them,
+                // publishes through here), so on a real device this arm
+                // costs one create, which is precisely what the A/B pair
+                // removes from the serving path. The slot is created and
+                // the same write asked again; the fence that follows
+                // covers the bytes and the size both.
+                // `Ok(true)`: the slot's name is new, and is published
+                // after its fence, before the publish is adopted.
+                match storage.create(FileKind::Manifest, slot) {
+                    Ok(()) | Err(StorageError::AlreadyExists) => {}
+                    Err(e) => return Err(map_storage(e)),
+                }
                 storage
-                    .write_at(FileKind::Manifest, slot, 0, &buf[..p])
+                    .write_at(FileKind::Manifest, slot, 0, bytes)
                     .map_err(map_storage)?;
+                Ok(true)
             }
-            Err(e) => return Err(map_storage(e)),
+            Err(e) => Err(map_storage(e)),
         }
-        storage
-            .fsync_submit(FileKind::Manifest, slot)
-            .map_err(map_storage)
     }
 
-    /// Ensure one manifest slot file exists at its final size.
+    /// A publish that had to create its manifest slot publishes the
+    /// slot's name, after its fence and before it is adopted: recovery
+    /// must be able to FIND the manifest it is told is in force.
+    fn publish_slot_name(&mut self, slot: u32) -> Result<(), StoreError> {
+        if self.state.slot_unnamed & slot_bit(slot) != 0 {
+            self.storage
+                .fsync_name(FileKind::Manifest, slot)
+                .map_err(map_storage)?;
+            self.state.slot_unnamed &= !slot_bit(slot);
+        }
+        Ok(())
+    }
+
+    /// One action of ensuring a manifest slot file exists at its final
+    /// size: `Ok(true)` once it does.
     ///
     /// Idempotent and NEVER destructive: an existing slot is left
     /// exactly as it is, because it may be the authoritative manifest.
-    /// Only a slot that is genuinely absent is created and zero-filled.
-    /// This is the one place a manifest file is ever created, and it is
-    /// off the serving path (see `prepare_step`).
-    fn manifest_slot_prepare(storage: &mut S, slot: u32) -> Result<(), StoreError> {
-        match storage.create(FileKind::Manifest, slot) {
-            Ok(()) => {}
-            Err(StorageError::AlreadyExists) => return Ok(()),
-            Err(e) => return Err(map_storage(e)),
+    /// Only a slot that is genuinely absent is created, zero-filled and
+    /// fenced — three storage actions, each asked again as it stands
+    /// (`prep_stage`), so a zero-fill the device takes part-way is
+    /// continued, never skipped and never started over. This is the one
+    /// place a manifest file is ever created, and it is off the serving
+    /// path (see `prepare_step`).
+    fn manifest_slot_prepare(&mut self, slot: u32) -> Result<bool, StoreError> {
+        match self.state.prep_stage {
+            PREP_CREATE => {
+                match self.storage.create(FileKind::Manifest, slot) {
+                    Ok(()) => {}
+                    // Never touched — it may be the manifest in force — but
+                    // its name is published (a no-op for one that already
+                    // is), so a slot a crash caught before its fence counts
+                    // only once it can be found.
+                    Err(StorageError::AlreadyExists) => {
+                        self.state.prep_stage = PREP_NAME;
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(map_storage(e)),
+                }
+                self.state.prep_stage = PREP_ZERO;
+                Ok(false)
+            }
+            PREP_ZERO => {
+                let zero = [0u8; MANIFEST_SLOT_LEN];
+                self.storage
+                    .write_at(FileKind::Manifest, slot, 0, &zero)
+                    .map_err(map_storage)?;
+                self.state.prep_stage = PREP_SYNC;
+                Ok(false)
+            }
+            PREP_SYNC => {
+                self.storage
+                    .fsync(FileKind::Manifest, slot)
+                    .map_err(map_storage)?;
+                self.state.prep_stage = PREP_NAME;
+                Ok(false)
+            }
+            _ => {
+                self.storage
+                    .fsync_name(FileKind::Manifest, slot)
+                    .map_err(map_storage)?;
+                self.state.prep_stage = PREP_CREATE;
+                Ok(true)
+            }
         }
-        let zero = [0u8; MANIFEST_SLOT_LEN];
-        storage
-            .write_at(FileKind::Manifest, slot, 0, &zero)
-            .map_err(map_storage)?;
-        storage.fsync(FileKind::Manifest, slot).map_err(map_storage)
     }
 
     /// Flush the memtable into one immutable sorted run file, publish
@@ -2860,15 +3207,40 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// that order: the memtable is only released once its contents are
     /// durably referenced).
     ///
-    /// Drives `flush_step` to completion. Unbounded by construction, so
-    /// it must NOT be called from a scheduled `module_step` on a real
-    /// device — `disk_maintenance` drives the chunked form instead.
-    /// Retained because it is the natural shape for host tests and for
-    /// the install path, both of which run outside the step budget.
+    /// Drives `flush_step` to completion, asking a step that waits on the
+    /// device (a storage `Again`, a fence not yet durable) again at once.
+    /// HOST ONLY: on a real device the device moves only between steps,
+    /// so this would spin — module code drives [`Self::flush_step`] once
+    /// per step, or [`Self::flush_drive`] where a caller must make room
+    /// inside one step. It is the natural shape for host tests, whose
+    /// backends move on every call.
     pub fn flush(&mut self) -> Result<(), StoreError> {
         loop {
-            match self.flush_step()? {
+            match self.flush_step() {
+                Ok(Progress::Done) => return Ok(()),
+                Ok(Progress::InProgress { .. }) => {}
+                Err(StoreError::Backpressure) if self.state.flush.active => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Drive a flush on as far as it goes without waiting on the device:
+    /// `Ok` once it has published, `Err(Backpressure)` as soon as a step
+    /// must wait (storage `Again`, or a fence still pending) — the flush
+    /// stays in flight where it stood and a later step continues it — and
+    /// any other error as the step reports it. Never spins.
+    pub fn flush_drive(&mut self) -> Result<(), StoreError> {
+        self.flush_drive_guarded(false)
+    }
+
+    fn flush_drive_guarded(&mut self, ignore_install: bool) -> Result<(), StoreError> {
+        loop {
+            match self.flush_step_guarded(ignore_install)? {
                 Progress::Done => return Ok(()),
+                Progress::InProgress { .. } if self.state.io_wait => {
+                    return Err(StoreError::Backpressure);
+                }
                 Progress::InProgress { .. } => {}
             }
         }
@@ -2892,6 +3264,16 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// boundaries only in the region where nothing is yet published,
     /// so it cannot create a new torn state.
     ///
+    /// Every storage action of the flush is one stage of its phase. A
+    /// stage the device cannot take now answers `Err(Backpressure)` with
+    /// the flush STILL IN FLIGHT (`flush_in_progress()`), standing at that
+    /// stage, and [`DiskState::io_wait`] set: the next call asks the same
+    /// action again, which the storage continues — nothing already
+    /// written is written again and nothing is started over. A
+    /// `Backpressure` with no flush in flight is a refusal before any I/O
+    /// (run set full, an exclusion fence). Any other error abandons the
+    /// flush: nothing was published, the partial run is an orphan.
+    ///
     /// Writes continue to be ACCEPTED during a flush, up to the
     /// memtable's capacity — that is the entire point of chunking.
     /// They land in slots at or above the frozen prefix and are left in
@@ -2901,17 +3283,14 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     }
 
     /// Flush body that tolerates an active install (the install stream
-    /// flushes through this when its staging memtable fills).
+    /// flushes through this when its staging memtable fills), driven as
+    /// far as it goes without waiting (see [`Self::flush_drive`]).
     fn flush_inner(&mut self) -> Result<(), StoreError> {
-        loop {
-            match self.flush_step_guarded(true)? {
-                Progress::Done => return Ok(()),
-                Progress::InProgress { .. } => {}
-            }
-        }
+        self.flush_drive_guarded(true)
     }
 
     fn flush_step_guarded(&mut self, ignore_install: bool) -> Result<Progress, StoreError> {
+        self.state.io_wait = false;
         if !self.state.flush.active {
             if self.state.compact.active
                 || (self.state.capture.active && !self.state.capture.transfer)
@@ -2928,10 +3307,6 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                 return Err(StoreError::Backpressure);
             }
             let id = self.state.next_run_id.max(1);
-            create_fresh(self.storage, FileKind::Run, id)?;
-            let mut crc_state = CRC32_INIT;
-            let mut file_len = 0u64;
-            write_run_header(self.storage, id, &mut crc_state, &mut file_len)?;
             let freeze = self.state.mem_count;
             self.state.flush.active = true;
             self.state.flush.applied_at_freeze = self.state.pending_applied_index;
@@ -2939,6 +3314,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.revision_at_freeze = self.state.highest_revision;
             self.state.flush.clock_at_freeze = self.state.committed_clock_ms;
             self.state.flush.phase = FLUSH_PHASE_RECORDS;
+            self.state.flush.stage = STAGE_CREATE;
+            self.state.flush.part = 0;
             self.state.flush.ticket = 0;
             self.state.flush.pending_gen = 0;
             self.state.flush.pending_slot = 0;
@@ -2948,30 +3325,44 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.freeze_count = freeze;
             self.state.flush.cursor = 0;
             self.state.flush.out_blocks = 0;
-            self.state.flush.crc_state = crc_state;
+            self.state.flush.crc_state = CRC32_INIT;
             self.state.flush.block_recs = 0;
             self.state.flush.fill = 0;
             self.state.flush.chunks = 0;
             self.state.flush.bloom = [0u8; BLOOM_BYTES];
             self.state.flush.index.fill(0);
             self.state.flush.blk_has_first = false;
-            self.state.flush.out_len = file_len;
+            self.state.flush.out_len = 0;
             self.state.flush.smallest_off = 0;
             self.state.flush.largest_off = 0;
             // Freeze the sorted view. From here the flush reads its own
             // snapshot, so concurrent inserts cannot disturb it.
-            self.state.flush.slots[..freeze as usize]
-                .copy_from_slice(&self.state.order[..freeze as usize]);
+            for (d, o) in self
+                .state
+                .flush
+                .slots
+                .iter_mut()
+                .zip(self.state.order.iter())
+                .take(freeze as usize)
+            {
+                *d = *o;
+            }
         }
         let phase = self.state.flush.phase;
         let stepped = match phase {
             FLUSH_PHASE_RUN_SYNC => self.flush_poll_run(),
             FLUSH_PHASE_MAN_WRITE => self.flush_manifest_write(),
             FLUSH_PHASE_MAN_SYNC => self.flush_poll_manifest(),
-            _ => self.flush_step_inner(),
+            _ => self.flush_run_stages(),
         };
         match stepped {
             Ok(p) => Ok(p),
+            Err(StoreError::Backpressure) => {
+                // The device could not take this stage now. The flush
+                // stands where it is; the next step asks the same action.
+                self.state.io_wait = true;
+                Err(StoreError::Backpressure)
+            }
             Err(e) => {
                 // Fail closed: abandon the half-written run (an orphan
                 // for `recover()`), keep every record in the memtable.
@@ -2979,22 +3370,95 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                 // still the truth.
                 self.state.flush.active = false;
                 self.state.flush.phase = FLUSH_PHASE_RECORDS;
+                self.state.flush.stage = STAGE_CREATE;
                 self.state.flush.ticket = 0;
                 Err(e)
             }
         }
     }
 
-    fn flush_step_inner(&mut self) -> Result<Progress, StoreError> {
+    /// The run file's stages: create, header, records, footer, fence
+    /// submit. Each storage action moves the stage on only once it has
+    /// landed.
+    fn flush_run_stages(&mut self) -> Result<Progress, StoreError> {
         let id = self.state.flush.run_id;
+        if self.state.flush.stage == STAGE_CREATE {
+            create_fresh(self.storage, FileKind::Run, id)?;
+            self.state.flush.stage = STAGE_HEADER;
+        }
+        if self.state.flush.stage == STAGE_HEADER {
+            let mut crc_state = CRC32_INIT;
+            let mut file_len = 0u64;
+            write_run_header(self.storage, id, &mut crc_state, &mut file_len)?;
+            self.state.flush.crc_state = crc_state;
+            self.state.flush.out_len = file_len;
+            self.state.flush.stage = STAGE_BODY;
+            // The create and the header are the first chunk: on FAT32 a
+            // create is the step's whole budget.
+            self.state.flush.chunks += 1;
+            return Ok(Progress::InProgress {
+                cursor: u64::from(self.state.flush.cursor),
+            });
+        }
+        if self.state.flush.stage == STAGE_BODY {
+            match self.flush_step_records()? {
+                Some(p) => return Ok(p),
+                None => {
+                    self.state.flush.stage = STAGE_FOOTER;
+                    self.state.flush.part = 0;
+                }
+            }
+        }
+        if self.state.flush.stage == STAGE_FOOTER {
+            while self.state.flush.part < FOOTER_PARTS {
+                let mut crc = self.state.flush.crc_state;
+                write_run_footer_part(
+                    self.storage,
+                    id,
+                    self.state.flush.part,
+                    self.state.flush.freeze_count,
+                    self.state.flush.out_blocks,
+                    self.state.flush.smallest_off,
+                    self.state.flush.largest_off,
+                    &self.state.flush.bloom,
+                    &self.state.flush.index,
+                    &mut crc,
+                )?;
+                self.state.flush.crc_state = crc;
+                self.state.flush.part += 1;
+            }
+            self.state.flush.pending_len = self.state.flush.out_len + RUN_FOOTER_LEN as u64;
+            self.state.flush.pending_crc = crc32_finish(self.state.flush.crc_state);
+            self.state.flush.stage = STAGE_RUN_SUBMIT;
+        }
+        // SUBMIT the run's durability fence and LEAVE. This is the
+        // 163 ms that killed the module: it is now spread across later
+        // steps as cheap polls instead of one blocking call.
+        let ticket = self
+            .storage
+            .fsync_submit(FileKind::Run, id)
+            .map_err(map_storage)?;
+        self.state.flush.ticket = ticket;
+        self.state.flush.phase = FLUSH_PHASE_RUN_SYNC;
+        self.state.flush.stage = STAGE_CREATE;
+        self.state.flush.chunks += 1;
+        Ok(Progress::InProgress {
+            cursor: u64::from(self.state.flush.cursor),
+        })
+    }
+
+    /// Write at most `FLUSH_STEP_RECORDS` records into the run's blocks:
+    /// `Some(progress)` when the step's budget is spent, `None` when the
+    /// frozen records are all written (the last block closed).
+    fn flush_step_records(&mut self) -> Result<Option<Progress>, StoreError> {
         let freeze = self.state.flush.freeze_count as usize;
         let mut written = 0u32;
         while (self.state.flush.cursor as usize) < freeze {
             if written >= FLUSH_STEP_RECORDS {
                 self.state.flush.chunks += 1;
-                return Ok(Progress::InProgress {
+                return Ok(Some(Progress::InProgress {
                     cursor: u64::from(self.state.flush.cursor),
-                });
+                }));
             }
             let slot = self.state.flush.slots[self.state.flush.cursor as usize] as usize;
             let (key_len, value_len) = {
@@ -3004,6 +3468,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             let rec_len = RECORD_FIXED + key_len + value_len;
             let fill = self.state.flush.fill as usize;
             if fill > 0 && fill + rec_len > BLOCK_TARGET {
+                // A block the device cannot take now is asked again next
+                // step from this same record: nothing below has moved.
                 self.flush_write_block()?;
             }
             let fill = self.state.flush.fill as usize;
@@ -3061,39 +3527,12 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.cursor += 1;
             written += 1;
         }
-        // Records exhausted: close the last block, then hand off to the
-        // fenced tail. Everything below spans steps.
+        // Records exhausted: close the last block. The footer and the
+        // fence submit follow as their own stages.
         if self.state.flush.fill > 0 {
             self.flush_write_block()?;
         }
-        let record_count = self.state.flush.freeze_count;
-        let (final_len, file_crc) = write_run_footer(
-            self.storage,
-            id,
-            record_count,
-            self.state.flush.out_blocks,
-            self.state.flush.smallest_off,
-            self.state.flush.largest_off,
-            &self.state.flush.bloom,
-            &self.state.flush.index,
-            self.state.flush.crc_state,
-            self.state.flush.out_len,
-        )?;
-        // SUBMIT the run's durability fence and LEAVE. This is the
-        // 163 ms that killed the module: it is now spread across later
-        // steps as cheap polls instead of one blocking call.
-        let ticket = self
-            .storage
-            .fsync_submit(FileKind::Run, id)
-            .map_err(map_storage)?;
-        self.state.flush.ticket = ticket;
-        self.state.flush.pending_len = final_len;
-        self.state.flush.pending_crc = file_crc;
-        self.state.flush.phase = FLUSH_PHASE_RUN_SYNC;
-        self.state.flush.chunks += 1;
-        Ok(Progress::InProgress {
-            cursor: u64::from(self.state.flush.cursor),
-        })
+        Ok(None)
     }
 
     /// Poll the run's fence. NOTHING is published or released here —
@@ -3107,6 +3546,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             .map_err(map_storage)?
         {
             FsyncState::Pending => {
+                self.state.io_wait = true;
                 self.state.flush.chunks += 1;
                 return Ok(Progress::InProgress {
                     cursor: u64::from(self.state.flush.cursor),
@@ -3118,40 +3558,66 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         // name it — but allocating that file is its own step.
         self.state.flush.pending_gen = self.state.generation + 1;
         self.state.flush.phase = FLUSH_PHASE_MAN_WRITE;
+        self.state.flush.stage = STAGE_RUN_NAME;
         self.state.flush.chunks += 1;
         Ok(Progress::InProgress {
             cursor: u64::from(self.state.flush.cursor),
         })
     }
 
-    /// Write the manifest bytes and submit its fence.
+    /// Write the manifest bytes, then submit its fence: two stages, each
+    /// asked again as it stands.
     fn flush_manifest_write(&mut self) -> Result<Progress, StoreError> {
-        let meta = RunMeta {
-            id: self.state.flush.run_id,
-            record_count: self.state.flush.freeze_count,
-            file_len: self.state.flush.pending_len,
-            digest: self.state.flush.pending_crc,
-            _pad: 0,
-        };
-        let mut new_runs = [RunMeta::empty(); MAX_RUNS];
-        new_runs[0] = meta;
-        let old_count = self.state.run_count as usize;
-        new_runs[1..1 + old_count].copy_from_slice(&self.state.runs[..old_count]);
         let slot = self.state.inactive_manifest_slot();
-        let ticket = Self::manifest_write_submit(
-            self.storage,
-            slot,
-            self.state.flush.pending_gen,
-            &new_runs[..old_count + 1],
-            self.state.compaction_floor,
-            self.state.flush.applied_at_freeze,
-            self.state.flush.term_at_freeze,
-            self.state.flush.revision_at_freeze,
-            self.state.flush.clock_at_freeze,
-        )?;
+        if self.state.flush.stage == STAGE_RUN_NAME {
+            // The run's bytes are durable; now its name. Only then may a
+            // manifest name it.
+            self.storage
+                .fsync_name(FileKind::Run, self.state.flush.run_id)
+                .map_err(map_storage)?;
+            self.state.flush.stage = STAGE_MAN_WRITE;
+        }
+        if self.state.flush.stage == STAGE_MAN_WRITE {
+            let meta = RunMeta {
+                id: self.state.flush.run_id,
+                record_count: self.state.flush.freeze_count,
+                file_len: self.state.flush.pending_len,
+                digest: self.state.flush.pending_crc,
+                _pad: 0,
+            };
+            let mut new_runs = [RunMeta::empty(); MAX_RUNS];
+            new_runs[0] = meta;
+            let old_count = self.state.run_count as usize;
+            for (d, r) in new_runs
+                .iter_mut()
+                .skip(1)
+                .zip(self.state.runs.iter())
+                .take(old_count)
+            {
+                *d = *r;
+            }
+            let body = ManifestBody {
+                generation: self.state.flush.pending_gen,
+                runs: new_runs.get(..old_count + 1).unwrap_or(&[]),
+                floor: self.state.compaction_floor,
+                applied_index: self.state.flush.applied_at_freeze,
+                applied_term: self.state.flush.term_at_freeze,
+                highest_revision: self.state.flush.revision_at_freeze,
+                committed_clock_ms: self.state.flush.clock_at_freeze,
+            };
+            if Self::manifest_write(self.storage, slot, &body)? {
+                self.state.slot_unnamed |= slot_bit(slot);
+            }
+            self.state.flush.stage = STAGE_MAN_SUBMIT;
+        }
+        let ticket = self
+            .storage
+            .fsync_submit(FileKind::Manifest, slot)
+            .map_err(map_storage)?;
         self.state.flush.pending_slot = slot;
         self.state.flush.ticket = ticket;
         self.state.flush.phase = FLUSH_PHASE_MAN_SYNC;
+        self.state.flush.stage = STAGE_MAN_POLL;
         self.state.flush.chunks += 1;
         Ok(Progress::InProgress {
             cursor: u64::from(self.state.flush.cursor),
@@ -3174,23 +3640,29 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let new_gen = self.state.flush.pending_gen;
         // The FILE id is the SLOT, not the generation — under A/B the
         // generation lives in the body and names no file at all.
-        match self
-            .storage
-            .fsync_poll(
-                FileKind::Manifest,
-                self.state.flush.pending_slot,
-                self.state.flush.ticket,
-            )
-            .map_err(map_storage)?
-        {
-            FsyncState::Pending => {
-                self.state.flush.chunks += 1;
-                return Ok(Progress::InProgress {
-                    cursor: u64::from(self.state.flush.cursor),
-                });
+        if self.state.flush.stage == STAGE_MAN_POLL {
+            match self
+                .storage
+                .fsync_poll(
+                    FileKind::Manifest,
+                    self.state.flush.pending_slot,
+                    self.state.flush.ticket,
+                )
+                .map_err(map_storage)?
+            {
+                FsyncState::Pending => {
+                    self.state.io_wait = true;
+                    self.state.flush.chunks += 1;
+                    return Ok(Progress::InProgress {
+                        cursor: u64::from(self.state.flush.cursor),
+                    });
+                }
+                FsyncState::Durable => {}
             }
-            FsyncState::Durable => {}
+            // The ticket is collected: never polled again.
+            self.state.flush.stage = STAGE_MAN_NAME;
         }
+        self.publish_slot_name(self.state.flush.pending_slot)?;
         let meta = RunMeta {
             id: self.state.flush.run_id,
             record_count: self.state.flush.freeze_count,
@@ -3231,6 +3703,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         // flush, and would leave a stale ticket one missed `active`
         // check away from being polled.
         self.state.flush.phase = FLUSH_PHASE_RECORDS;
+        self.state.flush.stage = STAGE_CREATE;
         self.state.flush.ticket = 0;
         self.state.flush.chunks += 1;
         self.state.release_flushed(self.state.flush.freeze_count);
@@ -3238,7 +3711,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     }
 
     /// Write the buffered block, tracking offsets exactly as the
-    /// single-call flush did.
+    /// single-call flush did. Nothing moves until the block has landed.
     fn flush_write_block(&mut self) -> Result<(), StoreError> {
         let id = self.state.flush.run_id;
         let fill = self.state.flush.fill as usize;
@@ -3247,14 +3720,21 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         let mut file_len = self.state.flush.out_len;
         // The payload must be handed to `write_run_block` as a slice
         // while `self.storage` is also borrowed mutably, so it goes via
-        // a stack copy — the same ~4 KB the single-call path kept on
-        // the stack for its whole run.
-        let mut payload = [0u8; BLOCK_MAX_PAYLOAD];
-        payload[..fill].copy_from_slice(&self.state.flush.block[..fill]);
+        // a stack copy — framed, so the block goes out as one append.
+        let mut framed = [0u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD];
+        for (d, b) in framed
+            .iter_mut()
+            .skip(BLOCK_HDR)
+            .zip(self.state.flush.block.iter())
+            .take(fill)
+        {
+            *d = *b;
+        }
         let off = write_run_block(
             self.storage,
             id,
-            &payload[..fill],
+            &mut framed,
+            fill,
             recs,
             &mut crc_state,
             &mut file_len,
@@ -3312,15 +3792,18 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// Idempotent and never destructive: an existing slot is left
     /// untouched, because it may be the authoritative manifest.
     pub fn prepare_step(&mut self) -> Result<Progress, StoreError> {
-        if self.state.prepared & 1 == 0 {
-            Self::manifest_slot_prepare(self.storage, MANIFEST_SLOT_A)?;
-            self.state.prepared |= 1;
-            return Ok(Progress::InProgress { cursor: 1 });
-        }
-        if self.state.prepared & 2 == 0 {
-            Self::manifest_slot_prepare(self.storage, MANIFEST_SLOT_B)?;
-            self.state.prepared |= 2;
-            return Ok(Progress::InProgress { cursor: 2 });
+        // A storage `Again` comes back as `Backpressure` with the slot's
+        // stage where it stood; the next call asks the same action.
+        for (bit, slot) in [(1u8, MANIFEST_SLOT_A), (2u8, MANIFEST_SLOT_B)] {
+            if self.state.prepared & bit == 0 {
+                if self.manifest_slot_prepare(slot)? {
+                    self.state.prepared |= bit;
+                    self.state.prep_stage = PREP_CREATE;
+                }
+                return Ok(Progress::InProgress {
+                    cursor: u64::from(self.state.prepared),
+                });
+            }
         }
         Ok(Progress::Done)
     }
@@ -3336,236 +3819,512 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// orphan files. The memtable starts empty; committed-entry replay
     /// (step 5) is the caller's job.
     ///
+    /// Drives [`Self::recover_step`] to its end, asking a step that waits
+    /// on the device again at once — HOST ONLY, like [`Self::flush`]: the
+    /// module drives `recover_step` once per step.
+    ///
     /// On `Err(StorageFault)` the state is left EMPTY and the on-disk
     /// files untouched (quarantine — never guess, never delete
     /// evidence). The caller must not serve.
     pub fn recover(&mut self) -> Result<(), StoreError> {
-        let range_gen = self.state.range_generation;
-        let prepared = self.state.prepared;
-        let (swept, sweep_ids, sweep_count, sweep_at) = (
-            self.state.recover_swept,
-            self.state.sweep_ids,
-            self.state.sweep_count,
-            self.state.sweep_at,
-        );
-        self.state.init();
-        self.state.range_generation = range_gen;
-        self.state.recover_swept = swept;
-        self.state.sweep_ids = sweep_ids;
-        self.state.sweep_count = sweep_count;
-        self.state.sweep_at = sweep_at;
-        // A sweep an earlier attempt queued finishes before anything is
-        // listed (see SWEEP_BATCH).
-        self.drain_sweep()?;
-        // Preallocation is a property of the FILESYSTEM, not of the
-        // recovered logical state: re-creating the pair after every
-        // recover would put a 159 ms create back on the boot path.
-        self.state.prepared = prepared;
+        loop {
+            match self.recover_step() {
+                Ok(Progress::Done) => return Ok(()),
+                Ok(Progress::InProgress { .. }) => {}
+                Err(StoreError::Backpressure) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
-        // A/B SELECTION. Read both fixed slots, validate each
-        // independently, and take the valid one with the HIGHER
-        // INTERNAL generation. No enumeration, no deletion: the pair is
-        // permanent, so recovery knows both names a priori.
-        let mut winner_gen: Option<u32>;
-        let mut winner_slot = MANIFEST_SLOT_A;
-        let mut floor = 0u64;
-        let mut run_count = 0usize;
-        let mut runs = [RunMeta::empty(); MAX_RUNS];
-        let mut applied = (0u64, 0u64);
-        let mut man_revision = 0u64;
-        let mut man_clock = 0u64;
-        let mut run_ids = [0u32; MAX_LISTED_RUNS];
-        self.state.recover_refusal = 2;
-        let run_n = loop {
-            match self.storage.list(FileKind::Run, &mut run_ids) {
-                Ok(n) => break n,
-                // More runs than a listing holds: a store whose writes
-                // outran its retirements (2026-10-14, pi5-a: 13 009 run
-                // files, a write storm upstream). Quarantining here would
-                // make the orphans permanent, so the listed runs neither
-                // manifest slot names are deleted and the root listed
-                // again. A delete the FS defers (E_AGAIN on a large root)
-                // returns here, and the next recovery attempt continues.
-                Err(StorageError::Overflow) => {
-                    if self.queue_listed_orphans(&run_ids)? == 0 {
+    /// Is a recovery part-way (asked again, it continues)?
+    pub fn recover_in_progress(&self) -> bool {
+        self.state.rec.phase != REC_IDLE
+    }
+
+    /// One bounded slice of recovery (see [`Self::recover`]).
+    ///
+    /// `Ok(InProgress)` — more to do; `Err(Backpressure)` — a storage
+    /// call answered `Again`: recovery stands exactly where it was
+    /// (`io_wait`), and the next call asks the same call again — the
+    /// listing continues into the same buffer, a run's verification from
+    /// the byte it reached, the delete in flight is the one asked. No
+    /// step established is redone. Any other error ends the attempt (the
+    /// state left EMPTY, the next call starts afresh) — a quarantine.
+    pub fn recover_step(&mut self) -> Result<Progress, StoreError> {
+        self.state.io_wait = false;
+        match self.recover_advance() {
+            Ok(true) => {
+                self.state.rec.phase = REC_IDLE;
+                self.state.recover_refusal = 0;
+                Ok(Progress::Done)
+            }
+            Ok(false) => Ok(Progress::InProgress {
+                cursor: u64::from(self.state.rec.phase),
+            }),
+            Err(StoreError::Backpressure) => {
+                self.state.io_wait = true;
+                Err(StoreError::Backpressure)
+            }
+            Err(e) => {
+                // Quarantine. The next attempt starts from the top; the
+                // sweep queue (`sweep_*`) survives it, as it always has.
+                self.state.rec.phase = REC_IDLE;
+                Err(e)
+            }
+        }
+    }
+
+    /// Run recovery's phases on from where they stand: `Ok(true)` once
+    /// recovered, `Ok(false)` when a bounded slice was spent.
+    fn recover_advance(&mut self) -> Result<bool, StoreError> {
+        if self.state.rec.phase == REC_IDLE {
+            let range_gen = self.state.range_generation;
+            let prepared = self.state.prepared;
+            let (swept, sweep_ids, sweep_count, sweep_at) = (
+                self.state.recover_swept,
+                self.state.sweep_ids,
+                self.state.sweep_count,
+                self.state.sweep_at,
+            );
+            self.state.init();
+            self.state.range_generation = range_gen;
+            self.state.recover_swept = swept;
+            self.state.sweep_ids = sweep_ids;
+            self.state.sweep_count = sweep_count;
+            self.state.sweep_at = sweep_at;
+            // Preallocation is a property of the FILESYSTEM, not of the
+            // recovered logical state: re-creating the pair after every
+            // recover would put a 159 ms create back on the boot path.
+            self.state.prepared = prepared;
+            self.state.rec.phase = REC_SWEEP;
+            self.state.rec.has_bad = false;
+            self.state.rec.has_winner = false;
+            self.state.rec.listed = 0;
+            self.state.rec.idx = 0;
+            self.state.rec.max_seen_id = 0;
+            self.state.rec.walk_started = false;
+            self.state.rec.highest = 0;
+        }
+        loop {
+            match self.state.rec.phase {
+                REC_SWEEP => {
+                    // A sweep an earlier attempt queued finishes before
+                    // anything is listed (see SWEEP_BATCH).
+                    self.drain_sweep()?;
+                    self.state.rec.phase = REC_LIST;
+                }
+                REC_LIST => {
+                    self.state.recover_refusal = 2;
+                    match self.storage.list(FileKind::Run, &mut self.state.rec.ids) {
+                        Ok(n) => {
+                            self.state.rec.listed = n as u32;
+                            self.state.recover_listed = n as u32;
+                            let mut max_seen = 0u32;
+                            for &id in self.state.rec.ids.iter().take(n) {
+                                max_seen = max_seen.max(id);
+                            }
+                            self.state.rec.max_seen_id = max_seen;
+                            self.state.rec.phase = REC_SELECT;
+                        }
+                        // More runs than a listing holds: a store whose writes
+                        // outran its retirements (2026-10-14, pi5-a: 13 009 run
+                        // files, a write storm upstream). Quarantining here
+                        // would make the orphans permanent, so the listed runs
+                        // neither manifest slot names are deleted and the root
+                        // listed again.
+                        Err(StorageError::Overflow) => {
+                            self.state.rec.phase = REC_OVERFLOW;
+                        }
+                        Err(e) => return Err(map_storage(e)),
+                    }
+                }
+                REC_OVERFLOW => {
+                    let listed = self.state.rec.ids;
+                    if self.queue_listed_orphans(&listed)? == 0 {
                         return Err(StoreError::StorageFault);
                     }
-                    self.drain_sweep()?;
+                    self.state.rec.phase = REC_SWEEP;
                 }
-                Err(e) => return Err(map_storage(e)),
-            }
-        };
-        self.state.recover_listed = run_n as u32;
-        let run_ids = &run_ids[..run_n];
-        let mut max_seen_id = 0u32;
-        for &id in run_ids {
-            max_seen_id = max_seen_id.max(id);
-        }
-
-        // The higher generation is tried first. When it names a run the
-        // disk does not hold, or one that does not validate, the OTHER
-        // slot — the previous durable state — is served instead, loudly
-        // counted (`recover_fallbacks`): a generation whose runs did not
-        // outlive the power cut that followed its publish is a torn
-        // publish, and the log replays on top of the older manifest from
-        // its applied index. Only with no usable slot at all is it a
-        // quarantine. The next publish's generation stays above both.
-        let mut bad_slot: Option<u32> = None;
-        let mut bad_gen = 0u32;
-        let mut bad_rr = 0u32;
-        loop {
-            winner_gen = None;
-            self.state.recover_refusal = 1;
-            for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
-                if bad_slot == Some(slot) {
-                    continue;
-                }
-                let Some((gen, f, rc, rs, ai, at, hr, clock)) = self.read_manifest(slot)? else {
-                    continue;
-                };
-                if winner_gen.is_none_or(|w| gen > w) {
-                    winner_gen = Some(gen);
-                    winner_slot = slot;
-                    floor = f;
-                    run_count = rc;
-                    runs = rs;
-                    applied = (ai, at);
-                    man_revision = hr;
-                    man_clock = clock;
-                }
-            }
-            let Some(gen) = winner_gen else {
-                break;
-            };
-            // Every referenced run must exist and validate.
-            let mut bad = false;
-            for meta in runs.iter().take(run_count) {
-                self.state.recover_refusal = 3;
-                if !run_ids.contains(&meta.id) {
-                    self.state.recover_missing_id = meta.id;
-                    bad = true;
-                    break;
-                }
-                let mut at = 40u32;
-                match verify_run(&*self.storage, meta, &mut at) {
-                    Ok(()) => {}
-                    Err(StoreError::StorageFault) => {
-                        self.state.recover_refusal = at;
-                        bad = true;
-                        break;
+                REC_SELECT => {
+                    // A/B SELECTION. Read both fixed slots, validate each
+                    // independently, and take the valid one with the HIGHER
+                    // INTERNAL generation (skipping one already refused). No
+                    // enumeration, no deletion: the pair is permanent, so
+                    // recovery knows both names a priori. Reading a slot is
+                    // pure, so a read the device defers re-reads both.
+                    self.state.recover_refusal = 1;
+                    let mut found = false;
+                    for slot in [MANIFEST_SLOT_A, MANIFEST_SLOT_B] {
+                        if self.state.rec.has_bad && self.state.rec.bad_slot == slot {
+                            continue;
+                        }
+                        let Some((gen, f, rc, rs, ai, at, hr, clock)) = self.read_manifest(slot)?
+                        else {
+                            continue;
+                        };
+                        if !found || gen > self.state.rec.winner_gen {
+                            found = true;
+                            let r = &mut self.state.rec;
+                            r.winner_gen = gen;
+                            r.winner_slot = slot;
+                            r.floor = f;
+                            r.run_count = rc as u32;
+                            r.runs = rs;
+                            r.applied_index = ai;
+                            r.applied_term = at;
+                            r.man_revision = hr;
+                            r.man_clock = clock;
+                        }
                     }
-                    Err(e) => return Err(e),
+                    self.state.rec.has_winner = found;
+                    self.state.rec.idx = 0;
+                    self.state.rec.vstage = VERIFY_HEADER;
+                    if found {
+                        self.state.rec.phase = REC_VERIFY;
+                    } else if self.state.rec.has_bad {
+                        // The only usable slot named what the disk does not
+                        // hold: quarantine, never an empty store in its place.
+                        self.state.recover_refusal = self.state.rec.bad_rr;
+                        return Err(StoreError::StorageFault);
+                    } else {
+                        // No usable manifest: the durable state is empty;
+                        // every run present was never published and is an
+                        // orphan.
+                        self.state.rec.phase = REC_ORPHANS;
+                    }
                 }
-                max_seen_id = max_seen_id.max(meta.id);
+                REC_VERIFY => {
+                    // Every referenced run must exist and validate.
+                    let i = self.state.rec.idx as usize;
+                    if i >= self.state.rec.run_count as usize {
+                        if self.state.rec.has_bad {
+                            self.state.recover_fallbacks =
+                                self.state.recover_fallbacks.wrapping_add(1);
+                        }
+                        self.state.rec.idx = 0;
+                        self.state.rec.phase = REC_ORPHANS;
+                        continue;
+                    }
+                    let meta = self
+                        .state
+                        .rec
+                        .runs
+                        .get(i)
+                        .copied()
+                        .unwrap_or(RunMeta::empty());
+                    self.state.recover_refusal = 3;
+                    let listed = self.state.rec.listed as usize;
+                    let held = self
+                        .state
+                        .rec
+                        .ids
+                        .iter()
+                        .take(listed)
+                        .any(|&id| id == meta.id);
+                    let verdict = if held {
+                        self.verify_run_step(&meta)?
+                    } else {
+                        self.state.recover_missing_id = meta.id;
+                        Verify::Bad
+                    };
+                    match verdict {
+                        Verify::Slice => return Ok(false),
+                        Verify::Good => {
+                            self.state.rec.max_seen_id = self.state.rec.max_seen_id.max(meta.id);
+                            self.state.rec.idx += 1;
+                            self.state.rec.vstage = VERIFY_HEADER;
+                        }
+                        Verify::Bad => {
+                            // The higher generation names a run the disk does
+                            // not hold, or one that does not validate: the
+                            // OTHER slot — the previous durable state — is
+                            // served instead, loudly counted
+                            // (`recover_fallbacks`): a generation whose runs
+                            // did not outlive the power cut that followed its
+                            // publish is a torn publish, and the log replays
+                            // on top of the older manifest from its applied
+                            // index. Only with no usable slot at all is it a
+                            // quarantine. The next publish's generation stays
+                            // above both.
+                            if self.state.rec.has_bad {
+                                return Err(StoreError::StorageFault);
+                            }
+                            self.state.rec.has_bad = true;
+                            self.state.rec.bad_slot = self.state.rec.winner_slot;
+                            self.state.rec.bad_gen = self.state.rec.winner_gen;
+                            self.state.rec.bad_rr = self.state.recover_refusal;
+                            self.state.rec.phase = REC_SELECT;
+                        }
+                    }
+                }
+                REC_ORPHANS => {
+                    // Orphans (present but unreferenced) are deleted — every
+                    // listed run when no manifest is usable.
+                    self.state.recover_refusal = if self.state.rec.has_winner { 5 } else { 7 };
+                    let listed = self.state.rec.listed as usize;
+                    while (self.state.rec.idx as usize) < listed {
+                        let id = self
+                            .state
+                            .rec
+                            .ids
+                            .get(self.state.rec.idx as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        let rc = self.state.rec.run_count as usize;
+                        let referenced = self.state.rec.has_winner
+                            && self.state.rec.runs.iter().take(rc).any(|m| m.id == id);
+                        if !referenced {
+                            // `Again`: asked again next step, here. A real
+                            // refusal ends the attempt with the run queued,
+                            // so the next attempt asks for it before it
+                            // lists anything (SWEEP_BATCH).
+                            match self.storage.delete(FileKind::Run, id) {
+                                Ok(()) | Err(StorageError::NotFound) => {}
+                                Err(StorageError::Again) => return Err(StoreError::Backpressure),
+                                Err(e) => {
+                                    if let Some(slot) = self.state.sweep_ids.get_mut(0) {
+                                        *slot = id;
+                                        self.state.sweep_count = 1;
+                                        self.state.sweep_at = 0;
+                                    }
+                                    return Err(map_storage(e));
+                                }
+                            }
+                        }
+                        self.state.rec.idx += 1;
+                    }
+                    self.state.rec.idx = 0;
+                    if self.state.rec.has_winner {
+                        let rc = self.state.rec.run_count as usize;
+                        self.state.runs = self.state.rec.runs;
+                        self.state.run_count = rc as u32;
+                        self.state.rec.phase = REC_FILTERS;
+                    } else {
+                        self.state.next_run_id = self.state.rec.max_seen_id + 1;
+                        self.state.rec.phase = REC_WALK;
+                    }
+                }
+                REC_FILTERS => {
+                    // Load each run's persisted filter. One bounded 1 KiB
+                    // read per run — versus the full record scan of every
+                    // run that rebuilding from keys would cost on the boot
+                    // path. `verify_run` has already validated the whole
+                    // file (including this region, which the file CRC
+                    // covers), so these bytes are known good before they
+                    // are trusted.
+                    self.state.recover_refusal = 6;
+                    let rc = self.state.run_count as usize;
+                    while (self.state.rec.idx as usize) < rc {
+                        let i = self.state.rec.idx as usize;
+                        let meta = self.state.runs.get(i).copied().unwrap_or(RunMeta::empty());
+                        let foot = meta.file_len - RUN_FOOTER_LEN as u64;
+                        let off = foot + RUN_FOOTER_BLOOM_OFF as u64;
+                        let Some(bloom) = self.state.run_blooms.get_mut(i) else {
+                            return Err(StoreError::StorageFault);
+                        };
+                        read_exact(&*self.storage, FileKind::Run, meta.id, off, bloom)?;
+                        let ioff = off + BLOOM_BYTES as u64;
+                        let Some(index) = self.state.run_index.get_mut(i) else {
+                            return Err(StoreError::StorageFault);
+                        };
+                        read_exact(&*self.storage, FileKind::Run, meta.id, ioff, index)?;
+                        self.state.rec.idx += 1;
+                    }
+                    let r = self.state.rec;
+                    self.state.generation = r.winner_gen.max(if r.has_bad { r.bad_gen } else { 0 });
+                    self.state.manifest_slot = r.winner_slot;
+                    self.state.compaction_floor = r.floor;
+                    self.state.durable_applied_index = r.applied_index;
+                    self.state.durable_applied_term = r.applied_term;
+                    // Baseline for the next flush: nothing newer than the
+                    // manifest has been applied yet at recovery time.
+                    self.state.pending_applied_index = r.applied_index;
+                    self.state.pending_applied_term = r.applied_term;
+                    // Restore the revision clock to the run-set's high
+                    // water: the WAL tail beyond the manifest replays ON TOP
+                    // of this, so run content stays visible and new versions
+                    // keep ascending. Without this, a truncated WAL restarts
+                    // the clock at the tail and every run version is
+                    // "future".
+                    self.state.durable_highest_revision = r.man_revision;
+                    self.state.highest_revision = self.state.highest_revision.max(r.man_revision);
+                    // Resume the clock the runs' deadlines are measured
+                    // against. A WAL tick replayed on top only ever moves
+                    // it forward (the host latches the maximum), so
+                    // recovering it here can never place the clock ahead of
+                    // the log.
+                    self.state.durable_clock_ms = r.man_clock;
+                    self.state.committed_clock_ms = self.state.committed_clock_ms.max(r.man_clock);
+                    self.state.next_run_id = r.max_seen_id + 1;
+                    self.state.rec.phase = REC_WALK;
+                }
+                REC_WALK => {
+                    // Rebuild `highest_revision` from the surviving records
+                    // (the walk also re-validates every block CRC), a
+                    // bounded slice per call, resuming at the key it
+                    // reached (inclusive: a key seen twice changes no max).
+                    self.state.recover_refusal = 8;
+                    if self.recover_walk()? {
+                        self.state.highest_revision = self.state.rec.highest;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                _ => {
+                    self.state.rec.phase = REC_IDLE;
+                    return Err(StoreError::StorageFault);
+                }
             }
-            if !bad {
-                break;
-            }
-            if bad_slot.is_some() {
-                return Err(StoreError::StorageFault);
-            }
-            bad_slot = Some(winner_slot);
-            bad_gen = gen;
-            bad_rr = self.state.recover_refusal;
         }
-        if bad_slot.is_some() {
-            // The only usable slot named what the disk does not hold:
-            // quarantine, never an empty store in its place.
-            if winner_gen.is_none() {
-                self.state.recover_refusal = bad_rr;
-                return Err(StoreError::StorageFault);
-            }
-            self.state.recover_fallbacks = self.state.recover_fallbacks.wrapping_add(1);
-        }
+    }
 
-        if let Some(gen) = winner_gen {
-            let gen = gen.max(bad_gen);
-            // Orphans (present but unreferenced) are deleted.
-            self.state.recover_refusal = 5;
-            for &id in run_ids {
-                if !runs.iter().take(run_count).any(|m| m.id == id) {
-                    self.delete_orphan(id)?;
-                }
+    /// One slice of the recovery walk: `Ok(true)` at its end.
+    fn recover_walk(&mut self) -> Result<bool, StoreError> {
+        let mut bound = [0u8; MAX_ENCODED_KEY];
+        let bl = if self.state.rec.walk_started {
+            let n = (self.state.rec.walk_key_len as usize).min(MAX_ENCODED_KEY);
+            for (d, b) in bound.iter_mut().zip(self.state.rec.walk_key.iter()).take(n) {
+                *d = *b;
             }
-            self.state.runs = runs;
-            self.state.run_count = run_count as u32;
-            // Load each run's persisted filter. One bounded 1 KiB read
-            // per run — versus the full record scan of every run that
-            // rebuilding from keys would cost on the boot path.
-            // `verify_run` has already validated the whole file
-            // (including this region, which the file CRC covers), so
-            // these bytes are known good before they are trusted.
-            self.state.recover_refusal = 6;
-            for (i, meta) in runs.iter().enumerate().take(run_count) {
-                let foot = meta.file_len - RUN_FOOTER_LEN as u64;
-                let off = foot + RUN_FOOTER_BLOOM_OFF as u64;
-                read_exact(
-                    &*self.storage,
-                    FileKind::Run,
-                    meta.id,
-                    off,
-                    &mut self.state.run_blooms[i],
-                )?;
-                let ioff = off + BLOOM_BYTES as u64;
-                read_exact(
-                    &*self.storage,
-                    FileKind::Run,
-                    meta.id,
-                    ioff,
-                    &mut self.state.run_index[i],
-                )?;
-            }
-            self.state.generation = gen;
-            self.state.manifest_slot = winner_slot;
-            self.state.compaction_floor = floor;
-            self.state.durable_applied_index = applied.0;
-            self.state.durable_applied_term = applied.1;
-            // Baseline for the next flush: nothing newer than the
-            // manifest has been applied yet at recovery time.
-            self.state.pending_applied_index = applied.0;
-            self.state.pending_applied_term = applied.1;
-            // Restore the revision clock to the run-set's high water:
-            // the WAL tail beyond the manifest replays ON TOP of this,
-            // so run content stays visible and new versions keep
-            // ascending. Without this, a truncated WAL restarts the
-            // clock at the tail and every run version is "future".
-            self.state.durable_highest_revision = man_revision;
-            self.state.highest_revision = self.state.highest_revision.max(man_revision);
-            // Resume the clock the runs' deadlines are measured
-            // against. A WAL tick replayed on top only ever moves it
-            // forward (the host latches the maximum), so recovering it
-            // here can never place the clock ahead of the log.
-            self.state.durable_clock_ms = man_clock;
-            self.state.committed_clock_ms = self.state.committed_clock_ms.max(man_clock);
+            n
         } else {
-            // No usable manifest: the durable state is empty; every
-            // run present was never published and is an orphan.
-            self.state.recover_refusal = 7;
-            for &id in run_ids {
-                self.delete_orphan(id)?;
-            }
-        }
-        self.state.next_run_id = max_seen_id + 1;
-
-        // Rebuild `highest_revision` from the surviving records (the
-        // walk also re-validates every block CRC).
-        let mut highest = 0u64;
-        self.state.recover_refusal = 8;
+            0
+        };
         // SAFETY: the state's merge, lent to this walk (see `point`): no
         // point read runs inside a whole-store walk, nor one walk inside
         // another, so nothing else holds it while this reference lives.
         let m = unsafe { &mut *self.state.point.get() };
-        m.fill_filtered(self.state, &*self.storage, false, b"", None)?;
+        m.fill_filtered(
+            self.state,
+            &*self.storage,
+            false,
+            bound.get(..bl).unwrap_or(&[]),
+            None,
+        )?;
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
-        while let Some((klen, _)) =
-            m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
-        {
-            highest = highest.max(key_timestamp(&kbuf[..klen]));
+        let mut visited = 0u32;
+        loop {
+            let next = m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?;
+            let Some((klen, _)) = next else {
+                return Ok(true);
+            };
+            let ts = key_timestamp(&kbuf[..klen]);
+            if ts > self.state.rec.highest {
+                self.state.rec.highest = ts;
+            }
+            for (d, b) in self
+                .state
+                .rec
+                .walk_key
+                .iter_mut()
+                .zip(kbuf.iter())
+                .take(klen)
+            {
+                *d = *b;
+            }
+            self.state.rec.walk_key_len = klen as u16;
+            self.state.rec.walk_started = true;
+            visited += 1;
+            if visited >= RECOVER_WALK_RECORDS {
+                return Ok(false);
+            }
         }
-        self.state.highest_revision = highest;
-        self.state.recover_refusal = 0;
-        Ok(())
+    }
+
+    /// One bounded slice of validating a referenced run end to end:
+    /// exact length, header/footer framing and versions, and the
+    /// whole-file CRC against both the stored footer field and the
+    /// manifest digest. Continues from `rec.vstage`/`voff`/`vcrc`; sets
+    /// `recover_refusal` to the check being made (41 too short, 42
+    /// header, 43 a read, 44 CRC, 45 trailing bytes, 46 footer), so a
+    /// refusal says which.
+    fn verify_run_step(&mut self, meta: &RunMeta) -> Result<Verify, StoreError> {
+        let foot_len = RUN_FOOTER_LEN as u64;
+        let id = meta.id;
+        let storage = &*self.storage;
+        let rec = &mut self.state.rec;
+        let refusal = &mut self.state.recover_refusal;
+        if rec.vstage == VERIFY_HEADER {
+            *refusal = 41;
+            if meta.file_len < RUN_HDR_LEN as u64 + foot_len {
+                return Ok(Verify::Bad);
+            }
+            // Header framing first.
+            let mut hdr = [0u8; RUN_HDR_LEN];
+            *refusal = 43;
+            read_or_bad(storage, id, 0, &mut hdr)?;
+            *refusal = 42;
+            if rd_u32(&hdr, 0) != RUN_MAGIC
+                || rd_u16(&hdr, 4) != RUN_FORMAT_VERSION
+                || rd_u16(&hdr, 8) != internal_key::KEY_FORMAT_VERSION
+                || rd_u16(&hdr, 10) != state_store::STATE_STORE_CONTRACT_VERSION
+            {
+                return Ok(Verify::Bad);
+            }
+            rec.vstage = VERIFY_BODY;
+            rec.voff = 0;
+            rec.vcrc = CRC32_INIT;
+        }
+        if rec.vstage == VERIFY_BODY {
+            // Rolling CRC over [0, file_len - 4), a bounded number of
+            // chunks per call; the position and CRC carry across calls.
+            let mut chunk = [0u8; 4096];
+            let crc_end = meta.file_len - 4;
+            let mut chunks = 0u32;
+            while rec.voff < crc_end {
+                if chunks >= VERIFY_STEP_CHUNKS {
+                    return Ok(Verify::Slice);
+                }
+                let want = (crc_end - rec.voff).min(chunk.len() as u64) as usize;
+                *refusal = 43;
+                let part = chunk.get_mut(..want).unwrap_or(&mut []);
+                if read_or_bad(storage, id, rec.voff, part)? == Verify::Bad {
+                    return Ok(Verify::Bad);
+                }
+                rec.vcrc = crc32_update(rec.vcrc, part);
+                rec.voff += want as u64;
+                chunks += 1;
+            }
+            rec.vstage = VERIFY_TAIL;
+        }
+        // The tail checks are a handful of small reads, made together;
+        // one the device defers re-makes them all (they are pure).
+        let computed = crc32_finish(rec.vcrc);
+        let crc_end = meta.file_len - 4;
+        let mut tail = [0u8; 4];
+        *refusal = 43;
+        if read_or_bad(storage, id, crc_end, &mut tail)? == Verify::Bad {
+            return Ok(Verify::Bad);
+        }
+        *refusal = 44;
+        if computed != rd_u32(&tail, 0) || computed != meta.digest {
+            return Ok(Verify::Bad);
+        }
+        // The file must end exactly at file_len.
+        let mut probe = [0u8; 1];
+        *refusal = 43;
+        let n = match storage.read_at(FileKind::Run, id, meta.file_len, &mut probe) {
+            Ok(n) => n,
+            Err(StorageError::Again) => return Err(StoreError::Backpressure),
+            Err(_) => return Ok(Verify::Bad),
+        };
+        *refusal = 45;
+        if n != 0 {
+            return Ok(Verify::Bad);
+        }
+        // Footer framing: its magic and record count lead it.
+        let mut foot = [0u8; 8];
+        *refusal = 43;
+        if read_or_bad(storage, id, meta.file_len - foot_len, &mut foot)? == Verify::Bad {
+            return Ok(Verify::Bad);
+        }
+        *refusal = 46;
+        if rd_u32(&foot, 0) != RUN_FOOTER_MAGIC || rd_u32(&foot, 4) != meta.record_count {
+            return Ok(Verify::Bad);
+        }
+        Ok(Verify::Good)
     }
 
     fn note_manifest(&self, slot: u32, verdict: u32, generation: u32, top_run: u32) {
@@ -3609,22 +4368,6 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.sweep_count = n as u16;
         self.state.sweep_at = 0;
         Ok(n)
-    }
-
-    /// Delete one orphan run. One the FS defers is queued, so the next
-    /// recovery attempt asks for it again before listing (SWEEP_BATCH).
-    fn delete_orphan(&mut self, id: u32) -> Result<(), StoreError> {
-        match self.storage.delete(FileKind::Run, id) {
-            Ok(()) | Err(StorageError::NotFound) => Ok(()),
-            Err(e) => {
-                if let Some(slot) = self.state.sweep_ids.get_mut(0) {
-                    *slot = id;
-                    self.state.sweep_count = 1;
-                    self.state.sweep_at = 0;
-                }
-                Err(map_storage(e))
-            }
-        }
     }
 
     /// Delete the queued orphans in order. A delete that fails (E_AGAIN
@@ -3758,82 +4501,61 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             committed_clock_ms,
         )))
     }
+}
 
-    /// Validate one referenced run end-to-end: exact length,
-    /// header/footer framing and versions, and the whole-file CRC
-    /// against both the stored footer field and the manifest digest.
-    fn verify_run(&self, meta: &RunMeta) -> Result<(), StoreError> {
-        let mut at = 0u32;
-        verify_run(&*self.storage, meta, &mut at)
+/// A range page the device made wait after `emitted` entries: those are
+/// the page (the caller asks on from its cursor, which the memo names), or
+/// with none, `Backpressure` — ask the same request again.
+fn range_held(emitted: usize, pos: usize, resume_cursor: u64) -> Result<ScanProgress, StoreError> {
+    if emitted == 0 {
+        return Err(StoreError::Backpressure);
+    }
+    Ok(ScanProgress {
+        entries: emitted,
+        bytes: pos,
+        progress: Progress::InProgress {
+            cursor: resume_cursor + emitted as u64,
+        },
+        paused: false,
+    })
+}
+
+/// A capture step that met `e` after emitting `pos` bytes: those bytes
+/// are the step's answer (the capture's position covers exactly them) and
+/// the walk resumes next step; with nothing emitted, the error itself.
+fn held_back(pos: usize, cursor: u64, e: StoreError) -> Result<(usize, Progress), StoreError> {
+    if pos > 0 && e == StoreError::Backpressure {
+        Ok((pos, Progress::InProgress { cursor }))
+    } else {
+        Err(e)
     }
 }
 
-/// Validate one run file end to end; `at` names the check being made
-/// (41 too short, 42 header, 43 a read, 44 CRC, 45 trailing bytes, 46
-/// footer), so a refusal says which.
-fn verify_run<S: RunStorage>(storage: &S, meta: &RunMeta, at: &mut u32) -> Result<(), StoreError> {
-    {
-        *at = 41;
-        let foot_len = RUN_FOOTER_LEN as u64;
-        if meta.file_len < RUN_HDR_LEN as u64 + foot_len {
-            return Err(StoreError::StorageFault);
-        }
-        // Header framing first.
-        let mut hdr = [0u8; RUN_HDR_LEN];
-        *at = 43;
-        read_exact(storage, FileKind::Run, meta.id, 0, &mut hdr)?;
-        *at = 42;
-        if rd_u32(&hdr, 0) != RUN_MAGIC
-            || rd_u16(&hdr, 4) != RUN_FORMAT_VERSION
-            || rd_u16(&hdr, 8) != internal_key::KEY_FORMAT_VERSION
-            || rd_u16(&hdr, 10) != state_store::STATE_STORE_CONTRACT_VERSION
-        {
-            return Err(StoreError::StorageFault);
-        }
-        // Rolling CRC over [0, file_len - 4).
-        let mut crc_state = CRC32_INIT;
-        let mut chunk = [0u8; 4096];
-        let crc_end = meta.file_len - 4;
-        let mut off = 0u64;
-        while off < crc_end {
-            let want = (crc_end - off).min(chunk.len() as u64) as usize;
-            *at = 43;
-            read_exact(storage, FileKind::Run, meta.id, off, &mut chunk[..want])?;
-            crc_state = crc32_update(crc_state, &chunk[..want]);
-            off += want as u64;
-        }
-        let computed = crc32_finish(crc_state);
-        let mut tail = [0u8; 4];
-        read_exact(storage, FileKind::Run, meta.id, crc_end, &mut tail)?;
-        *at = 44;
-        if computed != rd_u32(&tail, 0) || computed != meta.digest {
-            return Err(StoreError::StorageFault);
-        }
-        // The file must end exactly at file_len.
-        let mut probe = [0u8; 1];
-        *at = 43;
-        let n = storage
-            .read_at(FileKind::Run, meta.id, meta.file_len, &mut probe)
-            .map_err(map_storage)?;
-        *at = 45;
-        if n != 0 {
-            return Err(StoreError::StorageFault);
-        }
-        // Footer framing: its magic and record count lead it.
-        let mut foot = [0u8; 8];
-        *at = 43;
-        read_exact(
-            storage,
-            FileKind::Run,
-            meta.id,
-            meta.file_len - foot_len,
-            &mut foot,
-        )?;
-        *at = 46;
-        if rd_u32(&foot, 0) != RUN_FOOTER_MAGIC || rd_u32(&foot, 4) != meta.record_count {
-            return Err(StoreError::StorageFault);
-        }
-        Ok(())
+/// What one slice of a run's verification found.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verify {
+    /// Whole and valid.
+    Good,
+    /// Absent, short, torn or corrupt: refused.
+    Bad,
+    /// A bounded slice done; asked again, it continues.
+    Slice,
+}
+
+/// Fill `out` exactly from run `id` at `offset` for verification:
+/// `Good` when it read whole, `Bad` when the bytes are not there (short,
+/// or the file refuses), `Err(Backpressure)` when the device cannot say
+/// yet (ask again).
+fn read_or_bad<S: RunStorage>(
+    storage: &S,
+    id: u32,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<Verify, StoreError> {
+    match read_exact(storage, FileKind::Run, id, offset, out) {
+        Ok(()) => Ok(Verify::Good),
+        Err(StoreError::Backpressure) => Err(StoreError::Backpressure),
+        Err(_) => Ok(Verify::Bad),
     }
 }
 
@@ -3852,7 +4574,91 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     /// mistaken for a good one).
     fn install_abort(&mut self) {
         self.state.install.active = false;
+        self.state.install.destroy = 0;
+        // A flush the install had in flight wrote the records being
+        // dropped: abandoned with them (its run is an orphan).
+        self.state.flush.active = false;
+        self.state.flush.phase = FLUSH_PHASE_RECORDS;
+        self.state.flush.stage = STAGE_CREATE;
         self.state.mem_count = 0;
+    }
+
+    /// Remove the local materialization before an install takes its
+    /// stream: every manifest file, then every run — files first, so a
+    /// crash mid-install recovers to "no usable manifest" = empty,
+    /// forcing a re-install rather than serving a mix. Each listing and
+    /// each delete may answer `Again`; the destroy then stands where it
+    /// was and the next call continues it (the listing into the same
+    /// buffer, the delete in flight asked again).
+    fn install_destroy(&mut self) -> Result<(), StoreError> {
+        loop {
+            match self.state.install.destroy {
+                DESTROY_LIST_MAN | DESTROY_LIST_RUN => {
+                    let kind = if self.state.install.destroy == DESTROY_LIST_MAN {
+                        FileKind::Manifest
+                    } else {
+                        FileKind::Run
+                    };
+                    let n = self
+                        .storage
+                        .list(kind, &mut self.state.rec.ids)
+                        .map_err(map_storage)?;
+                    self.state.install.destroy_n = n as u32;
+                    self.state.install.destroy_at = 0;
+                    self.state.install.destroy += 1;
+                }
+                DESTROY_DEL_MAN | DESTROY_DEL_RUN => {
+                    let kind = if self.state.install.destroy == DESTROY_DEL_MAN {
+                        FileKind::Manifest
+                    } else {
+                        FileKind::Run
+                    };
+                    while self.state.install.destroy_at < self.state.install.destroy_n {
+                        let id = self
+                            .state
+                            .rec
+                            .ids
+                            .get(self.state.install.destroy_at as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        match self.storage.delete(kind, id) {
+                            Ok(()) | Err(StorageError::NotFound) => {}
+                            Err(e) => return Err(map_storage(e)),
+                        }
+                        self.state.install.destroy_at += 1;
+                    }
+                    if self.state.install.destroy == DESTROY_DEL_RUN {
+                        self.state.install.destroy = 0;
+                        return Ok(());
+                    }
+                    self.state.install.destroy = DESTROY_NAME_A;
+                }
+                // The manifests' removal is published before anything else
+                // is: a power cut must never bring back a pre-install
+                // manifest — its generation may stand above the install's
+                // own — over a half-installed store.
+                DESTROY_NAME_A | DESTROY_NAME_B => {
+                    let slot = if self.state.install.destroy == DESTROY_NAME_A {
+                        MANIFEST_SLOT_A
+                    } else {
+                        MANIFEST_SLOT_B
+                    };
+                    match self.storage.fsync_name(FileKind::Manifest, slot) {
+                        Ok(()) | Err(StorageError::NotFound) => {}
+                        Err(e) => return Err(map_storage(e)),
+                    }
+                    self.state.install.destroy = if slot == MANIFEST_SLOT_A {
+                        DESTROY_NAME_B
+                    } else {
+                        DESTROY_LIST_RUN
+                    };
+                }
+                _ => {
+                    self.state.install.destroy = 0;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Is a snapshot capture holding the apply/flush exclusion? A
@@ -3952,7 +4758,14 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         // point read runs inside a whole-store walk, nor one walk inside
         // another, so nothing else holds it while this reference lives.
         let m = unsafe { &mut *self.state.point.get() };
-        m.fill_filtered(self.state, &*self.storage, true, &resume[..rl], None)?;
+        // A read the device cannot take now ends the step with what it
+        // has emitted (the header included): the capture's position moves
+        // only with each record emitted, so the next step resumes after
+        // the last one — nothing emitted is lost, nothing is sent twice.
+        let cursor = self.state.capture.next_ordinal;
+        if let Err(e) = m.fill_filtered(self.state, &*self.storage, true, &resume[..rl], None) {
+            return held_back(pos, cursor, e);
+        }
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
         let mut visited = 0u32;
@@ -3965,9 +4778,11 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                     },
                 ));
             }
-            let Some((klen, vlen)) =
-                m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
-            else {
+            let next = match m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf) {
+                Ok(n) => n,
+                Err(e) => return held_back(pos, self.state.capture.next_ordinal, e),
+            };
+            let Some((klen, vlen)) = next else {
                 if self.state.capture.counting {
                     // Counted: the emitting pass starts from the first key.
                     self.state.capture.counting = false;
@@ -4254,10 +5069,19 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 {
                     return in_progress(scan, ordinal, emitted, pos, true);
                 }
-                let Some(next) = scan
-                    .merge
-                    .next(&mem, &*self.storage, &mut kbuf, &mut vbuf)?
-                else {
+                let next = match scan.merge.next(&mem, &*self.storage, &mut kbuf, &mut vbuf) {
+                    Ok(n) => n,
+                    // The device deferred a block read. The merge holds
+                    // its place (a deferred load is retried before any
+                    // head is chosen) and the memo stands at the last key
+                    // consumed: pause exactly as the step budget does, and
+                    // the re-driven command continues here.
+                    Err(StoreError::Backpressure) => {
+                        return in_progress(scan, ordinal, emitted, pos, true);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let Some(next) = next else {
                     scan.valid = false;
                     return Ok(ScanProgress::done(emitted, pos));
                 };
@@ -4429,7 +5253,19 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 rm.pending_klen = 0;
                 (kl, vl)
             } else {
-                let Some(next) = rm.merge.next(mem, storage, &mut kbuf, &mut vbuf)? else {
+                let next = match rm.merge.next(mem, storage, &mut kbuf, &mut vbuf) {
+                    Ok(n) => n,
+                    // The device deferred a block. The merge holds its
+                    // place and the memo stands at the last record
+                    // processed: the page so far is the answer, or — with
+                    // nothing in it — `Backpressure`, and the same request
+                    // asked again continues here (`scan_at` keeps the memo).
+                    Err(StoreError::Backpressure) => {
+                        return range_held(emitted, pos, resume_cursor);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let Some(next) = next else {
                     rm.valid = false;
                     return Ok(ScanProgress::done(emitted, pos));
                 };
@@ -4474,8 +5310,23 @@ impl<S: RunStorage> DiskStore<'_, S> {
                     }
                     bound_len = plen + VERSION_SUFFIX_LEN;
                     bound_inclusive = true;
-                    rm.merge
-                        .open_lazy_in(&src, storage, true, &boundbuf[..bound_len])?;
+                    // Not live until whole: a seek the device defers part-way
+                    // is reopened from the key memo by the next call.
+                    rm.live = false;
+                    match rm
+                        .merge
+                        .open_lazy_in(&src, storage, true, &boundbuf[..bound_len])
+                    {
+                        Ok(()) => rm.live = true,
+                        Err(StoreError::Backpressure) => {
+                            rm.last_key[..klen].copy_from_slice(&kbuf[..klen]);
+                            rm.last_key_len = klen as u16;
+                            rm.decided = decided;
+                            rm.ordinal = ordinal;
+                            return range_held(emitted, pos, resume_cursor);
+                        }
+                        Err(e) => return Err(e),
+                    }
                     stale = 0;
                 }
             } else if key_timestamp(&kbuf[..klen]) > revn {
@@ -4648,9 +5499,11 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             limit,
             out,
         );
-        if matches!(r, Err(e) if e != StoreError::OutputTooSmall) {
+        if matches!(r, Err(e) if e != StoreError::OutputTooSmall && e != StoreError::Backpressure) {
             // Records were consumed and the ordinal not published:
-            // forget the position rather than resume it wrongly.
+            // forget the position rather than resume it wrongly. A device
+            // wait is not that: the memo stands at the last record
+            // processed, and the next call resumes there.
             self.state.range_reset();
         }
         r
@@ -4693,12 +5546,15 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             return Ok(ScanProgress::done(0, 0));
         }
         let r = self.scan_versions_walk(span, from_revision, hi, resume_cursor, limit, out);
-        if matches!(r, Err(e) if e != StoreError::OutputTooSmall) {
+        if matches!(r, Err(e) if e != StoreError::OutputTooSmall && e != StoreError::Backpressure) {
             // A fault mid-walk leaves the memo's position and its
             // ordinal out of step (records were consumed, the ordinal
             // was not published). Forget it: the next request walks
             // fresh and exact. `OutputTooSmall` is not a fault — the
-            // record that did not fit is stashed and the memo is exact.
+            // record that did not fit is stashed and the memo is exact —
+            // and neither is `Backpressure` (the device deferred the
+            // reopen: the key memo stands, not live, and the next call
+            // reopens from it).
             self.state.scan_reset();
         }
         r
@@ -4803,34 +5659,21 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             if request.range_generation != self.state.range_generation {
                 return Err(StoreError::FenceMismatch);
             }
-            // Count total records once (full fidelity: every surviving
-            // version, tombstones included).
-            let mut total = 0u64;
-            // SAFETY: the state's merge, lent to this walk (see `point`): no
-            // point read runs inside a whole-store walk, nor one walk inside
-            // another, so nothing else holds it while this reference lives.
-            let m = unsafe { &mut *self.state.point.get() };
-            m.fill_filtered(self.state, &*self.storage, true, b"", None)?;
-            let mut kbuf = [0u8; MAX_ENCODED_KEY];
-            let mut vbuf = [0u8; MAX_VALUE_LEN];
-            while m
-                .next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
-                .is_some()
-            {
-                total += 1;
-            }
+            // The capture holds its exclusion from here: the count and the
+            // records it emits are over one view, however many steps the
+            // device makes the walks take.
             self.state.capture = CaptureState {
                 active: true,
                 header_sent: false,
                 transfer: false,
-                counting: false,
+                counting: true,
                 as_of: 0,
                 resume_len: 0,
                 resume: [0; MAX_ENCODED_KEY],
                 range_generation: request.range_generation,
                 applied_index: request.applied_index,
                 next_ordinal: 0,
-                total_entries: total,
+                total_entries: 0,
             };
         } else {
             if request.applied_index != self.state.capture.applied_index
@@ -4840,6 +5683,53 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             }
             if cursor != self.state.capture.next_ordinal {
                 return Err(StoreError::Malformed);
+            }
+        }
+        let mut kbuf = [0u8; MAX_ENCODED_KEY];
+        let mut vbuf = [0u8; MAX_VALUE_LEN];
+        let mut resume = [0u8; MAX_ENCODED_KEY];
+        if self.state.capture.counting {
+            // Count total records once (full fidelity: every surviving
+            // version, tombstones included), resuming at the key the count
+            // reached when the device made it wait — `Ok((0, InProgress))`
+            // then, the same request asked again continuing it.
+            let rl = self.state.capture.resume_len as usize;
+            resume[..rl].copy_from_slice(&self.state.capture.resume[..rl]);
+            // SAFETY: the state's merge, lent to this walk (see `point`): no
+            // point read runs inside a whole-store walk, nor one walk inside
+            // another, so nothing else holds it while this reference lives.
+            let m = unsafe { &mut *self.state.point.get() };
+            let counted = (|| -> Result<bool, StoreError> {
+                m.fill_filtered(self.state, &*self.storage, true, &resume[..rl], None)?;
+                loop {
+                    let Some((klen, _)) =
+                        m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
+                    else {
+                        return Ok(true);
+                    };
+                    // The bound is inclusive: the key last counted comes
+                    // back first.
+                    if rl > 0 && kbuf[..klen] == resume[..rl] {
+                        continue;
+                    }
+                    self.state.capture.total_entries += 1;
+                    self.state.capture.resume[..klen].copy_from_slice(&kbuf[..klen]);
+                    self.state.capture.resume_len = klen as u32;
+                }
+            })();
+            match counted {
+                Ok(true) => {
+                    self.state.capture.counting = false;
+                    self.state.capture.resume_len = 0;
+                }
+                Ok(false) => {}
+                Err(StoreError::Backpressure) => {
+                    return Ok((0, Progress::InProgress { cursor: 0 }));
+                }
+                Err(e) => {
+                    self.state.capture.active = false;
+                    return Err(e);
+                }
             }
         }
         let mut pos = 0usize;
@@ -4860,25 +5750,31 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             pos = SNAP_HDR_LEN;
             self.state.capture.header_sent = true;
         }
-        // Re-walk the merge, skip the already-emitted ordinal, emit
-        // whole records while they fit.
+        // Resume the walk AT the last key emitted (inclusive, skipped), not
+        // from the first record: each chunk costs its own records, not the
+        // whole prefix again. The view is stable — the capture excludes
+        // writes and flushes — so the key is exact.
+        let rl = self.state.capture.resume_len as usize;
+        resume[..rl].copy_from_slice(&self.state.capture.resume[..rl]);
         // SAFETY: the state's merge, lent to this walk (see `point`): no
         // point read runs inside a whole-store walk, nor one walk inside
         // another, so nothing else holds it while this reference lives.
         let m = unsafe { &mut *self.state.point.get() };
-        m.fill_filtered(self.state, &*self.storage, true, b"", None)?;
-        let mut kbuf = [0u8; MAX_ENCODED_KEY];
-        let mut vbuf = [0u8; MAX_VALUE_LEN];
-        let mut ordinal = 0u64;
+        // As in `transfer_step`: a read the device defers ends the step
+        // with what it emitted; the position moved only with them.
+        if let Err(e) = m.fill_filtered(self.state, &*self.storage, true, &resume[..rl], None) {
+            return held_back(pos, self.state.capture.next_ordinal, e);
+        }
         loop {
-            let Some((klen, vlen)) =
-                m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?
-            else {
+            let next = match m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf) {
+                Ok(n) => n,
+                Err(e) => return held_back(pos, self.state.capture.next_ordinal, e),
+            };
+            let Some((klen, vlen)) = next else {
                 self.state.capture.active = false;
                 return Ok((pos, Progress::Done));
             };
-            if ordinal < self.state.capture.next_ordinal {
-                ordinal += 1;
+            if rl > 0 && kbuf[..klen] == resume[..rl] {
                 continue;
             }
             let need = RECORD_FIXED + klen + vlen;
@@ -4898,8 +5794,9 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             out[pos + 6..pos + 6 + klen].copy_from_slice(&kbuf[..klen]);
             out[pos + 6 + klen..pos + need].copy_from_slice(&vbuf[..vlen]);
             pos += need;
-            ordinal += 1;
-            self.state.capture.next_ordinal = ordinal;
+            self.state.capture.next_ordinal += 1;
+            self.state.capture.resume[..klen].copy_from_slice(&kbuf[..klen]);
+            self.state.capture.resume_len = klen as u32;
         }
     }
 
@@ -4912,7 +5809,10 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         request: SnapshotRequest,
         chunk: SnapshotChunk<'_>,
     ) -> Result<Progress, StoreError> {
-        if self.state.capture.active || self.state.compact.active || self.state.flush.active {
+        if self.state.capture.active
+            || self.state.compact.active
+            || (self.state.flush.active && !self.state.install.active)
+        {
             return Err(StoreError::Backpressure);
         }
         if !self.state.install.active {
@@ -4922,35 +5822,38 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             if request.range_generation != self.state.range_generation {
                 return Err(StoreError::FenceMismatch);
             }
-            // Destroy the local materialization (files first: a crash
-            // mid-install must recover to "no usable manifest" =
-            // empty, forcing a re-install rather than serving a mix).
-            let mut ids = [0u32; MAX_MANIFEST_FILES];
-            let n = self
-                .storage
-                .list(FileKind::Manifest, &mut ids)
-                .map_err(map_storage)?;
-            for &id in ids.iter().take(n) {
-                match self.storage.delete(FileKind::Manifest, id) {
-                    Ok(()) | Err(StorageError::NotFound) => {}
-                    Err(e) => return Err(map_storage(e)),
-                }
-            }
-            let mut rids = [0u32; MAX_LISTED_RUNS];
-            let rn = self
-                .storage
-                .list(FileKind::Run, &mut rids)
-                .map_err(map_storage)?;
-            for &id in rids.iter().take(rn) {
-                match self.storage.delete(FileKind::Run, id) {
-                    Ok(()) | Err(StorageError::NotFound) => {}
-                    Err(e) => return Err(map_storage(e)),
+            // REPLACE: the install holds the store from here (writes and
+            // flushes refuse) while the local files are destroyed.
+            self.state.install.active = true;
+            self.state.install.destroy = DESTROY_LIST_MAN;
+            self.state.install.destroy_n = 0;
+            self.state.install.destroy_at = 0;
+            self.state.install.range_generation = request.range_generation;
+            self.state.install.applied_index = request.applied_index;
+            // A recovery part-way is moot: everything it read is going.
+            self.state.rec.phase = REC_IDLE;
+        } else if request.applied_index != self.state.install.applied_index
+            || request.range_generation != self.state.install.range_generation
+        {
+            self.install_abort();
+            return Err(StoreError::FenceMismatch);
+        }
+        if self.state.install.destroy != 0 {
+            // `Again` → `Backpressure`: the same chunk asked again
+            // continues the destroy where it stood.
+            match self.install_destroy() {
+                Ok(()) => {}
+                Err(StoreError::Backpressure) => return Err(StoreError::Backpressure),
+                Err(e) => {
+                    self.install_abort();
+                    return Err(e);
                 }
             }
             let range_gen = self.state.range_generation;
             self.state.init();
             self.state.range_generation = range_gen;
             self.state.install.active = true;
+            self.state.install.destroy = 0;
             self.state.install.header_done = false;
             self.state.install.range_generation = request.range_generation;
             self.state.install.applied_index = request.applied_index;
@@ -4958,20 +5861,31 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             self.state.install.entry_count = 0;
             self.state.install.entries_done = 0;
             self.state.install.partial_len = 0;
-        } else {
-            if request.applied_index != self.state.install.applied_index
-                || request.range_generation != self.state.install.range_generation
-            {
-                self.install_abort();
-                return Err(StoreError::FenceMismatch);
-            }
-            if chunk.offset != self.state.install.expected_offset {
-                self.install_abort();
-                return Err(StoreError::Malformed);
+        }
+        // A chunk is taken from where the stream has been consumed to: the
+        // same chunk asked again after a `Backpressure` (the store made
+        // room part-way through it) skips what it already took. A chunk
+        // that starts past that point, or ends before it, is a gap.
+        let exp = self.state.install.expected_offset;
+        let end = chunk.offset + chunk.data.len() as u64;
+        if chunk.offset > exp || end < exp {
+            self.install_abort();
+            return Err(StoreError::Malformed);
+        }
+        // The install's own flush, left in flight by an earlier call, goes
+        // on before anything more is taken.
+        if self.state.flush.active {
+            match self.flush_inner() {
+                Ok(()) => {}
+                Err(StoreError::Backpressure) => return Err(StoreError::Backpressure),
+                Err(e) => {
+                    self.install_abort();
+                    return Err(e);
+                }
             }
         }
         // Stream bytes through the partial-record staging buffer.
-        let mut in_pos = 0usize;
+        let mut in_pos = (exp - chunk.offset) as usize;
         loop {
             if !self.state.install.header_done {
                 let have = self.state.install.partial_len as usize;
@@ -5046,9 +5960,19 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 }
             }
             if self.state.mem_count as usize >= MEMTABLE_MAX_ENTRIES {
-                if let Err(e) = self.flush_inner() {
-                    self.install_abort();
-                    return Err(e);
+                match self.flush_inner() {
+                    Ok(()) => {}
+                    Err(StoreError::Backpressure) => {
+                        // The flush waits on the device. The record stays
+                        // staged whole; the stream is consumed up to it,
+                        // and the same chunk asked again continues here.
+                        self.state.install.expected_offset = chunk.offset + in_pos as u64;
+                        return Err(StoreError::Backpressure);
+                    }
+                    Err(e) => {
+                        self.install_abort();
+                        return Err(e);
+                    }
                 }
             }
             // Copy out of the staging buffer to release the borrow.
@@ -5065,7 +5989,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 break;
             }
         }
-        self.state.install.expected_offset += chunk.data.len() as u64;
+        self.state.install.expected_offset = end;
         if chunk.last {
             let complete = self.state.install.header_done
                 && self.state.install.partial_len == 0
@@ -5098,6 +6022,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
     /// for the next cycle — conservative, never wrong). The floor is
     /// trusted, never computed.
     fn compact(&mut self, floor: Revision, cursor: u64) -> Result<Progress, StoreError> {
+        self.state.io_wait = false;
         if self.state.install.active || self.state.capture.active || self.state.flush.active {
             return Err(StoreError::Backpressure);
         }
@@ -5113,18 +6038,12 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 return Ok(Progress::Done);
             }
             let id = self.state.next_run_id.max(1);
-            create_fresh(self.storage, FileKind::Run, id)?;
-            let mut crc_state = CRC32_INIT;
-            let mut file_len = 0u64;
-            if let Err(e) = write_run_header(self.storage, id, &mut crc_state, &mut file_len) {
-                self.state.compact.active = false;
-                return Err(e);
-            }
             self.state.next_run_id = id + 1;
             self.state.compact = CompactState {
                 active: true,
                 phase: COMPACT_PHASE_MERGE,
-                _pad: [0; 2],
+                stage: STAGE_CREATE,
+                part: 0,
                 ticket: 0,
                 pending_gen: 0,
                 pending_slot: 0,
@@ -5135,8 +6054,8 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 input_ordinal: 0,
                 out_records: 0,
                 out_blocks: 0,
-                out_len: file_len,
-                crc_state,
+                out_len: 0,
+                crc_state: CRC32_INIT,
                 _pad2: 0,
                 smallest_off: 0,
                 largest_off: 0,
@@ -5162,35 +6081,29 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 return Err(StoreError::Malformed);
             }
         }
-        // A fenced tail is outstanding: poll it instead of re-walking
-        // the merge. Same submit/poll split as the flush, same reason —
-        // the publish fsync is far too long for one step.
-        if self.state.compact.phase != COMPACT_PHASE_MERGE {
-            let polled = match self.state.compact.phase {
-                COMPACT_PHASE_FOOTER => self.compact_finalize(),
-                COMPACT_PHASE_RUN_SYNC => self.compact_poll_run(),
-                COMPACT_PHASE_MAN_WRITE => self.compact_manifest_write(),
-                _ => self.compact_poll_manifest(),
-            };
-            return match polled {
-                Ok(p) => Ok(p),
-                Err(e) => {
-                    self.state.compact.active = false;
-                    self.state.compact.phase = COMPACT_PHASE_MERGE;
-                    Err(e)
-                }
-            };
-        }
-        // One bounded step. Re-walk the run-only merge from the start:
-        // records before the resume point are RE-DECIDED (to rebuild
-        // the per-prefix shadowing context) but not re-emitted.
-        let step_result = self.compact_step();
-        match step_result {
+        // Every storage action is one stage; one the device cannot take
+        // now answers `Backpressure` with the compaction still in flight,
+        // standing where it was (`io_wait`), and is asked again on the
+        // next call. Any other error abandons it: compaction publishes
+        // last, so the pre-compaction manifest is still the truth and the
+        // half-written output run is an orphan for `recover()`.
+        let stepped = match self.state.compact.phase {
+            COMPACT_PHASE_MERGE => self.compact_merge_stages(),
+            COMPACT_PHASE_FOOTER => self.compact_finalize(),
+            COMPACT_PHASE_RUN_SYNC => self.compact_poll_run(),
+            COMPACT_PHASE_MAN_WRITE => self.compact_manifest_write(),
+            _ => self.compact_poll_manifest(),
+        };
+        match stepped {
             Ok(p) => Ok(p),
+            Err(StoreError::Backpressure) => {
+                self.state.io_wait = true;
+                Err(StoreError::Backpressure)
+            }
             Err(e) => {
-                // Fail closed: drop the half-written output run (it
-                // becomes an orphan for recover()) and reset.
                 self.state.compact.active = false;
+                self.state.compact.phase = COMPACT_PHASE_MERGE;
+                self.state.compact.stage = STAGE_CREATE;
                 Err(e)
             }
         }
@@ -5198,6 +6111,35 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
 }
 
 impl<S: RunStorage> DiskStore<'_, S> {
+    /// The output run's create and header, then the bounded merge steps.
+    fn compact_merge_stages(&mut self) -> Result<Progress, StoreError> {
+        let id = self.state.compact.out_run_id;
+        if self.state.compact.stage == STAGE_CREATE {
+            create_fresh(self.storage, FileKind::Run, id)?;
+            self.state.compact.stage = STAGE_HEADER;
+        }
+        if self.state.compact.stage == STAGE_HEADER {
+            let mut crc_state = CRC32_INIT;
+            let mut file_len = 0u64;
+            write_run_header(self.storage, id, &mut crc_state, &mut file_len)?;
+            self.state.compact.crc_state = crc_state;
+            self.state.compact.out_len = file_len;
+            self.state.compact.stage = STAGE_BODY;
+            return Ok(Progress::InProgress { cursor: 0 });
+        }
+        self.compact_step()
+    }
+
+    /// One bounded merge step, ATOMIC against the device: the step's
+    /// records are decided from the saved merge positions and the ONE
+    /// block they fill is appended as the step's last act; only once it
+    /// has landed are the positions, the counts and the block's index
+    /// entry saved. A step whose read or write the device cannot take now
+    /// therefore leaves nothing behind, and the next call — from the same
+    /// saved positions, over the same immutable runs — decides the same
+    /// records into the same block bytes and asks the same append again,
+    /// which the storage continues. Blocks already read stay in the
+    /// block cache, so the repeated step does not read them again.
     fn compact_step(&mut self) -> Result<Progress, StoreError> {
         let floor = self.state.compact.floor;
         let resume = self.state.compact.input_ordinal;
@@ -5229,10 +6171,21 @@ impl<S: RunStorage> DiskStore<'_, S> {
             kept_below_floor = self.state.compact.carry_kept_below_floor;
         }
         let mut processed = resume;
-        let mut block = [0u8; BLOCK_MAX_PAYLOAD];
+        // The step's block, framed: payload from BLOCK_HDR.
+        let mut block = [0u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD];
         let mut fill = 0usize;
         let mut block_recs = 0u32;
+        let mut first_key = [0u8; INDEX_KEY_BYTES];
+        // The merge positions before the record in hand: where the next
+        // step resumes when this one ends before taking it.
+        let mut at_block = [0u64; MAX_RUNS];
+        let mut at_rec = [0u32; MAX_RUNS];
         loop {
+            for i in 0..m.run_count.min(MAX_RUNS) {
+                let (b, r) = m.runs[i].save_pos();
+                at_block[i] = b;
+                at_rec[i] = r;
+            }
             let next = m.next(&self.state.mem_view(), &*self.storage, &mut kbuf, &mut vbuf)?;
             let Some((klen, vlen)) = next else {
                 // Input exhausted: close the last block, then hand the
@@ -5240,10 +6193,13 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 // each is a separate step with its own deadline
                 // budget.
                 if fill > 0 {
-                    self.compact_write_block(&block[..fill], block_recs)?;
+                    self.compact_write_block(&mut block, fill, block_recs, &first_key)?;
                 }
+                self.state.compact.input_ordinal = processed;
                 self.state.compact.resume_valid = false;
                 self.state.compact.phase = COMPACT_PHASE_FOOTER;
+                self.state.compact.stage = STAGE_FOOTER;
+                self.state.compact.part = 0;
                 return Ok(Progress::InProgress {
                     cursor: self.state.compact.input_ordinal,
                 });
@@ -5251,52 +6207,58 @@ impl<S: RunStorage> DiskStore<'_, S> {
             if klen < MIN_ENCODED_KEY {
                 return Err(StoreError::StorageFault);
             }
+            // Decide the record against a copy of the dedup context: it is
+            // committed only if the record is taken into this step.
             let plen = klen - VERSION_SUFFIX_LEN;
-            if plen != prefix_len || kbuf[..plen] != prefix[..prefix_len] {
-                prefix[..plen].copy_from_slice(&kbuf[..plen]);
-                prefix_len = plen;
-                kept_below_floor = false;
-            }
+            let new_prefix = plen != prefix_len || kbuf[..plen] != prefix[..prefix_len];
+            let mut kept = if new_prefix { false } else { kept_below_floor };
             let ts = key_timestamp(&kbuf[..klen]);
             let keep = if ts > floor {
                 true
-            } else if !kept_below_floor {
-                kept_below_floor = true;
+            } else if !kept {
+                kept = true;
                 // Rule (b): the newest at-or-below-floor version being
                 // a tombstone means nothing survives beneath it.
                 key_kind_byte(&kbuf[..klen]) != ValueKind::PointTombstone as u8
             } else {
                 false // rule (a): shadowed below the floor
             };
+            let rec_len = RECORD_FIXED + klen + vlen;
+            if keep && fill > 0 && fill + rec_len > BLOCK_TARGET {
+                // The block is full: this record opens the next step. The
+                // step ends BEFORE it, at the positions saved above, with
+                // the dedup context as it stood before it.
+                self.compact_write_block(&mut block, fill, block_recs, &first_key)?;
+                self.compact_save(
+                    processed,
+                    &at_block,
+                    &at_rec,
+                    m.run_count,
+                    &prefix,
+                    prefix_len,
+                    kept_below_floor,
+                );
+                return Ok(Progress::InProgress { cursor: processed });
+            }
+            if new_prefix {
+                prefix[..plen].copy_from_slice(&kbuf[..plen]);
+                prefix_len = plen;
+            }
+            kept_below_floor = kept;
             processed += 1;
             if keep {
-                let rec_len = RECORD_FIXED + klen + vlen;
-                if fill > 0 && fill + rec_len > BLOCK_TARGET {
-                    self.compact_write_block(&block[..fill], block_recs)?;
-                    fill = 0;
-                    block_recs = 0;
-                }
-                if !self.state.compact.blk_has_first {
+                if fill == 0 {
                     let n = klen.min(INDEX_KEY_BYTES);
-                    let mut k = [0u8; INDEX_KEY_BYTES];
-                    k[..n].copy_from_slice(&kbuf[..n]);
-                    self.state.compact.blk_first_key = k;
-                    self.state.compact.blk_has_first = true;
+                    first_key = [0u8; INDEX_KEY_BYTES];
+                    first_key[..n].copy_from_slice(&kbuf[..n]);
                 }
-                copy_at(&mut block, fill, &(klen as u16).to_le_bytes());
-                copy_at(&mut block, fill + 2, &(vlen as u32).to_le_bytes());
-                copy_at(&mut block, fill + 6, &kbuf[..klen]);
-                copy_at(&mut block, fill + 6 + klen, &vbuf[..vlen]);
-                // Same incremental filter build as the flush path: the
-                // merged output run gets its own filter, one key at a
-                // time, so no extra pass is ever needed.
-                bloom_insert(
-                    &mut self.state.compact.bloom,
-                    &kbuf[..klen.saturating_sub(VERSION_SUFFIX_LEN)],
-                );
+                let at = BLOCK_HDR + fill;
+                copy_at(&mut block, at, &(klen as u16).to_le_bytes());
+                copy_at(&mut block, at + 2, &(vlen as u32).to_le_bytes());
+                copy_at(&mut block, at + 6, &kbuf[..klen]);
+                copy_at(&mut block, at + 6 + klen, &vbuf[..vlen]);
                 fill += rec_len;
                 block_recs += 1;
-                self.state.compact.out_records += 1;
             }
             if processed - resume >= COMPACT_STEP_RECORDS {
                 // Step budget spent: close the partial block so no
@@ -5304,32 +6266,77 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 // the exact merge positions + dedup-walk context so
                 // the next step SEEKS here instead of replaying.
                 if fill > 0 {
-                    self.compact_write_block(&block[..fill], block_recs)?;
+                    self.compact_write_block(&mut block, fill, block_recs, &first_key)?;
                 }
-                self.state.compact.input_ordinal = processed;
-                self.state.compact.resume_valid = true;
-                self.state.compact.run_pos_count = m.run_count as u8;
-                for i in 0..m.run_count {
+                for i in 0..m.run_count.min(MAX_RUNS) {
                     let (b, r) = m.runs[i].save_pos();
-                    self.state.compact.run_block[i] = b;
-                    self.state.compact.run_rec[i] = r;
+                    at_block[i] = b;
+                    at_rec[i] = r;
                 }
-                self.state.compact.carry_prefix_len = prefix_len as u16;
-                self.state.compact.carry_prefix[..prefix_len]
-                    .copy_from_slice(&prefix[..prefix_len]);
-                self.state.compact.carry_kept_below_floor = kept_below_floor;
+                self.compact_save(
+                    processed,
+                    &at_block,
+                    &at_rec,
+                    m.run_count,
+                    &prefix,
+                    prefix_len,
+                    kept_below_floor,
+                );
                 return Ok(Progress::InProgress { cursor: processed });
             }
         }
     }
 
-    fn compact_write_block(&mut self, payload: &[u8], rec_count: u32) -> Result<(), StoreError> {
+    /// A merge step has landed: save where the next one resumes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the resume point is these fields; a struct would only rename them"
+    )]
+    fn compact_save(
+        &mut self,
+        processed: u64,
+        at_block: &[u64; MAX_RUNS],
+        at_rec: &[u32; MAX_RUNS],
+        run_count: usize,
+        prefix: &[u8; MAX_ENCODED_KEY],
+        prefix_len: usize,
+        kept_below_floor: bool,
+    ) {
+        let c = &mut self.state.compact;
+        c.input_ordinal = processed;
+        c.resume_valid = true;
+        c.run_pos_count = run_count as u8;
+        c.run_block = *at_block;
+        c.run_rec = *at_rec;
+        c.carry_prefix_len = prefix_len as u16;
+        for (d, b) in c
+            .carry_prefix
+            .iter_mut()
+            .zip(prefix.iter())
+            .take(prefix_len)
+        {
+            *d = *b;
+        }
+        c.carry_kept_below_floor = kept_below_floor;
+    }
+
+    /// Append the step's block (framed in `block`, payload `fill` bytes)
+    /// and, only once it has landed, account for it: the output run's
+    /// CRC, length, block count, index entry, filter and record count.
+    fn compact_write_block(
+        &mut self,
+        block: &mut [u8; BLOCK_OVERHEAD + BLOCK_MAX_PAYLOAD],
+        fill: usize,
+        rec_count: u32,
+        first_key: &[u8; INDEX_KEY_BYTES],
+    ) -> Result<(), StoreError> {
         let mut crc_state = self.state.compact.crc_state;
         let mut file_len = self.state.compact.out_len;
         let off = write_run_block(
             self.storage,
             self.state.compact.out_run_id,
-            payload,
+            block,
+            fill,
             rec_count,
             &mut crc_state,
             &mut file_len,
@@ -5340,19 +6347,33 @@ impl<S: RunStorage> DiskStore<'_, S> {
         self.state.compact.largest_off = off;
         {
             let ordinal = self.state.compact.out_blocks;
-            let first = self.state.compact.blk_first_key;
-            idx_push(&mut self.state.compact.index, ordinal, off, &first);
+            idx_push(&mut self.state.compact.index, ordinal, off, first_key);
+        }
+        // Same incremental filter build as the flush path, over the
+        // block's records now that they are in the run.
+        let mut p = BLOCK_HDR;
+        let end = BLOCK_HDR + fill;
+        while p + RECORD_FIXED <= end {
+            let klen = rd_u16(block, p) as usize;
+            let vlen = rd_u32(block, p + 2) as usize;
+            let k0 = p + RECORD_FIXED;
+            if let Some(key) = block.get(k0..k0 + klen.saturating_sub(VERSION_SUFFIX_LEN)) {
+                bloom_insert(&mut self.state.compact.bloom, key);
+            }
+            p = k0 + klen + vlen;
         }
         self.state.compact.blk_has_first = false;
         self.state.compact.out_blocks += 1;
+        self.state.compact.out_records += rec_count;
         self.state.compact.crc_state = crc_state;
         self.state.compact.out_len = file_len;
         Ok(())
     }
 
-    /// Close the output run and SUBMIT its durability fence. Nothing is
-    /// published here — the manifest is not written until the run is
-    /// proven durable, and the inputs are not deleted until the
+    /// Close the output run and SUBMIT its durability fence: the footer,
+    /// part by part, then the submit — each asked again as it stands.
+    /// Nothing is published here — the manifest is not written until the
+    /// run is proven durable, and the inputs are not deleted until the
     /// manifest is.
     fn compact_finalize(&mut self) -> Result<Progress, StoreError> {
         let c = self.state.compact;
@@ -5365,29 +6386,38 @@ impl<S: RunStorage> DiskStore<'_, S> {
             }
             self.state.compact.pending_gen = self.state.generation + 1;
             self.state.compact.phase = COMPACT_PHASE_MAN_WRITE;
+            self.state.compact.stage = STAGE_MAN_WRITE;
             return Ok(Progress::InProgress {
                 cursor: c.input_ordinal,
             });
         }
-        let (final_len, file_crc) = write_run_footer(
-            self.storage,
-            c.out_run_id,
-            c.out_records,
-            c.out_blocks,
-            c.smallest_off,
-            c.largest_off,
-            &self.state.compact.bloom,
-            &self.state.compact.index,
-            c.crc_state,
-            c.out_len,
-        )?;
+        if self.state.compact.stage == STAGE_FOOTER {
+            while self.state.compact.part < FOOTER_PARTS {
+                let mut crc = self.state.compact.crc_state;
+                write_run_footer_part(
+                    self.storage,
+                    c.out_run_id,
+                    self.state.compact.part,
+                    c.out_records,
+                    c.out_blocks,
+                    c.smallest_off,
+                    c.largest_off,
+                    &self.state.compact.bloom,
+                    &self.state.compact.index,
+                    &mut crc,
+                )?;
+                self.state.compact.crc_state = crc;
+                self.state.compact.part += 1;
+            }
+            self.state.compact.pending_len = c.out_len + RUN_FOOTER_LEN as u64;
+            self.state.compact.pending_crc = crc32_finish(self.state.compact.crc_state);
+            self.state.compact.stage = STAGE_RUN_SUBMIT;
+        }
         let ticket = self
             .storage
             .fsync_submit(FileKind::Run, c.out_run_id)
             .map_err(map_storage)?;
         self.state.compact.ticket = ticket;
-        self.state.compact.pending_len = final_len;
-        self.state.compact.pending_crc = file_crc;
         self.state.compact.phase = COMPACT_PHASE_RUN_SYNC;
         Ok(Progress::InProgress {
             cursor: c.input_ordinal,
@@ -5402,35 +6432,35 @@ impl<S: RunStorage> DiskStore<'_, S> {
             .map_err(map_storage)?
         {
             FsyncState::Pending => {
+                self.state.io_wait = true;
                 return Ok(Progress::InProgress {
                     cursor: c.input_ordinal,
-                })
+                });
             }
             FsyncState::Durable => {}
         }
         self.state.compact.pending_gen = self.state.generation + 1;
         self.state.compact.phase = COMPACT_PHASE_MAN_WRITE;
+        self.state.compact.stage = STAGE_RUN_NAME;
         Ok(Progress::InProgress {
             cursor: c.input_ordinal,
         })
     }
 
+    /// Publish the output run's name, write the manifest slot, then submit
+    /// its fence: three stages.
     fn compact_manifest_write(&mut self) -> Result<Progress, StoreError> {
-        let c = self.state.compact;
         let slot = self.state.inactive_manifest_slot();
-        let ticket = if c.out_records == 0 {
-            Self::manifest_write_submit(
-                self.storage,
-                slot,
-                c.pending_gen,
-                &[],
-                c.floor,
-                self.state.durable_applied_index,
-                self.state.durable_applied_term,
-                self.state.durable_highest_revision,
-                self.state.durable_clock_ms,
-            )?
-        } else {
+        if self.state.compact.stage == STAGE_RUN_NAME {
+            if self.state.compact.out_records != 0 {
+                self.storage
+                    .fsync_name(FileKind::Run, self.state.compact.out_run_id)
+                    .map_err(map_storage)?;
+            }
+            self.state.compact.stage = STAGE_MAN_WRITE;
+        }
+        let c = self.state.compact;
+        if c.stage == STAGE_MAN_WRITE {
             let meta = RunMeta {
                 id: c.out_run_id,
                 record_count: c.out_records,
@@ -5438,21 +6468,30 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 digest: c.pending_crc,
                 _pad: 0,
             };
-            Self::manifest_write_submit(
-                self.storage,
-                slot,
-                c.pending_gen,
-                &[meta],
-                c.floor,
-                self.state.durable_applied_index,
-                self.state.durable_applied_term,
-                self.state.durable_highest_revision,
-                self.state.durable_clock_ms,
-            )?
-        };
+            let metas = [meta];
+            let runs: &[RunMeta] = if c.out_records == 0 { &[] } else { &metas };
+            let body = ManifestBody {
+                generation: c.pending_gen,
+                runs,
+                floor: c.floor,
+                applied_index: self.state.durable_applied_index,
+                applied_term: self.state.durable_applied_term,
+                highest_revision: self.state.durable_highest_revision,
+                committed_clock_ms: self.state.durable_clock_ms,
+            };
+            if Self::manifest_write(self.storage, slot, &body)? {
+                self.state.slot_unnamed |= slot_bit(slot);
+            }
+            self.state.compact.stage = STAGE_MAN_SUBMIT;
+        }
+        let ticket = self
+            .storage
+            .fsync_submit(FileKind::Manifest, slot)
+            .map_err(map_storage)?;
         self.state.compact.pending_slot = slot;
         self.state.compact.ticket = ticket;
         self.state.compact.phase = COMPACT_PHASE_MAN_SYNC;
+        self.state.compact.stage = STAGE_MAN_POLL;
         Ok(Progress::InProgress {
             cursor: c.input_ordinal,
         })
@@ -5466,18 +6505,23 @@ impl<S: RunStorage> DiskStore<'_, S> {
     /// quarantine on the next boot.
     fn compact_poll_manifest(&mut self) -> Result<Progress, StoreError> {
         let c = self.state.compact;
-        match self
-            .storage
-            .fsync_poll(FileKind::Manifest, c.pending_slot, c.ticket)
-            .map_err(map_storage)?
-        {
-            FsyncState::Pending => {
-                return Ok(Progress::InProgress {
-                    cursor: c.input_ordinal,
-                })
+        if c.stage == STAGE_MAN_POLL {
+            match self
+                .storage
+                .fsync_poll(FileKind::Manifest, c.pending_slot, c.ticket)
+                .map_err(map_storage)?
+            {
+                FsyncState::Pending => {
+                    self.state.io_wait = true;
+                    return Ok(Progress::InProgress {
+                        cursor: c.input_ordinal,
+                    });
+                }
+                FsyncState::Durable => {}
             }
-            FsyncState::Durable => {}
+            self.state.compact.stage = STAGE_MAN_NAME;
         }
+        self.publish_slot_name(c.pending_slot)?;
         let old_count = self.state.run_count as usize;
         let old_runs = self.state.runs;
         self.state.runs = [RunMeta::empty(); MAX_RUNS];
@@ -5504,6 +6548,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
         self.state.compaction_floor = c.floor;
         self.state.compact.active = false;
         self.state.compact.phase = COMPACT_PHASE_MERGE;
+        self.state.compact.stage = STAGE_CREATE;
         // The merged-away inputs are unreferenced now. QUEUE their
         // deletion instead of doing it here: each FAT32 delete walks
         // and frees the file's whole cluster chain synchronously, and
@@ -5521,13 +6566,16 @@ impl<S: RunStorage> DiskStore<'_, S> {
             } else {
                 // The queue is full: deletions are being outpaced (a long
                 // import, a burst of writes that never lets the drain
-                // run). Deleted now, whatever it costs this step — a
-                // dropped id would leave the file for recovery, and a
-                // store killed with enough of them could not list its
-                // runs to recover.
+                // run). Asked now; the merge is ALREADY adopted, so a
+                // delete the device cannot take now (or refuses) is not a
+                // failure of this compaction — the file is left an
+                // unreferenced orphan, which recovery deletes (a listing
+                // too long to hold is swept in batches, `SWEEP_BATCH`).
                 match self.storage.delete(FileKind::Run, meta.id) {
                     Ok(()) | Err(StorageError::NotFound) => {}
-                    Err(e) => return Err(map_storage(e)),
+                    Err(_) => {
+                        self.state.retire_orphaned = self.state.retire_orphaned.wrapping_add(1);
+                    }
                 }
             }
         }

@@ -196,6 +196,29 @@ impl FdCache {
         None
     }
 
+    /// Forget the least-recently-used entry, returning its descriptor
+    /// for the caller to close (`None` when empty): room for a descriptor
+    /// the caller opens outside the cache within the same table budget.
+    pub fn evict_lru(&mut self) -> Option<i32> {
+        let mut victim: Option<usize> = None;
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.fd < 0 {
+                continue;
+            }
+            let older = match victim.and_then(|v| self.slots.get(v)) {
+                None => true,
+                Some(best) => s.used < best.used,
+            };
+            if older {
+                victim = Some(i);
+            }
+        }
+        let slot = self.slots.get_mut(victim?)?;
+        let fd = slot.fd;
+        *slot = FdSlot::empty();
+        Some(fd)
+    }
+
     /// Drain every descriptor into `out`, emptying the cache. Returns
     /// how many were written; `out` must hold `SLOTS`.
     pub fn take_all(&mut self, out: &mut [i32; SLOTS]) -> usize {
