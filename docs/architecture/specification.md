@@ -154,10 +154,14 @@ copy recaptures everything that landed after the first capture; and
 on its acknowledgement the cutover map publishes and the barrier
 lifts. Within that drain bound an acknowledged write is captured or
 retried onto the new owner, and the map never points at a span that
-is not yet resident. Both providers export the span (the disk provider
-merge-scans it into the same portable body; version history stays
-behind, since the destination partition's revision space is
-independent). Across nodes, the `span_courier` pair carries the same
+is not yet resident. Both providers export the span as a run of
+bodies in key order, each within the worker's snapshot body bound, so a
+span of any size moves; the target merges each into the install and
+acknowledges only the last (the disk provider merge-scans its span into
+the same portable form; version history stays behind, since the
+destination partition's revision space is independent). If no
+acknowledgement ever arrives, the driver cuts over unfenced after its
+settle timeout rather than wedge. Across nodes, the `span_courier` pair carries the same
 chunk stream and returning acknowledgement over one TCP connection,
 byte-for-byte; transport loss fails closed (an incomplete stream
 aborts the install, no acknowledgement returns, the cutover never
@@ -317,7 +321,14 @@ the lease. Watch delivery
 (`watch_registry` + `watch_fanout`) replays a revision window
 through versioned scans: every version in `(from, to]` is delivered
 in order, tombstones included, and a compacted answer abandons the
-backfill rather than delivering a partial tail. Watch and lease
+backfill rather than delivering a partial tail. While a watch's replay
+is open nothing is matched live for it; when the replay closes, what
+committed meanwhile is delivered first (from the registry's recent
+mutations, or by a further replay), so a watch sees revisions in order
+with no gap or repeat. A watch moved to another registry (a session
+handoff) moves only once every frame its registry sent has reached the
+anchor, and resumes from the revision its old registry had matched up
+to, so a move neither loses nor repeats an event. Watch and lease
 state is held in memory: it does not survive a node restart (see
 [Design targets](#design-targets-not-wired)). A record's TTL does
 survive one: the deadline lives in the record, and the clock it is

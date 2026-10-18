@@ -252,6 +252,12 @@ pub struct SessionAnchor<const N: usize> {
     relocate_to: u8,
     relocate_moved: u16,
     relocate_stayed: u16,
+    /// Relocations completed, and the last one's tally: sessions moved to
+    /// the target and sessions that stayed. What a relocation achieved is
+    /// otherwise invisible outside the anchor.
+    pub relocations: u32,
+    pub last_moved: u16,
+    pub last_stayed: u16,
     dir_seq: u64,
     scratch: [u8; FRAME_SCRATCH],
 }
@@ -269,6 +275,9 @@ impl<const N: usize> SessionAnchor<N> {
             relocate_to: NO_WORKER_IDX,
             relocate_moved: 0,
             relocate_stayed: 0,
+            relocations: 0,
+            last_moved: 0,
+            last_stayed: 0,
             dir_seq: 0,
             scratch: [0; FRAME_SCRATCH],
         }
@@ -289,6 +298,9 @@ impl<const N: usize> SessionAnchor<N> {
         self.relocate_to = NO_WORKER_IDX;
         self.relocate_moved = 0;
         self.relocate_stayed = 0;
+        self.relocations = 0;
+        self.last_moved = 0;
+        self.last_stayed = 0;
         self.dir_seq = 0;
     }
 
@@ -307,6 +319,11 @@ impl<const N: usize> SessionAnchor<N> {
 
     pub fn relocating(&self) -> bool {
         self.relocate_to != NO_WORKER_IDX
+    }
+
+    /// Sessions in service (attached and not ending).
+    pub fn in_service_count(&self) -> usize {
+        self.sessions.iter().filter(|s| s.in_service()).count()
     }
 
     pub fn len(&self) -> usize {
@@ -592,6 +609,39 @@ impl<const N: usize> SessionAnchor<N> {
         }
     }
 
+    /// True iff `payload`, a frame `from` a worker, is the export
+    /// (`CMD_SC_EXPORT_BEGIN`) of a session awaiting it whose outbound
+    /// cursor is ahead of what the module has relayed so far.
+    ///
+    /// A worker whose output reaches the module on a data path apart from
+    /// its control channel (through another module, or another channel)
+    /// can export before that output has been read here: everything it
+    /// counted as produced was written before the export, but the module
+    /// has not consumed it yet. Such a frame is held back, and the
+    /// channel it came on paused, until the module has relayed that
+    /// output; then the cursor check measures the same prefix on both
+    /// sides. The session's handoff deadline bounds the wait — once it
+    /// passes the session is no longer awaiting the export and this
+    /// returns `false`, so the held frame is handled (and ignored).
+    pub fn export_output_in_transit(&self, from: u8, msg_type: u8, payload: &[u8]) -> bool {
+        if msg_type != sc::CMD_SC_EXPORT_BEGIN || payload.len() < sc::SESSION_HEADER {
+            return false;
+        }
+        let mut sid: SessionId = [0; 16];
+        sid.copy_from_slice(sc::session_id(payload));
+        let Some(idx) = self.find(&sid) else {
+            return false;
+        };
+        let s = &self.sessions[idx];
+        if s.phase != APHASE_IMPORT_WAIT || from != s.worker {
+            return false;
+        }
+        match sc::export_cursors(payload).and_then(SessionCursors::decode) {
+            Some(c) => c.out_produced > s.relayed,
+            None => false,
+        }
+    }
+
     /// The worker serving session `idx`, for routing a worker-originated
     /// reply back to a stream by session.
     pub fn worker_of(&self, idx: usize) -> u8 {
@@ -798,6 +848,9 @@ impl<const N: usize> SessionAnchor<N> {
                             }
                             self.relocate_to = NO_WORKER_IDX;
                             self.active_worker = target;
+                            self.relocations = self.relocations.wrapping_add(1);
+                            self.last_moved = self.relocate_moved;
+                            self.last_stayed = self.relocate_stayed;
                             return AnchorAction::RelocationDone(
                                 target,
                                 self.relocate_moved,

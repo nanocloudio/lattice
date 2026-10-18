@@ -15,25 +15,48 @@
 //!   in-service watch it matches gets a personalised copy on
 //!   **`events_out`**.
 //! - **`progress`** — `MSG_WATCH_PROGRESS` from `watch_fanout`: one
-//!   ack per framed event advances the watch's `last_sent_revision`
-//!   and its delivery cursor in the same step; a `COMPACTED` ack ends
-//!   a watch whose replay window fell behind the compaction floor.
+//!   ack per framed event, live or replayed, advances the watch's
+//!   `last_sent_revision` and its delivery cursor in the same step; a
+//!   `REPLAYED` ack closes a replay plan and counts the frames it sent;
+//!   a `COMPACTED` ack ends a watch whose replay window fell behind the
+//!   compaction floor. Acks reach every registry; only the one serving
+//!   the watch counts them.
 //! - **`in_epoch_events`** — the substrate's placement epoch. Held,
 //!   never stamped into a session.
 //!
-//! Emits **`retention`** floors to `compaction_coordinator` and
-//! **`replay_plan`** to the fanout whenever a session (re)enters
-//! service here — after an import commits, or after a refused handoff
-//! reinstates the exporter — so the window the session missed while
-//! it was out of service is backfilled from history.
+//! Emits **`retention`** floors to `compaction_coordinator`, and
+//! **`replay_plan`** to the fanout when a watch is owed history this
+//! registry cannot deliver from what it has read itself (see below).
 //!
 //! ## Handoff
 //!
-//! `CMD_SC_DRAIN` takes a watch out of service; once every event it
-//! emitted has been acked (`WatchRecord::outbound_settled`) the
-//! registry declares `DRAINED` and exports the record with its
-//! cursors. The importing registry holds the record dormant until
-//! `CMD_SC_RESUME` commits it at the new epoch.
+//! `CMD_SC_DRAIN` takes a watch out of service at the registry's
+//! mutation head; once no replay for it is open and every frame owed
+//! toward the anchor has been acked (`WatchRecord::outbound_settled`)
+//! the registry declares `DRAINED` and exports the record with its
+//! cursors. The outbound cursor is the count of frames the fanout put
+//! on the wire for the session — exactly what the anchor counts as it
+//! reads them — so the anchor's cursor check holds precisely when it
+//! has relayed everything this registry produced. The importing
+//! registry holds the record dormant until `CMD_SC_RESUME` commits it
+//! at the new epoch.
+//!
+//! A watch's position is a revision: the client has every event up to
+//! the record's `last_sent_revision`, and after a drain settles that is
+//! the cut it drained at. A record entering service — imported,
+//! reinstated after a refused handoff, or defined from a past revision
+//! — resumes from there (`enter_service`). What it missed while moving
+//! this registry read too, and holds in its mutation tail
+//! (`watch_hub::MutationTail`): those are emitted at once, ahead of
+//! live matching. History older than the tail, or asked for by the
+//! client, comes from a store replay bounded at this registry's
+//! mutation head. While a replay is open nothing is matched live for the
+//! watch; when it closes, what this registry read meanwhile follows from
+//! the tail — or, if the tail no longer reaches back that far, from a
+//! further replay, and so on — and live matching opens only once the
+//! watch is caught up (`watch_hub::catch_up_step`). Events reach the
+//! client in revision order; each owed event is delivered once, none is
+//! skipped.
 
 #![no_std]
 #![allow(
@@ -80,19 +103,24 @@ use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{placement_event_epoch, worker_id, SessionId, CLASS_WATCH};
 use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
 use watch_hub::{
-    match_event, MatchedWatch, WatchHub, WatchRecord, MAX_WATCHES, WATCH_EVENT_DELETE,
-    WATCH_EVENT_PUT, WATCH_EXPORT_MAX, WATCH_PHASE_ACTIVE, WATCH_PHASE_DRAINED,
-    WATCH_PHASE_DRAINING, WATCH_PHASE_IMPORTED,
+    catch_up_step, match_event, CatchUp, MatchedWatch, MutationTail, WatchHub, WatchRecord,
+    MAX_WATCHES, WATCH_EVENT_DELETE, WATCH_EVENT_PUT, WATCH_EXPORT_MAX, WATCH_PHASE_ACTIVE,
+    WATCH_PHASE_DRAINED, WATCH_PHASE_DRAINING, WATCH_PHASE_IMPORTED,
 };
 use wire::{
     MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_FLOOR, MSG_WATCH_CTRL, MSG_WATCH_EVENT,
     MSG_WATCH_PROGRESS, MSG_WATCH_REPLAY_PLAN, WATCH_CTRL_DEFINE, WATCH_CTRL_PROGRESS,
-    WATCH_PROGRESS_COMPACTED, WATCH_PROGRESS_DELIVERED,
+    WATCH_PROGRESS_COMPACTED, WATCH_PROGRESS_DELIVERED, WATCH_PROGRESS_REPLAYED,
 };
 
 /// One envelope in or out: the largest watch event behind its watch id
 /// (`wire::WATCH_EVENT_MAX` + 8), with room to spare.
 const SCRATCH_BUF_SIZE: usize = 8832;
+
+/// Most mutations read ahead of a drain's cut (`catch_up_mutations`):
+/// what one channel holds, so a backlog is read whole while a producer
+/// that never pauses cannot hold the drain off.
+const MUTATION_CATCH_UP: usize = 256;
 
 #[repr(C)]
 struct RegistryState {
@@ -128,7 +156,14 @@ struct RegistryState {
     m_cancelled: u64,
     step_ctr: u64,
 
+    /// Highest revision read off `mutations`: every mutation at or below
+    /// it has been matched against the in-service watches.
+    mutation_head: i64,
+
     hub: WatchHub,
+    /// The most recent mutations read, for catching up a watch taken
+    /// over from another registry (`enter_service`).
+    tail: MutationTail,
     sw: SessionWorker<MAX_WATCHES>,
     /// An envelope read whole: header room, then the payload.
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
@@ -164,7 +199,9 @@ impl RegistryState {
         self.m_registered = 0;
         self.m_cancelled = 0;
         self.step_ctr = 0;
+        self.mutation_head = 0;
         self.hub.init();
+        self.tail.init();
         self.sw.init(worker_id(CLASS_WATCH, 0));
     }
 }
@@ -230,8 +267,18 @@ fn handle_session_frame(reg: &mut RegistryState, msg_type: u8, payload: &[u8]) {
         }
         WorkerAction::Drain(idx) => {
             let sid = *reg.sw.slots[idx].session_id();
+            catch_up_mutations(reg);
+            // The cut is a revision: the importer resumes above it. With
+            // one worker feeding `mutations` they arrive in revision order,
+            // so every revision at or below it has been read. When several
+            // workers' streams fan into one registry they interleave, and
+            // a revision at or below the cut read after it — committed by
+            // one worker before another's higher one reached here — is
+            // matched neither here (the record no longer produces events)
+            // nor by the importer: it is not delivered.
+            let head = reg.mutation_head;
             if let Some(rec) = reg.hub.find_session_mut(&sid) {
-                rec.phase = WATCH_PHASE_DRAINING;
+                rec.begin_drain(head);
             }
             // Settled already (nothing in flight)? Export right away.
             try_export(reg, idx);
@@ -251,29 +298,19 @@ fn handle_session_frame(reg: &mut RegistryState, msg_type: u8, payload: &[u8]) {
         }
         WorkerAction::Resumed(idx, new_epoch) => {
             let sid = *reg.sw.slots[idx].session_id();
-            let mut plan: Option<(u64, u64)> = None;
             if let Some(rec) = reg.hub.find_session_mut(&sid) {
                 rec.binding.adopt_epoch(new_epoch);
                 rec.binding.anchor_id = reg.sw.slots[idx].binding.anchor_id;
-                rec.phase = WATCH_PHASE_ACTIVE;
                 rec.in_consumed = reg.sw.slots[idx].in_consumed;
-                plan = Some((rec.watch_id, rec.last_sent_revision as u64));
             }
-            if let Some((wid, from)) = plan {
-                emit_replay_plan(reg, wid, from, 0);
-            }
+            enter_service(reg, &sid, true);
             emit_retention_floor(reg);
         }
         WorkerAction::Reinstated(idx) => {
+            // Back in service from where it stopped matching, not from
+            // its last delivered event (`settle_drain`).
             let sid = *reg.sw.slots[idx].session_id();
-            let mut plan: Option<(u64, u64)> = None;
-            if let Some(rec) = reg.hub.find_session_mut(&sid) {
-                rec.phase = WATCH_PHASE_ACTIVE;
-                plan = Some((rec.watch_id, rec.last_sent_revision as u64));
-            }
-            if let Some((wid, from)) = plan {
-                emit_replay_plan(reg, wid, from, 0);
-            }
+            enter_service(reg, &sid, true);
         }
         WorkerAction::EpochBumped(idx, new_epoch) => {
             let sid = *reg.sw.slots[idx].session_id();
@@ -310,12 +347,144 @@ fn try_export(reg: &mut RegistryState, idx: usize) {
     let n = match reg.hub.find_session_mut(&sid) {
         Some(rec) => {
             rec.phase = WATCH_PHASE_DRAINED;
+            rec.settle_drain();
             rec.in_consumed = reg.sw.slots[idx].in_consumed;
             rec.export(&mut blob)
         }
         None => 0,
     };
     let _ = reg.sw.export(idx, &blob[..n], &mut sink);
+}
+
+/// Put `sid`'s record in service here and deliver first what it is owed
+/// from the mutations this registry has already read: every one above
+/// the revision the client has everything up to
+/// (`WatchRecord::enter_service`).
+///
+/// A session taken over from another registry (`from_tail`) missed only
+/// what arrived while it moved, which this registry read and holds in
+/// its mutation tail: those are matched against the watch and emitted
+/// now, in the order read, ahead of anything matched live — and live
+/// matching takes every mutation read from here on. Otherwise (the tail
+/// no longer reaches back far enough, or a client asked for history
+/// from a revision of its choosing) the store replays
+/// `(from, mutation_head]`, live matching held off until that replay and
+/// the catch-up it continues into are done (`continue_catch_up`).
+/// Either way each owed mutation is delivered once, in revision order,
+/// none skipped.
+///
+/// A client's history from at or above this registry's head may still
+/// hold revisions this registry never read (written before it started):
+/// with no cut of its own to bound it by, that replay runs up to the
+/// store's present, which the fanout pins as it opens the window and
+/// reports as it closes it.
+///
+/// A record reinstated while a replay it entered an earlier service with
+/// is still open plans nothing: that replay's close catches it up.
+fn enter_service(reg: &mut RegistryState, sid: &SessionId, from_tail: bool) {
+    let head = reg.mutation_head;
+    let Some(rec) = reg.hub.find_session_mut(sid) else {
+        return;
+    };
+    let wid = rec.watch_id;
+    let Some(from) = rec.enter_service() else {
+        return;
+    };
+    if from >= head {
+        if !from_tail {
+            emit_replay_plan(reg, wid, from, 0);
+        }
+        return;
+    }
+    if from_tail && reg.tail.covers(from) {
+        catch_up_from_tail(reg, wid, from, head);
+        return;
+    }
+    emit_replay_plan(reg, wid, from, head);
+}
+
+/// The last replay open for `wid` closed with the client covered through
+/// `covered`: deliver what this registry read meanwhile, from the tail or
+/// a further replay, and open live matching once nothing is left
+/// (`watch_hub::catch_up_step`).
+fn continue_catch_up(reg: &mut RegistryState, wid: u64, covered: i64) {
+    let Some(rec) = reg.hub.get(wid) else {
+        return;
+    };
+    let active = rec.phase == WATCH_PHASE_ACTIVE;
+    match catch_up_step(rec, covered, reg.mutation_head, &reg.tail) {
+        CatchUp::Live(from) => {
+            if let Some(rec) = reg.hub.get_mut(wid) {
+                rec.live_from = from;
+            }
+        }
+        CatchUp::Settled => {}
+        CatchUp::Tail { from, to } => {
+            catch_up_from_tail(reg, wid, from, to);
+            if active {
+                if let Some(rec) = reg.hub.get_mut(wid) {
+                    rec.live_from = to;
+                }
+            }
+        }
+        CatchUp::Replay { from, to } => emit_replay_plan(reg, wid, from, to),
+    }
+}
+
+/// Emit, for watch `wid`, each mutation in the tail in `(from, to]` that
+/// it is owed.
+fn catch_up_from_tail(reg: &mut RegistryState, wid: u64, from: i64, to: i64) {
+    let mut at = 0usize;
+    let mut payload = [0u8; SCRATCH_BUF_SIZE];
+    while let Some((rev, p, next)) = reg.tail.entry(at) {
+        at = next;
+        let n = p.len();
+        if rev <= from || rev > to || n > payload.len() {
+            continue;
+        }
+        payload[..n].copy_from_slice(p);
+        let Some((_, kind, key_at, key_len)) = parse_mutation(&payload[..n]) else {
+            continue;
+        };
+        let owed = reg.hub.get(wid).is_some_and(|rec| {
+            rev > rec.start_revision && rec.owes(0, kind, &payload[key_at..key_at + key_len])
+        });
+        if owed {
+            emit_event(reg, wid, &payload[..n]);
+        }
+    }
+}
+
+/// Read every mutation already waiting on `mutations` and match it
+/// while the watches are still in service, so a drain's cut
+/// (`mutation_head`) falls between whole commits: the mutations one
+/// commit fans out (one revision, several keys) are written together,
+/// and none of them is left on the channel unmatched below the cut.
+fn catch_up_mutations(reg: &mut RegistryState) {
+    let sys = reg.syscalls;
+    if sys.is_null() || reg.mutations_in < 0 {
+        return;
+    }
+    let mut budget = MUTATION_CATCH_UP;
+    while budget > 0 {
+        // SAFETY: the module's syscall table, set at init.
+        let Some((mt, len)) = (unsafe {
+            read_envelope(
+                &mut reg.mutations_inbox,
+                &*sys,
+                reg.mutations_in,
+                &mut reg.scratch,
+            )
+        }) else {
+            return;
+        };
+        if mt == MSG_WATCH_EVENT {
+            let mut tmp = [0u8; SCRATCH_BUF_SIZE];
+            tmp[..len].copy_from_slice(&reg.scratch[..len]);
+            handle_mutation(reg, &tmp[..len]);
+        }
+        budget -= 1;
+    }
 }
 
 fn drop_record(reg: &mut RegistryState, sid: &SessionId) {
@@ -400,28 +569,34 @@ fn handle_define(reg: &mut RegistryState, idx: usize, sid: &SessionId, def: &[u8
             rec.in_consumed = reg.sw.slots[idx].in_consumed;
         }
         reg.m_registered += 1;
-        // A watch from a past revision: the history since then is
-        // replayed (the fanout pages it, or refuses it as compacted)
-        // before the live events it already receives.
+        // A watch from a past revision: the history since then up to
+        // this registry's head is replayed (the fanout pages it, or
+        // refuses it as compacted), and live matching starts above it.
         if from_rev > 0 {
-            emit_replay_plan(reg, watch_id, start_rev as u64, 0);
+            enter_service(reg, sid, false);
         }
         emit_retention_floor(reg);
     }
 }
 
-/// Emit a replay plan for `watch_id` over `(from, to]`.
+/// Emit a replay plan for `watch_id` over `(from, to]` (`to` 0: up to the
+/// store's present), counted open on its record until the fanout answers
+/// it finished; live matching for the watch is held off until then.
+///
+/// A plan that cannot be written is not open: live matching resumes for
+/// mutations read from here on, and the window is not delivered — as
+/// for a plan the fanout drops.
 ///
 /// The watch's key span is looked up here and shipped with the plan.
 /// The fanout holds no watch table by design, so if the span did not
 /// travel with the plan the only backfill it could perform would be a
 /// full-keyspace scan filtered afterwards — one client reconnecting
 /// would read the whole database.
-fn emit_replay_plan(reg: &mut RegistryState, watch_id: u64, from: u64, to: u64) {
+fn emit_replay_plan(reg: &mut RegistryState, watch_id: u64, from: i64, to: i64) {
     let mut body = [0u8; 24 + 4 + watch_hub::WATCH_KEY_MAX];
     body[0..8].copy_from_slice(&watch_id.to_le_bytes());
-    body[8..16].copy_from_slice(&from.to_le_bytes());
-    body[16..24].copy_from_slice(&to.to_le_bytes());
+    body[8..16].copy_from_slice(&(from as u64).to_le_bytes());
+    body[16..24].copy_from_slice(&(to as u64).to_le_bytes());
     let mut n = 24usize;
     match reg.hub.get(watch_id) {
         Some(rec) => {
@@ -441,15 +616,19 @@ fn emit_replay_plan(reg: &mut RegistryState, watch_id: u64, from: u64, to: u64) 
             n += 4;
         }
     }
-    unsafe {
+    let sent = unsafe {
         let sys = reg.syscalls;
-        if !sys.is_null() {
-            let _ = write_envelope(
+        !sys.is_null()
+            && write_envelope(
                 &*sys,
                 reg.replay_plan_out,
                 MSG_WATCH_REPLAY_PLAN,
                 &body[..n],
-            );
+            )
+    };
+    if sent {
+        if let Some(rec) = reg.hub.get_mut(watch_id) {
+            rec.begin_replay(from, to);
         }
     }
 }
@@ -477,63 +656,78 @@ fn emit_retention_floor(reg: &mut RegistryState) {
 // ── Mutation dispatcher ───────────────────────────────────────────────
 
 fn handle_mutation(reg: &mut RegistryState, payload: &[u8]) {
-    // Inbound from kv_state_worker:
-    //   [kpg:2][revision:8][op:1][key_len:2][key…][value_len:2][value…]
-    if payload.len() < 2 + 8 + 1 + 2 {
+    let Some((revision, event_kind, key_at, key_len)) = parse_mutation(payload) else {
         return;
+    };
+    reg.mutation_head = reg.mutation_head.max(revision);
+    reg.tail.push(revision, payload);
+    let key = &payload[key_at..key_at + key_len];
+
+    const MAX_MATCHES_PER_EVENT: usize = 32;
+    let mut matched = 0usize;
+    let mut matched_ids = [0u64; MAX_MATCHES_PER_EVENT];
+    match_event(&reg.hub, 0, revision, event_kind, key, |m| {
+        if matched < MAX_MATCHES_PER_EVENT {
+            matched_ids[matched] = m.watch_id;
+            matched += 1;
+        }
+    });
+    for &wid in &matched_ids[..matched] {
+        emit_event(reg, wid, payload);
+    }
+}
+
+/// A `MSG_WATCH_EVENT` payload from `kv_state_worker`
+/// (`[kpg:2][revision:8][op:1][key_len:2][key…][value_len:2][value…]`)
+/// as `(revision, event kind, key offset, key length)`; `None` when it
+/// is short or not a put or delete.
+fn parse_mutation(payload: &[u8]) -> Option<(i64, u8, usize, usize)> {
+    if payload.len() < 2 + 8 + 1 + 2 {
+        return None;
     }
     let revision = i64::from_le_bytes(slice8(payload, 2));
-    let op = payload[10];
     let key_len = u16::from_le_bytes([payload[11], payload[12]]) as usize;
-    let key_off = 13;
-    if key_off + key_len > payload.len() {
-        return;
+    let key_at = 13;
+    if key_at + key_len > payload.len() {
+        return None;
     }
-    let key = &payload[key_off..key_off + key_len];
-    let event_kind = match op {
+    let kind = match payload[10] {
         // A manifest's put is a put to every filter; the frame keeps
         // its op.
         types::KV_OP_PUT | types::KV_OP_PUT_MANIFEST => WATCH_EVENT_PUT,
         types::KV_OP_DELETE => WATCH_EVENT_DELETE,
-        _ => return,
+        _ => return None,
     };
+    Some((revision, kind, key_at, key_len))
+}
 
-    // For each matching in-service watch emit a personalised envelope
-    // downstream with the watch_id prepended so the anchor can route
-    // to the right open stream. Wire shape on `events_out` (consumed
-    // by watch_fanout and forwarded verbatim as MSG_WATCH_FRAME):
-    //
-    //   [watch_id:8][kpg:2][rev:8][op:1][klen:2][k][vlen:2][v]
+/// Emit mutation `payload` toward the fanout for watch `wid`, counted
+/// as owed on its record. The watch id is prepended so the anchor can
+/// route it to the right open stream. Wire shape on `events_out`
+/// (consumed by watch_fanout and forwarded verbatim as MSG_WATCH_FRAME):
+///
+///   [watch_id:8][kpg:2][rev:8][op:1][klen:2][k][vlen:2][v]
+fn emit_event(reg: &mut RegistryState, wid: u64, payload: &[u8]) {
     let sys = reg.syscalls;
-    let events_out = reg.events_out;
     let mut out_buf = [0u8; SCRATCH_BUF_SIZE];
     let body_len = payload.len();
-    if 8 + body_len > out_buf.len() {
+    if sys.is_null() || 8 + body_len > out_buf.len() {
         return;
     }
+    out_buf[0..8].copy_from_slice(&wid.to_le_bytes());
     out_buf[8..8 + body_len].copy_from_slice(payload);
-
-    const MAX_MATCHES_PER_EVENT: usize = 32;
-    let mut emitted = 0usize;
-    let mut matched_ids = [0u64; MAX_MATCHES_PER_EVENT];
-    match_event(&reg.hub, 0, revision, event_kind, key, |m| {
-        if emitted < MAX_MATCHES_PER_EVENT {
-            matched_ids[emitted] = m.watch_id;
-            emitted += 1;
-        }
-    });
-
-    if emitted == 0 || sys.is_null() {
-        return;
-    }
-    for &wid in &matched_ids[..emitted] {
-        out_buf[0..8].copy_from_slice(&wid.to_le_bytes());
-        let ok =
-            unsafe { write_envelope(&*sys, events_out, MSG_WATCH_EVENT, &out_buf[..8 + body_len]) };
-        if ok {
-            if let Some(rec) = reg.hub.get_mut(wid) {
-                rec.out_emitted = rec.out_emitted.wrapping_add(1);
-            }
+    // SAFETY: the module's syscall table, set at init.
+    let ok = unsafe {
+        write_envelope(
+            &*sys,
+            reg.events_out,
+            MSG_WATCH_EVENT,
+            &out_buf[..8 + body_len],
+        )
+    };
+    if ok {
+        if let Some(rec) = reg.hub.get_mut(wid) {
+            rec.out_emitted = rec.out_emitted.wrapping_add(1);
         }
     }
 }
@@ -541,7 +735,7 @@ fn handle_mutation(reg: &mut RegistryState, payload: &[u8]) {
 // ── Progress ack from fanout ──────────────────────────────────────────
 
 fn handle_progress_ack(reg: &mut RegistryState, payload: &[u8]) {
-    // [watch_id:8][revision:8][kind:1]
+    // [watch_id:8][revision:8][kind:1], and for REPLAYED [through:8]
     if payload.len() < 17 {
         return;
     }
@@ -553,12 +747,23 @@ fn handle_progress_ack(reg: &mut RegistryState, payload: &[u8]) {
                 emit_retention_floor(reg);
             }
         }
+        WATCH_PROGRESS_REPLAYED => {
+            // `rev` carries the frame count of the finished plan.
+            let through = i64::from_le_bytes(slice8(payload, 17));
+            if let Ok(Some(covered)) = reg.hub.replay_done(watch_id, rev as u64, through) {
+                continue_catch_up(reg, watch_id, covered);
+            }
+        }
         WATCH_PROGRESS_COMPACTED => {
             // The replay window fell behind the compaction floor: the
             // watch was refused explicitly on the wire by the fanout's
             // frame; here it ends. The anchor drops its session from
             // the same frame, so no DETACH exchange follows.
-            let sid = reg.hub.get(watch_id).map(|r| r.binding.session_id);
+            let sid = reg
+                .hub
+                .get(watch_id)
+                .filter(|r| r.serving())
+                .map(|r| r.binding.session_id);
             if let Some(sid) = sid {
                 if let Some(idx) = reg.sw.find(&sid) {
                     reg.sw.forget(idx);

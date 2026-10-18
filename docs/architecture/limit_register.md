@@ -37,8 +37,12 @@ big     | feature = "big"
 | In-memory physical-key slot | Shape | `MAX_KEY_LEN` | modules/common/kv_store.rs | 2584 | Derived: the 12-byte identity, a keyspace, and the longest model key (a document index entry at `MAX_DOCUMENT_ID_KEY`, worst-case escaped); a contract test holds it to the derivation. A longer composed key is rejected; what one replicated write carries is the consensus entry's bound. |
 | In-memory value bytes | Shape | `MAX_VALUE_LEN` | modules/common/kv_store.rs | 4096 | Rejects the operation. |
 | State-worker scratch | Capacity | `SCRATCH_BUF_SIZE` | modules/app/kv_state_worker/mod.rs | 8192 | A command frame whose payload is longer is discarded whole (never half-read) and counted; an over-budget memory snapshot export is refused, the WAL remaining authoritative. |
-| App-snapshot body | Shape | `SNAPSHOT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as 8164 bytes (`SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`); this binds before Clustor's 16384-byte snapshot body. |
-| Worker answer body | Shape | `RESULT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as `SCRATCH_BUF_SIZE` less the `MSG_KV_APPLIED` envelope (8151 bytes): the store answers into exactly what can be sent, so no answer is ever built that would go unsent. |
+| App-snapshot body | Shape | `SNAPSHOT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as 8164 bytes (`SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`); this binds before Clustor's 16384-byte snapshot body. A memory store's whole-state snapshot is one body within it; a span copy streams as a run of bodies, each within it, so a span of any size moves. |
+| Worker answer body | Shape | `RESULT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | The smaller of `APPLIED_BODY_MAX` and `KV_RESPONSE_BODY_MAX` (8132 bytes): the store answers into exactly what reaches the caller, so no answer is built that would go unsent; a byte-bound page (`KV_OP_RANGE_SCAN`) comes back short of its `limit` instead. |
+| Applied-answer room | Shape | `APPLIED_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as `SCRATCH_BUF_SIZE` less the `MSG_KV_APPLIED` envelope (8151 bytes): the room an answer has leaving the worker. |
+| KV response body | Shape | `KV_RESPONSE_BODY_MAX` | modules/common/wire.rs | — | Derived as `FRAME_PAYLOAD_MAX` less the response head and fence tail (8132 bytes): one `MSG_KV_RESPONSE` frame's body. A caller reading KV responses into `ENVELOPE_HDR + FRAME_PAYLOAD_MAX` takes every answer whole. |
+| Span request bound | Shape | `SPAN_BOUND_MAX` | modules/app/kv_state_worker/mod.rs | 256 | The longest start or end key a span request carries; a longer one is not served, and the requesting driver's settle timeout ends that move. |
+| Parked watch session frame | Shape | `WATCH_PARK_MAX` | modules/app/etcd_edge_anchor/mod.rs | 128 | The largest session frame the etcd anchor holds back while a registry's output is still in transit to it (an `EXPORT_BEGIN`); a larger one is handled at once, and the handoff's cursor check refuses it if output is missing. |
 | Snapshot chunk | Pacing | `SNAPSHOT_CHUNK_MAX` | modules/app/kv_state_worker/mod.rs | 4096 | Streams another chunk; does not cap total disk-state size. |
 | Disk provider user key | Shape | `MAX_USER_KEY` | modules/common/disk_store.rs | 2584 | Equal to `kv_store::MAX_KEY_LEN` (a contract test holds them together). |
 | Encoded disk key | Shape | `MAX_ENCODED_KEY` | modules/common/disk_store.rs | — | Derived: `internal_key::encoded_max_len(MAX_USER_KEY)`. Rejects keys whose escaped/on-disk representation cannot fit. |
@@ -54,6 +58,18 @@ big     | feature = "big"
 | Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held; the request times out upstream and is re-issued. Only `KV_OP_SCAN_VERSIONS` pauses, and its frame is bounded well under this. |
 | Command-log answer room | Shape | `CLOG_OUT_MAX` | modules/app/kv_state_worker/mod.rs | 65536 | The largest answer room an op is applied with (a store-provider call's); a logged op replays with the room it first had, capped here. |
 | Imported host-log record | Shape | `IMPORT_RECORD_MAX` | modules/app/kv_state_worker/mod.rs | 3149824 | One record of a fluxor host `store.log` being imported (`kv_state_worker_store`): the largest object (3 MiB) and its key. A larger record stops the import and quarantines the store rather than skip it. |
+| Held single-store write answers | Capacity | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 16 | Answers of single-store writes applied while their log records were not yet durable, each kept for its caller under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. Full of other callers' answers, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped. |
+| Store key | Shape | `KEY_MAX` | modules/common/store_provider.rs | 255 | The longest key the `storage.object`/`storage.namespace` provider takes (a LIST entry and a cursor carry its length in a byte). A longer key is refused `EINVAL` before the store is touched. |
+| Store inline value | Shape | `INLINE_MAX` | modules/common/store_provider.rs | — | Derived: one chunk's data (`kv_chunks::DATA_MAX`). A value up to it is stored and evented whole; a larger one is uploaded as chunks under a manifest, and its events carry no value (the value-elided flag). |
+| Store event | Shape | `EVENT_MAX` | modules/common/store_provider.rs | — | Derived: event head, change head, `KEY_MAX` and `INLINE_MAX`. The largest event a subscriber's channel is written; every event fits it by construction. |
+| Store fence buffer | Shape | `FENCE_WIRE_MAX` | modules/common/store_provider.rs | 62 | fluxor's `fence::WIRE_MAX_LEN`: a fence query's buffer holds any fence. A caller's fence buffer shorter than a fence gets none written, never a partial one. |
+| Store LIST trailer | Shape | `TRAILER_MAX` | modules/common/store_provider.rs | — | Derived: `3 + KEY_MAX`, the page trailer and the longest cursor. An entry that would leave the page no room for it ends the page there, that entry's key its cursor (the next page starts at it). |
+| Store walk re-drives | Pacing | `REDRIVE_MAX` | modules/common/store_provider.rs | — | `1 << 20` re-drives of one paused store walk in a call. Spent, the read answers `EAGAIN` (nothing moved; the store keeps its place and the re-ask continues it). |
+| Replica proposal body | Shape | `ENTRY_BODY_MAX` | modules/common/store_provider.rs | — | Derived: `kv_large::ENTRY_BODY_MAX`, the largest origin entry body a replicated write proposes (a chunk entry fills it). A larger body is never built: values past it go as chunks. |
+| Scope name | Shape | `SCOPE_NAME_MAX` | modules/common/store_provider.rs | 63 | The `scope` param's node name; longer, the scope is refused and the worker registers no contract (logged). |
+| Scoped prefixes | Shape | `SCOPED_MAX` | modules/common/store_provider.rs | 512 | The `scoped` param's comma-separated prefixes; longer, the scope is refused as `SCOPE_NAME_MAX` is. |
+| Scope key head | Shape | `SCOPE_HEAD_MAX` | modules/common/store_provider.rs | — | Derived: `/~node/` and `SCOPE_NAME_MAX`, the most a scope adds in front of a key. |
+| Scoped argument | Shape | `SCOPED_ARG_MAX` | modules/common/store_provider.rs | 1024 | A key-bearing call's argument once its names are the store's; one that would not fit is refused `EINVAL`. |
 | Skipped origin entries named | Pacing | `ORIGIN_SKIP_LOG_MAX` | modules/app/kv_state_worker/mod.rs | 32 | Origin entries a replica skips as stale or out of order are logged by name up to this many; the rest are counted (`oskip=` on the store heartbeat), so a diverging replica says where without flooding the log. |
 | Immutable runs | Capacity | `MAX_RUNS` | modules/common/disk_store.rs | 16 | Backpressures until compaction frees a run slot. |
 | Manifest files | Capacity | `MAX_MANIFEST_FILES` | modules/common/disk_store.rs | 8 | Bounds retained manifest generations; rotation/reclamation must keep pace. |
@@ -146,6 +162,7 @@ must expose any overrides and keep them consistent at every participant.
 | Large values per answer | Shape | `MAX_LARGE_PER_REPLY` | modules/common/kv_large.rs | 64 | Values one answer expands, each reserved at its place before it is fetched; a page holding more is cut (partial), any other answer is refused too large. |
 | etcd Txn nesting | Semantic | `ETCD_TXN_DEPTH_MAX` | modules/common/types.rs | 4 | Txns nested below the outermost; the store and the large-value layer refuse deeper ones alike. |
 | Chunk sweep budget | Shape | `SWEEP_BUDGET_MAX` | modules/common/kv_store.rs | 64 | Queue entries one replicated sweep takes, so one command's apply stays bounded; the proposer sweeps again while more are due. |
+| Chunk sweep room | Capacity | `SWEEP_ROOM` | modules/common/kv_store.rs | — | Derived: `kv_chunks::FANOUT` (61). Records a chunk upload leaves free on a provider with a fixed record count (the memory store's `MAX_KEYS`), so a sweep always has room to take a node apart (an entry per child); an upload past it is refused before it writes, and goes through once the sweep has reclaimed superseded trees. A node the store has no room to take apart stays queued and the sweep reports only that work waits. |
 | Data chunk | Shape | `DATA_MAX` | modules/common/kv_chunks.rs | — | Derived: `CHUNK_MAX` less the chunk's kind byte; a value within it is stored inline. |
 | Replicated write body | Shape | `ENTRY_BODY_MAX` | modules/common/kv_chunks.rs | — | Derived as 2004 (`CONSENSUS_PROPOSAL_BODY_MAX` less the entry tag and the command head; a contract test holds it): one replicated write's command body — exactly a chunk upload. A request past it carries its largest values as chunks until it fits, counting what the rewrite adds (an MSET's per-pair marks); one that cannot fit is refused too large. |
 | Chunk tree depth | Semantic | `MAX_DEPTH` | modules/common/kv_chunks.rs | 9 | Node levels any u64 total needs at 61-way fanout; a producer and a reader hold one node per level. Value size itself is each protocol's declared object policy, not this. |
@@ -351,8 +368,15 @@ store whose device is taken by a write, reproduced on Linux
 (`store_provider::Fault`). `N = 1` is refused (every step busy). Enabled,
 the worker logs `[kvw] FAULT INJECTION ON (test only)` at construction and
 counts injected waits on its store heartbeat (`fault=`).
+`fault_busy_reaches_store: 1` (id 21) moves a busy step from dispatch into
+the store itself (every store op a read applies answers `KV_RESULT_INTERNAL`
+with the backend busy, as the worker's store does while its device makes it
+wait), so the provider's own read paths must answer `EAGAIN`.
+`fault_log_hold_steps: N` (id 22, default 0 = off) keeps the log pending N
+worker steps after every single-store write, so another caller's write lands
+between a write and its re-ask.
 `tools/ci/no_fault_injection.sh` fails CI if any tracked graph outside
-`tests/` sets it.
+`tests/` sets any of them.
 
 ## Composition and scaling consequences
 
@@ -544,6 +568,10 @@ MAX_VALUE_LEN | modules/common/kv_store.rs | 4096
 SCRATCH_BUF_SIZE | modules/app/kv_state_worker/mod.rs | 8192
 SNAPSHOT_BODY_MAX | modules/app/kv_state_worker/mod.rs | -
 RESULT_BODY_MAX | modules/app/kv_state_worker/mod.rs | -
+APPLIED_BODY_MAX | modules/app/kv_state_worker/mod.rs | -
+KV_RESPONSE_BODY_MAX | modules/common/wire.rs | -
+SPAN_BOUND_MAX | modules/app/kv_state_worker/mod.rs | 256
+WATCH_PARK_MAX | modules/app/etcd_edge_anchor/mod.rs | 128
 SNAPSHOT_CHUNK_MAX | modules/app/kv_state_worker/mod.rs | 4096
 MAX_USER_KEY | modules/common/disk_store.rs | 2584
 MAX_ENCODED_KEY | modules/common/disk_store.rs | -
@@ -559,6 +587,18 @@ VERSIONS_TRANSCODE_SLACK | modules/common/kv_store.rs | 6
 HELD_FRAME_MAX | modules/app/kv_state_worker/mod.rs | 1024
 CLOG_OUT_MAX | modules/app/kv_state_worker/mod.rs | 65536
 IMPORT_RECORD_MAX | modules/app/kv_state_worker/mod.rs | 3149824
+LOCAL_ANSWERS | modules/common/store_provider.rs | 16
+KEY_MAX | modules/common/store_provider.rs | 255
+INLINE_MAX | modules/common/store_provider.rs | -
+EVENT_MAX | modules/common/store_provider.rs | -
+FENCE_WIRE_MAX | modules/common/store_provider.rs | 62
+TRAILER_MAX | modules/common/store_provider.rs | -
+REDRIVE_MAX | modules/common/store_provider.rs | -
+ENTRY_BODY_MAX | modules/common/store_provider.rs | -
+SCOPE_NAME_MAX | modules/common/store_provider.rs | 63
+SCOPED_MAX | modules/common/store_provider.rs | 512
+SCOPE_HEAD_MAX | modules/common/store_provider.rs | -
+SCOPED_ARG_MAX | modules/common/store_provider.rs | 1024
 ORIGIN_SKIP_LOG_MAX | modules/app/kv_state_worker/mod.rs | 32
 MAX_RUNS | modules/common/disk_store.rs | 16
 MAX_MANIFEST_FILES | modules/common/disk_store.rs | 8
@@ -631,6 +671,7 @@ CHUNK_REQUEST_MAX | modules/common/kv_large.rs | -
 MAX_LARGE_PER_REPLY | modules/common/kv_large.rs | 64
 ETCD_TXN_DEPTH_MAX | modules/common/types.rs | 4
 SWEEP_BUDGET_MAX | modules/common/kv_store.rs | 64
+SWEEP_ROOM | modules/common/kv_store.rs | -
 MAX_DEPTH | modules/common/kv_chunks.rs | 9
 CDC_MAX_VALUE_LEN | modules/common/cdc_wire.rs | 4096
 DATA_FRAME_MAX_PAYLOAD | modules/common/data_surface.rs | 8192

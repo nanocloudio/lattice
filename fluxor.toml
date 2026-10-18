@@ -93,8 +93,9 @@ unused_imports)."""
 #   2. host_crates.sh — with no root workspace, nothing else fmt/clippy/builds
 #      the three standalone tools/* crates, and the wire_lint / telemetry_guard
 #      catalog gates would never run.
-#   3. no_fault_injection.sh — the store provider's test-only fault knob
-#      (`fault_read_eagain_every`) is set by no graph outside tests/.
+#   3. no_fault_injection.sh — the store provider's test-only fault knobs
+#      (`fault_read_eagain_every`, `fault_busy_reaches_store`,
+#      `fault_log_hold_steps`) are set by no graph outside tests/.
 scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh", "tools/ci/no_fault_injection.sh"]
 
 [ci.templates]

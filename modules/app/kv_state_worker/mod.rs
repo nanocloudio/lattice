@@ -137,7 +137,10 @@ use kv_store::disk_store::{
     DiskState, DiskStore, SNAP_FLAG_DISK_RESIDENT, SNAP_FORMAT_VERSION, SNAP_HDR_CLOCK_OFF,
     SNAP_HDR_LEN, SNAP_MAGIC,
 };
-use kv_store::{DiskMaterializer, EventJournal, KvStore, Materializer, MAX_KEYS};
+use kv_store::{
+    DiskMaterializer, EventJournal, KvStore, Materializer, MAX_KEYS, MAX_KEY_LEN,
+    SNAPSHOT_FLAG_SPAN_MORE,
+};
 use types::{
     KV_OP_APPEND, KV_OP_CAS, KV_OP_DECR, KV_OP_DELETE, KV_OP_DELETE_META, KV_OP_EXISTS,
     KV_OP_FLUSH, KV_OP_GET, KV_OP_GET_AT, KV_OP_IDEMPOTENT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET,
@@ -499,6 +502,19 @@ define_params! {
     // counted on `[kvw] store hb … fault=`.
     20, fault_read_eagain_every, u32, 0
         => |s, d, len| { s.fault_read_eagain_every = p_u32(d, len, 0, 0); };
+    // TEST ONLY, with `fault_read_eagain_every`: a busy step reaches the
+    // store itself — every store op a read applies answers as the worker's
+    // store does while its device makes the op wait (`KV_RESULT_INTERNAL`,
+    // busy) — instead of ending at dispatch, so the provider's own read
+    // paths must answer EAGAIN. 0 (default): at dispatch.
+    21, fault_busy_reaches_store, u8, 0
+        => |s, d, len| { s.fault_busy_reaches_store = p_u8(d, len, 0, 0); };
+    // TEST ONLY: every single-store write the provider applies keeps the
+    // log pending this many further worker steps, so another caller's
+    // write lands between a write and its re-ask (the board's device
+    // holding the record). 0 (default): off.
+    22, fault_log_hold_steps, u32, 0
+        => |s, d, len| { s.fault_log_hold_steps = p_u32(d, len, 0, 0); };
 }
 
 /// Steps between chunk sweeps while writes may have queued chunk work.
@@ -879,6 +895,23 @@ struct WorkerState {
     xfer_len: usize,
     xfer_pos: usize,
     xfer_since_ms: u64,
+    /// A span copy for an elastic split (`MSG_APP_SNAPSHOT_SPAN_REQUEST`),
+    /// streamed a batch at a time: a RESET, then one span body per batch
+    /// until the one without `SNAPSHOT_FLAG_SPAN_MORE`.
+    /// `span_buf[..span_len]` is the batch in flight (`span_len == 0`:
+    /// none yet), `span_sent` bytes of it taken by the channel; the next
+    /// batch starts at `span_cursor` and the span ends before `span_end`.
+    span_active: bool,
+    span_reset_sent: bool,
+    span_more: bool,
+    span_len: usize,
+    span_sent: usize,
+    span_since_ms: u64,
+    span_cursor_len: usize,
+    span_end_len: usize,
+    /// The span install under way has taken a batch with more to follow:
+    /// the next batch's body is merged into the store, not a replacement.
+    import_span_merge: bool,
     m_xfer_exports: u64,
     m_xfer_installs: u64,
 
@@ -899,6 +932,9 @@ struct WorkerState {
 
     import_buf: [u8; SNAPSHOT_BODY_MAX],
     xfer_buf: [u8; SNAPSHOT_BODY_MAX],
+    span_buf: [u8; SNAPSHOT_BODY_MAX],
+    span_cursor: [u8; MAX_KEY_LEN],
+    span_end: [u8; SPAN_BOUND_MAX],
 
     held_frame: [u8; HELD_FRAME_MAX],
 
@@ -926,8 +962,11 @@ struct WorkerState {
     scoped_len: u16,
     /// `provider_selector::hash(volume)`, or 0: the default provider.
     selector: u32,
-    /// TEST ONLY: the store provider's injected read waits (param 20).
+    /// TEST ONLY: the store provider's injected read waits (param 20),
+    /// where they meet a read (21), and its held log records (22).
     fault_read_eagain_every: u32,
+    fault_busy_reaches_store: u8,
+    fault_log_hold_steps: u32,
 
     /// `command_log` param, and the log's life: off, replaying its tail
     /// after recovery, or live (every applied op logged).
@@ -1042,6 +1081,14 @@ impl WorkerState {
         self.xfer_done = false;
         self.xfer_len = 0;
         self.xfer_pos = 0;
+        self.span_active = false;
+        self.span_reset_sent = false;
+        self.span_more = false;
+        self.span_len = 0;
+        self.span_sent = 0;
+        self.span_cursor_len = 0;
+        self.span_end_len = 0;
+        self.import_span_merge = false;
         self.m_xfer_exports = 0;
         self.m_xfer_installs = 0;
         self.sweep_out = -1;
@@ -1836,10 +1883,17 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
         return CmdOutcome::Answered(true);
     }
 
-    // The store answers into exactly the room `MSG_KV_APPLIED` has for a
-    // body: an answer that filled the whole scratch could not be sent,
-    // and the command would go unanswered.
-    const RESULT_BODY_MAX: usize = SCRATCH_BUF_SIZE - 3 - wire::KvAppliedHead::LEN - 8;
+    // The store answers into the room both hops of the answer have for a
+    // body: `MSG_KV_APPLIED` out of this scratch, and the router's
+    // `MSG_KV_RESPONSE` re-heading of it, whose head and fence tail are
+    // longer. An answer past either could not be sent on, and the command
+    // would go unanswered.
+    const APPLIED_BODY_MAX: usize = SCRATCH_BUF_SIZE - 3 - wire::KvAppliedHead::LEN - 8;
+    const RESULT_BODY_MAX: usize = if APPLIED_BODY_MAX < wire::KV_RESPONSE_BODY_MAX {
+        APPLIED_BODY_MAX
+    } else {
+        wire::KV_RESPONSE_BODY_MAX
+    };
     let mut result_body = [0u8; RESULT_BODY_MAX];
     let now_ms = worker.committed_now_ms;
     let applied = if origin::is_provider_keyspace(id_keyspace) {
@@ -1875,14 +1929,17 @@ unsafe fn apply_command_frame(worker: &mut WorkerState, cmd: &[u8]) -> CmdOutcom
     let (result, result_body_len, result_revision) =
         (applied.result, applied.len, applied.revision);
     // A sweep is store maintenance this worker (or a replica's) proposed:
-    // nobody awaits its answer, which says only what is left to do.
+    // nobody awaits its answer, which says only what is left to do. One
+    // refused says nothing of the queues, so they are taken to hold work
+    // and swept again on the waiting cadence: a store full of what only
+    // the sweep reclaims may see no write land to arm it.
     if op == types::KV_OP_CHUNK_SWEEP {
         worker.sweeps_applied = worker.sweeps_applied.wrapping_add(1);
         worker.sweep_inflight = false;
         worker.sweep_flags = if result == KV_RESULT_OK {
             result_body[0]
         } else {
-            0
+            kv_store::SWEEP_WAITING
         };
         return CmdOutcome::Answered(true);
     }
@@ -3586,6 +3643,24 @@ unsafe fn provider_new(worker: &mut WorkerState) {
             };
             let mut k = write_prefix(&mut m, 0, what);
             k = write_dec(&mut m, k, u64::from(every));
+            if on && worker.fault_busy_reaches_store != 0 {
+                k = write_prefix(&mut m, k, b" (in the store)");
+            }
+            dev_log(sys, 1, m.as_ptr(), k);
+        }
+        if p.provides {
+            (*p.state).fault_busy_reaches_store(worker.fault_busy_reaches_store != 0);
+        }
+        if p.provides && worker.fault_log_hold_steps != 0 {
+            let hold = worker.fault_log_hold_steps;
+            (*p.state).fault_log_hold_steps(hold);
+            let mut m = [0u8; 96];
+            let mut k = write_prefix(
+                &mut m,
+                0,
+                b"[kvw] FAULT INJECTION ON (test only): each write's log record held, steps=",
+            );
+            k = write_dec(&mut m, k, u64::from(hold));
             dev_log(sys, 1, m.as_ptr(), k);
         }
         if p.provides && worker.import_path_len > 0 {
@@ -4826,8 +4901,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // SAFETY: the kernel passes this module's own state.
         let worker = unsafe { &mut *state.cast::<WorkerState>() };
         if worker.prov.provides && !worker.prov.state.is_null() {
-            // An injected read wait (test only) lasts until this step.
-            unsafe { (*worker.prov.state).fault_step() };
+            // A step for the provider: held write answers age, and an
+            // injected wait (test only) lasts until this step.
+            unsafe { (*worker.prov.state).step() };
         }
     }
     let rc = step(state);
@@ -4876,6 +4952,7 @@ fn step(state: *mut u8) -> i32 {
         drain_epoch_events(worker);
         drain_snapshot_ctl(worker);
         export_step(worker);
+        span_export_step(worker);
         drain_gc_floor(worker);
         drain_expire(worker);
         drive_expiry_resume(worker);
@@ -6126,6 +6203,11 @@ unsafe fn drain_epoch_events(worker: &mut WorkerState) {
 /// caps a snapshot body at 16 KiB, but our own transfer buffer is the
 /// tighter constraint.
 const SNAPSHOT_BODY_MAX: usize = SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR;
+/// Longest span bound a span request may carry.
+const SPAN_BOUND_MAX: usize = 256;
+/// Span-copy chunk frames one step writes at most (the channel's room
+/// bounds it sooner).
+const SPAN_FRAMES_PER_STEP: usize = 8;
 
 /// Service one app-snapshot control message per tick.
 ///
@@ -6153,6 +6235,12 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
         // Leave the channel unread (backpressure) rather than draining
         // and dropping: a consumed-then-ignored RESET would silently
         // lose the whole boot restore.
+        return;
+    }
+    if worker.span_active {
+        // A span copy owns `snapshot_export` until its last batch is
+        // taken: an answer to anything read now would interleave with it.
+        // The channel holds what arrives meanwhile.
         return;
     }
     let sys = &*sys_ptr;
@@ -6214,30 +6302,30 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             // No applied_index gate: a span copy is labelled state, not a
             // raft snapshot of THIS partition — a direct-apply source has a
             // valid store at index 0.
-            if worker.snapshot_export_out < 0 {
+            if worker.snapshot_export_out < 0 || payload_len < 20 {
                 return;
             }
-            let mut start = [0u8; 256];
-            let mut end = [0u8; 256];
-            let (sl, el) = {
-                let p = &worker.scratch;
-                if payload_len < 20 {
-                    return;
-                }
-                let sl = u16::from_le_bytes([p[16], p[17]]) as usize;
-                let el_off = 18 + sl;
-                if sl > 256 || el_off + 2 > payload_len {
-                    return;
-                }
-                let el = u16::from_le_bytes([p[el_off], p[el_off + 1]]) as usize;
-                if el > 256 || el_off + 2 + el > payload_len {
-                    return;
-                }
-                start[..sl].copy_from_slice(&p[18..18 + sl]);
-                end[..el].copy_from_slice(&p[el_off + 2..el_off + 2 + el]);
-                (sl, el)
-            };
-            emit_span_snapshot_chunks(worker, sys, &start[..sl], &end[..el]);
+            let p = &worker.scratch;
+            let sl = u16::from_le_bytes([p[16], p[17]]) as usize;
+            let el_off = 18 + sl;
+            if sl > SPAN_BOUND_MAX || el_off + 2 > payload_len {
+                return;
+            }
+            let el = u16::from_le_bytes([p[el_off], p[el_off + 1]]) as usize;
+            if el > SPAN_BOUND_MAX || el_off + 2 + el > payload_len {
+                return;
+            }
+            worker.span_cursor[..sl].copy_from_slice(&p[18..18 + sl]);
+            worker.span_end[..el].copy_from_slice(&p[el_off + 2..el_off + 2 + el]);
+            worker.span_cursor_len = sl;
+            worker.span_end_len = el;
+            worker.span_active = true;
+            worker.span_reset_sent = false;
+            worker.span_more = false;
+            worker.span_len = 0;
+            worker.span_sent = 0;
+            worker.span_since_ms = dev_millis(sys);
+            span_export_step(worker);
         }
         MSG_APP_SNAPSHOT_EXPORT_REQUEST => {
             if worker.snapshot_export_out < 0 || payload_len < 20 {
@@ -6303,6 +6391,7 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             worker.applied_term = term;
             worker.applied_index = index;
             worker.import_len = 0;
+            worker.import_span_merge = false;
             worker.importing = true;
         }
         MSG_APP_SNAPSHOT_DURABLE => {
@@ -6523,7 +6612,12 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                         false
                     }
                 } else {
-                    let ok = worker.store.snapshot_decode(&worker.import_buf[..total]);
+                    let body = &worker.import_buf[..total];
+                    let ok = if worker.import_span_merge {
+                        worker.store.snapshot_merge(body)
+                    } else {
+                        worker.store.snapshot_decode(body)
+                    };
                     if ok {
                         // The records are back; so must be the clock
                         // they were deadlined against. Their `expiry_ms`
@@ -6538,6 +6632,19 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
                     }
                     ok
                 };
+                worker.import_span_merge = false;
+                if installed
+                    && worker.state_store != STATE_STORE_DISK
+                    && u16::from_le_bytes([worker.import_buf[6], worker.import_buf[7]])
+                        & SNAPSHOT_FLAG_SPAN_MORE
+                        != 0
+                {
+                    // One batch of a span copy: the next adds to it, and
+                    // only the copy's last batch completes the install.
+                    worker.import_span_merge = true;
+                    worker.import_len = 0;
+                    return;
+                }
                 if installed {
                     // State now reflects the RESET's (term, index), which
                     // we already adopted (pending pair stamped above).
@@ -6932,47 +7039,45 @@ unsafe fn emit_snapshot_chunks(worker: &mut WorkerState, sys: &SyscallTable) {
     }
 }
 
-/// Elastic split: stream ONLY the keys in `[start, end)` as a
-/// `MSG_APP_SNAPSHOT_CHUNK` sequence — the elastic split's span copy to a
+/// Elastic split: stream ONLY the keys of the requested span as a
+/// `MSG_APP_SNAPSHOT_CHUNK` sequence — the span copy to a
 /// demand-provisioned partition. Both providers export: the memory store
 /// encodes its records directly, the disk provider merge-scans the span
 /// and streams the same portable body (current state; version history
 /// stays behind, as the target's revision space is independent).
 ///
+/// The copy is a RESET, then the span in key-ordered batches of at most
+/// `SNAPSHOT_BODY_MAX` bytes, each a complete span body sent as its own
+/// chunk sequence, every one but the last flagged
+/// `SNAPSHOT_FLAG_SPAN_MORE`. A batch is encoded only once the previous one
+/// has been taken, so a span of any size moves at the pace the channel
+/// drains, and writes go on between batches: a key written behind the
+/// cursor is caught by the split's fenced re-copy, which the router holds
+/// the span's writes for.
+///
 /// Unlike [`emit_snapshot_chunks`] this is a COPY to ANOTHER partition, not
 /// a snapshot of THIS worker's own state, so it deliberately touches none of
 /// this worker's GC-snapshot bookkeeping. An empty span still emits one
-/// header-only chunk, so the target's install path always runs.
-unsafe fn emit_span_snapshot_chunks(
-    worker: &mut WorkerState,
-    sys: &SyscallTable,
-    start: &[u8],
-    end: &[u8],
-) {
-    if worker.snapshot_export_out < 0 {
+/// header-only body, so the target's install path always runs.
+unsafe fn span_export_step(worker: &mut WorkerState) {
+    if !worker.span_active || worker.syscalls.is_null() {
         return;
     }
-    let mut body = [0u8; SNAPSHOT_BODY_MAX];
-    let encoded = if worker.state_store == STATE_STORE_DISK {
-        let store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
-        let mut mat = DiskMaterializer::new(store, worker.disk_revision, worker.disk_replay_floor);
-        mat.snapshot_encode_span(&mut body, worker.committed_now_ms, start, end)
-    } else {
-        worker
-            .store
-            .snapshot_encode_span(&mut body, worker.committed_now_ms, start, end)
-    };
-    let Some(total) = encoded else {
-        worker.m_snapshot_refusals = worker.m_snapshot_refusals.wrapping_add(1);
+    let sys = &*worker.syscalls;
+    let now = dev_millis(sys);
+    if now.saturating_sub(worker.span_since_ms) > XFER_IDLE_MS {
+        worker.span_active = false;
+        let m = b"[kvw] span copy abandoned: not taken";
+        dev_log(sys, 1, m.as_ptr(), m.len());
         return;
-    };
-    // The target is a demand-provisioned (empty) partition: send a RESET
-    // first so its CHUNK path is armed (`importing`) and any prior state is
-    // discarded, then the span body. Labelled at (0, 0): this is a COPY of
-    // another range's keys, not a raft position the target should adopt —
-    // the target keeps its own apply position and simply gains the keys.
+    }
+    // Labelled at (0, 0): this is a COPY of another range's keys, not a
+    // raft position the target should adopt — the target keeps its own
+    // apply position and simply gains the keys.
     let (term, index) = (0u64, 0u64);
-    {
+    if !worker.span_reset_sent {
+        // The target is a demand-provisioned (empty) partition: the RESET
+        // arms its CHUNK path (`importing`) and discards any prior state.
         let reset_payload = APP_SNAPSHOT_HDR;
         worker.scratch[0] = MSG_APP_SNAPSHOT_RESET;
         worker.scratch[1] = (reset_payload & 0xFF) as u8;
@@ -6989,13 +7094,56 @@ unsafe fn emit_span_snapshot_chunks(
             3 + reset_payload,
         );
         if n != (3 + reset_payload) as i32 {
-            return;
+            return; // the channel is full: the RESET next step
         }
+        worker.span_reset_sent = true;
+        worker.span_since_ms = now;
     }
-    let mut sent = 0usize;
-    loop {
-        let chunk = (total - sent).min(SNAPSHOT_CHUNK_MAX);
-        let done = sent + chunk == total;
+    for _ in 0..SPAN_FRAMES_PER_STEP {
+        if worker.span_len == 0 {
+            let mut next = [0u8; MAX_KEY_LEN];
+            let cl = worker.span_cursor_len;
+            let el = worker.span_end_len;
+            let encoded = if worker.state_store == STATE_STORE_DISK {
+                let store = DiskStore::new(&mut worker.disk_state, &mut worker.fs_storage);
+                let mut mat =
+                    DiskMaterializer::new(store, worker.disk_revision, worker.disk_replay_floor);
+                mat.snapshot_encode_span_batch(
+                    &mut worker.span_buf,
+                    worker.committed_now_ms,
+                    &worker.span_cursor[..cl],
+                    &worker.span_end[..el],
+                    &mut next,
+                )
+            } else {
+                worker.store.snapshot_encode_span_batch(
+                    &mut worker.span_buf,
+                    worker.committed_now_ms,
+                    &worker.span_cursor[..cl],
+                    &worker.span_end[..el],
+                    &mut next,
+                )
+            };
+            let Some((len, more)) = encoded else {
+                // Fail closed: the target holds an armed, incomplete
+                // install it never acknowledges.
+                worker.m_snapshot_refusals = worker.m_snapshot_refusals.wrapping_add(1);
+                worker.span_active = false;
+                let m = b"[kvw] span copy refused";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return;
+            };
+            if let Some(nl) = more {
+                worker.span_cursor[..nl].copy_from_slice(&next[..nl]);
+                worker.span_cursor_len = nl;
+            }
+            worker.span_more = more.is_some();
+            worker.span_len = len;
+            worker.span_sent = 0;
+        }
+        let sent = worker.span_sent;
+        let chunk = (worker.span_len - sent).min(SNAPSHOT_CHUNK_MAX);
+        let done = sent + chunk == worker.span_len;
         let payload = APP_SNAPSHOT_HDR + chunk;
         worker.scratch[0] = MSG_APP_SNAPSHOT_CHUNK;
         worker.scratch[1] = (payload & 0xFF) as u8;
@@ -7005,19 +7153,24 @@ unsafe fn emit_span_snapshot_chunks(
         worker.scratch[19..27].copy_from_slice(&(sent as u64).to_le_bytes());
         worker.scratch[27] = u8::from(done);
         worker.scratch[28..31].copy_from_slice(&[0, 0, 0]);
-        worker.scratch[31..31 + chunk].copy_from_slice(&body[sent..sent + chunk]);
+        worker.scratch[31..31 + chunk].copy_from_slice(&worker.span_buf[sent..sent + chunk]);
         let n = (sys.channel_write)(
             worker.snapshot_export_out,
             worker.scratch.as_mut_ptr(),
             3 + payload,
         );
         if n != (3 + payload) as i32 {
-            return;
+            return; // the channel is full: the same chunk next step
         }
         worker.m_snapshot_chunks = worker.m_snapshot_chunks.wrapping_add(1);
-        sent += chunk;
+        worker.span_since_ms = now;
+        worker.span_sent = sent + chunk;
         if done {
-            return;
+            worker.span_len = 0;
+            if !worker.span_more {
+                worker.span_active = false;
+                return;
+            }
         }
     }
 }

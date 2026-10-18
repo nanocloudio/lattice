@@ -125,8 +125,33 @@ pub struct WatchRecord {
     /// delivered).
     pub start_revision: i64,
     /// Highest revision delivered to this watch's client. Bumped
-    /// only after the fanout confirms the frame is on the wire.
+    /// only after the fanout confirms the frame is on the wire, and
+    /// once a drain settles, to `drained_through` (see
+    /// [`WatchRecord::settle_drain`]).
     pub last_sent_revision: i64,
+    /// The registry's mutation head when the record left service: every
+    /// mutation at or below it was matched against the watch, and each
+    /// that matched was emitted — or, while a replay is open, is owed by
+    /// the catch-up that replay continues into ([`catch_up_step`]), which
+    /// a draining record runs up to here and no further. Local to this
+    /// registry; never exported.
+    pub drained_through: i64,
+    /// Live matching floor: a mutation at or below it is not matched —
+    /// the client already has it, or a replay or tail catch-up covered
+    /// it. Local; never exported.
+    pub live_from: i64,
+    /// Replay plans this registry issued for the watch that the fanout
+    /// has not yet answered as finished. While one is open nothing is
+    /// matched live for the watch: the replay's frames reach the client
+    /// first, and its close continues the catch-up from where it ended
+    /// ([`WatchHub::replay_done`], [`catch_up_step`]). Local; never
+    /// exported.
+    pub replays_open: u16,
+    /// The revision the open replay is known to cover through: its upper
+    /// bound, or for an open-ended replay its lower one (the fanout
+    /// reports the ceiling it pinned when it closes). Local; never
+    /// exported.
+    pub replay_through: i64,
     /// Fluxor session identity: `session_id`, the `anchor_id`
     /// fronting the watch, and the per-session `session_epoch` that
     /// advances on every authoritative rebind of this watch. Stale
@@ -139,10 +164,14 @@ pub struct WatchRecord {
     /// Delivery cursor, inbound: control envelopes the anchor
     /// forwarded for this session that this record accounts for.
     pub in_consumed: u64,
-    /// Events this registry emitted toward the fanout for this watch.
+    /// Frames owed toward the anchor for this watch: live events this
+    /// registry emitted to the fanout, plus the frames each finished
+    /// replay reported sending.
     pub out_emitted: u64,
-    /// Events the fanout confirmed it framed for this watch. Advances
-    /// in the same handler as `last_sent_revision`, so the delivery
+    /// Frames the fanout confirmed it put on the wire toward the anchor
+    /// for this watch, live and replayed alike: the session's outbound
+    /// delivery cursor, which the anchor counts as it reads them.
+    /// Advances in the same handler as `last_sent_revision`, so the
     /// cursor and the acked revision always describe the same prefix.
     pub out_acked: u64,
     /// `(NOPUT | NODELETE)` bitset.
@@ -167,6 +196,10 @@ impl WatchRecord {
             tenant_id: 0,
             start_revision: 0,
             last_sent_revision: 0,
+            drained_through: 0,
+            live_from: 0,
+            replays_open: 0,
+            replay_through: 0,
             binding: SessionBinding::empty(),
             phase: WATCH_PHASE_ACTIVE,
             in_consumed: 0,
@@ -195,11 +228,97 @@ impl WatchRecord {
         self.in_use() && self.phase == WATCH_PHASE_ACTIVE && self.binding.bound
     }
 
-    /// True iff every event emitted for this watch has been acked by
-    /// the fanout — the point at which the delivery cursor and
-    /// `last_sent_revision` describe the same prefix.
+    /// True iff nothing more is coming toward the anchor for this
+    /// watch: no replay is open, and every frame owed — live or replayed —
+    /// has been acked by the fanout. The point at which the delivery
+    /// cursor counts every frame the session will produce here, and
+    /// `last_sent_revision` describes the same prefix.
     pub fn outbound_settled(&self) -> bool {
-        self.out_emitted == self.out_acked
+        self.replays_open == 0 && self.out_emitted == self.out_acked
+    }
+
+    /// True iff this registry serves the record: in service, or draining
+    /// out of it. Fanout acks fan out to every registry; only the one
+    /// serving a watch counts them, so a record dormant here (imported, or
+    /// drained and exported) is never advanced by frames another registry
+    /// produced.
+    pub fn serving(&self) -> bool {
+        self.in_use() && matches!(self.phase, WATCH_PHASE_ACTIVE | WATCH_PHASE_DRAINING)
+    }
+
+    /// Put the record in service; returns the revision the client has
+    /// everything up to: `last_sent_revision`, once a drain settles (see
+    /// [`WatchRecord::settle_drain`]). Live matching starts above it.
+    ///
+    /// From here on the registry matches only mutations it has yet to
+    /// read. Those it read before, above the returned revision, are owed
+    /// first: the caller delivers them from its [`MutationTail`], or from
+    /// a store replay ([`WatchRecord::begin_replay`]), which holds live
+    /// matching off until it closes.
+    ///
+    /// `None` when a replay is still open (a drain refused before it
+    /// settled): the record is back in service, the client's position is
+    /// still being advanced by that replay, and its close carries the
+    /// catch-up on to the registry's head — nothing is to be planned now.
+    pub fn enter_service(&mut self) -> Option<i64> {
+        self.phase = WATCH_PHASE_ACTIVE;
+        if self.replays_open > 0 {
+            return None;
+        }
+        self.settle_drain();
+        self.live_from = self.last_sent_revision;
+        Some(self.last_sent_revision)
+    }
+
+    /// A replay plan over `(from, to]` was issued for the watch (`to` 0:
+    /// up to the store's present). Live matching is held off until it
+    /// closes.
+    pub fn begin_replay(&mut self, from: i64, to: i64) {
+        self.replays_open = self.replays_open.saturating_add(1);
+        self.replay_through = if to == 0 { from } else { to };
+    }
+
+    /// True iff a mutation (`event_kind` on `event_key`, for `tenant_id`)
+    /// is one this watch reports, revision aside: in service, the
+    /// watch's tenant, not filtered out, and in its key span.
+    pub fn wants(&self, tenant_id: u32, event_kind: u8, event_key: &[u8]) -> bool {
+        self.produces_events() && self.reports(tenant_id, event_kind, event_key)
+    }
+
+    /// True iff a mutation the registry has already read is owed to the
+    /// client by a catch-up: as [`WatchRecord::wants`], but for a record
+    /// draining out of service too — its catch-up runs to the drain cut.
+    pub fn owes(&self, tenant_id: u32, event_kind: u8, event_key: &[u8]) -> bool {
+        self.serving() && self.binding.bound && self.reports(tenant_id, event_kind, event_key)
+    }
+
+    /// The watch's tenant, not filtered out, and in its key span.
+    fn reports(&self, tenant_id: u32, event_kind: u8, event_key: &[u8]) -> bool {
+        self.tenant_id == tenant_id && self.passes_filter(event_kind) && self.matches_key(event_key)
+    }
+
+    /// Take the record out of service with the registry's mutation head
+    /// at `head`: it produces nothing more until it is resumed.
+    pub fn begin_drain(&mut self, head: i64) {
+        self.phase = WATCH_PHASE_DRAINING;
+        self.drained_through = head;
+    }
+
+    /// Advance `last_sent_revision` to the revision the watch has missed
+    /// nothing up to as it leaves service: `drained_through`. A revision
+    /// at or below it either did not match the watch — the client was
+    /// never owed it — or did and was emitted, so the fanout frames it
+    /// whatever happens to the session. The resume point the record
+    /// exports, and the replay plan it is reinstated with, therefore
+    /// start there. Left at the last delivered event, a watch whose key
+    /// has been quiet (one that has seen no event at all sits at 0)
+    /// would ask for history back to that point: a window the client
+    /// does not need, which a store without that history refuses as
+    /// compacted — ending the watch.
+    pub fn settle_drain(&mut self) {
+        if self.drained_through > self.last_sent_revision {
+            self.last_sent_revision = self.drained_through;
+        }
     }
 
     /// Serialise the record for `CMD_SC_EXPORT_*`. Layout (all LE
@@ -268,6 +387,7 @@ impl WatchRecord {
         rec.last_sent_revision = i64::from_le_bytes(arr8(src, 24));
         rec.in_consumed = u64::from_le_bytes(arr8(src, 32));
         rec.out_acked = u64::from_le_bytes(arr8(src, 40));
+        // Exported settled: no replay open, every owed frame acked.
         rec.out_emitted = rec.out_acked;
         rec.binding = binding;
         rec.phase = WATCH_PHASE_IMPORTED;
@@ -580,8 +700,11 @@ impl WatchHub {
     /// One ack is one framed event, so the delivery cursor
     /// (`out_acked`) and the acked revision advance together here and
     /// nowhere else — they cannot describe different prefixes.
+    ///
+    /// Counted only by the registry serving the watch
+    /// ([`WatchRecord::serving`]); elsewhere `NotFound`.
     pub fn mark_delivered(&mut self, watch_id: u64, rev: i64) -> Result<(), WatchError> {
-        let idx = self.index_of(watch_id).ok_or(WatchError::NotFound)?;
+        let idx = self.serving_index(watch_id).ok_or(WatchError::NotFound)?;
         let rec = &mut self.records[idx];
         rec.out_acked = rec.out_acked.wrapping_add(1);
         if rev > rec.last_sent_revision {
@@ -589,6 +712,39 @@ impl WatchHub {
         }
         self.registry_revision = self.registry_revision.wrapping_add(1);
         Ok(())
+    }
+
+    /// A replay plan issued for `watch_id` is finished with, having put
+    /// `frames` frames on the wire (each already acked through
+    /// [`WatchHub::mark_delivered`]) and covered the window through
+    /// `through` (the ceiling the fanout scanned to; 0 when it reports
+    /// none): they join the frames owed, and the plan is no longer open.
+    /// Counted only by the serving registry.
+    ///
+    /// Returns, once no replay is left open, the revision the client now
+    /// has every owed event through: what the catch-up continues from
+    /// ([`catch_up_step`]). The fanout sends a plan's frames ahead of its
+    /// close, so every frame up to it is already on the wire.
+    pub fn replay_done(
+        &mut self,
+        watch_id: u64,
+        frames: u64,
+        through: i64,
+    ) -> Result<Option<i64>, WatchError> {
+        let idx = self.serving_index(watch_id).ok_or(WatchError::NotFound)?;
+        let rec = &mut self.records[idx];
+        rec.replays_open = rec.replays_open.saturating_sub(1);
+        rec.out_emitted = rec.out_emitted.wrapping_add(frames);
+        if rec.replays_open > 0 {
+            return Ok(None);
+        }
+        Ok(Some(rec.replay_through.max(through)))
+    }
+
+    /// The slot of `watch_id` when this registry serves it.
+    fn serving_index(&self, watch_id: u64) -> Option<usize> {
+        self.index_of(watch_id)
+            .filter(|&i| self.records[i].serving())
     }
 
     /// Compute the lowest `last_sent_revision` across all active
@@ -626,7 +782,13 @@ pub struct MatchedWatch {
 /// start_revision)` admits this event.
 /// `event_revision` is the worker-side commit revision; we drop
 /// the event for any watch where `event_revision <=
-/// start_revision`.
+/// start_revision`, or `<= live_from` (a replay covers it), and for any
+/// watch with a replay open: everything it reads meanwhile is delivered
+/// by the catch-up that follows the replay, in revision order.
+///
+/// Matching skips by revision, not by read order: when several workers'
+/// mutation streams fan into one registry, a revision at or below
+/// `live_from` read after live matching opened is not delivered.
 pub fn match_event<F: FnMut(MatchedWatch)>(
     hub: &WatchHub,
     tenant_id: u32,
@@ -636,19 +798,13 @@ pub fn match_event<F: FnMut(MatchedWatch)>(
     mut sink: F,
 ) {
     for rec in hub.records.iter() {
-        if !rec.produces_events() {
+        if event_revision <= rec.start_revision
+            || event_revision <= rec.live_from
+            || rec.replays_open > 0
+        {
             continue;
         }
-        if rec.tenant_id != tenant_id {
-            continue;
-        }
-        if event_revision <= rec.start_revision {
-            continue;
-        }
-        if !rec.passes_filter(event_kind) {
-            continue;
-        }
-        if !rec.matches_key(event_key) {
+        if !rec.wants(tenant_id, event_kind, event_key) {
             continue;
         }
         sink(MatchedWatch {
@@ -656,6 +812,185 @@ pub fn match_event<F: FnMut(MatchedWatch)>(
             session_id: rec.binding.session_id,
             session_epoch: rec.binding.session_epoch,
         });
+    }
+}
+
+// ── Catch-up after a replay ───────────────────────────────────────────
+
+/// What a watch whose replay just closed, covering it through `covered`,
+/// is owed next ([`catch_up_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatchUp {
+    /// Nothing more is owed: match live above this revision.
+    Live(i64),
+    /// Draining, and everything up to the drain cut is delivered.
+    Settled,
+    /// Deliver the mutation tail's entries in `(from, to]` that the watch
+    /// reports, in the order read; then, in service, match live above
+    /// `to`.
+    Tail { from: i64, to: i64 },
+    /// Replay `(from, to]` from the store, live matching still held off;
+    /// its close is the next step.
+    Replay { from: i64, to: i64 },
+}
+
+/// The next step of a watch's catch-up once its replay has closed with
+/// the client covered through `covered`, the registry having read every
+/// mutation up to `head`.
+///
+/// The mutations read while the replay ran were not matched live (see
+/// [`match_event`]); they lie above `covered` and are owed now, ahead of
+/// anything matched live. A record in service is owed them up to `head`;
+/// a draining one up to its drain cut. Read recently enough, they are
+/// still in the mutation tail and are delivered from it at once;
+/// otherwise a further store replay covers them, and the loop repeats
+/// when it closes. Each round starts where the last ended, so revisions
+/// reach the client in order with none repeated or skipped, and the loop
+/// ends at the first round whose gap the tail still holds — once the
+/// replay finishes faster than [`MUTATION_TAIL_BYTES`] of new mutations
+/// arrive (always, for a draining record, whose cut is fixed).
+pub fn catch_up_step(rec: &WatchRecord, covered: i64, head: i64, tail: &MutationTail) -> CatchUp {
+    let target = match rec.phase {
+        WATCH_PHASE_ACTIVE => head,
+        WATCH_PHASE_DRAINING => rec.drained_through,
+        _ => return CatchUp::Settled,
+    };
+    if covered >= target {
+        return if rec.phase == WATCH_PHASE_ACTIVE {
+            CatchUp::Live(covered)
+        } else {
+            CatchUp::Settled
+        };
+    }
+    if tail.covers(covered) {
+        CatchUp::Tail {
+            from: covered,
+            to: target,
+        }
+    } else {
+        CatchUp::Replay {
+            from: covered,
+            to: target,
+        }
+    }
+}
+
+// ── Mutation tail ─────────────────────────────────────────────────────
+
+/// Bytes of mutation stream a registry retains in its [`MutationTail`].
+pub const MUTATION_TAIL_BYTES: usize = 16384;
+
+/// The most recent mutations a registry has read, in the order read, each
+/// as its `MSG_WATCH_EVENT` payload
+/// (`[kpg:2][revision:8][op:1][key_len:2][key][…]`).
+///
+/// A watch session handed to a registry has missed the mutations that
+/// arrived between the cut its previous registry drained at and this
+/// registry taking it over. This registry read them all: the tail lets it
+/// deliver them from what it read rather than asking the store for
+/// history — which a store that keeps none cannot give. It covers every
+/// mutation above [`MutationTail::floor`] that the registry has read; the
+/// oldest are evicted (raising the floor) to make room.
+#[repr(C)]
+pub struct MutationTail {
+    /// Entries `[len:2][payload]`, oldest first, in `buf[..len]`.
+    buf: [u8; MUTATION_TAIL_BYTES],
+    len: usize,
+    /// Revision the tail is complete above; meaningful once `seeded`.
+    floor: i64,
+    /// Whether any mutation has been read since the registry started.
+    seeded: bool,
+}
+
+impl MutationTail {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; MUTATION_TAIL_BYTES],
+            len: 0,
+            floor: 0,
+            seeded: false,
+        }
+    }
+
+    pub fn init(&mut self) {
+        self.len = 0;
+        self.floor = 0;
+        self.seeded = false;
+    }
+
+    /// The revision the tail is complete above: every mutation above it
+    /// the registry has read is held. `None` before the first.
+    pub fn floor(&self) -> Option<i64> {
+        self.seeded.then_some(self.floor)
+    }
+
+    /// True iff every mutation above `from` that the registry has read
+    /// is held.
+    pub fn covers(&self, from: i64) -> bool {
+        self.seeded && from >= self.floor
+    }
+
+    /// Hold one mutation read at `revision`. The first one read seeds the
+    /// floor just below it: nothing earlier was read here.
+    pub fn push(&mut self, revision: i64, payload: &[u8]) {
+        if !self.seeded {
+            self.seeded = true;
+            self.floor = revision.saturating_sub(1);
+        }
+        let need = 2 + payload.len();
+        if payload.len() > u16::MAX as usize || need > MUTATION_TAIL_BYTES {
+            // Too large to hold: nothing at or below it is complete.
+            self.len = 0;
+            self.floor = self.floor.max(revision);
+            return;
+        }
+        while self.len + need > MUTATION_TAIL_BYTES {
+            self.evict_oldest();
+        }
+        self.buf[self.len..self.len + 2].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        self.buf[self.len + 2..self.len + need].copy_from_slice(payload);
+        self.len += need;
+    }
+
+    fn evict_oldest(&mut self) {
+        let n = u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize;
+        let at = (2 + n).min(self.len);
+        self.floor = self.floor.max(Self::revision_of(&self.buf[2..at]));
+        self.buf.copy_within(at..self.len, 0);
+        self.len -= at;
+    }
+
+    fn revision_of(payload: &[u8]) -> i64 {
+        i64::from_le_bytes(arr8(payload, 2))
+    }
+
+    /// The held mutation at offset `at` (0 for the oldest) as
+    /// `(revision, payload, offset of the next)`; `None` past the newest.
+    pub fn entry(&self, at: usize) -> Option<(i64, &[u8], usize)> {
+        if at + 2 > self.len {
+            return None;
+        }
+        let n = u16::from_le_bytes([self.buf[at], self.buf[at + 1]]) as usize;
+        let p = self.buf.get(at + 2..at + 2 + n)?;
+        Some((Self::revision_of(p), p, at + 2 + n))
+    }
+
+    /// Call `f(revision, payload)` for each held mutation above `from`, in
+    /// the order read.
+    pub fn for_each_above<F: FnMut(i64, &[u8])>(&self, from: i64, mut f: F) {
+        let mut at = 0usize;
+        while let Some((rev, p, next)) = self.entry(at) {
+            if rev > from {
+                f(rev, p);
+            }
+            at = next;
+        }
+    }
+}
+
+impl Default for MutationTail {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -837,6 +1172,460 @@ mod tests {
         h.mark_delivered(id, 7).unwrap();
         assert_eq!(h.get(id).unwrap().last_sent_revision, 7);
         assert_eq!(h.get(id).unwrap().out_acked, 3);
+    }
+
+    #[test]
+    fn a_settled_drain_resumes_from_where_matching_stopped() {
+        let mut h = fresh();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        // No event yet: the watch is current through the registry's
+        // head when it leaves service, not through revision 0.
+        let rec = h.get_mut(id).unwrap();
+        rec.begin_drain(9);
+        assert_eq!(rec.phase, WATCH_PHASE_DRAINING);
+        rec.settle_drain();
+        assert_eq!(rec.last_sent_revision, 9);
+        let mut blob = [0u8; WATCH_EXPORT_MAX];
+        let n = rec.export(&mut blob);
+        assert_eq!(
+            WatchRecord::import(&blob[..n]).unwrap().last_sent_revision,
+            9
+        );
+        // A delivered revision beyond the head is never wound back.
+        let rec = h.get_mut(id).unwrap();
+        rec.last_sent_revision = 12;
+        rec.begin_drain(10);
+        rec.settle_drain();
+        assert_eq!(rec.last_sent_revision, 12);
+    }
+
+    #[test]
+    fn a_drain_settles_only_once_every_replay_is_finished() {
+        let mut h = fresh();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        let rec = h.get_mut(id).unwrap();
+        rec.out_emitted = 1; // one live event emitted
+        rec.replays_open = 1; // and one replay plan issued
+        h.mark_delivered(id, 3).unwrap(); // the live event
+        h.mark_delivered(id, 4).unwrap(); // two replayed frames
+        h.mark_delivered(id, 5).unwrap();
+        assert!(!h.get(id).unwrap().outbound_settled(), "replay still open");
+        h.replay_done(id, 2, 5).unwrap();
+        let rec = h.get(id).unwrap();
+        assert!(rec.outbound_settled());
+        assert_eq!(rec.out_acked, 3, "every frame toward the anchor counted");
+        assert_eq!(rec.last_sent_revision, 5);
+    }
+
+    #[test]
+    fn only_the_serving_registry_counts_acks() {
+        let mut h = fresh();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        let mut blob = [0u8; WATCH_EXPORT_MAX];
+        let n = h.get(id).unwrap().export(&mut blob);
+        // The same watch, imported dormant on another registry.
+        let mut other = fresh();
+        other
+            .adopt(WatchRecord::import(&blob[..n]).unwrap())
+            .unwrap();
+        assert_eq!(
+            other.mark_delivered(id, 7),
+            Err(WatchError::NotFound),
+            "an imported record is not advanced"
+        );
+        assert_eq!(other.replay_done(id, 1, 0), Err(WatchError::NotFound));
+        // Draining, the exporter still counts; drained, it no longer does.
+        h.get_mut(id).unwrap().begin_drain(0);
+        h.mark_delivered(id, 7).unwrap();
+        h.get_mut(id).unwrap().phase = WATCH_PHASE_DRAINED;
+        assert_eq!(h.mark_delivered(id, 8), Err(WatchError::NotFound));
+        assert_eq!(h.get(id).unwrap().out_acked, 1);
+        assert_eq!(h.get(id).unwrap().last_sent_revision, 7);
+    }
+
+    #[test]
+    fn entering_service_matches_live_only_above_the_resume_point() {
+        let mut h = fresh();
+        let id = h.register(0, 0, b"k", b"", 0, 0, false, sid(1), A).unwrap();
+        let rec = h.get_mut(id).unwrap();
+        rec.begin_drain(6);
+        rec.phase = WATCH_PHASE_DRAINED;
+        assert_eq!(rec.enter_service(), Some(6), "resumes from the drain cut");
+        assert_eq!(rec.phase, WATCH_PHASE_ACTIVE);
+        let hits = |h: &WatchHub, rev: i64| {
+            let mut n = 0;
+            match_event(h, 0, rev, WATCH_EVENT_PUT, b"k", |_| n += 1);
+            n
+        };
+        assert_eq!(hits(&h, 6), 0, "the client has revision 6");
+        assert_eq!(hits(&h, 7), 1);
+        // A store replay up to the head covers what lies below it.
+        h.get_mut(id).unwrap().live_from = 9;
+        assert_eq!(hits(&h, 9), 0);
+        assert_eq!(hits(&h, 10), 1);
+    }
+
+    /// A `MSG_WATCH_EVENT` payload for `key` at `rev`.
+    fn mutation(rev: i64, key: &[u8], value_len: usize) -> Vec<u8> {
+        let mut p = vec![0u8, 0];
+        p.extend_from_slice(&rev.to_le_bytes());
+        p.push(1);
+        p.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        p.extend_from_slice(key);
+        p.extend_from_slice(&(value_len as u16).to_le_bytes());
+        p.extend(std::iter::repeat_n(b'v', value_len));
+        p
+    }
+
+    fn held_above(t: &MutationTail, from: i64) -> Vec<i64> {
+        let mut v = Vec::new();
+        t.for_each_above(from, |r, _| v.push(r));
+        v
+    }
+
+    #[test]
+    fn the_mutation_tail_holds_what_was_read_above_its_floor() {
+        let mut t = MutationTail::new();
+        assert!(!t.covers(0), "nothing read: nothing covered");
+        t.push(5, &mutation(5, b"a", 4));
+        assert_eq!(t.floor(), Some(4), "nothing before the first was read");
+        assert!(t.covers(4) && !t.covers(3));
+        t.push(6, &mutation(6, b"b", 4));
+        t.push(6, &mutation(6, b"c", 4));
+        assert_eq!(held_above(&t, 4), vec![5, 6, 6]);
+        assert_eq!(held_above(&t, 5), vec![6, 6]);
+        let (rev, p, _) = t.entry(0).unwrap();
+        assert_eq!((rev, p), (5, &mutation(5, b"a", 4)[..]));
+    }
+
+    #[test]
+    fn the_mutation_tail_raises_its_floor_as_it_evicts() {
+        let mut t = MutationTail::new();
+        let big = MUTATION_TAIL_BYTES / 3;
+        for rev in 1..=4 {
+            t.push(rev, &mutation(rev, b"k", big));
+        }
+        // Two fit at a time: 1 and 2 were evicted.
+        assert_eq!(t.floor(), Some(2));
+        assert!(!t.covers(1) && t.covers(2));
+        assert_eq!(held_above(&t, 2), vec![3, 4]);
+        // One larger than the tail empties it, and covers nothing below.
+        t.push(5, &mutation(5, b"k", MUTATION_TAIL_BYTES));
+        assert_eq!(t.floor(), Some(5));
+        assert!(held_above(&t, 0).is_empty());
+    }
+
+    /// One registry, its fanout and the store, stepped by hand: commits
+    /// land in the store and are read by the registry; a replay plan
+    /// runs when the test says so. `wire` is what reaches the client.
+    struct Sim {
+        hub: WatchHub,
+        tail: MutationTail,
+        head: i64,
+        store: Vec<(i64, Vec<u8>)>,
+        wire: Vec<i64>,
+        wid: u64,
+        plan: Option<(i64, i64)>,
+        value_len: usize,
+    }
+
+    impl Sim {
+        /// A watch on `k` from above `start_rev`, held out of service
+        /// (as an import is) until [`Sim::enter`].
+        fn new(start_rev: i64) -> Self {
+            let mut hub = fresh();
+            let wid = hub
+                .register(0, 0, b"k", b"", start_rev, 0, false, sid(1), A)
+                .unwrap();
+            hub.get_mut(wid).unwrap().phase = WATCH_PHASE_IMPORTED;
+            Sim {
+                hub,
+                tail: MutationTail::new(),
+                head: 0,
+                store: Vec::new(),
+                wire: Vec::new(),
+                wid,
+                plan: None,
+                value_len: 16,
+            }
+        }
+
+        fn rec(&mut self) -> &mut WatchRecord {
+            self.hub.get_mut(self.wid).unwrap()
+        }
+
+        /// A frame for revision `rev` put on the wire and acked.
+        fn send(&mut self, rev: i64) {
+            self.wire.push(rev);
+            self.hub.mark_delivered(self.wid, rev).unwrap();
+        }
+
+        /// Commit `key` at the next revision, in the store only.
+        fn commit_unread(&mut self, key: &[u8]) -> i64 {
+            let rev = self.store.last().map_or(0, |e| e.0) + 1;
+            self.store.push((rev, key.to_vec()));
+            rev
+        }
+
+        /// The registry reads the mutation at `rev`.
+        fn read(&mut self, rev: i64) {
+            let key = self.store.iter().find(|e| e.0 == rev).unwrap().1.clone();
+            self.head = self.head.max(rev);
+            self.tail.push(rev, &mutation(rev, &key, self.value_len));
+            let mut hits = 0;
+            match_event(&self.hub, 0, rev, WATCH_EVENT_PUT, &key, |_| hits += 1);
+            for _ in 0..hits {
+                self.rec().out_emitted += 1;
+                self.send(rev);
+            }
+        }
+
+        fn commit(&mut self, key: &[u8]) -> i64 {
+            let rev = self.commit_unread(key);
+            self.read(rev);
+            rev
+        }
+
+        fn issue(&mut self, from: i64, to: i64) {
+            assert!(self.plan.is_none(), "one replay open at a time");
+            self.rec().begin_replay(from, to);
+            self.plan = Some((from, to));
+        }
+
+        /// The record enters service, as the registry's `enter_service`.
+        fn enter(&mut self, from_tail: bool) {
+            let head = self.head;
+            let Some(from) = self.rec().enter_service() else {
+                return;
+            };
+            if from >= head {
+                if !from_tail {
+                    self.issue(from, 0);
+                }
+            } else if from_tail && self.tail.covers(from) {
+                self.from_tail(from, head);
+            } else {
+                self.issue(from, head);
+            }
+        }
+
+        fn from_tail(&mut self, from: i64, to: i64) {
+            let mut owed = Vec::new();
+            let rec = *self.hub.get(self.wid).unwrap();
+            self.tail.for_each_above(from, |rev, p| {
+                let kl = u16::from_le_bytes([p[11], p[12]]) as usize;
+                if rev <= to
+                    && rev > rec.start_revision
+                    && rec.owes(0, WATCH_EVENT_PUT, &p[13..13 + kl])
+                {
+                    owed.push(rev);
+                }
+            });
+            for rev in owed {
+                self.rec().out_emitted += 1;
+                self.send(rev);
+            }
+        }
+
+        /// The fanout runs the open plan (pinning an open-ended one at
+        /// the store's present), then the registry takes its close.
+        /// Returns the catch-up step it led to.
+        fn run_replay(&mut self) -> CatchUp {
+            let (from, to) = self.plan.take().expect("a replay is open");
+            let ceiling = if to == 0 {
+                self.store.last().map_or(0, |e| e.0)
+            } else {
+                to
+            };
+            let frames: Vec<i64> = self
+                .store
+                .iter()
+                .filter(|e| e.0 > from && e.0 <= ceiling && e.1 == b"k")
+                .map(|e| e.0)
+                .collect();
+            for &rev in &frames {
+                self.send(rev);
+            }
+            let covered = self
+                .hub
+                .replay_done(self.wid, frames.len() as u64, ceiling)
+                .unwrap()
+                .expect("the only replay closed");
+            let rec = *self.hub.get(self.wid).unwrap();
+            let step = catch_up_step(&rec, covered, self.head, &self.tail);
+            match step {
+                CatchUp::Live(f) => self.rec().live_from = f,
+                CatchUp::Settled => {}
+                CatchUp::Tail { from, to } => {
+                    self.from_tail(from, to);
+                    if self.rec().phase == WATCH_PHASE_ACTIVE {
+                        self.rec().live_from = to;
+                    }
+                }
+                CatchUp::Replay { from, to } => self.issue(from, to),
+            }
+            step
+        }
+
+        /// Every revision of the watched key above `start`, in order.
+        fn owed(&self, start: i64, through: i64) -> Vec<i64> {
+            self.store
+                .iter()
+                .filter(|e| e.0 > start && e.0 <= through && e.1 == b"k")
+                .map(|e| e.0)
+                .collect()
+        }
+    }
+
+    fn assert_strictly_ascending(wire: &[i64]) {
+        for w in wire.windows(2) {
+            assert!(w[0] < w[1], "out of order or repeated: {wire:?}");
+        }
+    }
+
+    #[test]
+    fn live_commits_during_a_replay_reach_the_client_after_it_in_order() {
+        // A watch from revision 5, defined after the registry read 1..=60
+        // with values large enough that the tail no longer reaches back.
+        let mut sim = Sim::new(4);
+        sim.value_len = 1000;
+        for i in 0..60 {
+            sim.commit(if i % 3 == 0 { b"x" } else { b"k" });
+        }
+        assert!(!sim.tail.covers(4));
+        sim.enter(false);
+        assert_eq!(sim.plan, Some((4, 60)));
+        // Commits land while the replay runs: none is matched live.
+        for i in 0..40 {
+            sim.commit(if i % 2 == 0 { b"k" } else { b"x" });
+        }
+        assert!(sim.wire.is_empty(), "nothing live ahead of the replay");
+        // The replay closes behind a gap the tail no longer holds: a
+        // follow-on replay from where it ended.
+        assert_eq!(sim.run_replay(), CatchUp::Replay { from: 60, to: 100 });
+        sim.commit(b"k");
+        sim.commit(b"x");
+        sim.commit(b"k");
+        // That one closes behind a gap the tail holds: delivered from it,
+        // then live.
+        assert_eq!(sim.run_replay(), CatchUp::Tail { from: 100, to: 103 });
+        assert_eq!(sim.rec().live_from, 103);
+        for _ in 0..5 {
+            sim.commit(b"k");
+        }
+        assert_strictly_ascending(&sim.wire);
+        assert_eq!(sim.wire, sim.owed(4, 108), "no gap, no duplicate");
+        let rec = sim.hub.get(sim.wid).unwrap();
+        assert!(rec.outbound_settled());
+        assert_eq!(rec.last_sent_revision, 108);
+    }
+
+    #[test]
+    fn an_open_ended_replay_opens_live_at_the_ceiling_it_scanned_to() {
+        // The store is ahead of the registry: a watch from revision 3
+        // replays up to the store's present, and the mutations the
+        // registry reads afterwards at or below it are not sent twice.
+        let mut sim = Sim::new(2);
+        for _ in 0..10 {
+            sim.commit_unread(b"k");
+        }
+        sim.enter(false);
+        assert_eq!(sim.plan, Some((2, 0)));
+        assert_eq!(sim.run_replay(), CatchUp::Live(10));
+        for rev in 1..=10 {
+            sim.read(rev);
+        }
+        sim.commit(b"k");
+        assert_strictly_ascending(&sim.wire);
+        assert_eq!(sim.wire, sim.owed(2, 11));
+    }
+
+    #[test]
+    fn the_catch_up_loop_ends_once_the_tail_holds_the_gap() {
+        let mut sim = Sim::new(0);
+        sim.value_len = 2000;
+        for _ in 0..20 {
+            sim.commit(b"k");
+        }
+        sim.enter(true);
+        assert!(!sim.tail.covers(0));
+        assert_eq!(sim.plan, Some((0, 20)));
+        // While writes outpace the tail, each round replays the gap the
+        // last one left; every round ends above where the last did.
+        let mut rounds = 0;
+        let mut last_to = 20;
+        for burst in [12, 12, 12, 2] {
+            for _ in 0..burst {
+                sim.commit(b"k");
+            }
+            rounds += 1;
+            match sim.run_replay() {
+                CatchUp::Replay { from, to } => {
+                    assert_eq!(from, last_to);
+                    assert!(to > from);
+                    last_to = to;
+                }
+                CatchUp::Tail { from, .. } => {
+                    assert_eq!(from, last_to);
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(rounds, 4, "the quiet round ends the loop");
+        assert!(sim.plan.is_none());
+        sim.commit(b"k");
+        assert_strictly_ascending(&sim.wire);
+        assert_eq!(sim.wire, sim.owed(0, sim.head));
+    }
+
+    #[test]
+    fn a_draining_catch_up_stops_at_the_cut_whatever_keeps_arriving() {
+        let mut sim = Sim::new(0);
+        sim.value_len = 2000;
+        for _ in 0..20 {
+            sim.commit(b"k");
+        }
+        sim.enter(false);
+        assert_eq!(sim.plan, Some((0, 20)));
+        for _ in 0..30 {
+            sim.commit(b"k");
+        }
+        sim.rec().begin_drain(50);
+        for _ in 0..30 {
+            sim.commit(b"k");
+        }
+        assert_eq!(sim.run_replay(), CatchUp::Replay { from: 20, to: 50 });
+        for _ in 0..30 {
+            sim.commit(b"k");
+        }
+        assert_eq!(sim.run_replay(), CatchUp::Settled);
+        let rec = sim.hub.get(sim.wid).unwrap();
+        assert!(rec.outbound_settled());
+        assert_eq!(sim.wire, sim.owed(0, 50), "exactly up to the cut");
+    }
+
+    #[test]
+    fn a_refused_drain_rejoins_the_open_replay_instead_of_planning_anew() {
+        let mut sim = Sim::new(0);
+        for _ in 0..5 {
+            sim.commit(b"k");
+        }
+        sim.enter(false);
+        assert_eq!(sim.plan, Some((0, 5)));
+        sim.commit(b"k");
+        sim.rec().begin_drain(6);
+        // Reinstated before it settled: back in service, no new plan,
+        // the drain cut left unsettled.
+        sim.enter(true);
+        assert_eq!(sim.rec().phase, WATCH_PHASE_ACTIVE);
+        assert_eq!(sim.rec().last_sent_revision, 0);
+        assert_eq!(sim.plan, Some((0, 5)));
+        sim.commit(b"k");
+        assert_eq!(sim.run_replay(), CatchUp::Tail { from: 5, to: 7 });
+        sim.commit(b"k");
+        assert_strictly_ascending(&sim.wire);
+        assert_eq!(sim.wire, sim.owed(0, 8));
     }
 
     #[test]

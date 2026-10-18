@@ -65,10 +65,10 @@ use super::origin::{self, Outcome, Record, IMPORT_MARK_LEN, NO_OUTCOME, RING};
 use super::types::{
     KV_OP_DELETE, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_IMPORT, KV_OP_ORIGIN_REGISTER,
     KV_OP_ORIGIN_WRITE, KV_OP_PUT, KV_OP_PUT_MANIFEST, KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS,
-    KV_OP_TXN, KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_KVS, KV_RESULT_MISSING_CHUNK,
-    KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_TOO_LARGE, KV_RESULT_TXN, KV_RESULT_VERSIONS,
-    RANGE_META_FLAG_MANIFESTS, RECORD_FLAG_MANIFEST, TXN_CMP_MOD_EQUAL, VERSIONS_FLAG_MANIFESTS,
-    VERSIONS_FLAG_META, VERSION_KIND_DELETE,
+    KV_OP_TXN, KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_KVS,
+    KV_RESULT_MISSING_CHUNK, KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_TOO_LARGE, KV_RESULT_TXN,
+    KV_RESULT_VERSIONS, RANGE_META_FLAG_MANIFESTS, RECORD_FLAG_MANIFEST, TXN_CMP_MOD_EQUAL,
+    VERSIONS_FLAG_MANIFESTS, VERSIONS_FLAG_META, VERSION_KIND_DELETE,
 };
 
 // ── The contracts' wire ─────────────────────────────────────────────
@@ -190,6 +190,11 @@ pub const REOFFER_STEPS: u32 = 2000;
 /// Steps a write goes unasked before it is let go (one in the log is let
 /// go only once decided).
 pub const IDLE_STEPS: u32 = 60_000;
+/// A single store's write answers held for their callers at once
+/// ([`Provider::answers`]): one for each caller writing at the same time.
+/// Full, a new write is not taken (`EINPROGRESS`) until one is collected or
+/// expires — never by dropping another caller's.
+pub const LOCAL_ANSWERS: usize = 16;
 
 // ── What the provider runs on ────────────────────────────────────────
 
@@ -411,20 +416,23 @@ pub struct Provider {
     rep: Replication,
     /// This node's private records (a replica's).
     scope: Scope,
-    /// A single store's write that has applied but whose record its own
-    /// log has not made durable yet: answered `EINPROGRESS` until it is,
-    /// keyed by the caller and the request's bytes as a replica keys its
-    /// writes, so asking again is a second look at the same write.
-    local: LocalWrite,
+    /// A single store's writes that were applied while their records were
+    /// not yet durable in its own log, each answer kept until its caller
+    /// collects it: keyed by the caller and the request's bytes as a
+    /// replica keys its writes, so asking again is a second look at the
+    /// same write, whoever else wrote meanwhile (see [`local_write`]).
+    answers: [Answer; LOCAL_ANSWERS],
     /// Injected read waits (test only; off unless configured).
     fault: Fault,
 }
 
 /// TEST-ONLY fault injection: reads answered `EAGAIN`, as a board's store
-/// answers them while its device is busy with a write.
+/// answers them while its device is busy with a write; and (`hold`) a
+/// write's log record kept pending, as a board's device keeps it while it
+/// writes.
 ///
 /// With `every = N` (N >= 2), one step of the store in N is BUSY: from the
-/// worker's step that opens it ([`Provider::fault_step`], every Nth) to its
+/// worker's step that opens it ([`Provider::step`], every Nth) to its
 /// next, every read the provider is asked — `GET`, `HEAD`, `RANGE_GET`,
 /// `LIST`, `CHANGES` and a `SUBSCRIBE` with an initial listing, by any
 /// module — answers `EAGAIN`, as the board's store answers every read while
@@ -448,6 +456,17 @@ pub struct Provider {
 /// Deterministic: busy steps are the worker's step count modulo N, from the
 /// knob's setting. `every = 1` would make every step busy and never let a
 /// read through: refused. 0 is off.
+///
+/// Where a busy step meets a read: at dispatch, before the provider looks
+/// at it (the default); or, with `deep`, in the store itself — every store
+/// op the read applies answers `KV_RESULT_INTERNAL` with
+/// [`Backend::busy`] set, exactly as the worker's store answers while its
+/// device makes the op wait, so the provider's own read paths are what
+/// must answer `EAGAIN`.
+///
+/// `hold`: every single-store write applied keeps the log pending for
+/// this many further worker steps, so another caller's write lands between
+/// the write and its re-ask (the board's device holding the record).
 #[derive(Clone, Copy)]
 struct Fault {
     every: u32,
@@ -455,7 +474,13 @@ struct Fault {
     steps: u32,
     /// This step is busy: every read answers `EAGAIN`.
     busy: bool,
-    /// Reads answered `EAGAIN` by injection (telemetry).
+    /// A busy step reaches the store rather than ending at dispatch.
+    deep: bool,
+    /// Steps a write's log record is held pending, and those left of it.
+    hold: u32,
+    held: u32,
+    /// Reads a busy step met by injection (telemetry): at dispatch, each
+    /// one answered `EAGAIN`; in the store, each one sent there.
     injected: u32,
 }
 
@@ -463,23 +488,44 @@ const NO_FAULT: Fault = Fault {
     every: 0,
     steps: 0,
     busy: false,
+    deep: false,
+    hold: 0,
+    held: 0,
     injected: 0,
 };
 
-/// See [`Provider::local`].
+/// Where an injected wait meets a read (see [`Fault`]).
+#[derive(PartialEq, Eq)]
+enum Injected {
+    No,
+    AtDispatch,
+    InStore,
+}
+
+/// A single store's write answer kept for its caller (see
+/// [`local_write`]).
 #[derive(Clone, Copy)]
-struct LocalWrite {
-    active: bool,
+struct Answer {
+    used: bool,
+    /// Its log record is durable: the answer may be collected. At most one
+    /// answer is not (a write is taken only once the log has settled).
+    durable: bool,
     /// The decision (0, or the errno), and the revision a success is at.
     rc: i32,
     rev: u64,
+    /// Steps since it was decided or last asked for.
+    idle: u32,
+    caller: [u8; 8],
     id: Hash,
 }
 
-const NO_LOCAL_WRITE: LocalWrite = LocalWrite {
-    active: false,
+const NO_ANSWER: Answer = Answer {
+    used: false,
+    durable: false,
     rc: 0,
     rev: 0,
+    idle: 0,
+    caller: [0; 8],
     id: [0u8; HASH_LEN],
 };
 
@@ -497,7 +543,7 @@ impl Provider {
             cache_at: 0,
             rep: NO_REPLICATION,
             scope: NO_SCOPE,
-            local: NO_LOCAL_WRITE,
+            answers: [NO_ANSWER; LOCAL_ANSWERS],
             fault: NO_FAULT,
         }
     }
@@ -506,20 +552,48 @@ impl Provider {
     /// answered `EAGAIN` (see [`Fault`]). 0 is off; 1 is refused (`false`,
     /// and off): every step would be busy.
     pub fn fault_read_eagain_every(&mut self, every: u32) -> bool {
-        self.fault = NO_FAULT;
+        let f = &mut self.fault;
+        f.every = 0;
+        f.steps = 0;
+        f.busy = false;
+        f.injected = 0;
         if every == 1 {
             return false;
         }
-        self.fault.every = every;
+        f.every = every;
         true
     }
 
-    /// The worker has stepped: the next step is busy or clear.
-    pub fn fault_step(&mut self) {
+    /// TEST ONLY: whether a busy step reaches the store (`true`) or ends
+    /// at dispatch (see [`Fault`]).
+    pub fn fault_busy_reaches_store(&mut self, deep: bool) {
+        self.fault.deep = deep;
+    }
+
+    /// TEST ONLY: keep the log pending `steps` worker steps after each
+    /// single-store write (see [`Fault`]). 0 is off.
+    pub fn fault_log_hold_steps(&mut self, steps: u32) {
+        self.fault.hold = steps;
+        self.fault.held = 0;
+    }
+
+    /// The worker has stepped: the next step is busy or clear, a held log
+    /// record is a step nearer settling, and an answer nobody asks for a
+    /// step nearer expiring.
+    pub fn step(&mut self) {
         let f = &mut self.fault;
         if f.every != 0 {
             f.steps = f.steps.wrapping_add(1);
             f.busy = f.steps.is_multiple_of(f.every);
+        }
+        f.held = f.held.saturating_sub(1);
+        for x in self.answers.iter_mut().filter(|x| x.used) {
+            x.idle = x.idle.saturating_add(1);
+            if x.idle > IDLE_STEPS {
+                // Its caller stopped asking: the write stands (it is in the
+                // log), only its answer goes uncollected.
+                *x = NO_ANSWER;
+            }
         }
     }
 
@@ -528,12 +602,17 @@ impl Provider {
         (self.fault.every != 0, self.fault.injected)
     }
 
-    /// Whether this read is answered `EAGAIN` by injection: the step is
+    /// Single-store write answers held for their callers.
+    pub fn answers_held(&self) -> usize {
+        self.answers.iter().filter(|x| x.used).count()
+    }
+
+    /// Whether, and where, this read meets an injected wait: the step is
     /// busy.
-    fn fault_read(&mut self, op: u32, a: &[u8]) -> bool {
+    fn fault_read(&mut self, op: u32, a: &[u8]) -> Injected {
         let f = &mut self.fault;
         if !f.busy {
-            return false;
+            return Injected::No;
         }
         let read = match op {
             OBJ_GET | OBJ_HEAD | OBJ_RANGE_GET | NS_LIST | NS_CHANGES => true,
@@ -544,10 +623,15 @@ impl Provider {
                 .is_some_and(|fl| fl & 1 != 0),
             _ => false,
         };
-        if read {
-            f.injected = f.injected.wrapping_add(1);
+        if !read {
+            return Injected::No;
         }
-        read
+        f.injected = f.injected.wrapping_add(1);
+        if f.deep {
+            Injected::InStore
+        } else {
+            Injected::AtDispatch
+        }
     }
 
     /// Empty a provider where it lies: it is integers and flags, and all
@@ -886,6 +970,17 @@ fn run<B: Backend>(b: &mut B, op: u8, body: &[u8], out: &mut [u8]) -> (u8, usize
     (KV_RESULT_PAUSED, 0)
 }
 
+/// A read the store did not answer now: its device made the read wait
+/// (`busy`, whatever result came with it), or its walk is still paused
+/// after every re-drive (the store keeps its place). Either way nothing
+/// moved, and the contract's word is `EAGAIN`: the caller asks again with
+/// the same request. Every read path checks this before it reads the
+/// answer — a busy store's answer is not an answer, and read as one an
+/// object that exists would be told absent.
+fn read_waits<B: Backend>(b: &B, r: u8) -> bool {
+    r == KV_RESULT_PAUSED || b.busy()
+}
+
 /// A read, answered and expanded into `bufs.cache`: large values whole,
 /// entries unmarked. `(result, answer length)`; an answer that is not a
 /// page (a refusal) is copied as it is.
@@ -897,9 +992,7 @@ fn read<B: Backend>(
 ) -> Result<(u8, usize), i32> {
     let req = bufs.req.get(..len).ok_or(EINVAL)?;
     let (r, n) = run(b, op, req, bufs.ans);
-    if r != KV_RESULT_PAUSED && b.busy() {
-        // The device made the read wait: not now — the caller asks again
-        // with the same request.
+    if read_waits(b, r) {
         return Err(EAGAIN);
     }
     let ans = bufs.ans.get(..n).ok_or(ERROR)?;
@@ -915,8 +1008,11 @@ fn read<B: Backend>(
             Need::Chunk(h) => {
                 let (cr, cn) =
                     b.apply(kv_large::FETCH_OP, &kv_large::chunk_request(&h), &mut chunk);
+                if read_waits(b, cr) {
+                    return Err(EAGAIN);
+                }
                 if cr != KV_RESULT_OK {
-                    return Err(if b.busy() { EAGAIN } else { ERROR });
+                    return Err(ERROR);
                 }
                 ex.take(chunk.get(..cn).ok_or(ERROR)?, bufs.cache)
                     .map_err(|_| ERROR)?;
@@ -981,6 +1077,9 @@ fn lookup<B: Backend>(
         bufs.req.get(..n).ok_or(EINVAL)?,
         bufs.ans,
     );
+    if read_waits(b, r) {
+        return Err(EAGAIN);
+    }
     if r != KV_RESULT_KVS {
         return Err(ERROR);
     }
@@ -1208,39 +1307,70 @@ fn obj_put<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
 
 /// A single store's write: decided in the call — and answered so once the
 /// store's own log holds its record durably. A write whose record the
-/// device has not made durable yet is answered `EINPROGRESS` and kept
-/// (with its decision); the same request asked again is answered from it
-/// once the log is durable, never applied a second time. Another write
-/// asked meanwhile is not taken (`EINPROGRESS`: asked again, taken then).
+/// device has not made durable yet is answered `EINPROGRESS` and its
+/// decision kept for its caller ([`Provider::answers`]); the same request
+/// asked again is answered from it once the log is durable, never applied a
+/// second time.
+///
+/// Why each part holds:
+/// - Keyed by `(caller, request bytes)`: another caller's write never meets
+///   this one's answer, so a write asked between a decision and its re-ask
+///   (a second module writing, which nothing stops) cannot lose it.
+/// - One write in the log at a time: while the log is pending no write is
+///   taken (`EINPROGRESS`: asked again, taken then). A write is applied
+///   only once every record before it is durable, so writes reach the store
+///   and its log in the order they are taken, each answer's revision is
+///   exactly its own, and at most one held answer is not yet durable — once
+///   the log settles, every held answer is (`durable`), and is collected
+///   even while a later write's record is pending.
+/// - Bounded: [`LOCAL_ANSWERS`]. Full of other callers' answers, a write is
+///   not taken (`EINPROGRESS`) — never by dropping one of theirs.
+/// - An answer goes when its caller collects it; when that caller asks a
+///   different write, which is taken (a caller asks one write at a time:
+///   it has stopped asking for the old one); or after [`IDLE_STEPS`]
+///   steps unasked ([`Provider::step`]). The write stands either way (it is
+///   in the log); only its answer goes uncollected, and the same request
+///   asked after that is a new write.
 fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B) -> Result<(), i32>>(
     pv: &mut Provider,
     b: &mut B,
     w: &WriteArgs<'_>,
     apply: F,
 ) -> i32 {
-    let id = write_id(&b.caller(), w);
-    if pv.local.active {
-        if b.log_pending() {
-            return EINPROGRESS;
-        }
-        let x = pv.local;
-        if x.id == id {
-            pv.local.active = false;
-            if x.rc == 0 {
-                // SAFETY: the contract names `fence_cap` bytes at
-                // `fence_ptr`.
-                unsafe { write_fence(write_fence_kind(b), x.rev, w.fence_ptr, w.fence_cap) };
+    let caller = b.caller();
+    let id = write_id(&caller, w);
+    if let Some(k) = pv.answers.iter().position(|x| x.used && x.id == id) {
+        pv.answers[k].idle = 0;
+        if !pv.answers[k].durable {
+            if log_pending(pv, b) {
+                return EINPROGRESS;
             }
-            return x.rc;
+            settled(pv);
         }
-        // Its caller stopped asking: the write stands (it is in the log),
-        // only the answer goes uncollected.
-        pv.local.active = false;
+        let x = pv.answers[k];
+        pv.answers[k] = NO_ANSWER;
+        if x.rc == 0 {
+            // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
+            unsafe { write_fence(write_fence_kind(b), x.rev, w.fence_ptr, w.fence_cap) };
+        }
+        return x.rc;
     }
-    if b.log_pending() {
+    if log_pending(pv, b) {
         // The log is finishing another record; nothing is applied now.
         return EINPROGRESS;
     }
+    settled(pv);
+    // A room for its answer, should its record wait: one of this caller's
+    // own (it asks something else now) or a free one.
+    let room = pv
+        .answers
+        .iter()
+        .position(|x| x.used && x.caller == caller)
+        .or_else(|| pv.answers.iter().position(|x| !x.used));
+    let Some(room) = room else {
+        // Every answer held is another caller's, uncollected: not taken.
+        return EINPROGRESS;
+    };
     let rc = match apply(pv, b) {
         Err(e) => e,
         Ok(()) => 0,
@@ -1250,11 +1380,23 @@ fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B) -> Result<(), i32>>(
         // write wait (and it was undone). Asked again, it is taken then.
         return EINPROGRESS;
     }
-    if b.log_pending() {
-        pv.local = LocalWrite {
-            active: true,
+    // Taken: this caller's earlier answers go uncollected.
+    for x in pv
+        .answers
+        .iter_mut()
+        .filter(|x| x.used && x.caller == caller)
+    {
+        *x = NO_ANSWER;
+    }
+    pv.fault.held = pv.fault.hold;
+    if log_pending(pv, b) {
+        pv.answers[room] = Answer {
+            used: true,
+            durable: false,
             rc,
             rev: b.revision(),
+            idle: 0,
+            caller,
             id,
         };
         return EINPROGRESS;
@@ -1264,6 +1406,20 @@ fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B) -> Result<(), i32>>(
         unsafe { write_fence(write_fence_kind(b), b.revision(), w.fence_ptr, w.fence_cap) };
     }
     rc
+}
+
+/// Whether the store's log holds a record not yet durable (asking it on),
+/// or one an injected hold keeps (test only, see [`Fault`]).
+fn log_pending<B: Backend>(pv: &Provider, b: &mut B) -> bool {
+    let pending = b.log_pending();
+    pending || pv.fault.held > 0
+}
+
+/// The log has settled: every answer held is durable.
+fn settled(pv: &mut Provider) {
+    for x in pv.answers.iter_mut().filter(|x| x.used) {
+        x.durable = true;
+    }
 }
 
 /// Put `value` at `key` under a precondition (`pre`, and the revision an
@@ -2049,15 +2205,24 @@ fn event_with<B: Backend>(
 /// writes pump themselves; the worker pumps after every command it
 /// applies, and on its step.
 pub fn pump<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>) {
+    pump_to(pv, b, bufs);
+}
+
+/// [`pump`]: `false` when the store made its history read wait — nothing
+/// told and nobody owed LOST for it, the same changes pumped next time.
+fn pump_to<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>) -> bool {
     if !pv.opened {
-        return;
+        return true;
     }
     let now = b.revision();
     if now > pv.seen && pv.subs.iter().any(|s| s.used && !s.lost) {
         // The pages go through the cache.
         pv.cached = 0;
-        let whole = feed(pv, b, bufs, now);
-        if !whole {
+        let fed = feed(pv, b, bufs, now);
+        if fed == Fed::Waited {
+            return false;
+        }
+        if fed == Fed::Partial {
             pv.m_pump_partial = pv.m_pump_partial.wrapping_add(1);
             // What happened is not (or no longer) wholly readable here:
             // every subscriber reads again.
@@ -2072,12 +2237,23 @@ pub fn pump<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>) {
             s.lost = false;
         }
     }
+    true
+}
+
+/// How a pump's changes went: all told, not all readable (every
+/// subscriber is owed LOST), or the store made the read wait (nothing
+/// told, nothing owed).
+#[derive(PartialEq, Eq)]
+enum Fed {
+    Whole,
+    Partial,
+    Waited,
 }
 
 /// One pump's changes, `(seen, now]`: collected into the feed (only those
 /// a subscriber watches, values past an event's elided), put in revision
-/// order, and told. `false` when they could not all be read.
-fn feed<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, now: u64) -> bool {
+/// order, and told: none is told before all are read.
+fn feed<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, now: u64) -> Fed {
     let Bufs {
         req,
         ans,
@@ -2113,17 +2289,19 @@ fn feed<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, now: u64)
             change_into(feed, &mut fed, rev, kind, key, val).is_some()
         },
     );
-    if !matches!(walked, Ok(Walk::Done)) {
-        return false;
+    match walked {
+        Ok(Walk::Done) => {}
+        Err(EAGAIN) => return Fed::Waited,
+        _ => return Fed::Partial,
     }
     let records = feed.get_mut(..fed).unwrap_or(&mut []);
     if !by_revision(records, count, walk.cache) {
-        return false;
+        return Fed::Partial;
     }
     let mut p = 0usize;
     for _ in 0..count {
         let Some((rev, kind, key, val, next)) = record_at(records, p) else {
-            return false;
+            return Fed::Partial;
         };
         p = next;
         for s in pv.subs.iter_mut().filter(|s| !s.lost && s.watches(key)) {
@@ -2140,7 +2318,7 @@ fn feed<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, now: u64)
             }
         }
     }
-    true
+    Fed::Whole
 }
 
 /// A change record `[rev][kind][klen u16][vlen u32][key][value]` at `at`,
@@ -2187,8 +2365,12 @@ fn ns_subscribe<B: Backend>(
     if initial && !pv.opened {
         return EAGAIN;
     }
-    // Everyone else first: the new subscriber hears only what follows.
-    pump(pv, b, bufs);
+    // Everyone else first: the new subscriber hears only what follows. A
+    // store that makes that wait has the subscription asked again — taken
+    // now, it would hear changes from before it.
+    if !pump_to(pv, b, bufs) {
+        return EAGAIN;
+    }
     let Some(i) = pv.subs.iter().position(|s| !s.used) else {
         return ENOMEM;
     };
@@ -2216,6 +2398,13 @@ fn ns_subscribe<B: Backend>(
             // A watcher set up on part of the state would believe it had
             // seen all of it: refused, as the host store refuses.
             Ok(_) => return EAGAIN,
+            // The store made the listing wait before any of it was told:
+            // nothing moved, asked again.
+            Err(EAGAIN) if s.seq == 0 => return EAGAIN,
+            // ... or after some was: told is told, so the subscription is
+            // taken, owed LOST — it reads again, as one whose channel
+            // filled does, and never believes it saw all of the state.
+            Err(EAGAIN) => s.lost = true,
             Err(e) => return e,
         }
     }
@@ -3155,11 +3344,84 @@ pub unsafe fn dispatch<B: Backend>(
     } else {
         raw
     };
-    let slot = slot_of(handle);
-    // Injected read waits (test only): answered before anything moves.
-    if pv.fault_read(op, a) {
-        return EAGAIN;
+    // Injected read waits (test only): answered before anything moves, or
+    // met by the read in the store itself.
+    match pv.fault_read(op, a) {
+        Injected::No => serve(pv, b, bufs, handle, op, a, strip, arg, arg_len),
+        Injected::AtDispatch => EAGAIN,
+        Injected::InStore => serve(
+            pv,
+            &mut StoreBusy(b),
+            bufs,
+            handle,
+            op,
+            a,
+            strip,
+            arg,
+            arg_len,
+        ),
     }
+}
+
+/// TEST ONLY: a store whose device makes every op wait, as the worker's
+/// answers then — `KV_RESULT_INTERNAL`, nothing applied, and
+/// [`Backend::busy`] set (see [`Fault`]).
+struct StoreBusy<'b, B: Backend>(&'b mut B);
+
+impl<B: Backend> Backend for StoreBusy<'_, B> {
+    fn apply(&mut self, _op: u8, _body: &[u8], _out: &mut [u8]) -> (u8, usize) {
+        (KV_RESULT_INTERNAL, 0)
+    }
+    fn revision(&self) -> u64 {
+        self.0.revision()
+    }
+    fn history(&self) -> u64 {
+        self.0.history()
+    }
+    fn durable(&self) -> bool {
+        self.0.durable()
+    }
+    fn busy(&self) -> bool {
+        true
+    }
+    fn log_pending(&mut self) -> bool {
+        self.0.log_pending()
+    }
+    fn write(&mut self, chan: i32, bytes: &[u8]) -> i32 {
+        self.0.write(chan, bytes)
+    }
+    fn replicated(&self) -> bool {
+        self.0.replicated()
+    }
+    fn propose(&mut self, op: u8, corr: u64, parts: &[&[u8]]) -> bool {
+        self.0.propose(op, corr, parts)
+    }
+    fn caller(&self) -> [u8; 8] {
+        self.0.caller()
+    }
+    fn group(&self) -> Group {
+        self.0.group()
+    }
+}
+
+/// Serve one call, its argument in the store's names (`strip`: the scope
+/// head an answer's names lose).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "dispatch's own arguments, handed on whole to the store it serves through"
+)]
+unsafe fn serve<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    handle: i32,
+    op: u32,
+    a: &[u8],
+    strip: usize,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    let slot = slot_of(handle);
     // Every read but a slot's own passes through the cache.
     if !matches!(
         op,

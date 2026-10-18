@@ -54,17 +54,25 @@ name = "txn_result_in"
 direction = "input"
 content_type = "OctetStream"
 
-# Results out to pg_edge_anchor.
+# Results out to pg_edge_anchor. A response is one envelope of up to
+# RESP_BUF (28672) payload bytes, written all-or-nothing, so the ring
+# must hold the largest whole.
 [[ports]]
 name = "pg_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 32768
+max_record = 28675
 
-# Results out to mysql_edge_anchor.
+# Results out to mysql_edge_anchor. A response is one envelope of up to
+# RESP_BUF (28672) payload bytes, written all-or-nothing, so the ring
+# must hold the largest whole.
 [[ports]]
 name = "mysql_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 32768
+max_record = 28675
 
 # MSG_KV_REQUEST out to kv_request_router.internal_sql_in, stamped
 # PROTO_INTERNAL_SQL so replies come back on this module's own port pair

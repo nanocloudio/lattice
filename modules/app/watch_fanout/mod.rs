@@ -31,6 +31,17 @@
 //!   whole one to the client, so offering it would convert a visible
 //!   failure into a silent one.
 //!
+//! Every plan read is answered with one `WATCH_PROGRESS_REPLAYED` ack
+//! once it is finished with — sent, refused or dropped — carrying the
+//! number of frames it put on the wire and the revision its window
+//! reached. It follows those frames' own acks, so the registry knows
+//! when a watch has nothing more coming from a replay, how many
+//! replayed frames its delivery cursor counts, and where to continue
+//! the watch from; a watch is handed off only once that is so. A plan
+//! up to "now" (`to` 0) is pinned to the ceiling the provider reports
+//! for its first page, so every later page reads the same window and
+//! the ack names it.
+//!
 //! Backfills are serialized: one in flight, the rest queued. That keeps
 //! the module's memory fixed and stops a reconnect storm from issuing
 //! an unbounded number of concurrent scans. When the queue is full a
@@ -79,7 +90,7 @@ use watch_replay::{
 use wire::{
     MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_WATCH_EVENT, MSG_WATCH_FRAME, MSG_WATCH_PROGRESS,
     MSG_WATCH_REPLAY_PLAN, WATCH_FRAME_OP_COMPACTED, WATCH_PROGRESS_COMPACTED,
-    WATCH_PROGRESS_DELIVERED,
+    WATCH_PROGRESS_DELIVERED, WATCH_PROGRESS_REPLAYED,
 };
 
 /// One envelope in or out: the largest watch event behind its watch id
@@ -170,6 +181,8 @@ struct FanoutState {
     /// from `fill_at` on.
     filling: bool,
     fill_at: usize,
+    /// Frames the in-flight backfill has put on the wire.
+    replay_sent: u64,
 
     // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
@@ -210,6 +223,7 @@ impl FanoutState {
         self.prev_len = 0;
         self.filling = false;
         self.fill_at = 0;
+        self.replay_sent = 0;
         self.m_events = 0;
         self.m_delivered = 0;
         self.m_dropped = 0;
@@ -235,7 +249,9 @@ unsafe fn write_envelope(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &
     (sys.channel_write)(chan, buf.as_mut_ptr(), total) == total as i32
 }
 
-fn handle_event(fanout: &mut FanoutState, event_payload: &[u8]) {
+/// Frame one event toward the anchor and ack it to the registry; `true`
+/// when the frame was written.
+fn handle_event(fanout: &mut FanoutState, event_payload: &[u8]) -> bool {
     // Frame the event for the anchor. The fanout doesn't know which
     // anchor stream to target (the routing is per-watch, owned by
     // watch_registry); for the single-watch-per-stream case the
@@ -248,7 +264,7 @@ fn handle_event(fanout: &mut FanoutState, event_payload: &[u8]) {
         let sys = fanout.syscalls;
         if sys.is_null() {
             fanout.m_dropped += 1;
-            return;
+            return false;
         }
         if write_envelope(&*sys, fanout.frames_out, MSG_WATCH_FRAME, event_payload) {
             fanout.frames_emitted = fanout.frames_emitted.wrapping_add(1);
@@ -270,8 +286,10 @@ fn handle_event(fanout: &mut FanoutState, event_payload: &[u8]) {
                     WATCH_PROGRESS_DELIVERED,
                 );
             }
+            true
         } else {
             fanout.m_dropped += 1;
+            false
         }
     }
 }
@@ -310,6 +328,23 @@ fn refuse_compacted(fanout: &mut FanoutState, watch_id: u64, compact_rev: u64) {
     emit_progress(fanout, watch_id, compact_rev, WATCH_PROGRESS_COMPACTED);
 }
 
+/// Tell the registry a plan for `watch_id` is finished with, having put
+/// `frames` frames on the wire and covered its window through `through`
+/// (0: unknown): after the frames' own acks, on the same channel.
+fn replay_finished(fanout: &mut FanoutState, watch_id: u64, frames: u64, through: u64) {
+    let mut body = [0u8; 25];
+    body[0..8].copy_from_slice(&watch_id.to_le_bytes());
+    body[8..16].copy_from_slice(&frames.to_le_bytes());
+    body[16] = WATCH_PROGRESS_REPLAYED;
+    body[17..25].copy_from_slice(&through.to_le_bytes());
+    unsafe {
+        let sys = fanout.syscalls;
+        if !sys.is_null() {
+            let _ = write_envelope(&*sys, fanout.progress_out, MSG_WATCH_PROGRESS, &body);
+        }
+    }
+}
+
 /// Record a plan we could not service. Always paired with a reason in
 /// the caller, because the metric's job is to make a client that
 /// silently missed events visible.
@@ -327,6 +362,7 @@ fn handle_replay_plan(fanout: &mut FanoutState, payload: &[u8]) {
     // to replay from. Honest refusal, not a silent no-op.
     if fanout.kv_out < 0 {
         unserviceable(fanout);
+        replay_finished(fanout, plan.watch_id, 0, plan.to);
         return;
     }
     // Nothing asked for: a closed window (the client missed nothing) or
@@ -334,11 +370,13 @@ fn handle_replay_plan(fanout: &mut FanoutState, payload: &[u8]) {
     // Both are legitimate no-ops, not failures — see
     // `ReplayPlan::is_empty`.
     if plan.is_empty() {
+        replay_finished(fanout, plan.watch_id, 0, plan.to);
         return;
     }
     if fanout.active {
         if fanout.pending_len >= MAX_PENDING_PLANS {
             unserviceable(fanout);
+            replay_finished(fanout, plan.watch_id, 0, plan.to);
             return;
         }
         fanout.pending[fanout.pending_len] = plan;
@@ -401,6 +439,13 @@ fn finish_backfill(fanout: &mut FanoutState, serviced: bool) {
     if !serviced {
         unserviceable(fanout);
     }
+    replay_finished(
+        fanout,
+        fanout.current.watch_id,
+        fanout.replay_sent,
+        fanout.current.to,
+    );
+    fanout.replay_sent = 0;
     fanout.win_len = 0;
     fanout.win_n = 0;
     fanout.prev_len = 0;
@@ -477,6 +522,21 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
     }
     let body = &payload[20..20 + blen];
     let watch_id = fanout.current.watch_id;
+    // A window up to "now" is held at the ceiling its first page was read
+    // at (the reply's revision), so later pages read the same window and
+    // the plan's close names how far it reached.
+    if fanout.current.to == 0 {
+        fanout.current.to = u64::from_le_bytes([
+            payload[10],
+            payload[11],
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+            payload[16],
+            payload[17],
+        ]);
+    }
 
     // Each version framed straight into the window — the base frame and
     // its `[create][version][lease]` — to be sorted, given the version it
@@ -797,7 +857,9 @@ fn send_window(fanout: &mut FanoutState) {
                 n += 8;
             }
         }
-        handle_event(fanout, &frame[..n]);
+        if handle_event(fanout, &frame[..n]) {
+            fanout.replay_sent = fanout.replay_sent.wrapping_add(1);
+        }
         fanout.m_replayed = fanout.m_replayed.wrapping_add(1);
     }
 }
@@ -871,7 +933,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if mt == MSG_WATCH_EVENT {
                 let mut tmp = [0u8; SCRATCH_BUF_SIZE];
                 tmp[..len].copy_from_slice(&fanout.scratch[..len]);
-                handle_event(fanout, &tmp[..len]);
+                let _ = handle_event(fanout, &tmp[..len]);
             }
         }
         if let Some((mt, len)) = read_envelope(

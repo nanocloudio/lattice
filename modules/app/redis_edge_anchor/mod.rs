@@ -951,9 +951,39 @@ fn dispatch(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispatch 
         } else {
             1
         };
-        let _ = anchor.psa.relocate(target);
+        let begun = anchor.psa.relocate(target);
         let s = &mut anchor.slots[slot_idx];
-        let _ = enc_simple_str(&mut s.send_buf, &mut s.send_len, b"OK");
+        if begun {
+            let _ = enc_simple_str(&mut s.send_buf, &mut s.send_len, b"OK");
+        } else {
+            let _ = enc_error(
+                &mut s.send_buf,
+                &mut s.send_len,
+                b"ERR relocation refused: one is in progress or the target is not wired",
+            );
+        }
+        return Dispatch::Handled;
+    }
+    if eq_ascii_ci(cmd, b"LATTICE.RELOCATING") {
+        // Ops / test hook: 1 while a relocation is moving sessions.
+        let busy = i64::from(anchor.psa.relocating());
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_integer(&mut s.send_buf, &mut s.send_len, busy);
+        return Dispatch::Handled;
+    }
+    if eq_ascii_ci(cmd, b"LATTICE.RELOCATED") {
+        // Ops / test hook: relocations completed, and the last one's
+        // sessions moved and stayed.
+        let (done, moved, stayed) = (
+            i64::from(anchor.psa.relocations),
+            i64::from(anchor.psa.last_moved),
+            i64::from(anchor.psa.last_stayed),
+        );
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_array_header(&mut s.send_buf, &mut s.send_len, 3)
+            && enc_integer(&mut s.send_buf, &mut s.send_len, done)
+            && enc_integer(&mut s.send_buf, &mut s.send_len, moved)
+            && enc_integer(&mut s.send_buf, &mut s.send_len, stayed);
         return Dispatch::Handled;
     }
     if eq_ascii_ci(cmd, b"PUBLISH") {

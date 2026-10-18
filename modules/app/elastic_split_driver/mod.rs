@@ -327,6 +327,17 @@ fn publish_barrier(s: &mut DriverState, set: bool) -> bool {
     }
 }
 
+/// Say a phase change on the module log: the move's progress is otherwise
+/// visible only in counters, and a test that loads the span while it moves
+/// needs to know when the move began and when routing cut over.
+fn log_phase(s: &DriverState, msg: &[u8]) {
+    if s.syscalls.is_null() {
+        return;
+    }
+    // SAFETY: the module's syscall table.
+    unsafe { dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len()) };
+}
+
 /// Publish the cutover map frame verbatim as a MSG_RANGE_MAP_UPDATE.
 fn publish_cutover(s: &mut DriverState) -> bool {
     let at = wire::ENVELOPE_HDR;
@@ -440,6 +451,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.phase = P_COPY1;
                 s.phase_ms = now.max(1);
                 s.m_span_requests = s.m_span_requests.wrapping_add(1);
+                log_phase(s, b"[esd] move started");
             }
         }
         P_COPY1 => {
@@ -450,6 +462,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.fenced = 1;
                     s.phase = P_BARRIER;
                     s.phase_ms = now.max(1);
+                    log_phase(s, b"[esd] span fenced");
                 }
             } else if phase_timed_out {
                 // No ack ever arrived (ack unwired or lost): degrade to
@@ -457,6 +470,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if publish_cutover(s) {
                     s.phase = P_DONE;
                     s.m_cutovers = s.m_cutovers.wrapping_add(1);
+                    log_phase(s, b"[esd] cutover published");
                 }
             }
         }
@@ -467,6 +481,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.phase = P_COPY2;
                 s.phase_ms = now.max(1);
                 s.m_span_requests = s.m_span_requests.wrapping_add(1);
+                log_phase(s, b"[esd] re-copy requested");
             }
         }
         P_COPY2 => {
@@ -476,6 +491,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // the new map first.
             if (acked || phase_timed_out) && publish_cutover(s) {
                 s.m_cutovers = s.m_cutovers.wrapping_add(1);
+                log_phase(s, b"[esd] cutover published");
                 if s.fenced == 1 && publish_barrier(s, false) {
                     s.fenced = 0;
                 }

@@ -108,6 +108,15 @@ pub const MSG_KV_RESPONSE: u8 = 0xC1;
 /// Size of [`MSG_KV_RESPONSE`]'s trailing fence record.
 pub const KV_RESPONSE_FENCE_TAIL_LEN: usize = 8 + 8 + 4 + 1 + 8 + 8;
 
+/// Largest [`MSG_KV_RESPONSE`] body: what one channel frame holds after
+/// the response head and the fence tail. A store answer longer than this
+/// cannot reach the caller, so it is the bound a worker answers within
+/// (a byte-bound page such as a `KV_OP_RANGE_SCAN`'s comes back short of
+/// its `limit` instead), and a caller that reads a KV response into a
+/// buffer of `ENVELOPE_HDR + FRAME_PAYLOAD_MAX` takes every answer whole.
+pub const KV_RESPONSE_BODY_MAX: usize =
+    FRAME_PAYLOAD_MAX - KvResponseHead::LEN - KV_RESPONSE_FENCE_TAIL_LEN;
+
 /// Router → worker. Stamps the routing decision as `kpg_id` and carries
 /// the canonical identity `(tenant, database, keyspace)` the worker
 /// scopes the store to. `route_epoch` is omitted while there is a single
@@ -316,13 +325,25 @@ pub const MSG_WATCH_REPLAY_PLAN: u8 = 0xCC;
 /// Fanout → registry: one frame was put on the wire toward the anchor
 /// (`kind = WATCH_PROGRESS_DELIVERED`), or a replay the registry asked
 /// for could not be serviced and the watch was refused
-/// (`kind = WATCH_PROGRESS_COMPACTED`; the registry drops the record).
-/// One ack per frame: it is the watch's delivery cursor as well as its
-/// acked revision, and the registry advances both in one step.
-/// Payload: `[watch_id:u64 LE][revision:u64 LE][kind:u8]`
+/// (`kind = WATCH_PROGRESS_COMPACTED`; the registry drops the record),
+/// or a replay plan is finished with (`kind = WATCH_PROGRESS_REPLAYED`).
+/// One DELIVERED ack per frame, live or replayed: it is the watch's
+/// delivery cursor as well as its acked revision, and the registry
+/// advances both in one step. A plan's REPLAYED ack follows the
+/// DELIVERED acks of every frame it sent and carries their number in
+/// place of a revision — the registry's count of replayed frames it
+/// owes the cursor, and its sign that no frame of that plan is still to
+/// come. Every plan the fanout reads gets exactly one, serviced or not.
+/// It also carries the plan's upper bound as scanned — for a plan up to
+/// "now", the ceiling the provider pinned on the first page; 0 when no
+/// page was read — which the registry continues the watch's catch-up
+/// from.
+/// Payload: `[watch_id:u64 LE][revision | frames:u64 LE][kind:u8]`,
+/// then for REPLAYED `[through:u64 LE]`.
 pub const MSG_WATCH_PROGRESS: u8 = 0xCF;
 pub const WATCH_PROGRESS_DELIVERED: u8 = 0;
 pub const WATCH_PROGRESS_COMPACTED: u8 = 1;
+pub const WATCH_PROGRESS_REPLAYED: u8 = 2;
 
 // ── Lease service (manager ↔ scheduler ↔ anchor) ───────────────────────
 
@@ -735,8 +756,11 @@ pub const MSG_APP_SNAPSHOT_RESET: u8 = 0x59;
 /// copying the whole store. Payload:
 /// `[term:u64 LE][last_included_index:u64 LE][start_len:u16 LE][start…][end_len:u16 LE][end…]`
 /// (bounds are STORED-key bytes; empty start = MIN, empty end = MAX). The
-/// chunk stream and the target's install path are identical to the whole-store
-/// snapshot — a span snapshot is a whole-store snapshot of just the span.
+/// answer is a `MSG_APP_SNAPSHOT_RESET` then the span as key-ordered batches,
+/// each a complete span body (a whole-store snapshot of part of the span) in
+/// its own chunk sequence; every batch but the last carries
+/// `kv_store::SNAPSHOT_FLAG_SPAN_MORE`, and the target merges them, installing
+/// the copy at the last.
 pub const MSG_APP_SNAPSHOT_SPAN_REQUEST: u8 = 0x5A;
 
 /// durability → app: the exported snapshot at `last_included_index` is now

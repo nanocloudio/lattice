@@ -919,7 +919,22 @@ struct AnchorState {
     lease_sess1_inbox: Inbox,
     watch_sess0_inbox: Inbox,
     watch_sess1_inbox: Inbox,
+    /// Per watch registry, a session frame held back with its channel
+    /// paused (`len` 0: none): an export whose outbound cursor counts
+    /// watch frames still on `watch_in` (see `poll_watch_session`).
+    watch_parked: [[u8; WATCH_PARK_MAX]; 2],
+    watch_parked_len: [u16; 2],
+    watch_parked_mt: [u8; 2],
     relocate_inbox: Inbox,
+    /// Param `relocate_at_sessions`: once the lease and watch layers hold
+    /// this many sessions between them, relocate them all to worker 1,
+    /// once (0: never). A test drives a handoff from what it has opened
+    /// rather than from how long the graph has run.
+    relocate_at_sessions: u8,
+    auto_relocated: bool,
+    /// Relocations already logged, per layer.
+    lease_relocations_seen: u32,
+    watch_relocations_seen: u32,
     lease_revoke_inbox: Inbox,
     /// Leases that ended (expired or revoked) whose keys the store has
     /// yet to delete, a ring served one `KV_OP_LEASE_REVOKE` at a time;
@@ -1035,7 +1050,13 @@ impl AnchorState {
         self.lease_sess1_inbox = Inbox::new();
         self.watch_sess0_inbox = Inbox::new();
         self.watch_sess1_inbox = Inbox::new();
+        self.watch_parked_len = [0; 2];
+        self.watch_parked_mt = [0; 2];
         self.relocate_inbox = Inbox::new();
+        self.relocate_at_sessions = 0;
+        self.auto_relocated = false;
+        self.lease_relocations_seen = 0;
+        self.watch_relocations_seen = 0;
         self.lease_revoke_inbox = Inbox::new();
         self.lease_end = [0; LEASE_END_QUEUE];
         self.lease_end_head = 0;
@@ -1241,6 +1262,11 @@ define_params! {
     // do not collide.
     1, listen_port, u16, 2379
         => |s, d, len| { s.listen_port = p_u16(d, len, 0, 2379); };
+
+    // Relocate every lease and watch session to worker 1 once this many
+    // are open (0: never) — a handoff driven by what a client has opened.
+    2, relocate_at_sessions, u8, 0
+        => |s, d, len| { s.relocate_at_sessions = p_u8(d, len, 0, 0); };
 }
 
 // ── SessionCtrlV1 session layer ───────────────────────────────────────
@@ -5473,10 +5499,41 @@ unsafe fn poll_lease_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
     true
 }
 
+/// Largest session frame held back by `poll_watch_session`: an
+/// EXPORT_BEGIN (session header, total length and CRC, cursor pair) with
+/// room to spare.
+const WATCH_PARK_MAX: usize = 128;
+
 /// Drain one SessionCtrlV1 frame from watch_registry `worker_idx` and
 /// drive the watch handoff relay. Watch events themselves flow on the
 /// separate `watch_in` path; this is control-plane only.
+///
+/// A registry exports a watch once every frame it produced for it is on
+/// `watch_in` — written there before the export was written here — but
+/// this anchor may not have read them all yet. Its relayed count, which
+/// the export's outbound cursor is checked against, is then short only
+/// by frames in transit. Such an export is held back, with this channel
+/// paused behind it to keep its order, until `poll_watch_in` has read
+/// them (`SessionAnchor::export_output_in_transit`); the check then
+/// compares the same frames on both sides.
 unsafe fn poll_watch_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
+    let w = usize::from(worker_idx);
+    if anchor.watch_parked_len[w] != 0 {
+        let len = usize::from(anchor.watch_parked_len[w]);
+        let mt = anchor.watch_parked_mt[w];
+        let mut tmp = [0u8; WATCH_PARK_MAX];
+        tmp[..len].copy_from_slice(&anchor.watch_parked[w][..len]);
+        if anchor
+            .wsa
+            .export_output_in_transit(worker_idx, mt, &tmp[..len])
+        {
+            return false;
+        }
+        anchor.watch_parked_len[w] = 0;
+        let mut sink = watch_sink!(anchor);
+        let _ = anchor.wsa.on_frame(worker_idx, mt, &tmp[..len], &mut sink);
+        return true;
+    }
     let chan = if worker_idx == 0 {
         anchor.watch_sess0_in
     } else {
@@ -5507,6 +5564,16 @@ unsafe fn poll_watch_session(anchor: &mut AnchorState, worker_idx: u8) -> bool {
     if (0x70..=0x9F).contains(&mt) {
         let mut tmp = [0u8; SCRATCH_BUF_SIZE];
         tmp[..len].copy_from_slice(&anchor.scratch[..len]);
+        if len <= WATCH_PARK_MAX
+            && anchor
+                .wsa
+                .export_output_in_transit(worker_idx, mt, &tmp[..len])
+        {
+            anchor.watch_parked[w][..len].copy_from_slice(&tmp[..len]);
+            anchor.watch_parked_len[w] = len as u16;
+            anchor.watch_parked_mt[w] = mt;
+            return true;
+        }
         let mut sink = watch_sink!(anchor);
         let _ = anchor.wsa.on_frame(worker_idx, mt, &tmp[..len], &mut sink);
     }
@@ -5542,8 +5609,18 @@ unsafe fn poll_relocate_lease(anchor: &mut AnchorState) -> bool {
     true
 }
 
-/// Drive the lease and watch handoff machines one tick.
+/// Drive the lease and watch handoff machines one tick, and say when a
+/// relocation of either completes.
 fn lease_step(anchor: &mut AnchorState) {
+    if anchor.relocate_at_sessions != 0
+        && !anchor.auto_relocated
+        && anchor.lsa.in_service_count() + anchor.wsa.in_service_count()
+            >= usize::from(anchor.relocate_at_sessions)
+    {
+        anchor.auto_relocated = true;
+        let _ = anchor.lsa.relocate(1);
+        let _ = anchor.wsa.relocate(1);
+    }
     if anchor.lease_ctrl_out >= 0 {
         let mut sink = lease_sink!(anchor);
         let _ = anchor.lsa.step(&mut sink);
@@ -5552,6 +5629,62 @@ fn lease_step(anchor: &mut AnchorState) {
         let mut sink = watch_sink!(anchor);
         let _ = anchor.wsa.step(&mut sink);
     }
+    if anchor.lsa.relocations != anchor.lease_relocations_seen {
+        anchor.lease_relocations_seen = anchor.lsa.relocations;
+        log_relocation(
+            anchor,
+            b"[etcd_anc] lease relocation done moved=",
+            anchor.lsa.last_moved,
+            anchor.lsa.last_stayed,
+        );
+    }
+    if anchor.wsa.relocations != anchor.watch_relocations_seen {
+        anchor.watch_relocations_seen = anchor.wsa.relocations;
+        log_relocation(
+            anchor,
+            b"[etcd_anc] watch relocation done moved=",
+            anchor.wsa.last_moved,
+            anchor.wsa.last_stayed,
+        );
+    }
+}
+
+/// `<prefix><moved> stayed=<stayed>`, on the module log.
+fn log_relocation(anchor: &AnchorState, prefix: &[u8], moved: u16, stayed: u16) {
+    if anchor.syscalls.is_null() {
+        return;
+    }
+    let mut buf = [0u8; 80];
+    let mut n = 0usize;
+    let mut put = |b: &[u8], n: &mut usize| {
+        for &c in b {
+            if *n < buf.len() {
+                buf[*n] = c;
+                *n += 1;
+            }
+        }
+    };
+    let mut dec = [0u8; 5];
+    put(prefix, &mut n);
+    put(itoa_u16(moved, &mut dec), &mut n);
+    put(b" stayed=", &mut n);
+    put(itoa_u16(stayed, &mut dec), &mut n);
+    // SAFETY: the module's syscall table; `buf[..n]` is initialised.
+    unsafe { dev_log(&*anchor.syscalls, 3, buf.as_ptr(), n) };
+}
+
+/// `v` in decimal, into `out`.
+fn itoa_u16(mut v: u16, out: &mut [u8; 5]) -> &[u8] {
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &out[at..]
 }
 
 // ── Lease reply path ──────────────────────────────────────────────────
@@ -6340,6 +6473,18 @@ unsafe fn poll_watch_in(anchor: &mut AnchorState) -> bool {
     };
     if msg_type != MSG_WATCH_FRAME {
         return false;
+    }
+    // Every frame read counts as relayed for its watch's session: the
+    // registry serving the watch counts each frame the fanout writes
+    // toward this anchor (its outbound cursor), and from here on the
+    // anchor alone answers for the frame — it reaches the client, or the
+    // watch ends — whichever registry serves the session next.
+    if payload_len >= 8 {
+        let mut wid = [0u8; 8];
+        wid.copy_from_slice(&anchor.reply[..8]);
+        if let Some(sess) = anchor.wsa.find_app(CLASS_WATCH, u64::from_le_bytes(wid)) {
+            anchor.wsa.relayed(sess);
+        }
     }
     // Min envelope: 8 watch_id + 2 kpg + 8 rev + 1 op + 2 klen + 2 vlen = 23
     const MIN_WATCH_FRAME_LEN: usize = 8 + 2 + 8 + 1 + 2 + 2;

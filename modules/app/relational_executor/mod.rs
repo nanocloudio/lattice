@@ -129,8 +129,17 @@ const ROWS_BUF: usize = 24576;
 /// descriptors, and slack.
 const RESP_BUF: usize = ROWS_BUF + 4096;
 
-/// Inbound envelope scratch.
+/// Inbound statement scratch: the longest SQL request (or 2PC outcome)
+/// taken; a longer one is discarded whole by its inbox.
 const SCRATCH_BUF: usize = 4096 + sql_exec::SQL_REQUEST_HEAD + 64;
+
+/// Inbound KV reply room: one whole channel frame. The worker answers
+/// within the frame (`wire::KV_RESPONSE_BODY_MAX`), not within this
+/// module's statement scratch — a `KV_OP_RANGE_SCAN` page of wide rows is
+/// byte-bound near the frame — so a reply read into anything smaller is
+/// discarded as oversize and the statement waits out the watchdog.
+const KV_IN_BUF: usize = wire::FRAME_PAYLOAD_MAX;
+const _: () = assert!(KV_IN_BUF >= SCRATCH_BUF);
 
 /// `ORDER BY` on the primary key sorts the staged result in the executor
 /// because a store need not return a scan in key order (the in-memory KV
@@ -151,8 +160,13 @@ const IX_PK_BUF: usize = 2048;
 /// Statements waiting behind the one in flight.
 const QUEUE_DEPTH: usize = 4;
 
-/// Rows scanned per `KV_OP_RANGE_SCAN` page. Bounded so one page fits a
-/// KV response and one step's work stays small.
+/// A refusal's whole envelope: a response with no columns and no rows.
+const REJECT_ENV: usize = 128;
+
+/// Rows asked for per `KV_OP_RANGE_SCAN` page, so one step's work stays
+/// small. The worker also ends a page at its answer room
+/// (`wire::KV_RESPONSE_BODY_MAX`), so a page of wide rows comes back
+/// shorter, with a cursor to continue from.
 const SCAN_PAGE: u16 = 64;
 
 /// Keys deleted per `KV_OP_DELETE` during a `DROP TABLE`.
@@ -657,8 +671,23 @@ struct ExecState {
     /// the watchdog can never fire.
     timer_fd: i32,
 
-    /// An envelope read whole: header room, then the payload.
-    scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF],
+    /// A finished statement's response envelope, `env[..out_held]`, that
+    /// its connector channel has not yet taken (0: none), and the channel.
+    /// While one is held no statement starts, so `env` stays untouched
+    /// until it is written.
+    out_held: usize,
+    out_held_dest: i32,
+    /// A refusal answered while a statement is in flight, written from
+    /// its own envelope so the statement's `env` is never disturbed; held
+    /// the same way when its channel cannot take it yet (0: none).
+    rej_env: [u8; REJECT_ENV],
+    rej_held: usize,
+    rej_held_dest: i32,
+
+    /// An envelope read whole: header room, then the payload. Sized for
+    /// a KV reply; statement inputs are read through its first
+    /// `ENVELOPE_HDR + SCRATCH_BUF` bytes.
+    scratch: [u8; ENVELOPE_HDR + KV_IN_BUF],
     resp: [u8; RESP_BUF],
     env: [u8; RESP_BUF + wire::ENVELOPE_HDR],
 }
@@ -757,6 +786,10 @@ impl ExecState {
         self.step_ctr = 0;
         self.inflight_since_ms = 0;
         self.timer_fd = -1;
+        self.out_held = 0;
+        self.out_held_dest = -1;
+        self.rej_held = 0;
+        self.rej_held_dest = -1;
     }
 
     fn busy(&self) -> bool {
@@ -966,6 +999,9 @@ fn reply_rows(exec: &mut ExecState) {
 }
 
 /// Copy a finished response payload into the envelope buffer and write.
+/// A response the channel cannot take now is held in `env` and written
+/// by [`flush_held`] once it can: a response is never dropped for want of
+/// room.
 fn ship(exec: &mut ExecState, payload_len: Option<usize>, from_mysql: bool) {
     let Some(len) = payload_len else {
         return;
@@ -984,10 +1020,38 @@ fn ship(exec: &mut ExecState, payload_len: Option<usize>, from_mysql: bool) {
     }
     unsafe {
         let sys = exec.syscalls;
-        if !sys.is_null() {
-            let _ = write_envelope(&*sys, dest, MSG_SQL_RESPONSE, len, &mut exec.env);
+        if !sys.is_null()
+            && !write_envelope(&*sys, dest, MSG_SQL_RESPONSE, len, &mut exec.env)
+            && dest >= 0
+        {
+            exec.out_held = wire::ENVELOPE_HDR + len;
+            exec.out_held_dest = dest;
+            // Level-triggered once expired: the module stays runnable
+            // until the response is written and the timer cancelled.
+            arm_timer(exec, 1);
         }
     }
+}
+
+/// Write the held response, if any: whether none is held now.
+fn flush_held(exec: &mut ExecState) -> bool {
+    if exec.out_held == 0 {
+        return true;
+    }
+    let sys = exec.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let total = exec.out_held;
+    let n = unsafe { ((*sys).channel_write)(exec.out_held_dest, exec.env.as_mut_ptr(), total) };
+    if n != total as i32 {
+        return false;
+    }
+    exec.out_held = 0;
+    if !exec.busy() && exec.rej_held == 0 {
+        disarm_watchdog(exec);
+    }
+    true
 }
 
 /// Clear the job and start the next queued statement, if any.
@@ -1010,8 +1074,11 @@ fn finish_job(exec: &mut ExecState) {
     exec.phase = P_IDLE;
     // The statement is done; stop the wake timer so its (level-triggered)
     // expiry does not keep re-stepping an idle executor. A dequeued
-    // statement that issues a KV op re-arms it in `kv_send`.
-    disarm_watchdog(exec);
+    // statement that issues a KV op re-arms it in `kv_send`. A held
+    // response keeps it: the timer is what steps the executor to write it.
+    if exec.out_held == 0 && exec.rej_held == 0 {
+        disarm_watchdog(exec);
+    }
     exec.rows_len = 0;
     exec.row_count = 0;
     exec.proj_len = 0;
@@ -1024,6 +1091,15 @@ fn finish_job(exec: &mut ExecState) {
     // misrouted into the inner-table probe.
     exec.join_stage = 0;
     exec.join_left_count = 0;
+    start_queued(exec);
+}
+
+/// Begin the next queued statement, unless a statement is in flight or a
+/// response is still held (the statement would build in `env`).
+fn start_queued(exec: &mut ExecState) {
+    if exec.busy() || exec.out_held != 0 {
+        return;
+    }
     if exec.queue_len > 0 {
         let next = exec.queue[0];
         let n = exec.queue_len;
@@ -1102,6 +1178,11 @@ fn kv_send(exec: &mut ExecState, op: u8, body_len: usize, next_phase: u8) {
 /// module runnable, so `module_step` runs the watchdog check even if no
 /// SQL is arriving to step it. A no-op when the platform gave no timer.
 fn arm_watchdog(exec: &mut ExecState) {
+    arm_timer(exec, WEDGE_TIMER_MS);
+}
+
+/// Arm the wake timer for `ms`.
+fn arm_timer(exec: &mut ExecState, ms: u32) {
     if exec.timer_fd < 0 {
         return;
     }
@@ -1110,7 +1191,7 @@ fn arm_watchdog(exec: &mut ExecState) {
         if sys.is_null() {
             return;
         }
-        let mut ms = WEDGE_TIMER_MS.to_le_bytes();
+        let mut ms = ms.to_le_bytes();
         ((*sys).provider_call)(exec.timer_fd, TIMER_SET, ms.as_mut_ptr(), 4);
     }
 }
@@ -1303,7 +1384,7 @@ fn hexit(n: u8) -> u8 {
 
 /// Accept one `MSG_SQL_REQUEST`: run it, or queue it, or refuse.
 fn on_sql_request(exec: &mut ExecState, from_mysql: bool, payload: &[u8]) {
-    if exec.busy() {
+    if exec.busy() || exec.out_held != 0 {
         if exec.queue_len >= QUEUE_DEPTH {
             // Report it. A dropped statement is a client hung forever;
             // ERR_BUSY is a condition it can back off from.
@@ -1339,9 +1420,54 @@ fn reject_now(exec: &mut ExecState, from_mysql: bool, payload: &[u8], code: u8) 
         b.finish()
     };
     exec.m_errors = exec.m_errors.wrapping_add(1);
-    // `ship` reads `exec.corr_id`-independent state only, so this does
-    // not touch the running job.
-    ship(exec, n, from_mysql);
+    let Some(len) = n else {
+        return;
+    };
+    let total = wire::ENVELOPE_HDR + len;
+    if total > exec.rej_env.len() {
+        return;
+    }
+    let dest = if from_mysql {
+        exec.mysql_out
+    } else {
+        exec.pg_out
+    };
+    exec.rej_env[wire::ENVELOPE_HDR..total].copy_from_slice(&exec.resp[..len]);
+    unsafe {
+        let sys = exec.syscalls;
+        if !sys.is_null()
+            && !write_envelope(&*sys, dest, MSG_SQL_RESPONSE, len, &mut exec.rej_env)
+            && dest >= 0
+        {
+            exec.rej_held = total;
+            exec.rej_held_dest = dest;
+            arm_timer(exec, 1);
+        }
+    }
+}
+
+/// Write the held refusal, if any: whether none is held now.
+fn flush_rej(exec: &mut ExecState) -> bool {
+    if exec.rej_held == 0 {
+        return true;
+    }
+    let sys = exec.syscalls;
+    if sys.is_null() {
+        return false;
+    }
+    let total = exec.rej_held;
+    let n = unsafe { ((*sys).channel_write)(exec.rej_held_dest, exec.rej_env.as_mut_ptr(), total) };
+    if n != total as i32 {
+        return false;
+    }
+    exec.rej_held = 0;
+    if exec.busy() {
+        // The statement in flight is judged by its own deadline again.
+        arm_watchdog(exec);
+    } else if exec.out_held == 0 {
+        disarm_watchdog(exec);
+    }
+    true
 }
 
 /// Parse a statement and take the first step of executing it.
@@ -1567,12 +1693,10 @@ fn on_kv_response(exec: &mut ExecState, payload: &[u8]) {
     if exec.phase == P_IDLE || r.corr_id != exec.kv_corr {
         return;
     }
-    // Copy the body out before mutating `exec` — the payload lives in
-    // `exec.scratch`.
-    let mut body = [0u8; SCRATCH_BUF];
-    let bl = r.body.len().min(body.len());
-    body[..bl].copy_from_slice(&r.body[..bl]);
-    let (result, body_len) = (r.result, bl);
+    // `payload` is the caller's copy of the reply, not `exec` state, so
+    // the body is borrowed whole while the handlers mutate `exec`.
+    let (result, body) = (r.result, r.body);
+    let body_len = body.len();
     exec.last_generation = r.catalog_generation;
 
     // Late validation of an optimistic cache hit. The mapping was
@@ -5829,6 +5953,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // Responses still waiting for their channel go before anything
+        // that could produce another; the queue resumes once the held
+        // response is out.
+        flush_rej(exec);
+        if flush_held(exec) {
+            start_queued(exec);
+        }
+
         // KV replies first: they advance the statement in flight, and
         // draining them before accepting new work keeps the queue from
         // filling behind a job that was ready to finish.
@@ -5836,7 +5968,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             read_envelope(&mut exec.kv_inbox, sys, exec.kv_in, &mut exec.scratch)
         {
             if mt == MSG_KV_RESPONSE {
-                let mut tmp = [0u8; SCRATCH_BUF];
+                let mut tmp = [0u8; KV_IN_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
                 on_kv_response(exec, &tmp[..len]);
             }
@@ -5848,7 +5980,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 &mut exec.txn_result_inbox,
                 sys,
                 exec.txn_result_in,
-                &mut exec.scratch,
+                &mut exec.scratch[..ENVELOPE_HDR + SCRATCH_BUF],
             ) {
                 if mt == MSG_TXN_SUBMIT_RESULT {
                     let mut tmp = [0u8; SCRATCH_BUF];
@@ -5857,18 +5989,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
-        if let Some((mt, len)) =
-            read_envelope(&mut exec.pg_inbox, sys, exec.pg_in, &mut exec.scratch)
-        {
+        // A held refusal keeps new statements on their channel: one that
+        // had to be refused too would have nowhere to be answered from.
+        let pg_req = if exec.rej_held == 0 {
+            read_envelope(
+                &mut exec.pg_inbox,
+                sys,
+                exec.pg_in,
+                &mut exec.scratch[..ENVELOPE_HDR + SCRATCH_BUF],
+            )
+        } else {
+            None
+        };
+        if let Some((mt, len)) = pg_req {
             if mt == MSG_SQL_REQUEST {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
                 on_sql_request(exec, false, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) =
-            read_envelope(&mut exec.mysql_inbox, sys, exec.mysql_in, &mut exec.scratch)
-        {
+        let mysql_req = if exec.rej_held == 0 {
+            read_envelope(
+                &mut exec.mysql_inbox,
+                sys,
+                exec.mysql_in,
+                &mut exec.scratch[..ENVELOPE_HDR + SCRATCH_BUF],
+            )
+        } else {
+            None
+        };
+        if let Some((mt, len)) = mysql_req {
             if mt == MSG_SQL_REQUEST {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);

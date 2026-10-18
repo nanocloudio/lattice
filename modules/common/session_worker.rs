@@ -225,12 +225,21 @@ impl<const N: usize> SessionWorker<N> {
     }
 
     /// Admit a data-plane envelope for `session_id` at `epoch`: the
-    /// slot index when the session is in service at exactly that
-    /// epoch, else `None` (stale, future, unknown, or not in service).
+    /// slot index when the session is in service, or draining toward a
+    /// handoff, at exactly that epoch; else `None` (stale, future,
+    /// unknown, importing).
     pub fn admit(&self, session_id: &SessionId, epoch: u32) -> Option<usize> {
         let idx = self.find(session_id)?;
         let s = &self.slots[idx];
-        if !s.in_service() || s.binding.admit(epoch) != session_core::EpochCheck::Current {
+        // A draining or drained session still takes its own tail: the
+        // anchor holds every envelope from the moment it sends DRAIN, but
+        // one it forwarded just before can arrive after it (control and
+        // data are separate channels). Dropping it would lose it, because
+        // the anchor refuses any export whose consumed cursor missed it and
+        // the session resumes here — while a handoff that succeeds proves
+        // by that same cursor that no such envelope was outstanding.
+        let open = s.in_use && matches!(s.phase, WPHASE_ACTIVE | WPHASE_DRAINING | WPHASE_DRAINED);
+        if !open || s.binding.admit(epoch) != session_core::EpochCheck::Current {
             return None;
         }
         Some(idx)

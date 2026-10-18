@@ -80,7 +80,7 @@ use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use abi::contracts::net::net_proto::{
     conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
-    CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    CONN_ID_LEN, MAX_CMD_DATA, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
 use pg::relational::{LogicalType, Value};
@@ -101,6 +101,17 @@ const RECV_BUF: usize = 8192;
 
 /// Per-slot send buffer. Sized for one result-set response plus framing.
 const SEND_BUF: usize = 32768;
+
+/// The most reply bytes one `CMD_SEND` carries: the net contract's
+/// `MAX_CMD_DATA`, and no more than one channel frame holds beside the
+/// connection id. A result set larger than that goes out as several
+/// sends; one frame past its channel could never be written, and the
+/// session would stall on it.
+const NET_CHUNK: usize = if MAX_CMD_DATA < wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN {
+    MAX_CMD_DATA
+} else {
+    wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN
+};
 
 /// Envelope scratch. Must hold the largest `MSG_SQL_RESPONSE`.
 const SCRATCH_BUF: usize = 32768;
@@ -1002,20 +1013,25 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
 unsafe fn flush_slots(anchor: &mut AnchorState) {
     let mut i = 0;
     while i < MAX_CONNS {
-        let (conn_id, send_len, state) = {
+        let (conn_id, state) = {
             let s = &anchor.slots[i];
-            (s.conn_id, s.send_len, s.state)
+            (s.conn_id, s.state)
         };
         if conn_id == SLOT_FREE {
             i += 1;
             continue;
         }
-        if send_len > 0 {
-            let mut out = [0u8; SEND_BUF];
-            out[..send_len].copy_from_slice(&anchor.slots[i].send[..send_len]);
-            if net_send(anchor, NET_CMD_SEND, conn_id, &out[..send_len]) {
-                anchor.slots[i].send_len = 0;
+        // A chunk at a time, keeping what the channel does not take.
+        while anchor.slots[i].send_len > 0 {
+            let n = anchor.slots[i].send_len.min(NET_CHUNK);
+            let mut chunk = [0u8; NET_CHUNK];
+            chunk[..n].copy_from_slice(&anchor.slots[i].send[..n]);
+            if !net_send(anchor, NET_CMD_SEND, conn_id, &chunk[..n]) {
+                break;
             }
+            let s = &mut anchor.slots[i];
+            s.send.copy_within(n..s.send_len, 0);
+            s.send_len -= n;
         }
         // Close only after the buffer has drained, so a FATAL error
         // message actually reaches the client before the socket goes.

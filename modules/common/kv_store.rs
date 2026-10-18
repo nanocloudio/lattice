@@ -76,6 +76,11 @@ pub const SNAPSHOT_FORMAT_VERSION: u16 = 2;
 /// record whose deadline had already passed VISIBLE AGAIN, and would
 /// then re-age the survivors from zero.
 pub const SNAPSHOT_HDR_LEN: usize = 32;
+/// Body-header flag: this body is one batch of a span copy and another
+/// batch of the same copy follows. The installer merges each batch into the
+/// store the copy's RESET emptied; the copy is whole at the first body
+/// without the flag.
+pub const SNAPSHOT_FLAG_SPAN_MORE: u16 = 0x0001;
 /// Per-record fixed prefix ahead of the key/value bytes:
 /// `[key_len:2][value_len:4][create_rev:8][mod_rev:8][version:8][lease:8][expiry:8][flags:1]`
 pub const SNAPSHOT_REC_FIXED: usize = 47;
@@ -746,21 +751,112 @@ impl KvStore {
         Some(p)
     }
 
-    /// Restore state from a snapshot body produced by
-    /// `snapshot_encode`. The store is cleared first, so this is a
-    /// REPLACE (clustor's app-snapshot contract discards current
-    /// state), not a merge.
+    /// One batch of a span copy: the records whose key lies in
+    /// `[from, end)`, in key order, as many as fit `out`, in the span body
+    /// format ([`Self::snapshot_encode_span`]). Returns the body length and,
+    /// when records of the span remain past this batch, the length of the
+    /// key the next batch starts from (an inclusive bound), written to
+    /// `next`. A batch with more to follow carries
+    /// [`SNAPSHOT_FLAG_SPAN_MORE`].
     ///
-    /// Records are re-inserted through the normal hash/probe path so the
-    /// linear-probe invariants are rebuilt correctly rather than assumed
-    /// from slot positions; the per-record revision metadata is then
-    /// restored verbatim and `revision` is set last (plain inserts would
-    /// otherwise bump it).
+    /// A span larger than one body ships as successive batches, each
+    /// encoded when the previous one has been taken. Key order makes the
+    /// resume point a key rather than a slot, so it holds across the
+    /// probe-chain compaction a delete performs between batches.
     ///
-    /// Returns false — leaving the store CLEARED — on a malformed body
-    /// (bad magic/format, truncation, over-long key/value, duplicate or
-    /// unindexable key). A partial restore must never be mistaken for a
-    /// good one; the caller fails closed and replays from the log.
+    /// Fails closed (`None`) on a corrupt record, or when `out` or `next`
+    /// cannot hold the record a batch must carry.
+    pub fn snapshot_encode_span_batch(
+        &self,
+        out: &mut [u8],
+        clock_ms: u64,
+        from: &[u8],
+        end: &[u8],
+        next: &mut [u8],
+    ) -> Option<(usize, Option<usize>)> {
+        if out.len() < SNAPSHOT_HDR_LEN {
+            return None;
+        }
+        let mut order = [0u16; MAX_KEYS];
+        let mut n = 0usize;
+        let mut i = 0;
+        while i < MAX_KEYS {
+            let r = &self.records[i];
+            if r.used {
+                let klen = r.key_len as usize;
+                if klen > MAX_KEY_LEN || r.value_len as usize > MAX_VALUE_LEN {
+                    return None;
+                }
+                let key = &r.key[..klen];
+                if key >= from && (end.is_empty() || key < end) {
+                    order[n] = i as u16;
+                    n += 1;
+                }
+            }
+            i += 1;
+        }
+        sort_slots_by_key(&self.records, &mut order[..n]);
+
+        let mut p = SNAPSHOT_HDR_LEN;
+        let mut count: u32 = 0;
+        let mut more = None;
+        for &slot in &order[..n] {
+            let r = &self.records[slot as usize];
+            let klen = r.key_len as usize;
+            let vlen = r.value_len as usize;
+            let need = SNAPSHOT_REC_FIXED + klen + vlen;
+            if p + need > out.len() {
+                if count == 0 || klen > next.len() {
+                    return None;
+                }
+                next[..klen].copy_from_slice(&r.key[..klen]);
+                more = Some(klen);
+                break;
+            }
+            out[p..p + 2].copy_from_slice(&r.key_len.to_le_bytes());
+            out[p + 2..p + 6].copy_from_slice(&r.value_len.to_le_bytes());
+            out[p + 6..p + 14].copy_from_slice(&r.create_revision.to_le_bytes());
+            out[p + 14..p + 22].copy_from_slice(&r.mod_revision.to_le_bytes());
+            out[p + 22..p + 30].copy_from_slice(&r.version.to_le_bytes());
+            out[p + 30..p + 38].copy_from_slice(&r.lease_id.to_le_bytes());
+            out[p + 38..p + 46].copy_from_slice(&r.expiry_ms.to_le_bytes());
+            out[p + 46] = r.flags;
+            p += SNAPSHOT_REC_FIXED;
+            out[p..p + klen].copy_from_slice(&r.key[..klen]);
+            p += klen;
+            out[p..p + vlen].copy_from_slice(&r.value[..vlen]);
+            p += vlen;
+            count += 1;
+        }
+
+        let flags = if more.is_some() {
+            SNAPSHOT_FLAG_SPAN_MORE
+        } else {
+            0
+        };
+        out[0..4].copy_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        out[6..8].copy_from_slice(&flags.to_le_bytes());
+        out[8..16].copy_from_slice(&self.revision.to_le_bytes());
+        out[16..20].copy_from_slice(&count.to_le_bytes());
+        out[20..24].copy_from_slice(&0u32.to_le_bytes()); // reserved
+        out[24..32].copy_from_slice(&clock_ms.to_le_bytes());
+        Some((p, more))
+    }
+
+    /// Merge one span-copy batch into the store: [`Self::snapshot_decode`]
+    /// without the clear, the store's revision raised to the body's when
+    /// the body's is higher. A key the store already holds is a malformed
+    /// copy (a span's batches are disjoint): like every failed decode it
+    /// leaves the store CLEARED.
+    pub fn snapshot_merge(&mut self, src: &[u8]) -> bool {
+        let ok = self.decode_records(src, false);
+        if !ok {
+            self.init();
+        }
+        ok
+    }
+
     /// `(deadline_ms, key_hash)` for the record in `slot`, if it holds
     /// one with an absolute expiry deadline.
     ///
@@ -794,7 +890,29 @@ impl KvStore {
         ])
     }
 
+    /// Restore state from a snapshot body produced by
+    /// `snapshot_encode`. The store is cleared first, so this is a
+    /// REPLACE (clustor's app-snapshot contract discards current
+    /// state), not a merge.
+    ///
+    /// Records are re-inserted through the normal hash/probe path so the
+    /// linear-probe invariants are rebuilt correctly rather than assumed
+    /// from slot positions; the per-record revision metadata is then
+    /// restored verbatim and `revision` is set last (plain inserts would
+    /// otherwise bump it).
+    ///
+    /// Returns false — leaving the store CLEARED — on a malformed body
+    /// (bad magic/format, truncation, over-long key/value, duplicate or
+    /// unindexable key). A partial restore must never be mistaken for a
+    /// good one; the caller fails closed and replays from the log.
     pub fn snapshot_decode(&mut self, src: &[u8]) -> bool {
+        self.decode_records(src, true)
+    }
+
+    /// The records of a snapshot body into the store: cleared first when
+    /// `replace`, the body's revision adopted then; otherwise added to what
+    /// the store holds, its revision kept unless the body's is higher.
+    fn decode_records(&mut self, src: &[u8], replace: bool) -> bool {
         if src.len() < SNAPSHOT_HDR_LEN {
             return false;
         }
@@ -816,7 +934,10 @@ impl KvStore {
             return false;
         }
 
-        self.init();
+        let held_revision = self.revision;
+        if replace {
+            self.init();
+        }
 
         let mut p = SNAPSHOT_HDR_LEN;
         let mut done = 0usize;
@@ -931,8 +1052,50 @@ impl KvStore {
         }
 
         // Set last: the inserts above each bumped `revision`.
-        self.revision = revision;
+        self.revision = if replace {
+            revision
+        } else {
+            revision.max(held_revision)
+        };
         true
+    }
+}
+
+/// Order `order`'s slot indices by their records' keys (heapsort: in
+/// place, no allocation, `n log n` whatever the input).
+fn sort_slots_by_key(records: &[KvRecord], order: &mut [u16]) {
+    let n = order.len();
+    let mut i = n / 2;
+    while i > 0 {
+        i -= 1;
+        sift_slot(records, order, i, n);
+    }
+    let mut end = n;
+    while end > 1 {
+        end -= 1;
+        order.swap(0, end);
+        sift_slot(records, order, 0, end);
+    }
+}
+
+fn sift_slot(records: &[KvRecord], order: &mut [u16], mut root: usize, end: usize) {
+    let key = |s: u16| {
+        let r = &records[s as usize];
+        &r.key[..r.key_len as usize]
+    };
+    loop {
+        let mut child = 2 * root + 1;
+        if child >= end {
+            return;
+        }
+        if child + 1 < end && key(order[child]) < key(order[child + 1]) {
+            child += 1;
+        }
+        if key(order[root]) >= key(order[child]) {
+            return;
+        }
+        order.swap(root, child);
+        root = child;
     }
 }
 
@@ -1317,8 +1480,9 @@ pub trait Materializer {
     /// refuses a multi-put transaction whose inserts would not all fit
     /// BEFORE applying any op, rather than tearing at the put that fills
     /// the store (an INSERT that wrote its row but not its index entry
-    /// would corrupt the secondary index). Providers with no fixed
-    /// ceiling — the disk store — return `usize::MAX` and are never
+    /// would corrupt the secondary index). Chunk uploads and the chunk
+    /// sweep read it the same way ([`SWEEP_ROOM`]). Providers with no
+    /// fixed ceiling — the disk store — return `usize::MAX` and are never
     /// pre-flighted.
     fn free_slots(&self) -> usize {
         usize::MAX
@@ -3722,6 +3886,26 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         start: &[u8],
         end: &[u8],
     ) -> Option<usize> {
+        let mut next = [0u8; MAX_KEY_LEN];
+        match self.snapshot_encode_span_batch(out, clock_ms, start, end, &mut next)? {
+            (n, None) => Some(n),
+            (_, Some(_)) => None, // the span outgrows one body
+        }
+    }
+
+    /// One batch of a span copy, disk provider: the CURRENT records of
+    /// `[from, end)` in key order, as many as fit `out`, with the resume
+    /// key (inclusive, STORED-key form) in `next` when more remain —
+    /// [`KvStore::snapshot_encode_span_batch`]'s contract, body flag
+    /// included.
+    pub fn snapshot_encode_span_batch(
+        &mut self,
+        out: &mut [u8],
+        clock_ms: u64,
+        from: &[u8],
+        end: &[u8],
+        next: &mut [u8],
+    ) -> Option<(usize, Option<usize>)> {
         if out.len() < SNAPSHOT_HDR_LEN {
             return None;
         }
@@ -3743,7 +3927,7 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         }
         let mut sb = [0u8; disk_store::MAX_ENCODED_KEY];
         let mut eb = [0u8; disk_store::MAX_ENCODED_KEY];
-        let sn = encoded_bound(start, &mut sb)?;
+        let sn = encoded_bound(from, &mut sb)?;
         let en = encoded_bound(end, &mut eb)?;
         let span = disk_store::state_store::KeySpan {
             start: &sb[..sn],
@@ -3752,9 +3936,10 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
 
         let mut p = SNAPSHOT_HDR_LEN;
         let mut count: u32 = 0;
+        let mut more = None;
         let mut resume = 0u64;
         let mut sbuf = [0u8; DISK_SCAN_BUF];
-        loop {
+        'scan: loop {
             let prog = match self.store.scan_at(span, 0, resume, usize::MAX, &mut sbuf) {
                 Ok(v) => v,
                 Err(_) => {
@@ -3784,7 +3969,16 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
                 }
                 let need = SNAPSHOT_REC_FIXED + stored_klen + public.len();
                 if p + need > out.len() {
-                    return None; // fail closed — never a truncated span
+                    // The batch is full: the next one starts at this key.
+                    if count == 0 || stored_klen > next.len() {
+                        return None; // fail closed — never a truncated span
+                    }
+                    next[0..4].copy_from_slice(&dec.tenant.to_be_bytes());
+                    next[4..8].copy_from_slice(&dec.database.to_be_bytes());
+                    next[8..12].copy_from_slice(&dec.keyspace.to_be_bytes());
+                    next[12..stored_klen].copy_from_slice(user);
+                    more = Some(stored_klen);
+                    break 'scan;
                 }
                 out[p..p + 2].copy_from_slice(&(stored_klen as u16).to_le_bytes());
                 out[p + 2..p + 6].copy_from_slice(&(public.len() as u32).to_le_bytes());
@@ -3817,12 +4011,17 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
         }
         out[0..4].copy_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
         out[4..6].copy_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
-        out[6..8].copy_from_slice(&0u16.to_le_bytes()); // flags
+        let flags = if more.is_some() {
+            SNAPSHOT_FLAG_SPAN_MORE
+        } else {
+            0
+        };
+        out[6..8].copy_from_slice(&flags.to_le_bytes());
         out[8..16].copy_from_slice(&self.revision.to_le_bytes());
         out[16..20].copy_from_slice(&count.to_le_bytes());
         out[20..24].copy_from_slice(&0u32.to_le_bytes()); // reserved
         out[24..32].copy_from_slice(&clock_ms.to_le_bytes());
-        Some(p)
+        Some((p, more))
     }
 
     /// The merged ordered walk behind both `scan_op` and `scan_as_of`.
@@ -5074,6 +5273,11 @@ fn apply_put_chunk<M: Materializer>(
             }
         }
     }
+    // A new chunk takes its records whole or not at all, and leaves the
+    // sweep its room ([`SWEEP_ROOM`]).
+    if store.free_slots() < CHUNK_RECORDS + SWEEP_ROOM {
+        return (KV_RESULT_INTERNAL, 0);
+    }
     let stored = in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
         s.put_meta(kv_chunks::hash_key(&hash), chunk)
     });
@@ -5221,19 +5425,26 @@ fn apply_chunk_sweep<M: Materializer>(
         }
     }
     left -= n;
-    // Unreferenced chunks: gone, a node's children released.
+    // Unreferenced chunks: gone, a node's children released. A node the
+    // store has no room to take apart stays queued; the pass goes on to
+    // the rest, whose removals make room.
     let Some(n) = due_entries(store, kv_chunks::KS_CHUNK_ZERO, Some(due), left, &mut got) else {
         return (KV_RESULT_INTERNAL, 0);
     };
+    let mut short_of_room = false;
     for q in &got[..n] {
-        if !as_identity(store, q.tenant, q.database, |s| {
+        match as_identity(store, q.tenant, q.database, |s| {
             remove_chunk(s, q.rev, &q.hash, now_ms)
         }) {
-            return (KV_RESULT_INTERNAL, 0);
+            Removal::Done => {}
+            Removal::NoRoom => short_of_room = true,
+            Removal::Fault => return (KV_RESULT_INTERNAL, 0),
         }
     }
     // What is left: due now (this pass's own queueing included — a later
-    // revision may take it), or waiting.
+    // revision may take it), or waiting. A pass short of room says only
+    // that work waits: what it left needs room it could not make, so
+    // proposing again at once would find the same.
     let mut probe: Due = [NO_ENTRY; SWEEP_BUDGET_MAX];
     let mut any = |store: &mut M, ks: u32, due: Option<DueAt>| {
         due_entries(store, ks, due, 1, &mut probe).map(|n| n > 0)
@@ -5253,19 +5464,45 @@ fn apply_chunk_sweep<M: Materializer>(
     let Some(o) = out.first_mut() else {
         return (KV_RESULT_INTERNAL, 0);
     };
-    *o = if r_due || z_due { SWEEP_MORE } else { 0 }
-        | if r_any || z_any { SWEEP_WAITING } else { 0 };
+    *o = if (r_due || z_due) && !short_of_room {
+        SWEEP_MORE
+    } else {
+        0
+    } | if r_any || z_any { SWEEP_WAITING } else { 0 };
     (KV_RESULT_OK, 1)
 }
 
+/// What taking one unreferenced chunk apart came to.
+enum Removal {
+    Done,
+    /// Left as it was: the store has no room for the entries its
+    /// children would queue.
+    NoRoom,
+    Fault,
+}
+
+/// Records the removal of one chunk frees: its data, its references and
+/// its entry in the unreferenced queue.
+const CHUNK_RECORDS: usize = 3;
+
+/// Room a chunk upload leaves the store: enough for a sweep to take any
+/// node apart — a node's removal queues an entry for each of up to
+/// `FANOUT` children before its own records are reused — with the record
+/// writes that name the uploads to spare. A provider with a fixed number
+/// of records ([`Materializer::free_slots`]) would otherwise fill with
+/// superseded trees the sweep has no room to take apart, and refuse every
+/// upload for want of the room only the sweep makes.
+pub const SWEEP_ROOM: usize = kv_chunks::FANOUT;
+
 /// An unreferenced chunk, queued at `since`, goes: its record and
-/// references, and a node's reference on each child.
+/// references, and a node's reference on each child. A node goes only
+/// when the store has room for an entry per child: all of it, or none.
 fn remove_chunk<M: Materializer>(
     store: &mut M,
     since: u64,
     h: &kv_chunks::Hash,
     now_ms: u64,
-) -> bool {
+) -> Removal {
     let mut chunk = [0u8; kv_chunks::CHUNK_MAX];
     let len = in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
         match s.get_live(kv_chunks::hash_key(h), now_ms, &mut chunk) {
@@ -5274,23 +5511,28 @@ fn remove_chunk<M: Materializer>(
         }
     });
     let Some(len) = len else {
-        return false;
+        return Removal::Fault;
     };
+    let node = match kv_chunks::parse_chunk(&chunk[..len]) {
+        Some((kv_chunks::KIND_NODE, payload)) => Some(payload),
+        _ => None,
+    };
+    let children = node.map_or(0, |p| kv_chunks::children(p).count());
+    if store.free_slots().saturating_add(CHUNK_RECORDS) < children {
+        return Removal::NoRoom;
+    }
     let ok = chunk_queue(store, kv_chunks::KS_CHUNK_ZERO, since, h, false, now_ms)
         && in_chunk_space(store, kv_chunks::KS_CHUNK_REF, |s| {
             s.remove_meta(kv_chunks::hash_key(h))
         })
         && in_chunk_space(store, kv_chunks::KS_CHUNK_DATA, |s| {
             s.remove_meta(kv_chunks::hash_key(h))
-        });
-    if !ok {
-        return false;
-    }
-    match kv_chunks::parse_chunk(&chunk[..len]) {
-        Some((kv_chunks::KIND_NODE, payload)) => {
-            kv_chunks::children(payload).all(|c| decref_chunk(store, &c, now_ms))
-        }
-        _ => true,
+        })
+        && node.is_none_or(|p| kv_chunks::children(p).all(|c| decref_chunk(store, &c, now_ms)));
+    if ok {
+        Removal::Done
+    } else {
+        Removal::Fault
     }
 }
 

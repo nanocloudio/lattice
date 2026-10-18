@@ -284,9 +284,10 @@ const WATCH_PAGE: usize = 64;
 const MAX_FOLLOWS: usize = 16;
 /// A followed watch's request, kept to re-run it from its cursor.
 const FOLLOW_REQ_MAX: usize = 1024;
-/// How often every followed watch is read again whatever notified it: a
-/// lost change notification costs at most this much latency.
-const FOLLOW_HEAL_MS: u64 = 1000;
+/// How often every followed watch is read again whatever notified it, by
+/// default (param `follow_heal_ms`): a lost change notification costs at
+/// most this much latency.
+const FOLLOW_HEAL_MS: u32 = 1000;
 
 /// A followed watch: whose it is, the request to re-run, the span its
 /// changes fall in, and where the next read starts.
@@ -509,11 +510,23 @@ struct ExecState {
     changes_in: i32,
     follows: [Follow; MAX_FOLLOWS],
     /// The followed watch whose read is the job in flight (index + 1; 0:
-    /// none), the next to consider, and the last heal.
+    /// none), the next to consider, when every followed watch was last read
+    /// again, and how often it is (param `follow_heal_ms`).
     follow_job: u8,
     follow_rr: u8,
-    follow_heal_ms: u64,
+    follow_healed_at: u64,
+    follow_heal_every: u64,
     follow_buf: [u8; FOLLOW_REQ_MAX + wire::ENVELOPE_HDR + 16],
+}
+
+define_params! {
+    ExecState;
+
+    // How often every followed watch is read again whatever notified it:
+    // the most a lost change notification costs. Tests stretch it to tell
+    // a pushed change from a re-read.
+    1, follow_heal_ms, u32, 1000
+        => |s, d, len| { s.follow_heal_every = u64::from(p_u32(d, len, 0, FOLLOW_HEAL_MS).max(1)); };
 }
 
 impl ExecState {
@@ -962,6 +975,40 @@ fn follow_cancel(exec: &mut ExecState, src: u8, corr: u64, conn: u8) {
             f.live = false;
         }
     }
+    // What a cancel left behind is otherwise visible only as the absence
+    // of answers: said, so a follow that outlives its cancel is caught at
+    // once rather than by waiting for a re-read that might push.
+    let live = exec.follows.iter().filter(|f| f.live).count();
+    log_count(exec, b"[docx] follow cancelled; live=", live as u64);
+}
+
+/// `<prefix><n>` on the module log.
+fn log_count(exec: &ExecState, prefix: &[u8], n: u64) {
+    if exec.syscalls.is_null() {
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let mut at = prefix.len().min(buf.len());
+    buf[..at].copy_from_slice(&prefix[..at]);
+    let mut digits = [0u8; 20];
+    let mut d = digits.len();
+    let mut v = n;
+    loop {
+        d -= 1;
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for &c in &digits[d..] {
+        if at < buf.len() {
+            buf[at] = c;
+            at += 1;
+        }
+    }
+    // SAFETY: the module's syscall table; `buf[..at]` is initialised.
+    unsafe { dev_log(&*exec.syscalls, 3, buf.as_ptr(), at) };
 }
 
 /// Change notifications mark the followed watches whose span holds the
@@ -1003,8 +1050,8 @@ unsafe fn follow_step(exec: &mut ExecState, sys: &SyscallTable) {
         }
     }
     let now = dev_millis(sys);
-    if now.saturating_sub(exec.follow_heal_ms) >= FOLLOW_HEAL_MS {
-        exec.follow_heal_ms = now;
+    if now.saturating_sub(exec.follow_healed_at) >= exec.follow_heal_every {
+        exec.follow_healed_at = now;
         for f in exec.follows.iter_mut() {
             f.dirty |= f.live;
         }
@@ -5574,8 +5621,8 @@ pub extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -5586,6 +5633,15 @@ pub extern "C" fn module_new(
     let sys_ptr = syscalls.cast::<SyscallTable>();
     let exec = unsafe { &mut *state.cast::<ExecState>() };
     exec.syscalls = sys_ptr;
+    exec.follow_heal_every = u64::from(FOLLOW_HEAL_MS);
+    if !params.is_null() && params_len >= 4 {
+        unsafe { parse_tlv(exec, params, params_len) };
+    }
+    log_count(
+        exec,
+        b"[docx] follow heal every ms=",
+        exec.follow_heal_every,
+    );
     exec.phase = P_IDLE;
     exec.lg_up = kv_large::Uploader::new();
     exec.lg_ex = kv_large::Expander::new();

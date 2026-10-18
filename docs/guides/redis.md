@@ -33,8 +33,9 @@ local applied state unless the graph sets `lin_reads: 1` (see the
 | Keyspace | `DEL`/`UNLINK`, `EXISTS`, `KEYS`, `SCAN` (`MATCH`, `COUNT`), `FLUSHDB`/`FLUSHALL` |
 | Time-series | `TS.ADD`, `TS.RANGE` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` |
-| Pub/sub session | `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE` |
+| Pub/sub | `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH` |
 | Connection | `PING`, `ECHO`, `QUIT`, `SELECT`, `AUTH`, `HELLO`, `RESET`, `CLIENT` (`ID`, `GETNAME`, `SETNAME`, `REPLY`), `COMMAND` |
+| Operations | `LATTICE.RELOCATE`, `LATTICE.RELOCATING`, `LATTICE.RELOCATED` |
 
 Notes:
 
@@ -44,9 +45,17 @@ Notes:
   anchors in the same graph.
 - `MULTI`/`EXEC` queues commands and runs them back to back; it is
   not atomic across the queue and there is no `WATCH` CAS layer.
-- `SUBSCRIBE` and friends answer the standard confirmation frames,
-  but `PUBLISH` does not exist, so no message is ever delivered.
-  Pub/sub is session state only.
+- Subscriptions are sessions held by a pub/sub worker. `PUBLISH`
+  answers how many subscribers it reached on this graph, and a
+  subscription survives its session moving from one worker to
+  another.
+- `LATTICE.RELOCATE [target]` moves every pub/sub session to worker
+  `target` (default 1); it answers an error when a move is already
+  in progress or the target is not wired. `LATTICE.RELOCATING`
+  answers `1` while a move is under way, `0` otherwise, and
+  `LATTICE.RELOCATED` answers `[moves completed, sessions moved,
+  sessions that stayed]` for the last move. A placement change moves
+  sessions the same way without a client asking.
 - Multi-key commands (`MGET`, `MSET`, multi-key `DEL`) and `KEYS`,
   `SCAN`, `FLUSHDB` are accepted only when one range owns the whole
   keyspace; on a split keyspace they are refused (today as a generic
