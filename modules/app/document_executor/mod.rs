@@ -138,7 +138,7 @@ use types::{
     KV_RESULT_KVS, KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_QUOTA, KV_RESULT_TOO_LARGE,
     KV_RESULT_TXN, KV_RESULT_VERSIONS, PROTO_INTERNAL_SQL, TXN_CMP_MOD_EQUAL,
 };
-use wire::{MSG_DOC_REQUEST, MSG_DOC_RESPONSE, MSG_KV_REQUEST, MSG_KV_RESPONSE};
+use wire::{MSG_DOC_REQUEST, MSG_DOC_RESPONSE, MSG_KV_PENDING, MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -1286,6 +1286,20 @@ fn kv_emit(exec: &mut ExecState, op: u8, body_len: usize, next: u8) {
     } else {
         fail_plain(exec, OUT_UNAVAILABLE);
     }
+}
+
+/// The store is still working on the exchange in flight (the router's
+/// `MSG_KV_PENDING`, `[corr_id u64][conn_id u8]` in `exec.scratch`): the
+/// wedge timer starts again. It answers an exchange no one is working on,
+/// not one a loaded store is taking long over — a 1 MiB write's chunks
+/// under load take tens of seconds, and each is answered when decided.
+fn on_kv_pending(exec: &mut ExecState, now: u64) {
+    let corr = u64::from_le_bytes(exec.scratch[..8].try_into().unwrap_or([0; 8]));
+    if !exec.busy() || corr != exec.kv_corr || now == 0 {
+        return;
+    }
+    exec.inflight_since_ms = now;
+    arm_watchdog(exec);
 }
 
 fn arm_watchdog(exec: &mut ExecState) {
@@ -5734,6 +5748,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut tmp = [0u8; SCRATCH_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
                 on_kv_response(exec, &tmp[..len]);
+            } else if mt == MSG_KV_PENDING && len == wire::KV_PENDING_LEN {
+                on_kv_pending(exec, dev_millis(sys));
             }
         }
         start_queued(exec);

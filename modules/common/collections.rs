@@ -205,6 +205,22 @@ impl<V, const N: usize> InflightTable<V, N> {
         })
     }
 
+    /// Iterate over live `(key, value)` pairs mutably (unordered): a sweep
+    /// that renews entries in place.
+    pub fn iter_entries_mut(&mut self) -> impl Iterator<Item = (u64, &mut V)> + '_ {
+        self.used
+            .iter()
+            .zip(self.keys.iter().zip(self.vals.iter_mut()))
+            .filter_map(|(used, (k, v))| {
+                if *used {
+                    // SAFETY: slot is marked used.
+                    Some((*k, unsafe { v.assume_init_mut() }))
+                } else {
+                    None
+                }
+            })
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &V> + '_ {
         self.used.iter().enumerate().filter_map(move |(i, used)| {
             if *used {

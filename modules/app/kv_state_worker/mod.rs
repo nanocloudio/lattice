@@ -153,7 +153,7 @@ use wire::{
     APP_SNAPSHOT_HDR, MSG_APP_APPLIED_POS, MSG_APP_SNAPSHOT_CHUNK, MSG_APP_SNAPSHOT_DURABLE,
     MSG_APP_SNAPSHOT_EXPORT_CHUNK, MSG_APP_SNAPSHOT_EXPORT_REQUEST, MSG_APP_SNAPSHOT_INSTALLED,
     MSG_APP_SNAPSHOT_REQUEST, MSG_APP_SNAPSHOT_RESET, MSG_APP_SNAPSHOT_SPAN_REQUEST,
-    MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_LEASE_TICK,
+    MSG_GC_FLOOR_COMMITTED, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_KV_WORKING, MSG_LEASE_TICK,
     MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_CLAIM, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REQUEST,
     MSG_TTL_CLOCK_RESUME, MSG_TTL_REGISTER, MSG_WATCH_EVENT, TS_LEASE_GRANT_WIRE_LEN,
     XFER_CHUNK_BODY,
@@ -515,6 +515,16 @@ define_params! {
     // holding the record). 0 (default): off.
     22, fault_log_hold_steps, u32, 0
         => |s, d, len| { s.fault_log_hold_steps = p_u32(d, len, 0, 0); };
+    // TEST ONLY: a slow device. One write command in
+    // `fault_slow_write_every` (default 1: every one) waits this many ms at
+    // the head of the command channel before it is applied, as a loaded
+    // board's store keeps a write waiting — the router must keep it in
+    // flight, never answer it fail-closed for taking long. Applies to every
+    // worker type. 0 (default): off.
+    23, fault_slow_write_ms, u32, 0
+        => |s, d, len| { s.fault_slow_write_ms = p_u32(d, len, 0, 0); };
+    24, fault_slow_write_every, u32, 0
+        => |s, d, len| { s.fault_slow_write_every = p_u32(d, len, 0, 0); };
 }
 
 /// Steps between chunk sweeps while writes may have queued chunk work.
@@ -693,6 +703,9 @@ struct WorkerState {
     /// A command the engine paused (`KV_RESULT_PAUSED`) is held here
     /// and re-applied one bounded slice per step until it answers.
     held_active: bool,
+    /// When the router was last told a waiting command is still being
+    /// worked on (`MSG_KV_WORKING`, see [`say_working`]).
+    working_said_ms: u64,
     held_len: u16,
     /// Version-scan slices that paused (cumulative), and frames the
     /// hold slot could not take because they were oversized.
@@ -967,6 +980,15 @@ struct WorkerState {
     fault_read_eagain_every: u32,
     fault_busy_reaches_store: u8,
     fault_log_hold_steps: u32,
+    /// TEST ONLY: the slow device (params 23, 24), and the write at the
+    /// channel head it is holding: its correlation, the writes counted, and
+    /// until when it waits.
+    fault_slow_write_ms: u32,
+    fault_slow_write_every: u32,
+    slow_seen: bool,
+    slow_corr: u64,
+    slow_count: u32,
+    slow_until_ms: u64,
 
     /// `command_log` param, and the log's life: off, replaying its tail
     /// after recovery, or live (every applied op logged).
@@ -1148,6 +1170,7 @@ impl WorkerState {
         self.disk_compact_steps = 0;
         self.disk_flush_t0 = 0;
         self.held_active = false;
+        self.working_said_ms = 0;
         self.held_len = 0;
         self.m_scan_pauses = 0;
         self.m_scan_hold_refusals = 0;
@@ -1488,7 +1511,7 @@ unsafe fn drain_commands(worker: &mut WorkerState) -> bool {
         // overlap.
         return adopt_retry(worker, &frame[ENVELOPE_HDR..total]);
     }
-    if !frame_admitted(worker, &frame[..total]) {
+    if slow_write_waits(worker, &frame[..total]) || !frame_admitted(worker, &frame[..total]) {
         worker.m_head_blocked = worker.m_head_blocked.wrapping_add(1);
         return false;
     }
@@ -2757,6 +2780,89 @@ unsafe fn apply_to_store_once(
     }
 }
 
+/// TEST ONLY (`fault_slow_write_ms`): whether the write command at the
+/// channel head (`frame`, peeked whole) is one the slow device keeps
+/// waiting now. Each write that reaches the head is counted once; one in
+/// `fault_slow_write_every` waits `fault_slow_write_ms` there, unapplied.
+unsafe fn slow_write_waits(worker: &mut WorkerState, frame: &[u8]) -> bool {
+    if worker.fault_slow_write_ms == 0 || worker.syscalls.is_null() {
+        return false;
+    }
+    if frame.first() != Some(&MSG_KV_COMMAND) {
+        return false;
+    }
+    let Some(head) = frame
+        .get(ENVELOPE_HDR..)
+        .and_then(wire::KvCommandHead::decode)
+    else {
+        return false;
+    };
+    if op_only_reads(head.op) {
+        return false;
+    }
+    let now = dev_millis(&*worker.syscalls);
+    if !worker.slow_seen || head.corr_id != worker.slow_corr {
+        worker.slow_seen = true;
+        worker.slow_corr = head.corr_id;
+        worker.slow_count = worker.slow_count.wrapping_add(1);
+        let every = worker.fault_slow_write_every.max(1);
+        worker.slow_until_ms = if worker.slow_count.is_multiple_of(every) {
+            now.saturating_add(u64::from(worker.fault_slow_write_ms))
+        } else {
+            0
+        };
+    }
+    now < worker.slow_until_ms
+}
+
+/// Tell the router, at most once per `KV_WORKING_INTERVAL_MS`, that a
+/// command it sent here is still being worked on (`MSG_KV_WORKING`): one
+/// still waits at the command channel's head after this step's drain — the
+/// device made it wait, its reply waits for the command log, the store is
+/// making room for it, or the step's budget ran out before it — or a paused
+/// walk is held. Commands are answered in channel order, so the router
+/// keeps every direct op it routed here in flight rather than answering it
+/// fail-closed for being slow. A worker that has stopped says nothing, and
+/// the router's deadline answers its commands.
+unsafe fn say_working(worker: &mut WorkerState) {
+    let sys_ptr = worker.syscalls;
+    if sys_ptr.is_null() || worker.responses_out < 0 || worker.commands_in < 0 {
+        return;
+    }
+    let sys = &*sys_ptr;
+    let now = dev_millis(sys);
+    if now.wrapping_sub(worker.working_said_ms) < wire::KV_WORKING_INTERVAL_MS {
+        return;
+    }
+    let mut frame = [0u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE];
+    let handle = worker.commands_in;
+    let head = match worker
+        .commands_inbox
+        .peek(&mut Chan { sys, handle }, &mut frame)
+    {
+        Some((MSG_KV_COMMAND, len)) => frame
+            .get(ENVELOPE_HDR..ENVELOPE_HDR + len)
+            .and_then(wire::KvCommandHead::decode),
+        _ => None,
+    };
+    let held = if worker.held_active {
+        wire::KvCommandHead::decode(&worker.held_frame[..worker.held_len as usize])
+    } else {
+        None
+    };
+    let Some(cmd) = head.or(held) else {
+        return;
+    };
+    let mut env = [0u8; ENVELOPE_HDR + wire::KV_WORKING_LEN];
+    env[0] = MSG_KV_WORKING;
+    env[1] = wire::KV_WORKING_LEN as u8;
+    env[3..5].copy_from_slice(&cmd.kpg_id.to_le_bytes());
+    env[5..13].copy_from_slice(&cmd.corr_id.to_le_bytes());
+    if (sys.channel_write)(worker.responses_out, env.as_mut_ptr(), env.len()) == env.len() as i32 {
+        worker.working_said_ms = now;
+    }
+}
+
 /// Keep a paused command's frame for re-application. One slot: the
 /// drain refuses to admit a second pausable command while it is
 /// occupied (see [`drain_commands`]), so occupancy is never a race.
@@ -3779,6 +3885,8 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
         n = write_dec(&mut buf, n, u64::from(pv.m_told));
         n = write_prefix(&mut buf, n, b" ev_refused=");
         n = write_dec(&mut buf, n, u64::from(pv.m_refused));
+        n = write_prefix(&mut buf, n, b" hashed=");
+        n = write_dec(&mut buf, n, u64::from(pv.m_ident_hashed));
         let (fault_on, injected) = pv.fault_injected();
         if fault_on {
             n = write_prefix(&mut buf, n, b" fault=");
@@ -4523,6 +4631,18 @@ pub extern "C" fn module_new(
         n = write_prefix(&mut buf, n, b" plen=");
         n = write_dec(&mut buf, n, params_len as u64);
         dev_log(&*sys_ptr, DISK_LOG_LEVEL, buf.as_ptr(), n);
+        if worker.fault_slow_write_ms != 0 {
+            let mut m = [0u8; 112];
+            let mut k = write_prefix(
+                &mut m,
+                0,
+                b"[kvw] FAULT INJECTION ON (test only): slow device, a write waits ms=",
+            );
+            k = write_dec(&mut m, k, u64::from(worker.fault_slow_write_ms));
+            k = write_prefix(&mut m, k, b" one in=");
+            k = write_dec(&mut m, k, u64::from(worker.fault_slow_write_every.max(1)));
+            dev_log(&*sys_ptr, 1, m.as_ptr(), k);
+        }
     }
 
     worker.commands_in = in_chan;
@@ -5000,6 +5120,7 @@ fn step(state: *mut u8) -> i32 {
             break;
         }
     }
+    unsafe { say_working(worker) };
     // Report the applied position upstream whenever it moved. This is
     // the half of the linearizable-read fence that only this module can
     // supply: consensus knows when IT applied through the fence index,
@@ -5308,7 +5429,18 @@ unsafe fn disk_maintenance(worker: &mut WorkerState) {
                 worker.disk_compact_cursor = 0;
                 worker.disk_compact_floor = worker.disk_state.compaction_floor;
             }
-            if worker.disk_compact_active && !worker.disk_flush_active {
+            // A memtable that must drain goes before a merge: a write that
+            // waits for room (and the command log behind it) waits on the
+            // flush alone, never on a merge of every run (seconds on a
+            // loaded board). The store lets a flush run while the merge is
+            // paused short of its manifest, and the merge publishes over
+            // the flushed run (`DiskState::compact_pausable`). With the run
+            // set full the flush cannot start: the merge goes first.
+            let flush_first = worker.disk_flush_active
+                || (worker.disk_flush_wanted
+                    && worker.disk_state.flush_may_start()
+                    && (worker.disk_state.run_count as usize) < kv_store::disk_store::MAX_RUNS);
+            if worker.disk_compact_active && !worker.disk_flush_active && !flush_first {
                 // Pinned at start — the provider refuses a mid-flight
                 // floor change, and a compaction must not reclaim half
                 // its input under one retention rule and half under

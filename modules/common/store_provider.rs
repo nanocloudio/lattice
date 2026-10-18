@@ -422,6 +422,17 @@ pub struct Provider {
     /// replica keys its writes, so asking again is a second look at the
     /// same write, whoever else wrote meanwhile (see [`local_write`]).
     answers: [Answer; LOCAL_ANSWERS],
+    /// The identity of each caller's latest write request, so an identical
+    /// re-ask is known without hashing its value again ([`identity`]).
+    idents: [Ident; LOCAL_ANSWERS],
+    /// What the identities' checksums are keyed with (set at `open`).
+    ident_seed: u64,
+    /// Write requests hashed whole (telemetry: once per request, not per
+    /// re-ask).
+    pub m_ident_hashed: u32,
+    /// A single store's large value being uploaded, resumed where it stopped
+    /// when its write is asked again ([`staged_upload`]).
+    stage: Stage,
     /// Injected read waits (test only; off unless configured).
     fault: Fault,
 }
@@ -529,6 +540,75 @@ const NO_ANSWER: Answer = Answer {
     id: [0u8; HASH_LEN],
 };
 
+/// A write request's identity, kept for its caller (see [`identity`]):
+/// what the request asks, exactly, but for its value, which is known by
+/// its length and a checksum.
+#[derive(Clone, Copy)]
+struct Ident {
+    used: bool,
+    caller: [u8; 8],
+    put: bool,
+    pre: u8,
+    rev: u64,
+    import: bool,
+    mark: [u8; IMPORT_MARK_LEN],
+    key: [u8; KEY_MAX],
+    key_len: u8,
+    len: u64,
+    check: [u64; 2],
+    /// Steps since it was last asked (the least recently asked is the one
+    /// a new caller's request replaces).
+    idle: u32,
+    id: Hash,
+}
+
+const NO_IDENT: Ident = Ident {
+    used: false,
+    caller: [0; 8],
+    put: false,
+    pre: 0,
+    rev: 0,
+    import: false,
+    mark: [0; IMPORT_MARK_LEN],
+    key: [0; KEY_MAX],
+    key_len: 0,
+    len: 0,
+    check: [0; 2],
+    idle: 0,
+    id: [0u8; HASH_LEN],
+};
+
+/// A single store's large value being uploaded (see [`staged_upload`]).
+struct Stage {
+    active: bool,
+    /// The write it is for.
+    id: Hash,
+    /// Value bytes the builder has been fed.
+    fed: u64,
+    builder: Builder,
+    /// A chunk built and not yet taken by the store (it was making room).
+    held: bool,
+    held_len: usize,
+    held_hash: Hash,
+    held_chunk: [u8; CHUNK_MAX],
+    /// Every chunk is stored: the value's manifest.
+    done: bool,
+    manifest: [u8; MANIFEST_LEN],
+}
+
+const NO_STAGE: Stage = Stage {
+    active: false,
+    id: [0u8; HASH_LEN],
+    fed: 0,
+    builder: Builder::IDLE,
+    held: false,
+    held_len: 0,
+    held_hash: [0u8; HASH_LEN],
+    held_chunk: [0; CHUNK_MAX],
+    done: false,
+    manifest: [0; MANIFEST_LEN],
+};
+
 impl Provider {
     pub const fn new() -> Self {
         Provider {
@@ -544,6 +624,10 @@ impl Provider {
             rep: NO_REPLICATION,
             scope: NO_SCOPE,
             answers: [NO_ANSWER; LOCAL_ANSWERS],
+            idents: [NO_IDENT; LOCAL_ANSWERS],
+            ident_seed: 0,
+            m_ident_hashed: 0,
+            stage: NO_STAGE,
             fault: NO_FAULT,
         }
     }
@@ -587,6 +671,9 @@ impl Provider {
             f.busy = f.steps.is_multiple_of(f.every);
         }
         f.held = f.held.saturating_sub(1);
+        for x in self.idents.iter_mut().filter(|x| x.used) {
+            x.idle = x.idle.saturating_add(1);
+        }
         for x in self.answers.iter_mut().filter(|x| x.used) {
             x.idle = x.idle.saturating_add(1);
             if x.idle > IDLE_STEPS {
@@ -649,6 +736,7 @@ impl Provider {
     pub fn open<B: Backend>(&mut self, b: &B) {
         self.seen = b.revision();
         self.opened = true;
+        self.ident_seed = b.revision() ^ (self as *const Self as usize as u64).rotate_left(17);
     }
 
     /// Subscriptions held.
@@ -1188,6 +1276,9 @@ fn txn(
 /// `Ok(false)` when the key had moved.
 fn commit<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, len: usize, put: bool) -> Result<bool, i32> {
     let (r, n) = b.apply(KV_OP_TXN, bufs.req.get(..len).ok_or(EINVAL)?, bufs.ans);
+    if r == KV_RESULT_MISSING_CHUNK {
+        return Err(RESTAGE);
+    }
     if r != KV_RESULT_TXN {
         // Not applied: a store making room takes it when asked again.
         return Err(if b.busy() { EINPROGRESS } else { ERROR });
@@ -1200,9 +1291,14 @@ fn commit<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, len: usize, put: bool) -> 
     }
     match a.get(3).copied() {
         Some(r) if op_done(put, r) => Ok(true),
+        Some(KV_RESULT_MISSING_CHUNK) => Err(RESTAGE),
         _ => Err(ERROR),
     }
 }
+
+/// [`commit`]'s word, never a caller's: the manifest names a chunk the store
+/// no longer holds (see [`put_staged`]).
+const RESTAGE: i32 = i32::MIN;
 
 /// A write's op did what it said: a put put (`OK`), a delete deleted
 /// (the count it deleted, none included).
@@ -1300,9 +1396,7 @@ fn obj_put<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
     if b.replicated() {
         return replicated_write(pv, b, &w);
     }
-    local_write(pv, b, &w, |pv, b| {
-        put_value(pv, b, bufs, w.key, w.value.unwrap_or(&[]), w.pre, w.rev)
-    })
+    local_write(pv, b, &w, |pv, b, id| put_staged(pv, b, bufs, &w, Some(id)))
 }
 
 /// A single store's write: decided in the call — and answered so once the
@@ -1331,14 +1425,14 @@ fn obj_put<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
 ///   steps unasked ([`Provider::step`]). The write stands either way (it is
 ///   in the log); only its answer goes uncollected, and the same request
 ///   asked after that is a new write.
-fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B) -> Result<(), i32>>(
+fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B, &Hash) -> Result<(), i32>>(
     pv: &mut Provider,
     b: &mut B,
     w: &WriteArgs<'_>,
     apply: F,
 ) -> i32 {
     let caller = b.caller();
-    let id = write_id(&caller, w);
+    let id = identity(pv, caller, w);
     if let Some(k) = pv.answers.iter().position(|x| x.used && x.id == id) {
         pv.answers[k].idle = 0;
         if !pv.answers[k].durable {
@@ -1371,7 +1465,7 @@ fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B) -> Result<(), i32>>(
         // Every answer held is another caller's, uncollected: not taken.
         return EINPROGRESS;
     };
-    let rc = match apply(pv, b) {
+    let rc = match apply(pv, b, &id) {
         Err(e) => e,
         Ok(()) => 0,
     };
@@ -1434,16 +1528,56 @@ pub fn put_value<B: Backend>(
     pre: u8,
     rev: u64,
 ) -> Result<(), i32> {
+    let w = WriteArgs {
+        key,
+        value: Some(value),
+        pre,
+        rev,
+        fence_ptr: 0,
+        fence_cap: 0,
+        mark: None,
+    };
+    put_staged(pv, b, bufs, &w, None)
+}
+
+/// [`put_value`] for write `w`; a large value uploaded through the stage
+/// when the write has an identity (`id`), so a write the store refuses for
+/// now resumes its upload when asked again rather than starting it over.
+fn put_staged<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    w: &WriteArgs<'_>,
+    id: Option<&Hash>,
+) -> Result<(), i32> {
+    let (key, value, pre, rev) = (w.key, w.value.unwrap_or(&[]), w.pre, w.rev);
     if key.is_empty() || !key_ok(key) {
         return Err(EINVAL);
     }
-    let what = if value.len() > INLINE_MAX {
-        Put::Manifest(upload(b, bufs, value)?.encode())
-    } else {
+    let what = if value.len() <= INLINE_MAX {
         Put::Value(value)
+    } else if let Some(id) = id {
+        Put::Manifest(staged_upload(pv, b, bufs, id, value)?)
+    } else {
+        Put::Manifest(upload(b, bufs, value)?.encode())
     };
     let n = txn(bufs.req, key, pre != PRE_ANY, rev, Some(&what)).ok_or(EINVAL)?;
-    match commit(b, bufs, n, true)? {
+    let held = match commit(b, bufs, n, true) {
+        // The chunks the stage stored are gone (collected while the write
+        // waited past their grace): uploaded again when it is asked again.
+        Err(RESTAGE) => {
+            pv.stage.active = false;
+            return Err(if id.is_some() { EINPROGRESS } else { ERROR });
+        }
+        // Not taken now: the stage keeps the manifest for the re-ask.
+        Err(e) => return Err(e),
+        Ok(held) => held,
+    };
+    // Decided: the stage has done its work.
+    if id.is_some_and(|id| pv.stage.active && pv.stage.id == *id) {
+        pv.stage.active = false;
+    }
+    match held {
         // Somebody else created it: a create has lost.
         false if pre == PRE_ABSENT => Err(EEXIST),
         // It moved under a compare-and-swap: read again and retry.
@@ -1452,6 +1586,82 @@ pub fn put_value<B: Backend>(
             pump(pv, b, bufs);
             Ok(())
         }
+    }
+}
+
+/// Upload write `id`'s large `value` through the stage: its manifest once
+/// every chunk is stored. A chunk the store refuses for now (it is making
+/// room) is kept, and the write asked again resumes from it — the chunks
+/// before it are neither built nor sent again, and once all are stored the
+/// manifest is kept until the write is decided. Another write's upload
+/// takes the stage over; this one, asked again, starts over (its chunks
+/// already stored are no-ops to send again).
+fn staged_upload<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    id: &Hash,
+    value: &[u8],
+) -> Result<[u8; MANIFEST_LEN], i32> {
+    let st = &mut pv.stage;
+    if !st.active || st.id != *id {
+        st.builder = Builder::new(value.len() as u64).ok_or(EOVERFLOW)?;
+        st.active = true;
+        st.id = *id;
+        st.fed = 0;
+        st.held = false;
+        st.done = false;
+    }
+    if st.done {
+        return Ok(st.manifest);
+    }
+    loop {
+        if !st.held {
+            match st.builder.next(&mut st.held_chunk) {
+                Some((n, h)) => {
+                    st.held = true;
+                    st.held_len = n;
+                    st.held_hash = h;
+                }
+                None => {
+                    let fed = st.fed as usize;
+                    if fed == value.len() {
+                        let m = st.builder.manifest().ok_or(ERROR)?.encode();
+                        st.done = true;
+                        st.manifest = m;
+                        return Ok(m);
+                    }
+                    let take = st.builder.room().min(value.len() - fed);
+                    let piece = value.get(fed..fed + take).ok_or(ERROR)?;
+                    st.builder.feed(piece).ok_or(ERROR)?;
+                    st.fed += take as u64;
+                    continue;
+                }
+            }
+        }
+        let mut p = 0usize;
+        put(bufs.req, &mut p, &st.held_hash).ok_or(ERROR)?;
+        put(bufs.req, &mut p, &(st.held_len as u16).to_le_bytes()).ok_or(ERROR)?;
+        put(
+            bufs.req,
+            &mut p,
+            st.held_chunk.get(..st.held_len).ok_or(ERROR)?,
+        )
+        .ok_or(ERROR)?;
+        let (r, _) = b.apply(
+            kv_large::UPLOAD_OP,
+            bufs.req.get(..p).ok_or(ERROR)?,
+            bufs.ans,
+        );
+        if r != KV_RESULT_OK {
+            if b.busy() {
+                // Not now: the chunk stays held for the re-ask.
+                return Err(EINPROGRESS);
+            }
+            st.active = false;
+            return Err(ERROR);
+        }
+        st.held = false;
     }
 }
 
@@ -1527,7 +1737,7 @@ fn obj_delete<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: 
     if b.replicated() {
         return replicated_write(pv, b, &w);
     }
-    local_write(pv, b, &w, |pv, b| {
+    local_write(pv, b, &w, |pv, b, _| {
         delete_key(pv, b, bufs, w.key, w.pre, w.rev)
     })
 }
@@ -2647,11 +2857,11 @@ impl Replication {
 /// A write asked of a replica: taken, moved on as far as it goes now, and
 /// answered — `EINPROGRESS` until it is decided.
 fn replicated_write<B: Backend>(pv: &mut Provider, b: &mut B, w: &WriteArgs<'_>) -> i32 {
-    let rep = &mut pv.rep;
-    if rep.superseded {
+    if pv.rep.superseded {
         return ERROR;
     }
-    let id = write_id(&b.caller(), w);
+    let id = identity(pv, b.caller(), w);
+    let rep = &mut pv.rep;
     let found = rep
         .writes
         .iter()
@@ -2705,6 +2915,92 @@ fn replicated_write<B: Backend>(pv: &mut Provider, b: &mut B, w: &WriteArgs<'_>)
     }
     rep.writes[i].state = W_FREE;
     rc
+}
+
+/// Write request `w`'s identity ([`write_id`]), computed once per request:
+/// an identical re-ask — the same caller, operation, precondition, key and
+/// value length, and a value with the same checksum — is the request its
+/// caller's [`Ident`] already names, and its identity is not hashed again
+/// (SHA-256 over a 1 MiB value, every re-ask, is what kept a loaded store's
+/// callers waiting). The checksum is two 64-bit lanes keyed per provider:
+/// it tells a re-ask from a caller's buffer reused for a different value,
+/// the one case the exact fields cannot. A request not matched is hashed
+/// whole and replaces its caller's (or the least recently asked) entry.
+fn identity(pv: &mut Provider, caller: [u8; 8], w: &WriteArgs<'_>) -> Hash {
+    let value = w.value.unwrap_or(&[]);
+    let check = checksum(pv.ident_seed, value);
+    let mark = w.mark.unwrap_or([0; IMPORT_MARK_LEN]);
+    let same = |x: &Ident| {
+        x.used
+            && x.caller == caller
+            && x.put == w.value.is_some()
+            && x.pre == w.pre
+            && x.rev == w.rev
+            && x.import == w.mark.is_some()
+            && x.mark == mark
+            && x.len == value.len() as u64
+            && x.check == check
+            && x.key.get(..x.key_len as usize) == Some(w.key)
+    };
+    if let Some(x) = pv.idents.iter_mut().find(|x| same(x)) {
+        x.idle = 0;
+        return x.id;
+    }
+    let id = write_id(&caller, w);
+    pv.m_ident_hashed = pv.m_ident_hashed.wrapping_add(1);
+    if w.key.len() <= KEY_MAX {
+        let k = pv
+            .idents
+            .iter()
+            .position(|x| x.used && x.caller == caller)
+            .or_else(|| pv.idents.iter().position(|x| !x.used))
+            .or_else(|| (0..LOCAL_ANSWERS).max_by_key(|&k| pv.idents.get(k).map_or(0, |x| x.idle)));
+        if let Some(x) = k.and_then(|k| pv.idents.get_mut(k)) {
+            *x = Ident {
+                used: true,
+                caller,
+                put: w.value.is_some(),
+                pre: w.pre,
+                rev: w.rev,
+                import: w.mark.is_some(),
+                mark,
+                key: [0; KEY_MAX],
+                key_len: w.key.len() as u8,
+                len: value.len() as u64,
+                check,
+                idle: 0,
+                id,
+            };
+            copy(&mut x.key, w.key);
+        }
+    }
+    id
+}
+
+/// A keyed two-lane checksum of `v`, word at a time: tens of times cheaper
+/// than SHA-256, and only ever compared within one caller's requests of one
+/// key and length (see [`identity`]).
+fn checksum(seed: u64, v: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9E37_79B9_7F4A_7C15;
+    const K1: u64 = 0xBF58_476D_1CE4_E5B9;
+    const K2: u64 = 0x94D0_49BB_1331_11EB;
+    let mut a = seed ^ K0;
+    let mut c = seed.rotate_left(32) ^ K2;
+    let mut words = v.chunks_exact(8);
+    for word in &mut words {
+        let x = u64::from_le_bytes(<[u8; 8]>::try_from(word).unwrap_or([0; 8]));
+        a = (a ^ x).wrapping_mul(K1);
+        a ^= a >> 31;
+        c = c.wrapping_add(x).rotate_left(27).wrapping_mul(K0);
+    }
+    let mut tail = [0u8; 8];
+    copy(&mut tail, words.remainder());
+    let x = u64::from_le_bytes(tail) ^ ((v.len() as u64) << 3);
+    a = (a ^ x).wrapping_mul(K1);
+    c = c.wrapping_add(x).rotate_left(27).wrapping_mul(K0);
+    a ^= a >> 33;
+    c ^= c >> 29;
+    [a.wrapping_mul(K2), c.wrapping_mul(K1)]
 }
 
 /// Which write a request is: its caller and what it asks — the operation,

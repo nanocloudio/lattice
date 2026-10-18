@@ -58,7 +58,7 @@ big     | feature = "big"
 | Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held; the request times out upstream and is re-issued. Only `KV_OP_SCAN_VERSIONS` pauses, and its frame is bounded well under this. |
 | Command-log answer room | Shape | `CLOG_OUT_MAX` | modules/app/kv_state_worker/mod.rs | 65536 | The largest answer room an op is applied with (a store-provider call's); a logged op replays with the room it first had, capped here. |
 | Imported host-log record | Shape | `IMPORT_RECORD_MAX` | modules/app/kv_state_worker/mod.rs | 3149824 | One record of a fluxor host `store.log` being imported (`kv_state_worker_store`): the largest object (3 MiB) and its key. A larger record stops the import and quarantines the store rather than skip it. |
-| Held single-store write answers | Capacity | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 16 | Answers of single-store writes applied while their log records were not yet durable, each kept for its caller under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. Full of other callers' answers, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped. |
+| Held single-store write answers | Capacity | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 16 | Answers of single-store writes applied while their log records were not yet durable, each kept for its caller under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. Full of other callers' answers, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped. The same count bounds the request identities kept (one per caller writing; a new caller's replaces the least recently asked), so a re-ask is known by its fields and a checksum of its value rather than hashed whole again; an identity let go costs only one hash on its next ask. |
 | Store key | Shape | `KEY_MAX` | modules/common/store_provider.rs | 255 | The longest key the `storage.object`/`storage.namespace` provider takes (a LIST entry and a cursor carry its length in a byte). A longer key is refused `EINVAL` before the store is touched. |
 | Store inline value | Shape | `INLINE_MAX` | modules/common/store_provider.rs | — | Derived: one chunk's data (`kv_chunks::DATA_MAX`). A value up to it is stored and evented whole; a larger one is uploaded as chunks under a manifest, and its events carry no value (the value-elided flag). |
 | Store event | Shape | `EVENT_MAX` | modules/common/store_provider.rs | — | Derived: event head, change head, `KEY_MAX` and `INLINE_MAX`. The largest event a subscriber's channel is written; every event fits it by construction. |
@@ -375,6 +375,11 @@ wait), so the provider's own read paths must answer `EAGAIN`.
 `fault_log_hold_steps: N` (id 22, default 0 = off) keeps the log pending N
 worker steps after every single-store write, so another caller's write lands
 between a write and its re-ask.
+`fault_slow_write_ms: M` (id 23, any state worker; default 0 = off) is a slow
+device: one write command in `fault_slow_write_every` (id 24, default 1)
+waits M ms at the head of the command channel before it is applied, so a
+write slower than the router's in-flight deadline proves it is kept in
+flight (the worker's `MSG_KV_WORKING`) rather than answered fail-closed.
 `tools/ci/no_fault_injection.sh` fails CI if any tracked graph outside
 `tests/` sets any of them.
 

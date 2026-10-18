@@ -142,6 +142,32 @@ pub const MSG_KV_COMMAND: u8 = 0xC2;
 /// taught to look.
 pub const MSG_KV_APPLIED: u8 = 0xC3;
 
+/// Worker → router (`responses` → `kv_in`): the command at the head of the
+/// worker's command channel is still being worked on — the device made it
+/// wait, its reply waits for the command log, or it is a paused walk being
+/// driven on. Payload: `[kpg_id:u16 LE][corr_id:u64 LE]`.
+///
+/// Sent at most once per `KV_WORKING_INTERVAL_MS` while such a command
+/// waits. The worker answers its commands in channel order, so every direct
+/// command routed to that partition is at or behind the head, and is being
+/// worked on: the router keeps each in flight (its deadline renewed) and
+/// tells in-graph callers (`MSG_KV_PENDING`). A command no one is working on
+/// — a worker that stopped — hears no notice, and the deadline answers it.
+pub const MSG_KV_WORKING: u8 = 0xF4;
+pub const KV_WORKING_LEN: usize = 10;
+/// How often a worker says a waiting command is still being worked on: well
+/// inside the router's in-flight deadline, so a live worker's commands are
+/// never answered fail-closed for taking long.
+pub const KV_WORKING_INTERVAL_MS: u64 = 1_000;
+
+/// Router → in-graph caller (`compute_out`, the internal protocols'
+/// outputs): the request `corr_id` is still being worked on by its store,
+/// and will be answered — the caller's own wedge timer starts again.
+/// Payload: `[corr_id:u64 LE][conn_id:u8]`. A caller that keeps no timer
+/// ignores it, as every reader ignores a message type it does not take.
+pub const MSG_KV_PENDING: u8 = 0xF5;
+pub const KV_PENDING_LEN: usize = 9;
+
 // ── Relational path (connector ↔ executor) ─────────────────────────────
 //
 // The connectors send SQL TEXT and receive TYPED rows. Two boundaries

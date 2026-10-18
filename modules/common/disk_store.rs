@@ -1242,6 +1242,12 @@ struct CompactState {
     /// Per-run record index within the resume block.
     run_rec: [u32; MAX_RUNS],
     run_pos_count: u8,
+    /// The runs this merge takes in: the oldest `inputs` of the run set,
+    /// fixed when it starts. A flush may publish while the merge is paused
+    /// between steps (see [`DiskStore::flush_may_start`]); its run goes in
+    /// front, newer than every input, so the inputs stay the run set's
+    /// last `inputs` entries and the merge's saved positions stay theirs.
+    inputs: u8,
     /// Carried dedup-walk context: the prefix run and its
     /// below-floor latch cross step boundaries with the positions —
     /// without them a resumed step would re-decide rule (a)/(b) from
@@ -1628,6 +1634,28 @@ impl DiskState {
         self.compact
             .active
             .then_some((self.compact.floor, self.compact.input_ordinal))
+    }
+
+    /// A compaction under way that a flush may run beside: it is paused
+    /// between steps short of its manifest — merging, or closing and
+    /// fencing its output run — so it has touched neither the manifest nor
+    /// the run set, and it will publish over whatever the run set is then
+    /// (its inputs, and any run flushed meanwhile in front of them). A
+    /// memtable that must drain therefore never waits out a merge.
+    pub fn compact_pausable(&self) -> bool {
+        self.compact.active
+            && matches!(
+                self.compact.phase,
+                COMPACT_PHASE_MERGE | COMPACT_PHASE_FOOTER | COMPACT_PHASE_RUN_SYNC
+            )
+    }
+
+    /// Whether a flush may start now beside whatever else is in flight (it
+    /// may be refused still for want of a run slot, or an empty memtable).
+    pub fn flush_may_start(&self) -> bool {
+        let merge_allows = !self.compact.active || self.compact_pausable();
+        let capture_allows = !self.capture.active || self.capture.transfer;
+        !self.flush.active && merge_allows && capture_allows && !self.install.active
     }
 
     /// The revision below which a historical read is refused: the
@@ -2789,6 +2817,32 @@ impl Merge {
         Ok(())
     }
 
+    /// Open a compaction's inputs for its first step: the oldest
+    /// `compact.inputs` runs, newest first as every merge orders them, from
+    /// their first records; the memtable is not an input.
+    fn fill_compact_in<S: RunStorage>(
+        &mut self,
+        state: &DiskState,
+        storage: &S,
+    ) -> Result<(), StoreError> {
+        self.include_mem = false;
+        self.mem_pos = 0;
+        let Some(base) = compact_base(state) else {
+            return Err(StoreError::StorageFault);
+        };
+        self.run_count = state.compact.inputs as usize;
+        for (i, rs) in self.runs.iter_mut().take(self.run_count).enumerate() {
+            state.bump_opened();
+            rs.reopen_at(
+                &state.runs[base + i],
+                idx_seek(&state.run_index[base + i], b""),
+            );
+            rs.next(storage, &state.block_cache)?;
+            state.add_blocks(rs.take_blocks());
+        }
+        Ok(())
+    }
+
     /// Rebuild the compaction merge at the exact positions a paused
     /// [`compact_step`] saved: one `open_at` + at most one block's
     /// records advanced per run — O(runs) per step, independent of how
@@ -2802,15 +2856,19 @@ impl Merge {
     ) -> Result<(), StoreError> {
         self.include_mem = false;
         self.mem_pos = 0;
-        self.run_count = state.run_count as usize;
+        let Some(base) = compact_base(state) else {
+            return Err(StoreError::StorageFault);
+        };
+        self.run_count = state.compact.inputs as usize;
         if state.compact.run_pos_count as usize != self.run_count {
-            // The run set changed under a paused compaction — the
-            // exclusion fence forbids that, so this is corruption.
+            // The inputs changed under a paused compaction — only runs
+            // newer than them may be added meanwhile, so this is
+            // corruption.
             return Err(StoreError::StorageFault);
         }
         for i in 0..self.run_count {
             self.runs[i] = RunScan::resume_to(
-                &state.runs[i],
+                &state.runs[base + i],
                 state.compact.run_block[i],
                 state.compact.run_rec[i],
                 storage,
@@ -3292,7 +3350,7 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
     fn flush_step_guarded(&mut self, ignore_install: bool) -> Result<Progress, StoreError> {
         self.state.io_wait = false;
         if !self.state.flush.active {
-            if self.state.compact.active
+            if (self.state.compact.active && !self.state.compact_pausable())
                 || (self.state.capture.active && !self.state.capture.transfer)
                 || (self.state.install.active && !ignore_install)
             {
@@ -6067,6 +6125,7 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
                 run_block: [0; MAX_RUNS],
                 run_rec: [0; MAX_RUNS],
                 run_pos_count: 0,
+                inputs: self.state.run_count as u8,
                 carry_kept_below_floor: false,
                 carry_prefix_len: 0,
                 carry_prefix: [0u8; MAX_ENCODED_KEY],
@@ -6108,6 +6167,13 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             }
         }
     }
+}
+
+/// Where a compaction's inputs begin in the run set: the runs before it
+/// were flushed while it was paused, and are newer. `None` when the run
+/// set holds fewer runs than its inputs (never, short of corruption).
+fn compact_base(state: &DiskState) -> Option<usize> {
+    (state.run_count as usize).checked_sub(state.compact.inputs as usize)
 }
 
 impl<S: RunStorage> DiskStore<'_, S> {
@@ -6158,7 +6224,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
         if resuming {
             m.resume_compact_in(self.state, &*self.storage)?;
         } else {
-            m.fill_filtered(self.state, &*self.storage, false, b"", None)?;
+            m.fill_compact_in(self.state, &*self.storage)?;
         }
         let mut kbuf = [0u8; MAX_ENCODED_KEY];
         let mut vbuf = [0u8; MAX_VALUE_LEN];
@@ -6468,11 +6534,19 @@ impl<S: RunStorage> DiskStore<'_, S> {
                 digest: c.pending_crc,
                 _pad: 0,
             };
-            let metas = [meta];
-            let runs: &[RunMeta] = if c.out_records == 0 { &[] } else { &metas };
+            // The runs flushed while the merge was paused stay, newest
+            // first, ahead of its output; the inputs it merged are gone.
+            let base = compact_base(self.state).ok_or(StoreError::StorageFault)?;
+            let mut metas = [RunMeta::empty(); MAX_RUNS];
+            metas[..base].copy_from_slice(&self.state.runs[..base]);
+            let mut n = base;
+            if c.out_records != 0 {
+                metas[n] = meta;
+                n += 1;
+            }
             let body = ManifestBody {
                 generation: c.pending_gen,
-                runs,
+                runs: metas.get(..n).unwrap_or(&[]),
                 floor: c.floor,
                 applied_index: self.state.durable_applied_index,
                 applied_term: self.state.durable_applied_term,
@@ -6522,26 +6596,30 @@ impl<S: RunStorage> DiskStore<'_, S> {
             self.state.compact.stage = STAGE_MAN_NAME;
         }
         self.publish_slot_name(c.pending_slot)?;
+        let base = compact_base(self.state).ok_or(StoreError::StorageFault)?;
         let old_count = self.state.run_count as usize;
         let old_runs = self.state.runs;
-        self.state.runs = [RunMeta::empty(); MAX_RUNS];
-        self.state.run_blooms = [[0u8; BLOOM_BYTES]; MAX_RUNS];
-        for slot in self.state.run_index.iter_mut() {
-            slot.fill(0);
+        // The runs flushed while the merge was paused keep their places
+        // (and their filters and indexes); the inputs give way to the
+        // output, at the end, the oldest.
+        for i in base..MAX_RUNS {
+            self.state.runs[i] = RunMeta::empty();
+            self.state.run_blooms[i] = [0u8; BLOOM_BYTES];
+            self.state.run_index[i].fill(0);
         }
         if c.out_records == 0 {
-            self.state.run_count = 0;
+            self.state.run_count = base as u32;
         } else {
-            self.state.run_blooms[0] = c.bloom;
-            self.state.run_index[0] = self.state.compact.index;
-            self.state.runs[0] = RunMeta {
+            self.state.run_blooms[base] = c.bloom;
+            self.state.run_index[base] = self.state.compact.index;
+            self.state.runs[base] = RunMeta {
                 id: c.out_run_id,
                 record_count: c.out_records,
                 file_len: c.pending_len,
                 digest: c.pending_crc,
                 _pad: 0,
             };
-            self.state.run_count = 1;
+            self.state.run_count = base as u32 + 1;
         }
         self.state.generation = c.pending_gen;
         self.state.manifest_slot = c.pending_slot;
@@ -6556,7 +6634,7 @@ impl<S: RunStorage> DiskStore<'_, S> {
         // overrun that would kill the worker at manifest adoption.
         // The maintenance loop drains one per step; a crash merely
         // leaves orphans for recovery.
-        for meta in old_runs.iter().take(old_count) {
+        for meta in old_runs.iter().take(old_count).skip(base) {
             if c.out_records != 0 && meta.id == c.out_run_id {
                 continue;
             }

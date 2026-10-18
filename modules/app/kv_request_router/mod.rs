@@ -86,7 +86,8 @@ use types::{
 use wire::{
     CLIENT_REJECT_NOT_LEADER, LATTICE_ENTRY_TAG, MSG_APP_APPLIED_POS, MSG_CLIENT_PROPOSAL,
     MSG_CLIENT_READ_REQUEST, MSG_CLIENT_READ_RESPONSE, MSG_CLIENT_REJECT,
-    MSG_CLIENT_REJECT_INTERNAL, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_KV_REQUEST, MSG_KV_RESPONSE,
+    MSG_CLIENT_REJECT_INTERNAL, MSG_KV_APPLIED, MSG_KV_COMMAND, MSG_KV_PENDING, MSG_KV_REQUEST,
+    MSG_KV_RESPONSE, MSG_KV_WORKING,
 };
 
 const SCRATCH_BUF_SIZE: usize = wire::KV_REQUEST_PAYLOAD_MAX;
@@ -483,7 +484,14 @@ struct InflightMeta {
     /// follower accepting a connection and then saying nothing is the
     /// transparent FIFO this design rejects: the caller cannot tell "not
     /// the leader" from "still working". See `sweep_inflight_deadlines`.
+    ///
+    /// Renewed while the store is working on it: a direct op's worker says
+    /// so (`MSG_KV_WORKING`, see `renew_working`), so the deadline bounds
+    /// only an op no one is working on, never one that is merely slow.
     deadline_ms: u64,
+    /// The partition the op was routed to: whose worker's notices renew
+    /// it.
+    kpg: u16,
 }
 
 /// True for protocols whose anchor keeps a per-conn response reorder
@@ -2186,6 +2194,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         id_database,
         id_keyspace,
         deadline_ms: unsafe { dev_millis(&*router.syscalls) }.wrapping_add(INFLIGHT_TIMEOUT_MS),
+        kpg: kpg_id,
     };
     if router.inflight.insert(corr_id, meta).is_err() {
         return DISPATCH_DROPPED;
@@ -2899,11 +2908,60 @@ unsafe fn send_help_command(
     )
 }
 
-/// How long an op may sit in the inflight table before it is answered
-/// fail-closed. An order of magnitude above the slowest healthy op
+/// How long an op may sit in the inflight table, unrenewed, before it is
+/// answered fail-closed. An order of magnitude above the slowest healthy op
 /// (a quorum write plus fence is tens of ms), so this only ever fires
-/// for a completion signal that is never coming.
+/// for a completion signal that is never coming. A direct op whose worker
+/// is still working on it is renewed (`renew_working`): a store that takes
+/// 20 s to decide a 1 MiB write under load answers it, it is not refused.
 const INFLIGHT_TIMEOUT_MS: u64 = 5_000;
+
+/// A worker says the command at its channel head is still being worked on
+/// (`MSG_KV_WORKING`). It answers its commands in channel order, so every
+/// direct op routed to that partition — at the head, behind it on the
+/// channel, or stashed here for room on it — is being worked on: each is
+/// renewed for another `INFLIGHT_TIMEOUT_MS`, and an in-graph caller
+/// waiting on one is told (`MSG_KV_PENDING`), so its own wedge timer does
+/// not answer it either. Consensus and fenced ops are not renewed: what
+/// they wait on is not the worker (a leader, a read index), and their
+/// deadline is what answers a node that cannot serve them.
+unsafe fn renew_working(router: &mut RouterState, kpg: u16) {
+    if router.syscalls.is_null() {
+        return;
+    }
+    let deadline = dev_millis(&*router.syscalls).wrapping_add(INFLIGHT_TIMEOUT_MS);
+    // In-graph callers told per notice: more than wait on one store at
+    // once in any composition; any past it are renewed all the same.
+    const TOLD_PER_NOTICE: usize = 32;
+    let mut told: [(u64, u8); TOLD_PER_NOTICE] = [(0, 0); TOLD_PER_NOTICE];
+    let mut n = 0usize;
+    for (corr_id, meta) in router.inflight.iter_entries_mut() {
+        if meta.path != PATH_DIRECT || meta.kpg != kpg {
+            continue;
+        }
+        meta.deadline_ms = deadline;
+        // The in-graph callers on `compute_out`: every reader of it ignores
+        // a message type it does not take, so the notice is safe for all.
+        if matches!(meta.proto, PROTO_INTERNAL_SQL | types::PROTO_INTERNAL_DATA) && n < told.len() {
+            told[n] = (corr_id, meta.conn);
+            n += 1;
+        }
+    }
+    if router.compute_out < 0 {
+        return;
+    }
+    let sys = &*router.syscalls;
+    for &(corr_id, conn) in &told[..n] {
+        let mut env = [0u8; 3 + wire::KV_PENDING_LEN];
+        env[0] = MSG_KV_PENDING;
+        env[1] = wire::KV_PENDING_LEN as u8;
+        env[3..11].copy_from_slice(&corr_id.to_le_bytes());
+        env[11] = conn;
+        // Best-effort: a notice the channel has no room for is the next
+        // one's to give (one a second while the store works).
+        let _ = (sys.channel_write)(router.compute_out, env.as_mut_ptr(), env.len());
+    }
+}
 
 /// Answer every in-flight op whose deadline passed.
 ///
@@ -3621,6 +3679,15 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
             // misattributed fence the design forbids.
             router.worker_applied_term[partition] = term;
         }
+        return true;
+    }
+    if msg_type == MSG_KV_WORKING {
+        // `[kpg_id:u16][corr_id:u64]`: that partition's worker is still
+        // working through its commands.
+        if payload_len != wire::KV_WORKING_LEN {
+            return false;
+        }
+        renew_working(router, u16::from_le_bytes([in_buf[0], in_buf[1]]));
         return true;
     }
     if msg_type != MSG_KV_APPLIED {

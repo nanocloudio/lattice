@@ -52,6 +52,11 @@ provides         = ["storage.object", "storage.namespace"]
 # pending N worker steps after every single-store write, so another
 # caller's write lands between a write and its re-ask (each caller's re-ask
 # must still get its own decision).
+# `fault_slow_write_ms: M` (param 23, every state worker type; default 0 =
+# off) is a slow device: one write command in `fault_slow_write_every`
+# (param 24, default 1) waits M ms at the head of the command channel before
+# it is applied — the router must keep it in flight (the worker says so,
+# MSG_KV_WORKING), never answer it fail-closed for taking long.
 # tools/ci/no_fault_injection.sh fails CI on any graph outside tests/ that
 # sets any of them; see docs/architecture/limit_register.md "Test-only fault
 # injection".
