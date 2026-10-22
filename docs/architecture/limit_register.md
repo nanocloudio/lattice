@@ -250,6 +250,50 @@ message limits: Redis 4096/4096, Memcached 8192/8192, etcd 4096/4096,
 PostgreSQL 8192/32768, MySQL 8192/32768, and the Prometheus HTTP
 anchor 16384/20480 bytes.
 
+## In-graph fronts
+
+The exchange fronts over the store (`sql_front`, `kv_front`, `cdc_front`) and
+the `exchange_cli` requester the examples put on them. A front's request and
+answer bounds are its protocol client's (`pg_client`, `redis_client`), so an
+application that swaps one for the other meets the same refusals.
+
+| Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
+|---|---|---|---|---:|---|
+| SQL front statement | Shape | `QUERY_MAX` | modules/app/sql_front/mod.rs | 4096 | A longer body is refused 413 whole, as `pg_client` refuses one. |
+| SQL front target | Shape | `TARGET_MAX` | modules/app/sql_front/mod.rs | 64 | A longer target is refused 413; any non-empty one 400. |
+| SQL front statement envelope | Shape | `REQ_ENV_MAX` | modules/app/sql_front/mod.rs | — | Derived: the envelope header, `MSG_SQL_REQUEST`'s head and `QUERY_MAX`; every statement taken fits it. |
+| SQL front executor answer | Shape | `RESP_ENV_MAX` | modules/app/sql_front/mod.rs | — | Derived: the executor's `RESP_BUF` (28672) behind the envelope header, the largest answer it writes; a larger envelope is discarded whole by the inbox and the statement answers 504 at its deadline. |
+| SQL answer body | Shape | `ANSWER_MAX` | modules/common/sql_answer.rs | 8192 | `pg_client`'s result buffer: a result set past it is refused 502 whole, never cut to the rows that fit. |
+| SQL answer cell | Shape | `CELL_MAX` | modules/common/sql_answer.rs | — | Derived: a text value at its type's bound, hex-encoded binary doubled; a cell that does not render answers 502. |
+| KV front command | Shape | `COMMAND_MAX` | modules/common/kv_front_core.rs | 4096 | A longer body is refused 413, as `redis_client` refuses one. |
+| KV front RESP command | Shape | `RESP_COMMAND_MAX` | modules/common/kv_front_core.rs | 8192 | A command whose RESP form is longer is refused 413. |
+| KV front reply | Shape | `REPLY_MAX` | modules/common/kv_front_core.rs | 8192 | `redis_client`'s reply buffer: a longer reply is answered 502, never cut. |
+| KV front operation body | Shape | `OP_BODY_MAX` | modules/common/kv_front_core.rs | — | Derived: `COMMAND_MAX` and the operation's fixed fields; a body that would not fit is the connector's `ERR` refusal (400). |
+| KV front reply render | Shape | `REPLY_RENDER_MAX` | modules/common/kv_front_core.rs | — | Derived: twice `REPLY_MAX` and slack, room for any store answer framed as RESP before it is judged against `REPLY_MAX`. |
+| KV front target | Shape | `TARGET_MAX` | modules/app/kv_front/mod.rs | 64 | A longer target is refused 413; any non-empty one 400. |
+| KV front marked request | Shape | `WORK_MAX` | modules/app/kv_front/mod.rs | — | Derived: `kv_large::mark_room(OP_BODY_MAX)`, the request as it goes out marked or rewritten, and each chunk exchange. |
+| KV front expanded value | Shape | `EXPAND_MAX` | modules/app/kv_front/mod.rs | — | Derived: `REPLY_MAX`. A large value that expands past it is answered as the connector answers one (`ERR value too large`, 400), never cut. |
+| KV front request envelope | Shape | `KV_ENV_MAX` | modules/app/kv_front/mod.rs | — | Derived: envelope header, `MSG_KV_REQUEST` head and `WORK_MAX`. |
+| KV front answer envelope | Shape | `KV_IN_MAX` | modules/app/kv_front/mod.rs | — | Derived: one channel frame behind the envelope header; every router answer fits. |
+| RESP nesting | Semantic | `RESP_DEPTH_MAX` | modules/common/resp_core.rs | 8 | An array reply nested deeper never frames complete: `redis_client` fills its reply buffer and answers 502. |
+| CDC subscriptions | Capacity | `SUBS` | modules/common/cdc_subscribe.rs | 4 | A further subscription is refused 503 until one ends. |
+| CDC subscription prefix | Shape | `PREFIX_MAX` | modules/common/cdc_subscribe.rs | 256 | `cdc_pump`'s keyrange bound: a longer prefix makes the target past `TARGET_MAX`, refused 413. |
+| CDC subscription target | Shape | `TARGET_MAX` | modules/common/cdc_subscribe.rs | — | Derived: `/cdc/` and `PREFIX_MAX` in hex (517 bytes); longer is refused 413. |
+| CDC subscription headers | Shape | `HEADERS_MAX` | modules/common/cdc_subscribe.rs | 256 | A larger header block is refused 413. |
+| CDC feed page request | Pacing | `PAGE_LIMIT` | modules/common/cdc_subscribe.rs | — | 16 changes per feed read (`cdc_pump`'s default); a window past one page is narrowed until it fits, a single revision past it walked page by page. |
+| CDC staged page entries | Capacity | `PAGE_ENTRIES` | modules/common/cdc_subscribe.rs | 16 | The page limit: a page answering more is a failed read (retried, then `FAILED`). |
+| CDC staged page | Shape | `PAGE_MAX` | modules/common/cdc_subscribe.rs | — | Derived: `KV_RESPONSE_BODY_MAX`, one whole answer body. |
+| CDC owed records | Capacity | `OWED_MAX` | modules/common/cdc_subscribe.rs | — | Derived: a terminal per subscription and one refusal; request reading stops while it could not all be placed (backpressure), so none is dropped. |
+| CDC feed read | Shape | `KV_FRAME_MAX` | modules/common/cdc_subscribe.rs | — | Derived: the envelope, the request head and two prefix-long span bounds with the window. |
+| CDC read failures | Pacing | `WEDGE_BUDGET` | modules/common/cdc_subscribe.rs | — | 16 consecutive failed feed reads end the subscription: 502 before it opened, ABORT `FAILED` after. |
+| CDC front answer envelope | Shape | `KV_IN_MAX` | modules/app/cdc_front/mod.rs | — | Derived: one channel frame behind the envelope header; every router answer fits. |
+| CDC front records per step | Pacing | `RECORDS_PER_STEP` | modules/app/cdc_front/mod.rs | 16 | Records written per step; the rest go on the next step. |
+| Exchange CLI target | Shape | `TARGET_MAX` | modules/app/exchange_cli/mod.rs | 128 | A longer `target` param refuses construction. |
+| Exchange CLI headers | Shape | `HEADERS_MAX` | modules/app/exchange_cli/mod.rs | 256 | A longer `headers` param refuses construction. |
+| Exchange CLI select | Shape | `SELECT_MAX` | modules/app/exchange_cli/mod.rs | 8 | A longer `select` param refuses construction. |
+| Exchange CLI answer | Shape | `ANSWER_MAX` | modules/app/exchange_cli/mod.rs | 8192 | The response credit each request grants: a provider never sends more. |
+| Exchange CLI line | Shape | `LINE_MAX` | modules/app/exchange_cli/mod.rs | — | Derived: a whole record in hex and its label; every line written fits. |
+
 ## Relational and model execution
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
@@ -909,6 +953,40 @@ SEND_BUF | modules/app/doc_wire_anchor/mod.rs | -
 NET_CHUNK | modules/app/doc_wire_anchor/mod.rs | -
 KV_REQUEST_PAYLOAD_MAX | modules/common/wire.rs | 4160
 RANGE_ASK_MAX | modules/common/held_read.rs | -
+QUERY_MAX | modules/app/sql_front/mod.rs | 4096
+TARGET_MAX | modules/app/sql_front/mod.rs | 64
+REQ_ENV_MAX | modules/app/sql_front/mod.rs | -
+RESP_ENV_MAX | modules/app/sql_front/mod.rs | -
+ANSWER_MAX | modules/common/sql_answer.rs | 8192
+CELL_MAX | modules/common/sql_answer.rs | -
+COMMAND_MAX | modules/common/kv_front_core.rs | 4096
+RESP_COMMAND_MAX | modules/common/kv_front_core.rs | 8192
+REPLY_MAX | modules/common/kv_front_core.rs | 8192
+OP_BODY_MAX | modules/common/kv_front_core.rs | -
+REPLY_RENDER_MAX | modules/common/kv_front_core.rs | -
+TARGET_MAX | modules/app/kv_front/mod.rs | 64
+WORK_MAX | modules/app/kv_front/mod.rs | -
+EXPAND_MAX | modules/app/kv_front/mod.rs | -
+KV_ENV_MAX | modules/app/kv_front/mod.rs | -
+KV_IN_MAX | modules/app/kv_front/mod.rs | -
+RESP_DEPTH_MAX | modules/common/resp_core.rs | 8
+SUBS | modules/common/cdc_subscribe.rs | 4
+PREFIX_MAX | modules/common/cdc_subscribe.rs | 256
+TARGET_MAX | modules/common/cdc_subscribe.rs | -
+HEADERS_MAX | modules/common/cdc_subscribe.rs | 256
+PAGE_LIMIT | modules/common/cdc_subscribe.rs | 16
+PAGE_ENTRIES | modules/common/cdc_subscribe.rs | 16
+PAGE_MAX | modules/common/cdc_subscribe.rs | -
+OWED_MAX | modules/common/cdc_subscribe.rs | -
+KV_FRAME_MAX | modules/common/cdc_subscribe.rs | -
+WEDGE_BUDGET | modules/common/cdc_subscribe.rs | 16
+KV_IN_MAX | modules/app/cdc_front/mod.rs | -
+RECORDS_PER_STEP | modules/app/cdc_front/mod.rs | 16
+TARGET_MAX | modules/app/exchange_cli/mod.rs | 128
+HEADERS_MAX | modules/app/exchange_cli/mod.rs | 256
+SELECT_MAX | modules/app/exchange_cli/mod.rs | 8
+ANSWER_MAX | modules/app/exchange_cli/mod.rs | 8192
+LINE_MAX | modules/app/exchange_cli/mod.rs | -
 ```
 
 ## Exempt names

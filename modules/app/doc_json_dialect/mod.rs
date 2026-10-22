@@ -296,11 +296,14 @@ struct DialectState {
     m_timeouts: u64,
 }
 
-/// The big build's heap: every `DocBuf` in the state, and the allocator's
-/// rounding.
+/// The big build's buffers: every `DocBuf` in the state, taken as one
+/// allocation.
 #[cfg(feature = "big")]
-const ARENA_BYTES: usize =
-    2 * JSON_MAX + 2 * EXEC_BUF + 2 * TREE_BUF + 2 * OWN_TEXT + SCRATCH + RESP_BUF + 64 * 1024;
+const BUFFER_BYTES: usize =
+    2 * JSON_MAX + 2 * EXEC_BUF + 2 * TREE_BUF + 2 * OWN_TEXT + SCRATCH + RESP_BUF;
+/// The big build's heap: the buffers, and the allocator's rounding.
+#[cfg(feature = "big")]
+const ARENA_BYTES: usize = BUFFER_BYTES + 64 * 1024;
 #[cfg(feature = "big")]
 declare_module_arena_bytes!(ARENA_BYTES);
 
@@ -1524,16 +1527,20 @@ pub extern "C" fn module_new(
         st.metrics_out = dev_channel_port(sys, 1, 2);
         #[cfg(feature = "big")]
         {
-            if !(st.jreq.alloc(sys)
-                && st.ereq.alloc(sys)
-                && st.tree.alloc(sys)
-                && st.eans.alloc(sys)
-                && st.doc.alloc(sys)
-                && st.text.alloc(sys)
-                && st.own_text.alloc(sys)
-                && st.own_tree.alloc(sys)
-                && st.scratch.alloc(sys)
-                && st.jresp.alloc(sys))
+            let Some(mut arena) = doc_buf::DocArena::take(sys, BUFFER_BYTES) else {
+                return -1;
+            };
+            let a = &mut arena;
+            if !(st.jreq.carve(a)
+                && st.ereq.carve(a)
+                && st.tree.carve(a)
+                && st.eans.carve(a)
+                && st.doc.carve(a)
+                && st.text.carve(a)
+                && st.own_text.carve(a)
+                && st.own_tree.carve(a)
+                && st.scratch.carve(a)
+                && st.jresp.carve(a))
             {
                 return -1;
             }

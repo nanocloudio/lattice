@@ -3433,16 +3433,19 @@ const IMPORT_RUN: u8 = 2;
 /// Host log records one step imports.
 #[cfg(feature = "store_provider")]
 const IMPORT_PER_STEP: u32 = 64;
-/// The heap: the provider, its buffers, and the allocator's rounding.
+/// The provider's state, rounded so the buffers carved after it start on
+/// the allocator's 16-byte grain.
 #[cfg(feature = "store_provider")]
-const ARENA_BYTES: usize = core::mem::size_of::<store_provider::Provider>()
-    + PROVIDER_REQ
-    + PROVIDER_ANS
-    + PROVIDER_CACHE
-    + PROVIDER_FEED
-    + IMPORT_RECORD_MAX
-    + CLOG_ARENA
-    + 64 * 1024;
+const PROVIDER_STATE: usize = core::mem::size_of::<store_provider::Provider>().next_multiple_of(16);
+/// The provider and its buffers: one allocation (`provider_new`), the
+/// import's record added to it when there is a host log to import.
+#[cfg(feature = "store_provider")]
+const PROVIDER_HEAP: usize =
+    PROVIDER_STATE + PROVIDER_REQ + PROVIDER_ANS + PROVIDER_CACHE + PROVIDER_FEED;
+/// The heap: the provider's allocation, the command log's, and the
+/// allocator's rounding.
+#[cfg(feature = "store_provider")]
+const ARENA_BYTES: usize = PROVIDER_HEAP + IMPORT_RECORD_MAX + CLOG_ARENA + 64 * 1024;
 /// Without the provider, the heap is the command log's (when it is on).
 #[cfg(not(feature = "store_provider"))]
 const ARENA_BYTES: usize = CLOG_ARENA + 16 * 1024;
@@ -3704,17 +3707,30 @@ unsafe fn provider_new(worker: &mut WorkerState) {
         worker.state_store == STATE_STORE_DISK && (!replicated || (worker.prov_out >= 0 && random));
     let p = &mut worker.prov;
     if wanted {
-        p.state = (sys.heap_alloc)(core::mem::size_of::<store_provider::Provider>() as u32)
-            .cast::<store_provider::Provider>();
-        p.req = (sys.heap_alloc)(PROVIDER_REQ as u32);
-        p.ans = (sys.heap_alloc)(PROVIDER_ANS as u32);
-        p.cache = (sys.heap_alloc)(PROVIDER_CACHE as u32);
-        p.feed = (sys.heap_alloc)(PROVIDER_FEED as u32);
-        p.provides = !p.state.is_null()
-            && !p.req.is_null()
-            && !p.ans.is_null()
-            && !p.cache.is_null()
-            && !p.feed.is_null();
+        // The provider and its buffers, the import's record among them when
+        // there is a host log to import, as ONE allocation carved in order.
+        // The heap may be elastic, growing in segments that are not
+        // contiguous, and an allocation cannot span two: taken one by one,
+        // the buffers would strand each segment's tail and a heap declared
+        // at their sum would refuse the last.
+        let importing = worker.import_path_len > 0;
+        let total = PROVIDER_HEAP + if importing { IMPORT_RECORD_MAX } else { 0 };
+        let base = (sys.heap_alloc)(total as u32);
+        p.provides = !base.is_null();
+        if p.provides {
+            p.state = base.cast::<store_provider::Provider>();
+            let mut at = base.add(PROVIDER_STATE);
+            p.req = at;
+            at = at.add(PROVIDER_REQ);
+            p.ans = at;
+            at = at.add(PROVIDER_ANS);
+            p.cache = at;
+            at = at.add(PROVIDER_CACHE);
+            p.feed = at;
+            if importing {
+                p.import_buf = at.add(PROVIDER_FEED);
+            }
+        }
         if p.provides {
             store_provider::Provider::clear(p.state);
             if replicated {
@@ -3770,8 +3786,6 @@ unsafe fn provider_new(worker: &mut WorkerState) {
             dev_log(sys, 1, m.as_ptr(), k);
         }
         if p.provides && worker.import_path_len > 0 {
-            p.import_buf = (sys.heap_alloc)(IMPORT_RECORD_MAX as u32);
-            p.provides = !p.import_buf.is_null();
             p.import_phase = IMPORT_CHECK;
         }
     }
@@ -4700,8 +4714,16 @@ unsafe fn command_log_new(worker: &mut WorkerState) -> bool {
         dev_log(sys, DISK_LOG_LEVEL, m.as_ptr(), m.len());
         return false;
     }
-    worker.clog_buf = (sys.heap_alloc)(command_log::PAYLOAD_MAX as u32);
-    worker.clog_out = (sys.heap_alloc)(CLOG_OUT_MAX as u32);
+    // Both buffers as one allocation: the heap may be elastic, growing in
+    // segments an allocation cannot span, and buffers taken one by one
+    // would strand a segment's tail the declared arena does not cover.
+    let base = (sys.heap_alloc)(CLOG_ARENA as u32);
+    worker.clog_buf = base;
+    worker.clog_out = if base.is_null() {
+        core::ptr::null_mut()
+    } else {
+        base.add(command_log::PAYLOAD_MAX)
+    };
     if worker.clog_buf.is_null() || worker.clog_out.is_null() {
         let m = b"[kvw] command_log: heap refused";
         dev_log(sys, DISK_LOG_LEVEL, m.as_ptr(), m.len());

@@ -1,0 +1,158 @@
+# lattice's store node, single-node, with its in-graph fronts.
+#
+# One durable store — the KV state worker on the ordered disk store with its
+# own command log (nothing orders it but itself), the router, the shared
+# relational executor and its index backfill, the TTL clock — and the three
+# exchange fronts an application reaches it through:
+#
+#   sql   sql_front   the exchange surface pg_client offers: POST, the SQL
+#                     text as the body, the first column of the rows back
+#   kv    kv_front    the exchange surface redis_client offers: POST, one
+#                     structured command as the body, the reply's value back
+#   cdc   cdc_front   change-feed subscriptions as held exchanges: GET
+#                     /cdc/<prefix hex>, then one BODY per change (the
+#                     envelope cdc_pump publishes), resumable with `after:`
+#
+# An application that wires pg_client or redis_client wires the matching
+# export pair instead and changes nothing else. A PUSH feed (cdc_pump) sits
+# beside the subscriptions on the `pump_kv_*` pair (its `proto: 3`).
+#
+# The includer creates the store directory (`store_dir`), as it would `kv/`.
+# The graph needs an FS provider (the linux board supplies one).
+#
+#   include:
+#     - stack: lattice_store       # or a path to this file
+#       as: store
+#       params: { store_dir: data/store }
+#   wiring:
+#     - { from: app.request_out, to: store.sql_request_in }
+#     - { from: store.sql_response_out, to: app.response_in }
+stack: lattice_store
+version: "0.1.0"
+description: >-
+  lattice's single-node durable store with its in-graph exchange fronts:
+  SQL (pg_client's surface), KV (redis_client's surface) and CDC
+  subscriptions as held exchanges.
+
+params:
+  store_dir:
+    type: string
+    default: kv
+    description: >-
+      The disk store's directory (absolute, or relative to the working
+      directory), created by the operator; up to 128 bytes.
+  history_revisions:
+    type: integer
+    default: 65536
+    min: 0
+    max: 4294967295
+    description: >-
+      History kept, in revisions: a subscription or change read from before
+      it answers 410. 0 keeps everything.
+  sweep_grace_ms:
+    type: integer
+    default: 300000
+    min: 1
+    max: 4294967295
+    description: >-
+      How long an unreferenced large-value chunk is kept before a sweep may
+      take it: the longest a write may take between uploading a value's
+      chunks and committing it.
+  feed_id:
+    type: integer
+    default: 1
+    min: 0
+    max: 4294967295
+    description: The CDC envelope's feed_id when a subscription names none.
+  table_id:
+    type: integer
+    default: 0
+    min: 0
+    max: 4294967295
+    description: The CDC envelope's table_id when a subscription names none.
+
+exports:
+  sql_request_in: sql_front.request_in
+  sql_response_out: sql_front.response_out
+  kv_request_in: kv_front.request_in
+  kv_response_out: kv_front.response_out
+  cdc_request_in: cdc_front.request_in
+  cdc_response_out: cdc_front.response_out
+  pump_kv_in: router.memcached_in
+  pump_kv_out: router.memcached_out
+
+modules:
+  - name: worker
+    type: kv_state_worker
+    params:
+      state_store: 1
+      command_log: 1
+      store_dir: ${param:store_dir}
+      history_revisions: ${param:history_revisions}
+      sweep_grace_ms: ${param:sweep_grace_ms}
+  - name: router
+    type: kv_request_router
+  - name: sql
+    type: relational_executor
+  - name: backfill
+    type: index_backfill
+  - name: clock
+    type: ttl_scheduler
+    params:
+      propose_wrap: 0
+  - name: sql_front
+    type: sql_front
+  - name: kv_front
+    type: kv_front
+  - name: cdc_front
+    type: cdc_front
+    params:
+      feed_id: ${param:feed_id}
+      table_id: ${param:table_id}
+      proto: 1
+
+wiring:
+  # ── The fronts ───────────────────────────────────────────────────
+  # SQL: statement text to the executor's PostgreSQL pair, typed rows back.
+  - from: sql_front.sql_out
+    to: sql.pg_in
+  - from: sql.pg_out
+    to: sql_front.sql_in
+  # KV: the router's Redis pair (PROTO_REDIS).
+  - from: kv_front.kv_out
+    to: router.redis_in
+  - from: router.redis_out
+    to: kv_front.kv_in
+  # CDC: the router's etcd pair (PROTO_ETCD), cdc_pump's default.
+  - from: cdc_front.kv_out
+    to: router.etcd_in
+  - from: router.etcd_out
+    to: cdc_front.kv_in
+
+  # ── The executor and its backfill on the router ──────────────────
+  - from: sql.kv_out
+    to: router.internal_sql_in
+  - from: router.compute_out
+    to: sql.kv_in
+  - from: backfill.kv_out
+    to: router.internal_job_in
+  - from: router.internal_job_out
+    to: backfill.kv_in
+
+  # ── Router ↔ worker ──────────────────────────────────────────────
+  - from: router.kv_out
+    to: worker.commands
+  - from: worker.responses
+    to: router.kv_in
+
+  # ── The clock and chunk sweeps, through the worker's own ordering ─
+  - from: clock.propose_out
+    to: worker.commands
+  - from: clock.propose_out
+    to: clock.tick_in
+  - from: worker.expiry_out
+    to: clock.kv_expiry
+  - from: worker.sweep_out
+    to: worker.commands
+  - from: clock.expire_out
+    to: worker.expire

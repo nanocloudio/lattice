@@ -65,8 +65,23 @@ const BIG_MAX: usize = 4 << 20;
 /// Steps between checks of the store.
 const VERIFY_EVERY: u64 = 500;
 
-/// The heap: a page and the largest value.
-const ARENA_BYTES: usize = PAGE + BIG_MAX + 64 * 1024;
+/// The page for a large value of `big` bytes: a LIST or CHANGES answer, and
+/// any node's large value read back whole.
+const fn page_bytes(big: usize) -> usize {
+    if big > PAGE {
+        big
+    } else {
+        PAGE
+    }
+}
+
+/// The heap: the page and the large value written, which live together for
+/// the module's life, so they are ONE allocation carved in two. The heap may
+/// be elastic, growing in segments an allocation cannot span: taken one by
+/// one, the second would find the first's segment tail too short and the
+/// cap reached. The cap is the largest configuration's allocation and the
+/// allocator's rounding.
+const ARENA_BYTES: usize = page_bytes(BIG_MAX) + BIG_MAX + 64 * 1024;
 declare_module_arena_bytes!(ARENA_BYTES);
 
 const PHASE_WRITE: u8 = 0;
@@ -433,7 +448,7 @@ unsafe fn step_verify(s: &mut ProbeState, sys: &SyscallTable) {
     // A read that answers EAGAIN decides nothing: the check is held where
     // it stopped (what it has read kept) and resumed next step.
     s.resume = true;
-    let page = core::slice::from_raw_parts_mut(s.page, PAGE.max(s.big as usize));
+    let page = core::slice::from_raw_parts_mut(s.page, page_bytes(s.big as usize));
     if !s.keys_done {
         let keys = count_keys(sys, b"/probe/", page);
         if keys == EAGAIN {
@@ -552,19 +567,20 @@ pub extern "C" fn module_new(
         parse_tlv(s, params, params_len);
         let big = (s.big as usize).min(BIG_MAX);
         s.big = big as u32;
-        s.page = (sys.heap_alloc)(PAGE.max(big) as u32);
-        if big > 0 {
-            s.big_buf = (sys.heap_alloc)(big as u32);
-            if !s.big_buf.is_null() {
-                for i in 0..big {
-                    *s.big_buf.add(i) = big_byte(s.node, i);
-                }
-            }
-        }
-        if s.page.is_null() || (big > 0 && s.big_buf.is_null()) {
+        let page = page_bytes(big);
+        // The page, then the large value: one allocation.
+        let base = (sys.heap_alloc)((page + big) as u32);
+        if base.is_null() {
             let m = b"[probe] heap refused";
             log(sys, m, m.len());
             return -1;
+        }
+        s.page = base;
+        if big > 0 {
+            s.big_buf = base.add(page);
+            for i in 0..big {
+                *s.big_buf.add(i) = big_byte(s.node, i);
+            }
         }
     }
     0

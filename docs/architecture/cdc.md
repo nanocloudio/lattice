@@ -83,6 +83,18 @@ Kafka and AMQP delivery are quantum's `mqtt_sink`, `kafka_sink` and
 `amqp_sink`, wired the same way. `configs/bare-metal-pi5-cdc.yaml` uses
 `mqtt_sink`.
 
+## Subscriptions
+
+The pump is the PUSH form of the feed. `cdc_front` serves the PULL form:
+a requester's `GET /cdc/<prefix hex>` (optionally `after: <revision>`) is
+answered `200` flagged `HOLD|MORE`, then one BODY per change, each the
+envelope above exactly as the pump publishes it, never past the
+requester's credit; a compacted `after` is 410, and the requester ends the
+subscription with ABORT. The subscriber owns its position, so there is no
+checkpoint; both forms read the same windows through the same router
+surface. The surface is in [guides/fronts.md](../guides/fronts.md#cdc-subscriptions-cdc_front);
+the protocol in `modules/common/cdc_subscribe.rs`.
+
 ## Lifecycle and retention
 
 The feed reports its state on a gauge: created, backfill, streaming,

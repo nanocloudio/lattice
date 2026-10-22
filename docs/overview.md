@@ -54,3 +54,7 @@ durable channel of its own.
   and its MongoDB dialect: commands, semantics, limits, errors
 - [guides/metrics.md](guides/metrics.md) — the Prometheus metrics
   surface: endpoints, the PromQL/MetricsQL/KQL query subsets, bounds
+- [guides/fronts.md](guides/fronts.md) — the in-graph exchange fronts
+  (SQL and KV with `pg_client`'s and `redis_client`'s conventions, CDC
+  subscriptions as held exchanges) and the store stacks that compose
+  them

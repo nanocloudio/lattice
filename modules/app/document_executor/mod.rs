@@ -187,11 +187,11 @@ const RESP_BUF: usize = wire::ENVELOPE_HDR + RESPONSE_MAX;
 /// The request in flight.
 const REQ_BUF: usize = REQUEST_MAX;
 
-/// The big build's heap: every `DocBuf` in the state, and the
-/// allocator's rounding. (Sums the fields' sizes; a field added without
-/// its share here fails `module_new`, never corrupts.)
+/// The big build's buffers: every `DocBuf` in the state, taken as one
+/// allocation. (Sums the fields' sizes; a field added without its share
+/// here fails `module_new`, never corrupts.)
 #[cfg(feature = "big")]
-const ARENA_BYTES: usize = 2 * REQ_BUF
+const BUFFER_BYTES: usize = 2 * REQ_BUF
     + 9 * DOC_BUF
     + 3 * MAX_RECORD
     + CODEC_SCRATCH
@@ -199,8 +199,10 @@ const ARENA_BYTES: usize = 2 * REQ_BUF
     + 3 * ENV_BUF
     + RESP_BUF
     + LG_OUT
-    + PAGE_BUF
-    + 64 * 1024;
+    + PAGE_BUF;
+/// The big build's heap: the buffers, and the allocator's rounding.
+#[cfg(feature = "big")]
+const ARENA_BYTES: usize = BUFFER_BYTES + 64 * 1024;
 #[cfg(feature = "big")]
 declare_module_arena_bytes!(ARENA_BYTES);
 /// A KV key: keyspace prefix and the model key.
@@ -5690,33 +5692,37 @@ pub extern "C" fn module_new(
     unsafe {
         let sys = &*sys_ptr;
         let e = &mut *exec;
+        let Some(mut arena) = doc_buf::DocArena::take(sys, BUFFER_BYTES) else {
+            return -1;
+        };
+        let a = &mut arena;
         let all = [
-            e.req.alloc(sys),
-            e.stored.alloc(sys),
-            e.buf_a.alloc(sys),
-            e.buf_b.alloc(sys),
-            e.owners.alloc(sys),
-            e.next_owners.alloc(sys),
-            e.own_a.alloc(sys),
-            e.own_b.alloc(sys),
-            e.own_c.alloc(sys),
-            e.codec.tree.alloc(sys),
-            e.codec.text.alloc(sys),
-            e.codec.own_text.alloc(sys),
-            e.codec.own_tree.alloc(sys),
-            e.codec.scratch.alloc(sys),
-            e.tx_ops.alloc(sys),
-            e.resp.alloc(sys),
-            e.env.alloc(sys),
-            e.lg_req.alloc(sys),
-            e.lg_out.alloc(sys),
-            e.hold_stored.alloc(sys),
-            e.hold_src.alloc(sys),
-            e.hold_doc.alloc(sys),
-            e.hold_commit.alloc(sys),
-            e.hold_patch.alloc(sys),
-            e.inbox.alloc(sys),
-            e.page.alloc(sys),
+            e.req.carve(a),
+            e.stored.carve(a),
+            e.buf_a.carve(a),
+            e.buf_b.carve(a),
+            e.owners.carve(a),
+            e.next_owners.carve(a),
+            e.own_a.carve(a),
+            e.own_b.carve(a),
+            e.own_c.carve(a),
+            e.codec.tree.carve(a),
+            e.codec.text.carve(a),
+            e.codec.own_text.carve(a),
+            e.codec.own_tree.carve(a),
+            e.codec.scratch.carve(a),
+            e.tx_ops.carve(a),
+            e.resp.carve(a),
+            e.env.carve(a),
+            e.lg_req.carve(a),
+            e.lg_out.carve(a),
+            e.hold_stored.carve(a),
+            e.hold_src.carve(a),
+            e.hold_doc.carve(a),
+            e.hold_commit.carve(a),
+            e.hold_patch.carve(a),
+            e.inbox.carve(a),
+            e.page.carve(a),
         ];
         if all.iter().any(|ok| !ok) {
             return -1;

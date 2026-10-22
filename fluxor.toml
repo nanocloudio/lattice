@@ -97,7 +97,10 @@ unused_imports)."""
 #      (`fault_read_eagain_every`, `fault_busy_reaches_store`,
 #      `fault_log_hold_steps`, `fault_slow_write_ms`/`_every`) are set by no
 #      graph outside tests/.
-scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh", "tools/ci/no_fault_injection.sh"]
+#   4. e2e/store_fronts.sh — the store fragment's in-graph fronts live (SQL,
+#      KV, CDC subscriptions, a three-voter group on ports 19490..19492); no
+#      docker, no server.
+scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh", "tools/ci/no_fault_injection.sh", "tools/e2e/store_fronts.sh"]
 
 [ci.templates]
 # Lattice's graph configs use `__SELF_ID__` / `__LISTEN_PORT__` /

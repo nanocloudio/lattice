@@ -1,0 +1,53 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+timer_class      = "wall_clock"
+
+# The CDC feed as held exchange subscriptions — the PULL form beside
+# cdc_pump's PUSH form. A requester's GET on `/cdc/<prefix hex>` is
+# answered 200 flagged HOLD|MORE, then one BODY per change: the
+# `cdc_wire::CdcEvent` envelope cdc_pump publishes, under the requester's
+# credit. Resume with `after: <revision>`; 410 when the store no longer
+# retains it. See modules/common/cdc_subscribe.rs for the surface.
+#
+# Wiring: kv_out/kv_in -> a free kv_request_router anchor pair (the etcd
+# pair by default; `proto` names it), request_in/response_out -> the
+# subscribers.
+
+[[ports]]
+name         = "request_in"
+index        = 0
+direction    = "input"
+content_type = "ExchangeRequest"
+buffer_size  = 16384
+max_record   = 8192
+
+# MSG_KV_RESPONSE from the router pair's output.
+[[ports]]
+name         = "kv_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# One record per HEAD, change event or ABORT; an event is one whole
+# envelope (cdc_wire::CDC_ENVELOPE_MAX) behind the record prefix.
+[[ports]]
+name         = "response_out"
+index        = 0
+direction    = "output"
+content_type = "ExchangeResponse"
+buffer_size  = 32768
+max_record   = 8192
+
+# MSG_KV_REQUEST into the router pair's input.
+[[ports]]
+name         = "kv_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[observability]
+exempt = "in-graph CDC subscription front; feed reads are observed at kv_request_router"

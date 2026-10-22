@@ -99,6 +99,15 @@ guides carry the detail.
 | **Models (RESP)** | `model_edge_anchor` | `GRAPH.*` (VERTEX/EDGE/IN/OUT/PATH/DELVERTEX/DELEDGE), `SEARCH.*` (INDEX/QUERY/DELETE), `VECTOR.*` (ADD/COS/SIM/SIMWHERE/ANN/GET/DEL/TAG), `TS.*` (ADD/RANGE/AGG/DOWNSAMPLE/ROLLUP/GETROLLUP/TRIM), hashes (HSET/HGET/HGETALL), lists (LPUSH/RPUSH/LRANGE/LLEN), sorted sets (ZADD/ZRANGE/ZSCORE), `FEED.READ` |
 | **Metrics** (Prometheus HTTP) | `prometheus_edge_anchor` | Remote-write ingest (`/api/v1/write`), PromQL/MetricsQL `query`/`query_range`, KQL (`/api/v1/kql`), labels/series discovery |
 
+An application in the same fluxor graph reaches the store without a wire
+protocol: the in-graph exchange fronts `sql_front` and `kv_front` take the
+same requests and give the same answers as the protocol clients `pg_client`
+and `redis_client`, so swapping a foreign server for the embedded store is
+wiring alone. The store and its fronts ship composed as the published stacks
+`packaging/stack/lattice_store.yaml` (single node) and
+`packaging/stack/lattice_store_group3.yaml` (a replica of a three-voter group);
+see [`docs/guides/fronts.md`](docs/guides/fronts.md).
+
 What is not implemented is listed under
 [Not implemented](#not-implemented).
 
@@ -110,8 +119,13 @@ emits one event per change to any sink module declaring the
 `stream.ordered_ack` capability, and advances a durable
 checkpoint only past the contiguous acknowledged prefix, so delivery
 is at-least-once and survives sink outages. The in-repo reference
-sink is `loopback_sink`; MQTT delivery lives in quantum. See
-[`docs/architecture/cdc.md`](docs/architecture/cdc.md).
+sink is `loopback_sink`; MQTT delivery lives in quantum. The
+`cdc_front` module serves the same feed as subscriptions: a requester's
+`GET /cdc/<prefix hex>` is held open (`HOLD|MORE`) and sent one event per
+change, in the pump's envelope, under the requester's credit, resumable
+with `after: <revision>`. See
+[`docs/architecture/cdc.md`](docs/architecture/cdc.md) and
+[`docs/guides/fronts.md`](docs/guides/fronts.md).
 
 ## Errors
 
@@ -166,6 +180,7 @@ The full mapping is in the
 | Path | Contents |
 |---|---|
 | `modules/app/` | `no_std` PIC modules: protocol anchors, KV/router/apply modules, watch/lease/TTL, compaction, backup, CDC, range lifecycle, and outbound client connectors. `fluxor modules build` packs each into a `.fmod`. |
+| `packaging/stack/` | Published stacks: lattice's store with its in-graph fronts, for an application graph to include ([`docs/guides/fronts.md`](docs/guides/fronts.md)). |
 | `modules/common/` | Shared `no_std` cores: the KV state machine, codecs, partition maps, wire constants. Pulled into each app module via `#[path]`. |
 | `docs/` | Reference documentation, indexed by [`docs/overview.md`](docs/overview.md): architecture (`docs/architecture/`) and guides (`docs/guides/`). |
 | `tools/` | Host-side helpers, including `lattice-scrape` (decodes the binary `/metrics` export). |
@@ -182,8 +197,8 @@ The full mapping is in the
 - [`docs/architecture/`](docs/architecture/) — the specification,
   CDC, and the limit register.
 - [`docs/guides/`](docs/guides/) — deployment, high availability,
-  tuning, and the per-protocol guides (Redis, Memcached, etcd,
-  metrics).
+  tuning, the per-protocol guides (Redis, Memcached, etcd,
+  metrics), and the in-graph fronts and store stack.
 
 ## License
 

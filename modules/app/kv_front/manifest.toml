@@ -1,0 +1,46 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+timer_class      = "wall_clock"
+
+# lattice's KV path as an exchange provider in the graph: the exchange
+# surface `redis_client` offers (each request's body is one STRUCTURED
+# Redis command, answered once with the reply's value), served by the
+# graph's own `kv_request_router` — no RESP on a socket, no TCP, no AUTH.
+# See mod.rs for the request and answer layouts byte for byte.
+
+[[ports]]
+name         = "request_in"
+index        = 0
+direction    = "input"
+content_type = "ExchangeRequest"
+buffer_size  = 16384
+max_record   = 8192
+
+# MSG_KV_RESPONSE from kv_request_router.redis_out.
+[[ports]]
+name         = "kv_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+[[ports]]
+name         = "response_out"
+index        = 0
+direction    = "output"
+content_type = "ExchangeResponse"
+buffer_size  = 16384
+max_record   = 8192
+
+# MSG_KV_REQUEST to kv_request_router.redis_in, stamped PROTO_REDIS.
+[[ports]]
+name         = "kv_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+[observability]
+exempt = "in-graph KV front; commands are observed at kv_request_router"

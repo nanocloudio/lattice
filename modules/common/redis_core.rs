@@ -38,6 +38,24 @@ pub fn resp_cmd_structured(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(pos)
 }
 
+/// Byte length of one structured command `[nargs:u8]{[len:u16][bytes]}` at the
+/// start of `buf`, or `None` if truncated/malformed. A request body is exactly one
+/// structured command when this is `Some(body.len())`.
+pub fn structured_len(buf: &[u8]) -> Option<usize> {
+    let nargs = *buf.first()? as usize;
+    let mut off = 1usize;
+    for _ in 0..nargs {
+        let lo = *buf.get(off)?;
+        let hi = *buf.get(off + 1)?;
+        let alen = u16::from_le_bytes([lo, hi]) as usize;
+        off += 2 + alen;
+        if off > buf.len() {
+            return None;
+        }
+    }
+    Some(off)
+}
+
 /// Encode a RESP `AUTH <password>` command into `out`.
 pub fn resp_auth(password: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut pos = 0usize;

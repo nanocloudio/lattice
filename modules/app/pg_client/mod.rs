@@ -47,6 +47,13 @@
 //! The body streams under the requester's response credit: the HEAD carries
 //! as much as `resp_credit` allows, BODY records the rest as CREDIT arrives.
 //!
+//! The same requests and answers are served in-graph by `sql_front` over
+//! lattice's own relational executor (`docs/guides/fronts.md`): an
+//! application swaps a foreign PostgreSQL for the embedded store by wiring
+//! alone. The front writes no LINK record (it has no connection to lose) and
+//! answers the executor's refusals with the message lattice's PostgreSQL
+//! connector sends.
+//!
 //! # LINK
 //!
 //! The connection opens on the first request. Once it has reached

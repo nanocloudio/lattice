@@ -7,17 +7,43 @@
 // Redis keeps a connection open across replies, so a client must know when one
 // reply is complete rather than waiting for TCP close. `resp_reply_len` reports
 // the byte length of the first complete top-level reply in a buffer (or `None`
-// if more bytes are needed), covering the reply shapes SET/GET produce: simple
-// string (`+OK`), error (`-ERR …`), integer (`:N`), and bulk string
-// (`$len\r\n…\r\n`, incl. the `$-1` nil).
+// if more bytes are needed): simple string (`+OK`), error (`-ERR …`), integer
+// (`:N`), bulk string (`$len\r\n…\r\n`, incl. the `$-1` nil), and array
+// (`*N\r\n` and its N replies, nested arrays included, incl. the `*-1` nil).
+
+/// Deepest array nesting `resp_reply_len` walks. A reply nested deeper is never
+/// complete: it is refused (by a reader whose buffer fills) rather than read
+/// past its end.
+pub const RESP_DEPTH_MAX: usize = 8;
 
 /// Length of the first complete RESP reply in `buf`, or `None` if more bytes are
 /// needed.
 pub fn resp_reply_len(buf: &[u8]) -> Option<usize> {
+    resp_reply_len_at(buf, 0)
+}
+
+fn resp_reply_len_at(buf: &[u8], depth: usize) -> Option<usize> {
     if buf.is_empty() {
         return None;
     }
     match buf[0] {
+        b'*' => {
+            let header_end = resp_crlf(buf, 1)?;
+            let n = resp_parse_int(&buf[1..header_end])?;
+            let mut total = header_end + 2;
+            if n < 0 {
+                return Some(total); // *-1\r\n (nil array)
+            }
+            if depth >= RESP_DEPTH_MAX {
+                return None;
+            }
+            let mut i = 0i64;
+            while i < n {
+                total += resp_reply_len_at(buf.get(total..)?, depth + 1)?;
+                i += 1;
+            }
+            Some(total)
+        }
         b'+' | b'-' | b':' => resp_crlf(buf, 1).map(|end| end + 2),
         b'$' => {
             let header_end = resp_crlf(buf, 1)?; // index of the '\r'
@@ -32,8 +58,8 @@ pub fn resp_reply_len(buf: &[u8]) -> Option<usize> {
                 None
             }
         }
-        // Arrays / inline replies aren't produced by SET/GET; best-effort to the
-        // first line so a reader never hangs on an unexpected reply.
+        // An inline reply: up to its line end, so a reader never hangs on an
+        // unexpected one.
         _ => resp_crlf(buf, 0).map(|end| end + 2),
     }
 }

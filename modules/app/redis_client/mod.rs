@@ -56,6 +56,12 @@
 //!
 //! The body streams under the requester's response credit.
 //!
+//! The same requests and answers are served in-graph by `kv_front` over
+//! lattice's own KV path (`docs/guides/fronts.md`): an application swaps a
+//! foreign Redis for the embedded store by wiring alone. The front writes no
+//! LINK record (it has no connection to lose) and answers a command whose
+//! meaning is a connection's state (AUTH, SELECT, MULTI, pub/sub) 400.
+//!
 //! # LINK
 //!
 //! The connection opens on the first request. Once a session has been ready,
@@ -693,21 +699,4 @@ unsafe fn overflowed(s: &mut RedisState, now: u64) {
     } else {
         connection_lost(s, now, 0);
     }
-}
-
-/// Byte length of one structured command `[nargs:u8]{[len:u16][bytes]}` at the
-/// start of `buf`, or `None` if truncated/malformed.
-fn structured_len(buf: &[u8]) -> Option<usize> {
-    let nargs = *buf.first()? as usize;
-    let mut off = 1usize;
-    for _ in 0..nargs {
-        let lo = *buf.get(off)?;
-        let hi = *buf.get(off + 1)?;
-        let alen = u16::from_le_bytes([lo, hi]) as usize;
-        off += 2 + alen;
-        if off > buf.len() {
-            return None;
-        }
-    }
-    Some(off)
 }

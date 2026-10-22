@@ -1,0 +1,298 @@
+# lattice's store node as one replica of a three-voter group, with its
+# in-graph fronts — `lattice_store.yaml` with clustor's consensus and
+# durability in place of the worker's own command log.
+#
+# A write through the leader's fronts leaves the router as a proposal, commits
+# on a quorum's WAL (`wal/` in the working directory) and applies on every
+# replica through its apply bridge; a follower's gateway refuses a proposal,
+# so its fronts answer writes with the connectors' no-authority refusal.
+# Reads and subscriptions are each replica's own (`lin_reads: 1` fences reads
+# through the leader). Each node of the group includes this stack once, with its
+# own `self_id` and the same three peer addresses, and wires its peer link:
+#
+#   include:
+#     - stack: lattice_store_group3
+#       as: store
+#       params: { self_id: 0, listen_port: 9090, peer0: "10.0.0.1:9090",
+#                 peer1: "10.0.0.2:9090", peer2: "10.0.0.3:9090" }
+#   wiring:
+#     - { from: linux_net.net_out, to: store.peer_net_in }
+#     - { from: store.peer_net_out, to: linux_net.net_in }
+#
+# The peer link is plain TCP here; a graph that wants it under TLS wires a
+# `tls` pair between `linux_net` and the same two exports. The group's size
+# is this stack's shape (peer_router's peerN keys, the voter count): a
+# group of another size is another stack.
+stack: lattice_store_group3
+version: "0.1.0"
+description: >-
+  lattice's durable store as one replica of a three-voter clustor group,
+  with its in-graph exchange fronts: SQL (pg_client's surface), KV
+  (redis_client's surface) and CDC subscriptions as held exchanges.
+
+params:
+  self_id:
+    type: integer
+    required: true
+    example: 0
+    min: 0
+    max: 2
+    description: This replica's id in the group (0, 1 or 2).
+  listen_port:
+    type: integer
+    default: 9090
+    min: 1
+    max: 65535
+    description: The port this replica's peer link listens on.
+  peer0:
+    type: string
+    required: true
+    example: "127.0.0.1:9090"
+    description: Replica 0's peer address, host:port.
+  peer1:
+    type: string
+    required: true
+    example: "127.0.0.1:9091"
+    description: Replica 1's peer address, host:port.
+  peer2:
+    type: string
+    required: true
+    example: "127.0.0.1:9092"
+    description: Replica 2's peer address, host:port.
+  store_dir:
+    type: string
+    default: kv
+    description: >-
+      The disk store's directory (absolute, or relative to the working
+      directory), created by the operator; up to 128 bytes.
+  lin_reads:
+    type: integer
+    default: 0
+    min: 0
+    max: 1
+    description: 1 fences every read through the leader (linearizable).
+  sweep_grace_ms:
+    type: integer
+    default: 300000
+    min: 1
+    max: 4294967295
+    description: >-
+      How long an unreferenced large-value chunk is kept before a sweep may
+      take it.
+  feed_id:
+    type: integer
+    default: 1
+    min: 0
+    max: 4294967295
+    description: The CDC envelope's feed_id when a subscription names none.
+  table_id:
+    type: integer
+    default: 0
+    min: 0
+    max: 4294967295
+    description: The CDC envelope's table_id when a subscription names none.
+
+exports:
+  sql_request_in: sql_front.request_in
+  sql_response_out: sql_front.response_out
+  kv_request_in: kv_front.request_in
+  kv_response_out: kv_front.response_out
+  cdc_request_in: cdc_front.request_in
+  cdc_response_out: cdc_front.response_out
+  pump_kv_in: router.memcached_in
+  pump_kv_out: router.memcached_out
+  peer_net_in: peers.net_in
+  peer_net_out: peers.net_out
+
+modules:
+  # ── The store ────────────────────────────────────────────────────
+  - name: worker
+    type: kv_state_worker
+    params:
+      state_store: 1
+      sweep_wrap: 1
+      store_dir: ${param:store_dir}
+      sweep_grace_ms: ${param:sweep_grace_ms}
+  - name: router
+    type: kv_request_router
+    params:
+      lin_reads: ${param:lin_reads}
+      replicated: 1
+  - name: apply
+    type: lattice_apply_bridge
+  - name: sql
+    type: relational_executor
+  - name: backfill
+    type: index_backfill
+  - name: clock
+    type: ttl_scheduler
+    params:
+      propose_wrap: 1
+
+  # ── The fronts ───────────────────────────────────────────────────
+  - name: sql_front
+    type: sql_front
+  - name: kv_front
+    type: kv_front
+  - name: cdc_front
+    type: cdc_front
+    params:
+      feed_id: ${param:feed_id}
+      table_id: ${param:table_id}
+      proto: 1
+
+  # ── The group ────────────────────────────────────────────────────
+  - name: peers
+    type: peer_router
+    params:
+      self_id: ${param:self_id}
+      peer_count: 3
+      listen_port: ${param:listen_port}
+      peer0: ${param:peer0}
+      peer1: ${param:peer1}
+      peer2: ${param:peer2}
+  - name: gateway
+    type: gateway
+    params:
+      self_id: ${param:self_id}
+  - name: admission
+    type: admission
+  - name: control
+    type: control_plane
+  - name: consensus
+    type: consensus
+    params:
+      self_id: ${param:self_id}
+      voter_count: 3
+      peer_count: 3
+      heartbeat_interval_ms: 150
+      election_timeout_ms: 4000
+      proposal_batch_timeout_ms: 1
+      forward_proposals: 1
+  - name: durability
+    type: durability
+    params:
+      self_id: ${param:self_id}
+      voter_count: 3
+      partition_id: 0
+      fsync_mode: 1
+      group_window_ms: 0
+      group_max_pending: 8
+      segment_bytes: 4194304
+
+wiring:
+  # ── The fronts ───────────────────────────────────────────────────
+  - from: sql_front.sql_out
+    to: sql.pg_in
+  - from: sql.pg_out
+    to: sql_front.sql_in
+  - from: kv_front.kv_out
+    to: router.redis_in
+  - from: router.redis_out
+    to: kv_front.kv_in
+  - from: cdc_front.kv_out
+    to: router.etcd_in
+  - from: router.etcd_out
+    to: cdc_front.kv_in
+
+  # ── The executor and its backfill on the router ──────────────────
+  - from: sql.kv_out
+    to: router.internal_sql_in
+  - from: router.compute_out
+    to: sql.kv_in
+  - from: backfill.kv_out
+    to: router.internal_job_in
+  - from: router.internal_job_out
+    to: backfill.kv_in
+
+  # ── Writes through the group's log, applied here ─────────────────
+  - from: router.proposal_out
+    to: gateway.client_requests
+  - from: gateway.responses
+    to: router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control.routing
+    to: gateway.placement
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: consensus.committed_entries
+    to: apply.committed_in
+  - from: apply.kv_out
+    to: worker.commands
+  - from: router.kv_out
+    to: worker.commands
+  - from: worker.responses
+    to: router.kv_in
+  - from: router.lin_read_out
+    to: consensus.read
+  - from: consensus.applied
+    to: router.read_release
+  - from: admission.permits
+    to: consensus.read_permits
+
+  # ── Peer links ───────────────────────────────────────────────────
+  - from: peers.peer_rx
+    to: consensus.ack
+  - from: peers.raft_rpc
+    to: consensus.rpc
+  - from: consensus.rpc_out
+    to: peers.peer_tx
+  - from: consensus.net_out
+    to: peers.repl_tx
+
+  # ── Durability ───────────────────────────────────────────────────
+  - from: consensus.log_append
+    to: durability.entries
+    rate: transaction
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: consensus.log_maintenance
+    to: durability.compact_before
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
+    to: peers.peer_tx
+  - from: durability.app_snapshot_ctl
+    to: worker.snapshot_import
+    rate: transaction
+  - from: worker.snapshot_export
+    to: durability.app_snapshot_body
+    rate: transaction
+  - from: worker.install_ack_out
+    to: durability.app_install_ack
+
+  # ── The clock and chunk sweeps, through the group's log ──────────
+  - from: clock.propose_out
+    to: gateway.client_requests
+  - from: apply.records_out
+    to: clock.tick_in
+  - from: worker.expiry_out
+    to: clock.kv_expiry
+  - from: worker.sweep_out
+    to: gateway.client_requests
+  - from: clock.expire_out
+    to: worker.expire

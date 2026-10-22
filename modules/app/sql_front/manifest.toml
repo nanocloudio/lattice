@@ -1,0 +1,47 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+timer_class      = "wall_clock"
+
+# lattice's relational path as an exchange provider in the graph: the
+# exchange surface `pg_client` offers (each request's body is one SQL
+# statement, answered once with the first column of its rows), served by
+# the graph's own `relational_executor` — no wire protocol, no TCP, no
+# SCRAM. See mod.rs for the request and answer layouts byte for byte.
+
+[[ports]]
+name         = "request_in"
+index        = 0
+direction    = "input"
+content_type = "ExchangeRequest"
+buffer_size  = 16384
+max_record   = 8192
+
+# MSG_SQL_RESPONSE from relational_executor.pg_out. One response is one
+# envelope of up to the executor's RESP_BUF (28672) payload bytes.
+[[ports]]
+name         = "sql_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 32768
+
+[[ports]]
+name         = "response_out"
+index        = 0
+direction    = "output"
+content_type = "ExchangeResponse"
+buffer_size  = 16384
+max_record   = 8192
+
+# MSG_SQL_REQUEST to relational_executor.pg_in, PostgreSQL dialect.
+[[ports]]
+name         = "sql_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+[observability]
+exempt = "in-graph SQL front; statements are observed at relational_executor"
