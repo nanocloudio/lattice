@@ -77,11 +77,13 @@ mod session_anchor;
 
 #[path = "../../common/envelope.rs"]
 mod envelope;
+#[path = "../../common/secret_param.rs"]
+mod secret_param;
 use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use redis_codec::{
-    enc_array_header, enc_bulk, enc_error, enc_integer, enc_null_bulk, enc_raw, enc_simple_str,
-    eq_ascii_ci, itoa, parse_i64, parse_one, ArgView, Argv, Built, ParseStep,
+    enc_array_header, enc_bulk, enc_error, enc_integer, enc_line_text, enc_null_bulk, enc_raw,
+    enc_simple_str, eq_ascii_ci, itoa, parse_i64, parse_one, ArgView, Argv, Built, ParseStep,
 };
 use session_anchor::session_core::session_ctrl as sc;
 use session_anchor::session_core::{
@@ -167,12 +169,8 @@ const SEND_BUF_SIZE: usize = 4096;
 const SCRATCH_BUF_SIZE: usize = 4096 + 32;
 
 // `MAX_ARGS` (the per-command argv cap) lives in `redis_codec.rs`
-// alongside the parser that enforces it. The anchor's MULTI queue
-// and pubsub caps below are anchor-specific session state and stay
-// here.
-
-/// MULTI queue depth per slot.
-const MAX_QUEUED: usize = 32;
+// alongside the parser that enforces it. The anchor's pubsub caps below
+// are anchor-specific session state and stay here.
 
 /// PubSub subscription cap per slot.
 const MAX_SUBS: usize = 16;
@@ -199,9 +197,10 @@ define_params! {
     // against it in constant time.
     2, requirepass, blob, 0
         => |s, d, len| {
-            let take = (len).min(REQUIREPASS_MAX);
-            for i in 0..take { s.requirepass[i] = *d.add(i); }
-            s.requirepass_len = take as u8;
+            // One entry of the self-delimiting blob: kept whole or
+            // refused at construction (`secret_param`).
+            let entry = core::slice::from_raw_parts(d, len);
+            s.secret.take(&mut s.requirepass, entry);
         };
 }
 
@@ -287,8 +286,6 @@ struct Slot {
     db_index: u16,
     tenant: u32,
 
-    in_multi: bool,
-    multi_count: u16,
     in_pubsub: bool,
     sub_count: u16,
     /// SessionCtrlV1 app id for this connection's pub/sub session
@@ -327,8 +324,6 @@ impl Slot {
             auth: 0,
             db_index: 0,
             tenant: DEFAULT_TENANT,
-            in_multi: false,
-            multi_count: 0,
             in_pubsub: false,
             sub_count: 0,
             pubsub_session: 0,
@@ -352,8 +347,6 @@ impl Slot {
         self.auth = 0;
         self.db_index = 0;
         self.tenant = DEFAULT_TENANT;
-        self.in_multi = false;
-        self.multi_count = 0;
         self.in_pubsub = false;
         self.sub_count = 0;
         self.pubsub_session = 0;
@@ -669,6 +662,10 @@ struct AnchorState {
     // anonymous clients. See `handle_auth`.
     requirepass: [u8; REQUIREPASS_MAX],
     requirepass_len: u8,
+    /// The `requirepass` param's bytes as they arrive; a secret that cannot be
+    /// kept whole (longer than `REQUIREPASS_MAX`) refuses the anchor at
+    /// construction.
+    secret: secret_param::SecretTake,
     _pad2: [u8; 7],
 
     // Monotonic counters emitted on `metrics_out` at
@@ -790,6 +787,7 @@ impl AnchorState {
         // wired worker set are known.
         self.requirepass = [0; REQUIREPASS_MAX];
         self.requirepass_len = 0;
+        self.secret = secret_param::SecretTake::new();
         self._pad2 = [0; 7];
         self.m_commands = 0;
         self.m_forwarded = 0;
@@ -931,14 +929,13 @@ fn dispatch(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispatch 
         let _ = enc_simple_str(&mut s.send_buf, &mut s.send_len, b"RESET");
         return Dispatch::Handled;
     }
-    if eq_ascii_ci(cmd, b"MULTI") {
-        return handle_multi(&mut anchor.slots[slot_idx]);
-    }
-    if eq_ascii_ci(cmd, b"DISCARD") {
-        return handle_discard(&mut anchor.slots[slot_idx]);
-    }
-    if eq_ascii_ci(cmd, b"EXEC") {
-        return handle_exec(&mut anchor.slots[slot_idx]);
+    if eq_ascii_ci(cmd, b"MULTI")
+        || eq_ascii_ci(cmd, b"EXEC")
+        || eq_ascii_ci(cmd, b"DISCARD")
+        || eq_ascii_ci(cmd, b"WATCH")
+        || eq_ascii_ci(cmd, b"UNWATCH")
+    {
+        return refuse_transaction(&mut anchor.slots[slot_idx], cmd);
     }
     if eq_ascii_ci(cmd, b"LATTICE.RELOCATE") {
         // Ops / test hook: drain the current active pub/sub worker onto
@@ -997,25 +994,9 @@ fn dispatch(anchor: &mut AnchorState, slot_idx: usize, argv: &Argv) -> Dispatch 
         return handle_subscribe_family(anchor, slot_idx, cmd, argv);
     }
 
-    // MULTI queueing.
     {
         let auth_required = anchor.requirepass_len > 0;
         let s = &mut anchor.slots[slot_idx];
-        if s.in_multi {
-            if s.multi_count as usize >= MAX_QUEUED {
-                let _ = enc_error(
-                    &mut s.send_buf,
-                    &mut s.send_len,
-                    b"ERR transaction too large",
-                );
-                s.in_multi = false;
-                s.multi_count = 0;
-                return Dispatch::Handled;
-            }
-            s.multi_count += 1;
-            let _ = enc_simple_str(&mut s.send_buf, &mut s.send_len, b"QUEUED");
-            return Dispatch::Handled;
-        }
         if auth_required && s.auth != 1 {
             let _ = enc_error(
                 &mut s.send_buf,
@@ -1269,54 +1250,19 @@ fn handle_select(slot: &mut Slot, argv: &Argv) -> Dispatch {
     Dispatch::Handled
 }
 
-fn handle_multi(slot: &mut Slot) -> Dispatch {
-    if slot.in_multi {
-        let _ = enc_error(
-            &mut slot.send_buf,
-            &mut slot.send_len,
-            b"ERR MULTI calls can not be nested",
-        );
-        return Dispatch::Handled;
-    }
-    slot.in_multi = true;
-    slot.multi_count = 0;
-    let _ = enc_simple_str(&mut slot.send_buf, &mut slot.send_len, b"OK");
-    Dispatch::Handled
-}
-
-fn handle_discard(slot: &mut Slot) -> Dispatch {
-    if !slot.in_multi {
-        let _ = enc_error(
-            &mut slot.send_buf,
-            &mut slot.send_len,
-            b"ERR DISCARD without MULTI",
-        );
-        return Dispatch::Handled;
-    }
-    slot.in_multi = false;
-    slot.multi_count = 0;
-    let _ = enc_simple_str(&mut slot.send_buf, &mut slot.send_len, b"OK");
-    Dispatch::Handled
-}
-
-fn handle_exec(slot: &mut Slot) -> Dispatch {
-    if !slot.in_multi {
-        let _ = enc_error(
-            &mut slot.send_buf,
-            &mut slot.send_len,
-            b"ERR EXEC without MULTI",
-        );
-        return Dispatch::Handled;
-    }
-    let count = slot.multi_count as i64;
-    slot.in_multi = false;
-    slot.multi_count = 0;
-    let _ = enc_array_header(&mut slot.send_buf, &mut slot.send_len, count);
-    let mut i = 0;
-    while i < count {
-        let _ = enc_simple_str(&mut slot.send_buf, &mut slot.send_len, b"OK");
-        i += 1;
-    }
+/// `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`: refused. The anchor runs
+/// each command as it arrives and has no transaction to queue commands
+/// into; answering `QUEUED` and then `EXEC` would tell a client that writes
+/// happened that never did. A client needing several writes applied
+/// together uses the etcd `Txn` or a SQL transaction.
+fn refuse_transaction(slot: &mut Slot, cmd: &[u8]) -> Dispatch {
+    let _ = enc_raw(&mut slot.send_buf, &mut slot.send_len, b"-ERR ");
+    let _ = enc_line_text(&mut slot.send_buf, &mut slot.send_len, cmd);
+    let _ = enc_raw(
+        &mut slot.send_buf,
+        &mut slot.send_len,
+        b" is not supported: this server runs no Redis transactions\r\n",
+    );
     Dispatch::Handled
 }
 
@@ -1354,10 +1300,17 @@ fn ensure_pubsub_session(anchor: &mut AnchorState, slot_idx: usize) -> u64 {
             anchor.pubsub_seq = 1;
         }
         let app = anchor.pubsub_seq;
-        anchor.slots[slot_idx].pubsub_session = app;
         let conn_id = anchor.slots[slot_idx].conn_id;
         let mut sink = ps_sink!(anchor);
-        let _ = anchor.psa.attach(CLASS_PUBSUB, app, conn_id, 0, &mut sink);
+        // Every session taken (or no worker active): the connection keeps
+        // none, and its next SUBSCRIBE tries again.
+        if anchor
+            .psa
+            .attach(CLASS_PUBSUB, app, conn_id, 0, &mut sink)
+            .is_ok()
+        {
+            anchor.slots[slot_idx].pubsub_session = app;
+        }
     }
     anchor.slots[slot_idx].pubsub_session
 }
@@ -1391,11 +1344,19 @@ fn handle_subscribe_family(
         return local_subscribe_ack(&mut anchor.slots[slot_idx], is_sub, is_psub, argv);
     }
 
-    if is_sub {
-        anchor.slots[slot_idx].in_pubsub = true;
-    }
     let app = ensure_pubsub_session(anchor, slot_idx);
     let Some(sess) = anchor.psa.find_app(CLASS_PUBSUB, app) else {
+        if !is_sub {
+            // Nothing subscribed: answered as a connection with no
+            // subscriptions is.
+            return local_subscribe_ack(&mut anchor.slots[slot_idx], is_sub, is_psub, argv);
+        }
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_error(
+            &mut s.send_buf,
+            &mut s.send_len,
+            b"ERR no pub/sub session is free; try again later",
+        );
         return Dispatch::Handled;
     };
     let n_names = (argv.count as usize).saturating_sub(1);
@@ -1421,9 +1382,23 @@ fn handle_subscribe_family(
         i += 1;
     }
     let mut sink = ps_sink!(anchor);
-    let _ = anchor
+    if !anchor
         .psa
-        .forward(sess, MSG_PUBSUB_CTRL, &body[..end], &mut sink);
+        .forward(sess, MSG_PUBSUB_CTRL, &body[..end], &mut sink)
+    {
+        // The worker's channel refused it: the worker's acks are the
+        // reply, so none would come — answered here instead.
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_error(
+            &mut s.send_buf,
+            &mut s.send_len,
+            b"ERR pub/sub worker busy; try again later",
+        );
+        return Dispatch::Handled;
+    }
+    if is_sub {
+        anchor.slots[slot_idx].in_pubsub = true;
+    }
     Dispatch::Handled
 }
 
@@ -1841,7 +1816,7 @@ fn forward_to_router(
         Built::Unknown => {
             let s = &mut anchor.slots[slot_idx];
             let _ = enc_raw(&mut s.send_buf, &mut s.send_len, b"-ERR unknown command '");
-            let _ = enc_raw(&mut s.send_buf, &mut s.send_len, cmd);
+            let _ = enc_line_text(&mut s.send_buf, &mut s.send_len, cmd);
             let _ = enc_raw(&mut s.send_buf, &mut s.send_len, b"'\r\n");
             return Dispatch::Handled;
         }
@@ -2833,6 +2808,16 @@ pub extern "C" fn module_new(
     anchor.init(sys_ptr);
     if !params.is_null() && params_len >= 4 {
         unsafe { parse_tlv(anchor, params, params_len) };
+    }
+    match anchor.secret.finished() {
+        Some(n) => anchor.requirepass_len = n as u8,
+        None => anchor.requirepass_len = 0,
+    }
+    if anchor.secret.finished().is_none() {
+        let m = b"[redis_anc] requirepass longer than the anchor holds: refusing to start";
+        // SAFETY: the loader's syscall table, checked non-null above.
+        unsafe { dev_log(&*sys_ptr, 1, m.as_ptr(), m.len()) };
+        return -1;
     }
 
     anchor.net_in = in_chan;

@@ -23,20 +23,20 @@ hardware_targets = ["bcm2712", "linux"]
 #
 # ⚠ STEP DEADLINE — REQUIRED IN ANY BARE-METAL `state_store = 1` GRAPH.
 # With `state_store = 1` this module performs the longest synchronous
-# storage action in the graph: the watermark flush writes the WHOLE
-# memtable (up to `MEMTABLE_FLUSH_WATERMARK` = 384 records, ~1.7 MB),
-# creates a fresh run file, rewrites the manifest and fsyncs — all
-# inside ONE `module_step`. It is the one action in `disk_maintenance`
-# that is NOT bounded per step.
+# storage actions in the graph. Each is bounded per step — a flush writes
+# at most `FLUSH_STEP_RECORDS` (32) memtable records a step and then its
+# footer, manifest and fences one stage at a time; a merge decides at
+# most `COMPACT_STEP_RECORDS` (32) input records a step — but a step of
+# either is real device I/O.
 #
 # A module that declares no `step_deadline_us` runs on the kernel
 # default of 2000 us (burst 16000 us), and a step timeout under the
 # DEFAULT `fault_policy` does not skip the step — `can_restart()` is
 # false for anything but `restart`, so the kernel TERMINATES the
-# module. One overlong flush and the worker is gone: no heartbeat, no
-# command drain, every counter frozen at its pre-flush value. On host
-# the flush is a page-cache write and this never fires; on
-# FAT32-over-NVMe it is milliseconds to tens of milliseconds.
+# module. One overlong step and the worker is gone: no heartbeat, no
+# command drain, every counter frozen at its last value. On host a step
+# is a page-cache write and this never fires; on FAT32-over-NVMe it is
+# milliseconds.
 #
 # So any bare-metal disk composition MUST give this module the same
 # treatment `durability` already gets for its WAL fsync, e.g.
@@ -49,13 +49,12 @@ hardware_targets = ["bcm2712", "linux"]
 #
 # Note the burst is capped by the config validator at 16 x tick_us, so
 # at tick_us = 1000 the values above are the CEILING, not a preference.
-# If `ms=` on the end line reaches it, the flush has outgrown what a
-# deadline can cover and must be chunked across steps the way `compact`
-# already is.
 #
-# `[kvw] disk flush begin` / `[kvw] disk flush end ok=N ms=M` bracket
-# the call: a capture ending on `begin` with no `end` is this fault,
-# and `ms=` on a healthy boot is what to size the deadline from.
+# `[kvw] disk flush begin` / `[kvw] disk flush end ok=N chunks=K ms=M`
+# bracket a flush, and `[kvw] disk flush chunk k=N ph=P ms=M` times each
+# of its steps: a capture ending on a `chunk` line with no `end` is this
+# fault, and the chunk `ms=` on a healthy boot is what to size the
+# deadline from (`[kvw] disk compact step us=` names a slow merge step).
 
 [[resources]]
 requires_contract = "fs"
@@ -152,8 +151,8 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# Demand-driven commit-timestamp lease requests to timestamp_allocator
-#. Unreplicated HINT — the grant returns replicated,
+# Demand-driven commit-timestamp lease requests to timestamp_allocator.
+# Unreplicated HINT — the grant returns replicated,
 # in-band on `commands` via the apply bridge. Sent only while the
 # worker's lease runs low, so an idle graph proposes nothing.
 # MSG_TS_LEASE_REQUEST `[corr_id:u64][requester:u32][size:u32]`
@@ -207,9 +206,9 @@ content_type = "OctetStream"
 # to see). Declaration order IS the id contract (id N = the Nth name);
 # the emitter in module_step passes values in this exact order.
 #
-# ids 0-2 are monotonic counters (METRIC_COUNTER). ids 3-13 are the disk
-# state-store diagnostic block, added so a wedged worker is readable from
-# a `/metrics` scrape when the request path is timing out.
+# ids 0-2 are monotonic counters (METRIC_COUNTER). ids 3-14 are the disk
+# state-store diagnostic block, so a wedged worker is readable from a
+# `/metrics` scrape when the request path is timing out.
 # APPEND ONLY — never renumber, ids are a wire contract.
 #
 # Counters (METRIC_COUNTER, monotonic):

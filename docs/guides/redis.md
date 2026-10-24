@@ -32,7 +32,7 @@ local applied state unless the graph sets `lin_reads: 1` (see the
 | Counters | `INCR`, `INCRBY`, `DECR`, `DECRBY` |
 | Keyspace | `DEL`/`UNLINK`, `EXISTS`, `KEYS`, `SCAN` (`MATCH`, `COUNT`), `FLUSHDB`/`FLUSHALL` |
 | Time-series | `TS.ADD`, `TS.RANGE` |
-| Transactions | `MULTI`, `EXEC`, `DISCARD` |
+| Transactions | none: `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` are refused |
 | Pub/sub | `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH` |
 | Connection | `PING`, `ECHO`, `QUIT`, `SELECT`, `AUTH`, `HELLO`, `RESET`, `CLIENT` (`ID`, `GETNAME`, `SETNAME`, `REPLY`), `COMMAND` |
 | Operations | `LATTICE.RELOCATE`, `LATTICE.RELOCATING`, `LATTICE.RELOCATED` |
@@ -43,8 +43,10 @@ Notes:
 - `FLUSHDB` and `FLUSHALL` are identical and flush the node's whole
   keyspace — including keys written through the other protocol
   anchors in the same graph.
-- `MULTI`/`EXEC` queues commands and runs them back to back; it is
-  not atomic across the queue and there is no `WATCH` CAS layer.
+- `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH` answer
+  `-ERR <command> is not supported: this server runs no Redis
+  transactions`. Each command runs as it arrives; writes that must apply
+  together go through the etcd `Txn` or a SQL transaction.
 - Subscriptions are sessions held by a pub/sub worker. `PUBLISH`
   answers how many subscribers it reached on this graph, and a
   subscription survives its session moving from one worker to

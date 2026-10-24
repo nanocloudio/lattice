@@ -82,18 +82,18 @@
 //! Entries are newest-first; `digest` is the run's `file_crc`.
 //!
 //! **Why a fixed A/B pair.** Giving every generation its own file, with
-//! the FILENAME carrying the generation, put a file CREATE on the
-//! publish path, and a FAT32 create was measured at **159 ms** on
-//! the Pi 5 rig — a linear directory scan, a dirent patch, a cluster
-//! allocation writing its FAT entry into every FAT copy as a
-//! read-modify-write, and a first-cluster zero-fill, every one a
-//! synchronous spin-polled single-sector write. That single allocation
-//! blew the module's step deadline and got it terminated on its first
-//! publish. Two fixed, preallocated slots replace it:
-//! `MANIFEST_SLOT_A`/`_B`, each exactly `MANIFEST_SLOT_LEN` bytes,
-//! written IN PLACE and alternated. The generation lives in the body, the slot is padded to a constant length so a write
-//! never extends the file, and the publish path performs no create, no
-//! unlink and no directory enumeration at all.
+//! the FILENAME carrying the generation, would put a file CREATE on the
+//! publish path, and a FAT32 create measures **159 ms** on the Pi 5
+//! rig — a linear directory scan, a dirent patch, a cluster allocation
+//! writing its FAT entry into every FAT copy as a read-modify-write, and
+//! a first-cluster zero-fill, every one a synchronous spin-polled
+//! single-sector write. That single allocation overruns the module's
+//! step deadline and gets it terminated on its first publish. So there
+//! are two fixed, preallocated slots: `MANIFEST_SLOT_A`/`_B`, each
+//! exactly `MANIFEST_SLOT_LEN` bytes, written IN PLACE and alternated.
+//! The generation lives in the body, the slot is padded to a constant
+//! length so a write never extends the file, and the publish path
+//! performs no create, no unlink and no directory enumeration at all.
 //!
 //! **Atomicity (this replaces "older manifests are deleted LAST").** A
 //! publish only ever writes the INACTIVE slot — the one that is not
@@ -190,7 +190,8 @@ pub const MEMTABLE_MAX_ENTRIES: usize = 512;
 /// FULL, at which point `apply` returns `Backpressure` (never drops).
 pub const MEMTABLE_FLUSH_WATERMARK: usize = 384;
 /// Bounded number of live run files. Flush past this is
-/// `Backpressure`; `compact` merges all runs back into one.
+/// `Backpressure`; `compact` merges the runs it finds at its start into
+/// one.
 pub const MAX_RUNS: usize = 16;
 /// Smallest legal encoded internal key: identity prefix + terminator +
 /// version suffix (empty user key).
@@ -479,11 +480,11 @@ pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 
 /// The manifest A/B pair. Two FIXED, PREALLOCATED files, alternated on
 /// every publish. Nothing on the publish path creates, unlinks or
-/// enumerates — a FAT32 create was measured at **159 ms** on the Pi 5
+/// enumerates — a FAT32 create measures **159 ms** on the Pi 5
 /// rig (linear directory scan, dirent patch, cluster allocation writing
 /// its FAT entry into every FAT copy as a read-modify-write, and a
 /// first-cluster zero-fill, every one a synchronous spin-polled
-/// single-sector write). Publishing is now: write one fixed-size record
+/// single-sector write). Publishing is: write one fixed-size record
 /// in place, fence it. That is all.
 pub const MANIFEST_SLOT_A: u32 = 1;
 pub const MANIFEST_SLOT_B: u32 = 2;
@@ -538,7 +539,7 @@ pub const SNAP_HDR_CLOCK_OFF: usize = 40;
 pub const SNAP_FLAG_DISK_RESIDENT: u16 = 0x0001;
 
 /// Input records consumed per bounded `compact` step.
-// TUNE (rig, 2026-08-16): 128 records/step ≈ 6-8 ms of synchronous
+// TUNE (rig): 128 records/step ≈ 6-8 ms of synchronous
 // device time EVERY worker step during a merge. The WAL (durability)
 // shares the same blocking storage path; its appends/fsyncs queue
 // behind those bursts, and with an unlucky alignment its own step
@@ -881,17 +882,19 @@ fn slot_bit(slot: u32) -> u8 {
 ///
 /// Every write sequence here (flush, compact, manifest publish) picks an
 /// id/generation that is NOT yet referenced by durable state — publish is
-/// always the last step, and `next_run_id` / `generation` only advance
-/// once a publish has landed. So an existing file at that id is *always*
-/// an unreferenced orphan from an attempt that faulted after `create()`
-/// but before publish.
+/// always the last step, `generation` only advances once a publish has
+/// landed, and a run id comes from `next_run_id`, above every id a
+/// manifest names. So an existing file at that id is *always* an
+/// unreferenced orphan from an attempt that faulted after `create()` but
+/// before publish.
 ///
 /// Without this, one transient backend failure mid-flush wedges the store
 /// forever: the retry re-derives the same id, `create()` answers
 /// `AlreadyExists`, and that maps to `StorageFault` — which the hosting
-/// worker treats as a hard fault and quarantines on. That is the bare-metal
-/// FAT32 wedge; on linux the backend never failed transiently, so the retry
-/// path was never taken. Deleting the orphan first makes the retry clean.
+/// worker treats as a hard fault and quarantines on. A bare-metal FAT32
+/// backend fails transiently; a Linux one practically never does, so only
+/// the board takes this path. Deleting the orphan first makes the retry
+/// clean.
 fn create_fresh<S: RunStorage + ?Sized>(
     storage: &mut S,
     kind: FileKind,
@@ -1231,11 +1234,10 @@ struct CompactState {
     blk_has_first: bool,
     /// A step boundary saved exact per-run merge positions below —
     /// [`compact_step`] resumes by SEEKING, not by replaying the walk
-    /// from record 0 (the replay made per-step cost grow linearly with
-    /// the cursor — O(n²) total — which on FAT32-over-NVMe crossed the
-    /// module step deadline around cursor ≈ 400 and got the worker
-    /// TERMINATED mid-compaction, killing the graph under sustained
-    /// write load).
+    /// from record 0 (a replay makes per-step cost grow linearly with
+    /// the cursor — O(n²) total — which on FAT32-over-NVMe crosses the
+    /// module step deadline around cursor ≈ 400 and gets the worker
+    /// TERMINATED mid-compaction under sustained write load).
     resume_valid: bool,
     /// Per-run resume block offsets (`u64::MAX` = run exhausted).
     run_block: [u64; MAX_RUNS],
@@ -1335,8 +1337,8 @@ struct RecoverState {
 /// Unlike `CompactState` this DOES carry the partial block buffer
 /// across steps. Compaction can end every step on a block boundary
 /// because nothing pins its output layout; a flush cannot, because the
-/// run it produces must be byte-identical to the one the single-call
-/// path produced before flushing was chunked (golden vectors). Holding
+/// run it produces must be byte-identical whatever its step bound (the
+/// golden vectors pin it). Holding
 /// `block`/`fill`/`block_recs` here makes the step bound purely a
 /// scheduling decision with no reach into the file format.
 ///
@@ -1512,9 +1514,9 @@ pub struct DiskState {
     /// Run files retired by a completed compaction, awaiting physical
     /// deletion. Drained ONE per maintenance step ([`DiskStore::
     /// retire_step`]): a FAT32 delete frees the whole FAT chain
-    /// synchronously (~35 ms measured on the rig), and doing three of
-    /// them inside the manifest-adoption step blew the module step
-    /// deadline and got the worker terminated. Correctness does not
+    /// synchronously (~35 ms measured on the rig), and three of them
+    /// inside the manifest-adoption step overrun the module step
+    /// deadline and get the worker terminated. Correctness does not
     /// depend on the queue: entries lost to a crash are unreferenced
     /// orphans, which recovery already collects.
     pub retire_ids: [u32; MAX_RUNS],
@@ -2435,11 +2437,11 @@ impl RunScan {
 
     /// Re-open the run standing on the exact record `save_pos`
     /// captured: load the saved block and advance `rec_idx + 1`
-    /// records. The run file is immutable while a compaction holds the
-    /// store's exclusion fence, so a saved offset that no longer lands
-    /// on a block boundary is corruption, not drift — fail closed
-    /// rather than silently walking from the head (which would emit
-    /// wrong records).
+    /// records. A run file is immutable, and a compaction's inputs stay
+    /// named by the run set until it publishes, so a saved offset that
+    /// does not land on a block boundary is corruption, not drift — fail
+    /// closed rather than silently walking from the head (which would
+    /// emit wrong records).
     fn resume_to<S: RunStorage>(
         meta: &RunMeta,
         block_off: u64,
@@ -3489,9 +3491,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
             self.state.flush.pending_crc = crc32_finish(self.state.flush.crc_state);
             self.state.flush.stage = STAGE_RUN_SUBMIT;
         }
-        // SUBMIT the run's durability fence and LEAVE. This is the
-        // 163 ms that killed the module: it is now spread across later
-        // steps as cheap polls instead of one blocking call.
+        // SUBMIT the run's durability fence and LEAVE. A blocking fsync
+        // here is ~163 ms on the board, past the module step deadline;
+        // submitted, it is spread across later steps as cheap polls.
         let ticket = self
             .storage
             .fsync_submit(FileKind::Run, id)
@@ -3768,8 +3770,9 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         Ok(Progress::Done)
     }
 
-    /// Write the buffered block, tracking offsets exactly as the
-    /// single-call flush did. Nothing moves until the block has landed.
+    /// Write the buffered block and track its offsets: the run is the
+    /// same bytes however the flush is stepped. Nothing moves until the
+    /// block has landed.
     fn flush_write_block(&mut self) -> Result<(), StoreError> {
         let id = self.state.flush.run_id;
         let fill = self.state.flush.fill as usize;
@@ -3986,8 +3989,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
                             self.state.rec.phase = REC_SELECT;
                         }
                         // More runs than a listing holds: a store whose writes
-                        // outran its retirements (2026-10-14, pi5-a: 13 009 run
-                        // files, a write storm upstream). Quarantining here
+                        // outran its retirements (13 009 run files seen on a
+                        // board after a write storm upstream). Quarantining here
                         // would make the orphans permanent, so the listed runs
                         // neither manifest slot names are deleted and the root
                         // listed again.
@@ -4905,7 +4908,8 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
         self.state.install.active
     }
 
-    /// Is a compaction holding the flush exclusion?
+    /// Is a compaction under way? It refuses a flush once it stands at
+    /// its manifest ([`DiskState::compact_pausable`]).
     pub fn compact_active(&self) -> bool {
         self.state.compact.active
     }
@@ -4917,9 +4921,10 @@ impl<'a, S: RunStorage> DiskStore<'a, S> {
 
     /// Release EVERY exclusion fence, unconditionally.
     ///
-    /// The bounded-starvation escape hatch. v1 excludes concurrent
-    /// apply from a capture/install/compaction by refusing writes with
-    /// `Backpressure`, which is only a safe simplification while the
+    /// The bounded-starvation escape hatch. A capture or an install
+    /// excludes concurrent apply by refusing writes with `Backpressure`,
+    /// and a compaction at its manifest holds off the flush a full
+    /// memtable waits for, which is only a safe simplification while the
     /// fence is guaranteed to be released — and one of them is not:
     /// an install opened by a RESET whose chunk stream is then
     /// abandoned (a gap, a leader that stops sending, a peer that
@@ -5654,8 +5659,8 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
             let Some(decoded) = internal_key::decode(key, &mut user_key) else {
                 return Err(StoreError::Malformed);
             };
-            // A tombstone is empty (historical layout) or carries
-            // exactly its 8-byte MVCC commit timestamp.
+            // A tombstone is empty or carries exactly its 8-byte MVCC
+            // commit timestamp.
             // Anything else is malformed.
             if decoded.kind == ValueKind::PointTombstone && vlen != 0 && vlen != 8 {
                 return Err(StoreError::Malformed);
@@ -6070,15 +6075,17 @@ impl<S: RunStorage> KvStateStore for DiskStore<'_, S> {
         })
     }
 
-    /// Merge every run into one, dropping (a) versions shadowed by a
-    /// newer version at-or-below `floor` and (b) tombstones at-or-below
-    /// `floor` with nothing beneath them. Bounded: each call consumes
-    /// at most `COMPACT_STEP_RECORDS` input records and writes only
-    /// complete blocks; the cursor is the count of input records
-    /// already decided. Shadowing considers RUN content only (a
-    /// memtable version additionally shadowing run versions is left
-    /// for the next cycle — conservative, never wrong). The floor is
-    /// trusted, never computed.
+    /// Merge the runs present at its start (its inputs) into one,
+    /// dropping (a) versions shadowed by a newer version at-or-below
+    /// `floor` and (b) tombstones at-or-below `floor` with nothing
+    /// beneath them. Bounded: each call consumes at most
+    /// `COMPACT_STEP_RECORDS` input records and writes only complete
+    /// blocks; the cursor is the count of input records already decided.
+    /// Shadowing considers INPUT content only (a version in the memtable,
+    /// or in a run flushed while the merge was paused, additionally
+    /// shadowing an input's is left for the next cycle — conservative,
+    /// never wrong): the inputs are the oldest runs, so nothing lies
+    /// beneath them for rule (b). The floor is trusted, never computed.
     fn compact(&mut self, floor: Revision, cursor: u64) -> Result<Progress, StoreError> {
         self.state.io_wait = false;
         if self.state.install.active || self.state.capture.active || self.state.flush.active {
@@ -6211,8 +6218,8 @@ impl<S: RunStorage> DiskStore<'_, S> {
         let resume = self.state.compact.input_ordinal;
         // Resume by SEEKING to the saved per-run positions (O(runs)),
         // never by replaying the merge from record 0 (O(resume) per
-        // step, O(n²) total — the shape that outgrew the module step
-        // deadline on FAT32 and got the worker terminated).
+        // step, O(n²) total — past the module step deadline on FAT32,
+        // where it gets the worker terminated).
         let resuming = self.state.compact.resume_valid;
         if !resuming && resume != 0 {
             return Err(StoreError::StorageFault);

@@ -76,6 +76,8 @@ mod telemetry;
 
 #[path = "../../common/envelope.rs"]
 mod envelope;
+#[path = "../../common/secret_param.rs"]
+mod secret_param;
 use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use abi::contracts::net::net_proto::{
@@ -208,6 +210,10 @@ struct AnchorState {
     /// Redis anchor's `requirepass` does.
     password: [u8; PASSWORD_MAX],
     password_len: usize,
+    /// The `password` param's bytes as they arrive; a secret that cannot be
+    /// kept whole (longer than `PASSWORD_MAX`) refuses the anchor at
+    /// construction.
+    secret: secret_param::SecretTake,
 
     corr_seq: u64,
 
@@ -237,9 +243,10 @@ define_params! {
     // would believe its password had been verified against a challenge.
     2, password, blob, 0
         => |s, d, len| {
-            let take = len.min(PASSWORD_MAX);
-            for i in 0..take { s.password[i] = *d.add(i); }
-            s.password_len = take;
+            // One entry of the self-delimiting blob: kept whole or
+            // refused at construction (`secret_param`).
+            let entry = core::slice::from_raw_parts(d, len);
+            s.secret.take(&mut s.password, entry);
         };
 }
 
@@ -257,6 +264,7 @@ impl AnchorState {
         self.server_conn_id = 0;
         self.listen_port = DEFAULT_LISTEN_PORT;
         self.password_len = 0;
+        self.secret = secret_param::SecretTake::new();
         self.corr_seq = 0;
         let mut i = 0;
         while i < MAX_CONNS {
@@ -1078,6 +1086,16 @@ pub extern "C" fn module_new(
     anchor.init(sys_ptr);
     if !params.is_null() && params_len >= 4 {
         unsafe { parse_tlv(anchor, params, params_len) };
+    }
+    match anchor.secret.finished() {
+        Some(n) => anchor.password_len = n,
+        None => anchor.password_len = 0,
+    }
+    if anchor.secret.finished().is_none() {
+        let m = b"[pg_anc] password longer than the anchor holds: refusing to start";
+        // SAFETY: the loader's syscall table, checked non-null above.
+        unsafe { dev_log(&*sys_ptr, 1, m.as_ptr(), m.len()) };
+        return -1;
     }
 
     // inputs:  net_in[0], sql_in[1]

@@ -145,9 +145,9 @@ const KPG_ID_DEFAULT: u16 = 0;
 // routing epoch. A mismatch is a stale route (`RetryClass::StaleRoute`)
 // and takes the router's existing reject-synth path as
 // KV_RESULT_DIRTY_EPOCH (redis: `MOVED routing epoch advanced`).
-// Mode 0 (default) is the legacy hash-routing path, byte-identical.
+// Mode 0 (default) is plain hash routing, with no map lookup.
 
-/// Router mode 0: legacy hash routing (no map lookup, KPG_ID_DEFAULT).
+/// Router mode 0: plain hash routing (no map lookup, KPG_ID_DEFAULT).
 const ROUTING_MODE_LEGACY: u8 = 0;
 /// Router mode 1: every request fenced through the partition map.
 const ROUTING_MODE_FENCED: u8 = 1;
@@ -366,10 +366,10 @@ impl HeldRequest {
 }
 
 /// Dense (protocol, conn) key space for the per-conn ordering state:
-/// 6 protocols × 256 conn ids. Four client protocols plus the two
-/// internal callers, which need ordering state for the same reason a
-/// client does — their requests pipeline and must not overtake their
-/// own earlier ones across a path transition.
+/// 256 conn ids for each protocol [`fence_key`] maps — the four client
+/// protocols, keys `0..4 * 256` — in a table of six protocols' room. The
+/// internal callers (SQL, data) keep no ordering state: `fence_key`
+/// answers `None` for them, and their ops pass no barrier.
 const FENCE_KEYS: usize = 6 * 256;
 
 /// Dispatch paths. Each path is internally FIFO (worker arrival order,
@@ -430,7 +430,7 @@ const DISPATCH_BLOCKED: i32 = -1;
 
 /// Per-corr bookkeeping for the response path: output port selection
 /// (proto) + per-conn ordering accounting (conn, path) + the per-key
-/// dependency key (task #17) so the barrier can tell whether a later
+/// dependency key so the barrier can tell whether a later
 /// same-conn op on a different path actually conflicts.
 #[derive(Clone, Copy)]
 struct InflightMeta {
@@ -495,7 +495,7 @@ struct InflightMeta {
 }
 
 /// True for protocols whose anchor keeps a per-conn response reorder
-/// buffer (redis, task #17). For these the router may let independent
+/// buffer (redis). For these the router may let independent
 /// same-conn ops pipeline across paths — the anchor restores FIFO. Other
 /// protocols keep the conservative all-transition barrier, since their
 /// anchors assume responses arrive in issue order.
@@ -1250,7 +1250,7 @@ define_params! {
     2, replicated, u8, 0
         => |s, d, len| { s.replicated = p_u8(d, len, 0, 0); };
 
-    // 0 = legacy hash routing (default, the original direct path).
+    // 0 = plain hash routing (default: no map lookup, the direct path).
     // 1 = partition-map-fenced: every request resolves through the
     // hash-slot map with a generation/epoch check; a mismatch rejects
     // with KV_RESULT_DIRTY_EPOCH (StaleRoute semantics) instead of
@@ -1367,7 +1367,7 @@ struct RouterState {
     /// Param `replicated`: 1 = this graph replicates writes through
     /// Raft. Cross-checked against `proposal_out` wiring at init.
     replicated: u8,
-    /// Param `routing_mode`: 0 = legacy, 1 = partition-map-fenced.
+    /// Param `routing_mode`: 0 = plain hash routing, 1 = partition-map-fenced.
     routing_mode: u8,
     /// Param `local_cluster_domain`: the Clustor cluster
     /// domain this router serves. A descriptor whose `binding.cluster_id`
@@ -1633,7 +1633,7 @@ impl RouterState {
         {
             // Static single-partition default: every slot → partition 0,
             // generation MAP_GENERATION_DEFAULT (a valid, matching map —
-            // mode 1 over it behaves exactly like the legacy path).
+            // mode 1 over it behaves exactly like mode 0).
             let mut s: u16 = 0;
             while (s as usize) < partition_map::SLOT_COUNT {
                 let _ = self.slot_map.bind_slot(s, SLOT_BINDING_DEFAULT);
@@ -1868,7 +1868,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
                                   // Canonical identity. The tenant rides in the fixed head; the
                                   // database and keyspace ride in an OPTIONAL 8-byte tail after the
                                   // body, appended only by anchors that carry a native RequestContext
-                                  // (today, `lattice_data_anchor`). A point-protocol envelope with no
+                                  // (`lattice_data_anchor`). A point-protocol envelope with no
                                   // tail is `(tenant, 0, 0)` — correct for a single flat keyspace.
     let id_tenant = u32::from_le_bytes([req[9], req[10], req[11], req[12]]);
     let conn_id = req[13];
@@ -1945,13 +1945,13 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
 
     // Route classification up front — the ordering barrier needs the
     // prospective path BEFORE any side effects.
-    // A write is ANY mutating op — not just PUT/DELETE. Getting this
-    // wrong (the old `op == 0x02 || op == 0x03`) sent INCR/DECR/APPEND/
-    // PREPEND/MSET/CAS/FLUSH/TXN down the read path: on a replicated
-    // deployment they bypassed consensus and mutated only the local
-    // worker (no replication — task #23), and on a fence-wired config
-    // they took the ReadIndex fence and returned CLUSTERDOWN. Classify
-    // by op so every mutation goes through consensus when it is wired.
+    // A write is ANY mutating op — not just PUT/DELETE. A mutation
+    // classified as a read (INCR/DECR/APPEND/PREPEND/MSET/CAS/FLUSH/TXN)
+    // would take the read path: on a replicated deployment it would
+    // bypass consensus and mutate only the local worker, and on a
+    // fence-wired config it would take the ReadIndex fence and return
+    // CLUSTERDOWN. Classify by op so every mutation goes through
+    // consensus when it is wired.
     let is_write = op_is_write(op);
     // Hash of the op's key, for hot-KEY tracking. Ops with no
     // single key (scans, txns spanning many) contribute nothing rather
@@ -1968,7 +1968,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         }
     };
 
-    // Dependency key for the per-conn barrier (task #17).
+    // Dependency key for the per-conn barrier.
     let (key_hash, wildcard) = op_key(op, &req[body_off..body_off + body_len]);
 
     // The routing fence (fail closed, no false absence): in fenced mode
@@ -2099,10 +2099,10 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     }
     let body_len = body_src_len;
 
-    // Port pair of the owning partition. Element 0 aliases the classic
-    // `kv_out`/`proposal_out`, so legacy and fenced modes see exactly
-    // the bytes they always did. In fanout mode a partition above 0
-    // rides the element-1 demux feed, tagged with `kpg_id`.
+    // Port pair of the owning partition. Element 0 is the single
+    // `kv_out`/`proposal_out` pair, so routing mode 0 and fenced mode
+    // emit identical bytes. In fanout mode a partition above 0 rides the
+    // element-1 demux feed, tagged with `kpg_id`.
     let (kv_port, kv_tag) = worker_port_tag(router, kpg_id);
     let (proposal_port, proposal_tag) = proposal_port_tag(router, kpg_id);
     if kv_port < 0 {
@@ -2197,20 +2197,27 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         kpg: kpg_id,
     };
     if router.inflight.insert(corr_id, meta).is_err() {
+        // Every slot holds an op in flight: refused retryably, never
+        // dropped — a caller with no answer waits on nothing.
+        emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
         return DISPATCH_DROPPED;
     }
 
     // Step 2: build MSG_KV_COMMAND in router.scratch. The head layout
     // (kpg + canonical identity) is owned by wire::KvCommandHead.
     let cmd_payload_len = wire::KvCommandHead::LEN + body_len;
-    if cmd_payload_len > u16::MAX as usize {
-        // Roll back the inflight slot we reserved above.
-        let _ = router.inflight.remove(corr_id);
-        return DISPATCH_DROPPED;
-    }
     let cmd_total = 3 + cmd_payload_len;
-    if cmd_total > SCRATCH_BUF_SIZE {
+    if cmd_payload_len > u16::MAX as usize || cmd_total > SCRATCH_BUF_SIZE {
+        // A command the worker's frame cannot carry: the inflight slot
+        // reserved above is rolled back, and the caller told.
         let _ = router.inflight.remove(corr_id);
+        emit_reject(
+            router,
+            protocol,
+            corr_id,
+            conn_id,
+            types::KV_RESULT_TOO_LARGE,
+        );
         return DISPATCH_DROPPED;
     }
 
@@ -2397,6 +2404,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         meta.path = PATH_DIRECT;
         let _ = router.inflight.remove(corr_id);
         if router.inflight.insert(corr_id, meta).is_err() {
+            emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
             return DISPATCH_DROPPED;
         }
     }
@@ -2917,21 +2925,28 @@ unsafe fn send_help_command(
 const INFLIGHT_TIMEOUT_MS: u64 = 5_000;
 
 /// A worker says the command at its channel head is still being worked on
-/// (`MSG_KV_WORKING`). It answers its commands in channel order, so every
-/// direct op routed to that partition — at the head, behind it on the
-/// channel, or stashed here for room on it — is being worked on: each is
-/// renewed for another `INFLIGHT_TIMEOUT_MS`, and an in-graph caller
+/// (`MSG_KV_WORKING`). It takes its commands in channel order and answers
+/// each one it takes, so every direct op routed to that partition — held
+/// as a paused walk, at the head, behind it on the channel, or stashed
+/// here for room on it — is being worked on: each is renewed for another
+/// `INFLIGHT_TIMEOUT_MS`, and an in-graph caller
 /// waiting on one is told (`MSG_KV_PENDING`), so its own wedge timer does
-/// not answer it either. Consensus and fenced ops are not renewed: what
-/// they wait on is not the worker (a leader, a read index), and their
-/// deadline is what answers a node that cannot serve them.
+/// not answer it either. The op's conn keeps its ordering slot too
+/// (`conn_deadline_ms`): the valve that force-settles a conn is for ops
+/// whose completion is lost, and one a worker is still working on will
+/// settle — reset under it, the conn's count would go short, and a later
+/// op could pass it at a path transition. Consensus and fenced ops are not
+/// renewed: what they wait on is not the worker (a leader, a read index),
+/// and their deadline is what answers a node that cannot serve them.
 unsafe fn renew_working(router: &mut RouterState, kpg: u16) {
     if router.syscalls.is_null() {
         return;
     }
-    let deadline = dev_millis(&*router.syscalls).wrapping_add(INFLIGHT_TIMEOUT_MS);
-    // In-graph callers told per notice: more than wait on one store at
-    // once in any composition; any past it are renewed all the same.
+    let now = dev_millis(&*router.syscalls);
+    let deadline = now.wrapping_add(INFLIGHT_TIMEOUT_MS);
+    // In-graph callers told per notice: more than ever wait on one store
+    // at once in any composition. Any past it are renewed all the same,
+    // just not told this time.
     const TOLD_PER_NOTICE: usize = 32;
     let mut told: [(u64, u8); TOLD_PER_NOTICE] = [(0, 0); TOLD_PER_NOTICE];
     let mut n = 0usize;
@@ -2940,6 +2955,11 @@ unsafe fn renew_working(router: &mut RouterState, kpg: u16) {
             continue;
         }
         meta.deadline_ms = deadline;
+        if let Some(key) = fence_key(meta.proto, meta.conn) {
+            if router.conn_outstanding[key] > 0 {
+                router.conn_deadline_ms[key] = now + CONN_ORDER_TIMEOUT_MS;
+            }
+        }
         // The in-graph callers on `compute_out`: every reader of it ignores
         // a message type it does not take, so the notice is safe for all.
         if matches!(meta.proto, PROTO_INTERNAL_SQL | types::PROTO_INTERNAL_DATA) && n < told.len() {
@@ -2968,10 +2988,10 @@ unsafe fn renew_working(router: &mut RouterState, kpg: u16) {
 /// `sweep_conn_deadlines` below force-settles the ORDERING state for a
 /// wedged conn, which unblocks the queue but tells the CALLER nothing —
 /// it goes on waiting for a reply that no longer has anything behind
-/// it. It also only understands four protocols, because it recovers
-/// proto/conn from a key encoding that predates the internal callers,
-/// so PROTO_INTERNAL_SQL and PROTO_INTERNAL_DATA were never swept at
-/// all.
+/// it. It also covers only the four client protocols: the internal
+/// callers keep no per-conn ordering state (`fence_key`), so an
+/// in-flight PROTO_INTERNAL_SQL or PROTO_INTERNAL_DATA op is never
+/// settled by it at all.
 ///
 /// This sweep answers instead. `emit_reject` routes by the protocol
 /// byte held in the entry, so every caller is covered — including the
@@ -2979,24 +2999,20 @@ unsafe fn renew_working(router: &mut RouterState, kpg: u16) {
 /// `DataRetryClass::UnavailableAuthority`, which is the truthful
 /// classification for "this node is not the leader".
 ///
-/// ## Verified, after two wrong readings
+/// ## Measured
 ///
-/// The failure it prevents is real and measured. With this sweep, a
-/// write sent to a FOLLOWER is refused at ~5.0s with
+/// With this sweep, a write sent to a FOLLOWER is refused at ~5.0s with
 /// `-CLUSTERDOWN`. Without it, the connection is CLOSED at ~8.6s with
 /// no reply at all — the caller gets a hangup. Network loss must
 /// never be reduced to a FIFO hangup, because a hangup is not an
 /// outcome.
 ///
-/// It took two bad readings to establish that. First the probe used a
-/// 5s read timeout and saw the 5.0s refusal land just past its own
-/// deadline, so the working path looked silent. Then the control
-/// counted the 8.6s EOF as "an answer" — `read()` returning zero bytes
-/// is a close, not a reply — so disabling the sweep looked like a
-/// no-op. Both errors were in the measurement, in opposite directions,
-/// and each on its own was enough to draw the wrong conclusion.
-///
-/// `tests/cluster.rs::a_follower_answers_a_write_it_cannot_commit` now
+/// Two measurement traps hide the difference: a probe whose own read
+/// timeout is 5s sees the 5.0s refusal land just past its deadline, so
+/// the working path looks silent; and a control that counts the 8.6s
+/// EOF as "an answer" (`read()` returning zero bytes is a close, not a
+/// reply) makes disabling the sweep look like a no-op.
+/// `tests/cluster.rs::a_follower_answers_a_write_it_cannot_commit`
 /// rejects EOF explicitly and fails when this sweep is disabled.
 unsafe fn sweep_inflight_deadlines(router: &mut RouterState) {
     if router.syscalls.is_null() || router.inflight.is_empty() {
@@ -3046,7 +3062,7 @@ unsafe fn sweep_inflight_deadlines(router: &mut RouterState) {
 ///
 /// Without this the rejection is dropped and the caller waits out the
 /// 5s inflight sweep. tests/cluster.rs pins the difference: a write to
-/// a follower must now fail in milliseconds, not at the timeout.
+/// a follower fails in milliseconds, not at the timeout.
 unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
     if router.gateway_reject_in < 0 || router.syscalls.is_null() {
         return false;
@@ -3365,7 +3381,7 @@ unsafe fn op_settled(router: &mut RouterState, proto: u8, conn: u8) {
     };
     router.conn_outstanding[key] = router.conn_outstanding[key].saturating_sub(1);
     if proto_reorders(proto) {
-        // Under per-key dependency (task #17), only conflicting ops are
+        // Under per-key dependency, only conflicting ops are
         // ever held — independent ops dispatch immediately and never
         // enter the pool, so the held set for a conn is a same-key /
         // wildcard dependent chain. A settle may have cleared the

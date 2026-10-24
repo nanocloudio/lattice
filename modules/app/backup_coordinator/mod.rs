@@ -23,11 +23,10 @@
 //! ## Where artifacts live
 //!
 //! In the KV store itself, under `KS_BACKUP_ARTIFACT`, keyed by
-//! `[backup_id][sequence]`. That is deliberate for this slice: the
-//! artifacts inherit the same durability, replication, and crash
-//! semantics as everything else, and a restore is a scan rather than a
-//! file-format reader. The external-object-store variant is a
-//! later slice and is named here rather than implied.
+//! `[backup_id][sequence]`, deliberately: the artifacts inherit the same
+//! durability, replication, and crash semantics as everything else, and
+//! a restore is a scan rather than a file-format reader. Backups held in
+//! an external object store are not provided.
 //!
 //! ## Restore
 //!
@@ -117,9 +116,10 @@ define_params! {
     1, mode, u8, 0
         => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
 
-    // Backup identity, low 8 bytes (the rest is zero-padded). An
-    // operator names the backup; the module never mints one, so a
-    // restore always addresses a backup someone chose.
+    // Backup identity: the 16-byte id is these four bytes (big-endian),
+    // eleven zero bytes, then 1 — so no id is all zero, which the
+    // contract refuses. An operator names the backup; the module never
+    // mints one, so a restore always addresses a backup someone chose.
     2, backup_id, u32, 1
         => |s, d, len| { s.backup_id_low = p_u32(d, len, 0, 1); };
 

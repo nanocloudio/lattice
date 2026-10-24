@@ -15,8 +15,8 @@
 //! The `state_store` param selects the physical materialization
 //! provider at graph construction — never a different engine:
 //!
-//! - `0` (memory, default): the bounded in-memory `KvStore` table.
-//!   Exactly the historical behaviour.
+//! - `0` (memory, default): the bounded in-memory `KvStore` table; no
+//!   FS use at all.
 //! - `1` (disk): the ordered disk provider (`kv_store::disk_store`)
 //!   over the Fluxor FS contract (`modules/common/fs_run_storage.rs`).
 //!   The module recovers the on-disk materialization before serving
@@ -123,6 +123,14 @@ mod doc_tree;
 #[cfg(feature = "store_provider")]
 #[path = "../../common/store_provider.rs"]
 mod store_provider;
+
+#[cfg(feature = "store_provider")]
+#[path = "../../common/change_ring.rs"]
+mod change_ring;
+
+#[cfg(feature = "store_provider")]
+#[path = "../../common/store_registry.rs"]
+mod store_registry;
 
 // Every replica applies a store provider's writes by their origin's
 // record, whether or not it provides the store itself.
@@ -305,8 +313,7 @@ define_params! {
     WorkerState;
 
     // Physical state-store provider, selected at graph construction.
-    // 0 = bounded in-memory table
-    // (default — the historical behaviour, no FS use at all); 1 = the
+    // 0 = bounded in-memory table (default, no FS use at all); 1 = the
     // ordered disk provider over the Fluxor FS contract (requires the
     // `fs` resource claim in the manifest and an FS provider in the
     // graph).
@@ -492,11 +499,11 @@ define_params! {
 
     // TEST ONLY — never in a shipped graph. kv_state_worker_store's store
     // provider makes one store step in N busy: from that worker step to its
-    // next, every read it is asked (GET, HEAD, RANGE_GET, LIST, CHANGES, an
-    // initial-listing SUBSCRIBE) answers EAGAIN with nothing moved — the
-    // board's store while its device is taken by a write, reproduced on
-    // Linux so an E2E proves its consumers hold a read that waits rather
-    // than read it as absent (`store_provider::Fault`). 0 (default): off.
+    // next, every read it is asked (GET, HEAD, RANGE_GET, LIST, CHANGES)
+    // answers EAGAIN with nothing moved — the board's store while its
+    // device is taken by a write, reproduced on Linux so an E2E proves its
+    // consumers hold a read that waits rather than read it as absent
+    // (`store_provider::Fault`). 0 (default): off.
     // 1: refused (every step busy), and off. Ignored by kv_state_worker (no
     // provider). Logged at construction as `[kvw] FAULT INJECTION ON …` and
     // counted on `[kvw] store hb … fault=`.
@@ -525,6 +532,19 @@ define_params! {
         => |s, d, len| { s.fault_slow_write_ms = p_u32(d, len, 0, 0); };
     24, fault_slow_write_every, u32, 0
         => |s, d, len| { s.fault_slow_write_every = p_u32(d, len, 0, 0); };
+
+    // kv_state_worker_store's change log: the bytes of the key-only ring
+    // its subscriptions are rung from and CHANGES is served from. A read
+    // from before what it holds walks the store's history. 0 (default):
+    // `store_provider::CHANGE_LOG_DEFAULT`. A larger figure needs the
+    // instance's heap raised to match (`heap.arena_bytes`).
+    25, store_change_log, u32, 0
+        => |s, d, len| { s.store_change_log = p_u32(d, len, 0, 0); };
+    // kv_state_worker_store: the subscriptions one workload owner may hold
+    // (the system owner, which holds the node's own controllers, is not
+    // held to it). 0 (default): `store_provider::DEFAULT_SUB_QUOTA`.
+    26, store_sub_quota, u32, 0
+        => |s, d, len| { s.store_sub_quota = p_u32(d, len, 0, 0); };
 }
 
 /// Steps between chunk sweeps while writes may have queued chunk work.
@@ -985,6 +1005,17 @@ struct WorkerState {
     /// until when it waits.
     fault_slow_write_ms: u32,
     fault_slow_write_every: u32,
+    /// `store_change_log` param (bytes; 0: the default).
+    store_change_log: u32,
+    /// `store_sub_quota` param (0: the default).
+    store_sub_quota: u32,
+    /// The keys the disk store's commands in flight changed, for the store
+    /// provider's change log (the memory store keeps its own,
+    /// `store.keylog`); and where the open command scope began in it, so an
+    /// undone command takes its keys back with it.
+    keylog: kv_store::KeyLog,
+    scope_keylog_len: usize,
+    scope_keylog_overflow: bool,
     slow_seen: bool,
     slow_corr: u64,
     slow_count: u32,
@@ -1147,6 +1178,8 @@ impl WorkerState {
         self.import_len = 0;
         self.m_applied = 0;
         self.events.clear();
+        self.keylog.clear();
+        self.keylog.on = false;
         self.m_reads = 0;
         self.m_snapshot_chunks = 0;
         self.m_snapshot_refusals = 0;
@@ -2393,15 +2426,33 @@ unsafe fn apply_to_store(
     };
     worker.scope_depth = worker.scope_depth.saturating_sub(1);
     if outer {
-        return scope_end(worker, a);
+        let a = scope_end(worker, a);
+        #[cfg(feature = "store_provider")]
+        provider_take(worker);
+        return a;
     }
     a
+}
+
+/// A command stood (or was undone): its keys go into the store provider's
+/// change log now, so a step applying many commands never stages more than
+/// one command's keys. Not inside a provider call — the provider takes its
+/// own writes' keys when it pumps, and its state is the call's then.
+#[cfg(feature = "store_provider")]
+unsafe fn provider_take(worker: &mut WorkerState) {
+    if !worker.prov.provides || worker.prov.in_call || !worker.prov.open {
+        return;
+    }
+    let pv = &mut *worker.prov.state;
+    store_provider::take(pv, &mut WorkerBackend { worker });
 }
 
 /// Open a command scope: mark where the store and the worker fields an
 /// undo restores stand.
 unsafe fn scope_begin(worker: &mut WorkerState) {
     worker.scope_waited = false;
+    worker.scope_keylog_len = worker.keylog.len;
+    worker.scope_keylog_overflow = worker.keylog.overflow;
     worker.scope_mark = worker.disk_state.apply_mark();
     worker.scope_revision = worker.disk_revision;
     worker.scope_catalog = worker.catalog_generation;
@@ -2429,6 +2480,9 @@ unsafe fn scope_end(worker: &mut WorkerState, a: Applied) -> Applied {
         worker.m_ts_stamped = worker.scope_stamped;
         worker.m_ts_unstamped = worker.scope_unstamped;
         worker.events.clear();
+        // Its keys go with it: the command never happened.
+        worker.keylog.len = worker.scope_keylog_len;
+        worker.keylog.overflow = worker.scope_keylog_overflow;
         return Applied::waited(worker.disk_revision);
     }
     log_disk_errno(
@@ -2490,13 +2544,12 @@ unsafe fn apply_to_store_once(
     // is a function of the log position that set it and never of the
     // applying node's local timer.
     let now_ms = worker.committed_now_ms;
-    // Read policy. `MSG_KV_COMMAND` carries the
-    // `Consistency` byte but not yet a `read_timestamp` field, so the
-    // only way a request reaches this worker asking for a historical
-    // revision today is the native `KV_OP_GET_AT` / `KV_OP_SCAN_AT`
-    // ops, which carry it in the op body. Threading the policy through
-    // anyway means the envelope extension is a one-line change here
-    // rather than a re-plumb of the engine.
+    // Read policy. `MSG_KV_COMMAND` carries the `Consistency` byte but
+    // no `read_timestamp` field, so a request asks this worker for a
+    // historical revision only through the native `KV_OP_GET_AT` /
+    // `KV_OP_SCAN_AT` ops, which carry it in the op body. The policy is
+    // threaded through all the same, so a read timestamp in the envelope
+    // would be one line here rather than a re-plumb of the engine.
     // Catalog generation (the schema generation, used by
     // relational_executor to validate a cached table name -> id
     // mapping).
@@ -2578,6 +2631,9 @@ unsafe fn apply_to_store_once(
         worker.events.clear();
         if worker.mutations_out >= 0 {
             mat.events = Some(&mut worker.events);
+        }
+        if worker.keylog.on {
+            mat.keylog = Some(&mut worker.keylog);
         }
         let mem_before = mat.store.state.mem_count as usize;
         let (r, n) = kv_store::apply_mat_ctx(&mut mat, op, body, out, now_ms, policy);
@@ -2820,13 +2876,18 @@ unsafe fn slow_write_waits(worker: &mut WorkerState, frame: &[u8]) -> bool {
 /// still waits at the command channel's head after this step's drain — the
 /// device made it wait, its reply waits for the command log, the store is
 /// making room for it, or the step's budget ran out before it — or a paused
-/// walk is held. Commands are answered in channel order, so the router
-/// keeps every direct op it routed here in flight rather than answering it
-/// fail-closed for being slow. A worker that has stopped says nothing, and
-/// the router's deadline answers its commands.
+/// walk is held. Commands are taken in channel order and each one taken is
+/// answered (a paused walk from the hold slot), so the router keeps every
+/// direct op it routed here in flight rather than answering it fail-closed
+/// for being slow. A worker that has stopped says nothing, and the router's
+/// deadline answers its commands — and so does a quarantined disk store:
+/// it never serves again, and the commands at its head are no one's work.
 unsafe fn say_working(worker: &mut WorkerState) {
     let sys_ptr = worker.syscalls;
     if sys_ptr.is_null() || worker.responses_out < 0 || worker.commands_in < 0 {
+        return;
+    }
+    if worker.state_store == STATE_STORE_DISK && worker.disk_phase == DISK_PHASE_QUARANTINED {
         return;
     }
     let sys = &*sys_ptr;
@@ -3418,8 +3479,13 @@ const PROVIDER_REQ: usize = store_provider::REQ_MIN;
 const PROVIDER_ANS: usize = 65536;
 #[cfg(feature = "store_provider")]
 const PROVIDER_CACHE: usize = (4 << 20) + 65536;
+/// The change log's bytes when the `store_change_log` param names none.
 #[cfg(feature = "store_provider")]
-const PROVIDER_FEED: usize = store_provider::FEED_MIN;
+const PROVIDER_LOG: usize = store_provider::CHANGE_LOG_DEFAULT;
+/// Heap held back for the subscription registry's pages beyond the
+/// declared demand (`heap_per_demand` adds that to the instance's heap).
+#[cfg(feature = "store_provider")]
+const REGISTRY_RESERVE: usize = 64 * 1024;
 /// One host store log record: the largest object (3 MiB) and its key
 /// (3 MiB + 4 KiB).
 #[cfg(feature = "store_provider")]
@@ -3440,12 +3506,12 @@ const PROVIDER_STATE: usize = core::mem::size_of::<store_provider::Provider>().n
 /// The provider and its buffers: one allocation (`provider_new`), the
 /// import's record added to it when there is a host log to import.
 #[cfg(feature = "store_provider")]
-const PROVIDER_HEAP: usize =
-    PROVIDER_STATE + PROVIDER_REQ + PROVIDER_ANS + PROVIDER_CACHE + PROVIDER_FEED;
+const PROVIDER_HEAP: usize = PROVIDER_STATE + PROVIDER_REQ + PROVIDER_ANS + PROVIDER_CACHE;
 /// The heap: the provider's allocation, the command log's, and the
 /// allocator's rounding.
 #[cfg(feature = "store_provider")]
-const ARENA_BYTES: usize = PROVIDER_HEAP + IMPORT_RECORD_MAX + CLOG_ARENA + 64 * 1024;
+const ARENA_BYTES: usize =
+    PROVIDER_HEAP + PROVIDER_LOG + REGISTRY_RESERVE + IMPORT_RECORD_MAX + CLOG_ARENA + 64 * 1024;
 /// Without the provider, the heap is the command log's (when it is on).
 #[cfg(not(feature = "store_provider"))]
 const ARENA_BYTES: usize = CLOG_ARENA + 16 * 1024;
@@ -3461,6 +3527,8 @@ struct ProviderHeap {
     open: bool,
     /// The last store call was refused for now (flush backpressure).
     busy: bool,
+    /// A provider call is being served (its state is the call's).
+    in_call: bool,
     /// Construction is not finished: the store is not yet ready (the FS
     /// provider is still coming up), and the loader calls again.
     pending: bool,
@@ -3479,7 +3547,6 @@ struct ProviderHeap {
     req: *mut u8,
     ans: *mut u8,
     cache: *mut u8,
-    feed: *mut u8,
     m_calls: u64,
     m_not_serving: u64,
     /// Calls by op class (telemetry): get, range, put, delete, list,
@@ -3626,6 +3693,66 @@ impl store_provider::Backend for WorkerBackend<'_> {
         owner
     }
 
+    fn module(&self) -> Option<[u8; 8]> {
+        self.query(-1, CALLER_MODULE, [0; 8])
+    }
+
+    fn module_live(&self, module: [u8; 8]) -> bool {
+        let mut rec = module;
+        // SAFETY: the worker's syscall table; 8 readable, writable bytes.
+        let rc = unsafe {
+            ((*self.worker.syscalls).provider_query)(-1, MODULE_LIVE, rec.as_mut_ptr(), rec.len())
+        };
+        rc == 1
+    }
+
+    fn event_owner(&self, event: i32) -> Option<[u8; 8]> {
+        self.query(event, EVENT_OWNER, [0; 8])
+    }
+
+    fn signal(&mut self, event: i32) -> i32 {
+        // SAFETY: the worker's syscall table; SIGNAL takes no argument.
+        unsafe {
+            ((*self.worker.syscalls).provider_call)(event, EVENT_SIGNAL, core::ptr::null_mut(), 0)
+        }
+    }
+
+    fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        // SAFETY: the worker's syscall table; the block is the provider's
+        // for the module's life (registry pages are never returned).
+        unsafe { ((*self.worker.syscalls).heap_alloc)(bytes as u32) }
+    }
+
+    fn take_keys<F: FnMut(u64, u8, &[u8])>(&mut self, mut f: F) -> Option<(bool, u64)> {
+        let w = &mut *self.worker;
+        // Mid-command (an origin entry's applies, a scope not yet closed),
+        // or a command whose record the log has not yet made durable: its
+        // keys are not the store's for good yet.
+        if w.scope_depth > 0 || w.clog_hold || (w.clog_phase == CLOG_LIVE && w.clog.pending()) {
+            return None;
+        }
+        let rev = store_revision(w);
+        let kl = if w.state_store == STATE_STORE_DISK {
+            &mut w.keylog
+        } else {
+            &mut w.store.keylog
+        };
+        for (r, h, k) in kl.entries() {
+            f(r, h, k);
+        }
+        let complete = !kl.overflow;
+        kl.clear();
+        Some((complete, rev))
+    }
+
+    fn ledger_deny(&mut self) {
+        let mut pool = POOL_STORE_SUBS.to_le_bytes();
+        // SAFETY: the worker's syscall table; `[pool u16]`.
+        unsafe {
+            ((*self.worker.syscalls).provider_call)(-1, LEDGER_DENY, pool.as_mut_ptr(), pool.len());
+        }
+    }
+
     fn group(&self) -> store_provider::Group {
         store_provider::Group {
             epoch: self.worker.group_epoch,
@@ -3638,6 +3765,44 @@ impl store_provider::Backend for WorkerBackend<'_> {
 /// `query_key::CALLER_OWNER`: the module a provider call serves.
 #[cfg(feature = "store_provider")]
 const CALLER_OWNER: u32 = 9;
+/// `query_key::CALLER_MODULE`, `MODULE_LIVE`, `EVENT_OWNER`: the calling
+/// module's occupancy, whether one still stands, and whose an event is.
+#[cfg(feature = "store_provider")]
+const CALLER_MODULE: u32 = 10;
+#[cfg(feature = "store_provider")]
+const MODULE_LIVE: u32 = 11;
+#[cfg(feature = "store_provider")]
+const EVENT_OWNER: u32 = 12;
+/// `kernel_abi::event::SIGNAL`.
+#[cfg(feature = "store_provider")]
+const EVENT_SIGNAL: u32 = 0x0B01;
+/// `internal::reconfigure::OWNER_RELEASED`, and its `[slot][0][generation]`
+/// argument.
+#[cfg(feature = "store_provider")]
+const OWNER_RELEASED: u32 = 0x0C22;
+/// `resource::POOL_SAMPLE` (the ledger asks how much of a pool is in use),
+/// `resource::LEDGER_DENY` (a refusal counted against it), and the pool
+/// this provider serves, `resource::POOL_STORE_SUBS`.
+#[cfg(feature = "store_provider")]
+const POOL_SAMPLE: u32 = 0x0C25;
+#[cfg(feature = "store_provider")]
+const LEDGER_DENY: u32 = 0x0C24;
+#[cfg(feature = "store_provider")]
+const POOL_STORE_SUBS: u16 = 0x000A;
+
+#[cfg(feature = "store_provider")]
+impl WorkerBackend<'_> {
+    /// An 8-byte record from `provider_query(handle, key)`, or `None` when
+    /// the kernel answers none.
+    fn query(&self, handle: i32, key: u32, mut rec: [u8; 8]) -> Option<[u8; 8]> {
+        // SAFETY: the worker's syscall table; 8 writable bytes.
+        let rc = unsafe {
+            ((*self.worker.syscalls).provider_query)(handle, key, rec.as_mut_ptr(), rec.len())
+        };
+        // All zero is a record too: module 0 at generation 0.
+        (rc >= rec.len() as i32).then_some(rec)
+    }
+}
 /// `kernel_abi::RANDOM_FILL`.
 #[cfg(feature = "store_provider")]
 const RANDOM_FILL: u32 = 0x0C3C;
@@ -3714,7 +3879,12 @@ unsafe fn provider_new(worker: &mut WorkerState) {
         // the buffers would strand each segment's tail and a heap declared
         // at their sum would refuse the last.
         let importing = worker.import_path_len > 0;
-        let total = PROVIDER_HEAP + if importing { IMPORT_RECORD_MAX } else { 0 };
+        let log = if worker.store_change_log == 0 {
+            PROVIDER_LOG
+        } else {
+            worker.store_change_log as usize
+        };
+        let total = PROVIDER_HEAP + log + if importing { IMPORT_RECORD_MAX } else { 0 };
         let base = (sys.heap_alloc)(total as u32);
         p.provides = !base.is_null();
         if p.provides {
@@ -3726,13 +3896,19 @@ unsafe fn provider_new(worker: &mut WorkerState) {
             at = at.add(PROVIDER_ANS);
             p.cache = at;
             at = at.add(PROVIDER_CACHE);
-            p.feed = at;
+            let log_at = at;
             if importing {
-                p.import_buf = at.add(PROVIDER_FEED);
+                p.import_buf = at.add(log);
             }
+            store_provider::Provider::clear(p.state);
+            (*p.state).attach_log(log_at, log);
+            (*p.state).set_quota(worker.store_sub_quota);
+            // Every key a command changes is noted for the change log.
+            worker.keylog.clear();
+            worker.keylog.on = true;
+            worker.keylog.want = (0, 0, 0);
         }
         if p.provides {
-            store_provider::Provider::clear(p.state);
             if replicated {
                 (*p.state).replicate(worker.replica_id, u64::from_le_bytes(nonce));
             }
@@ -3819,7 +3995,6 @@ unsafe fn provider_bufs(p: &ProviderHeap) -> store_provider::Bufs<'static> {
         req: core::slice::from_raw_parts_mut(p.req, PROVIDER_REQ),
         ans: core::slice::from_raw_parts_mut(p.ans, PROVIDER_ANS),
         cache: core::slice::from_raw_parts_mut(p.cache, PROVIDER_CACHE),
-        feed: core::slice::from_raw_parts_mut(p.feed, PROVIDER_FEED),
     }
 }
 
@@ -3880,7 +4055,7 @@ const PROVIDER_HB_STEPS: u64 = 5000;
 #[cfg(feature = "store_provider")]
 unsafe fn provider_heartbeat(worker: &WorkerState) {
     let p = &worker.prov;
-    let mut buf = [0u8; 384];
+    let mut buf = [0u8; 640];
     let mut n = write_prefix(&mut buf, 0, b"[kvw] store hb calls=");
     n = write_dec(&mut buf, n, p.m_calls);
     n = write_prefix(&mut buf, n, b" not_serving=");
@@ -3891,14 +4066,32 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
         let pv = &*p.state;
         n = write_prefix(&mut buf, n, b" subs=");
         n = write_dec(&mut buf, n, pv.subscriptions() as u64);
-        n = write_prefix(&mut buf, n, b" owed=");
-        n = write_dec(&mut buf, n, pv.owed() as u64);
-        n = write_prefix(&mut buf, n, b" partial=");
-        n = write_dec(&mut buf, n, u64::from(pv.m_pump_partial));
-        n = write_prefix(&mut buf, n, b" told=");
-        n = write_dec(&mut buf, n, u64::from(pv.m_told));
-        n = write_prefix(&mut buf, n, b" ev_refused=");
-        n = write_dec(&mut buf, n, u64::from(pv.m_refused));
+        let m = pv.m;
+        n = write_prefix(&mut buf, n, b" rung=");
+        n = write_dec(&mut buf, n, u64::from(m.rung));
+        n = write_prefix(&mut buf, n, b" pending=");
+        n = write_dec(&mut buf, n, pv.rung() as u64);
+        n = write_prefix(&mut buf, n, b" taken=");
+        n = write_dec(&mut buf, n, u64::from(m.taken));
+        n = write_prefix(&mut buf, n, b" gaps=");
+        n = write_dec(&mut buf, n, u64::from(m.gaps));
+        n = write_prefix(&mut buf, n, b" reaped=");
+        n = write_dec(&mut buf, n, u64::from(m.reaped));
+        n = write_prefix(&mut buf, n, b" sub_refused=");
+        n = write_dec(&mut buf, n, u64::from(m.refused));
+        n = write_prefix(&mut buf, n, b" owner_checks_failed=");
+        n = write_dec(&mut buf, n, u64::from(m.owner_checks_failed));
+        n = write_prefix(&mut buf, n, b" walk_refused=");
+        n = write_dec(&mut buf, n, u64::from(m.walk_refused));
+        let (base, frontier, used) = pv.log_span();
+        n = write_prefix(&mut buf, n, b" frontier_lag=");
+        n = write_dec(&mut buf, n, store_revision(worker).saturating_sub(frontier));
+        n = write_prefix(&mut buf, n, b" log_base=");
+        n = write_dec(&mut buf, n, base);
+        n = write_prefix(&mut buf, n, b" log_bytes=");
+        n = write_dec(&mut buf, n, used);
+        n = write_prefix(&mut buf, n, b" pages=");
+        n = write_dec(&mut buf, n, pv.registry_pages() as u64);
         n = write_prefix(&mut buf, n, b" hashed=");
         n = write_dec(&mut buf, n, u64::from(pv.m_ident_hashed));
         let (fault_on, injected) = pv.fault_injected();
@@ -3960,11 +4153,21 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
     log_line(worker, &buf, n);
 }
 
-/// A snapshot replaced the store: what became of the writes the store
-/// provider proposed is read from its origin record.
+/// A snapshot replaced the store: the change log no longer answers for
+/// what came before (a gap — every subscriber reads again), and what
+/// became of the writes the store provider proposed is read from its
+/// origin record.
 #[cfg(feature = "store_provider")]
 unsafe fn provider_resync(worker: &mut WorkerState) {
-    if !worker.prov.provides || worker.sweep_wrap == 0 {
+    if !worker.prov.provides {
+        return;
+    }
+    // Keys staged before the install name a store that is gone.
+    worker.keylog.clear();
+    worker.store.keylog.clear();
+    let rev = store_revision(worker);
+    (*worker.prov.state).log_gap(rev);
+    if worker.sweep_wrap == 0 {
         return;
     }
     let (term, index) = (worker.applied_term, worker.applied_index);
@@ -4450,6 +4653,24 @@ pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
     unsafe { (*state.cast::<WorkerState>()).selector }
 }
 
+/// Marks this provider as the ledger's sampler for the pool it serves
+/// (`store_subs`): the kernel asks `POOL_SAMPLE` once a PSTATUS round.
+#[cfg(feature = "store_provider")]
+#[no_mangle]
+#[link_section = ".text.module_samples_pool"]
+pub extern "C" fn module_samples_pool() -> u32 {
+    1
+}
+
+/// Subscribes this provider to `OWNER_RELEASED`: a released owner's
+/// subscriptions are dropped at once (see `module_provider_dispatch`).
+#[cfg(feature = "store_provider")]
+#[no_mangle]
+#[link_section = ".text.module_observes_owner_release"]
+pub extern "C" fn module_observes_owner_release() -> u32 {
+    1
+}
+
 /// `[0x14, 0x13]`: objects and their namespace, from one store — or
 /// nothing, when this worker does not provide (see above).
 #[cfg(feature = "store_provider")]
@@ -4496,6 +4717,30 @@ pub extern "C" fn module_provider_dispatch(
         if worker.syscalls.is_null() || !worker.prov.provides {
             return store_provider::ENOSYS;
         }
+        if op == POOL_SAMPLE {
+            // The ledger's question: the subscriptions held, which is what
+            // this provider serves of `store_subs`.
+            if arg.is_null() || arg_len < 2 {
+                return store_provider::EINVAL;
+            }
+            let pool = u16::from_le_bytes([*arg, *arg.add(1)]);
+            if pool != POOL_STORE_SUBS {
+                return store_provider::ENOSYS;
+            }
+            return (*worker.prov.state).subscriptions() as i32;
+        }
+        if op == OWNER_RELEASED {
+            // An owner going away: its subscriptions go now. (Before the
+            // readiness gate: a release never waits for the store. The lazy
+            // check before every signal would drop them anyway; this returns
+            // their memory early.)
+            if !arg.is_null() && arg_len >= 8 {
+                let mut owner = [0u8; 8];
+                core::ptr::copy_nonoverlapping(arg as *const u8, owner.as_mut_ptr(), 8);
+                (*worker.prov.state).owner_released(owner);
+            }
+            return 0;
+        }
         worker.prov.m_calls = worker.prov.m_calls.wrapping_add(1);
         let class = match op {
             store_provider::OBJ_GET => 0,
@@ -4525,6 +4770,7 @@ pub extern "C" fn module_provider_dispatch(
         }
         let pv = &mut *worker.prov.state;
         let mut bufs = provider_bufs(&worker.prov);
+        worker.prov.in_call = true;
         let rc = store_provider::dispatch(
             pv,
             &mut WorkerBackend {
@@ -4536,6 +4782,7 @@ pub extern "C" fn module_provider_dispatch(
             arg,
             arg_len,
         );
+        worker.prov.in_call = false;
         // A call refused for a reason other than the contract's own answers
         // (absent, exists, moved, no such op) is the store failing a
         // consumer, which the consumer sees only as a failure of its own:
@@ -4755,13 +5002,13 @@ const PER_TICK_DRAIN_BUDGET: u32 = 32;
 /// becomes a merge over the memtable PLUS every run — real synchronous
 /// FAT32/NVMe sector reads. So the step immediately after
 /// `release_flushed()` drains a backlog accumulated over the flush's 15
-/// steps, and each of those commands now pays disk I/O it did not pay
-/// before. 32 x (a few hundred us) is how a step that looks bounded
+/// steps, and each of those commands pays disk I/O the ones before the
+/// flush did not. 32 x (a few hundred us) is how a step that looks bounded
 /// blows a 16 ms burst ceiling.
 ///
 /// 1500 us leaves the rest of the module's 12000/16000 declared budget
-/// to maintenance (measured at <=1 ms per phase since the A/B manifest
-/// landed) with a wide margin. The budget is checked BEFORE starting
+/// to maintenance (measured at <=1 ms per phase with the A/B manifest)
+/// with a wide margin. The budget is checked BEFORE starting
 /// each additional command and never interrupts one in flight, so a
 /// step always makes at least one command of progress and the true
 /// worst case is 1500 us plus one command.
@@ -5084,8 +5331,8 @@ fn step(state: *mut u8) -> i32 {
             // so the scrape/log shows the state going INTO the flush and
             // `flush_attempts` exceeding `flush_completions + failures +
             // backpressure` pins the block to the flush call itself.
-            // Emitting after the action would report nothing at all,
-            // which is exactly the blackout this replaced.
+            // Emitting after the action would report nothing at all: a
+            // blackout exactly when the report is needed.
             disk_observe(worker);
             disk_maintenance(worker);
             drive_command_log(worker);
@@ -5158,9 +5405,7 @@ fn step(state: *mut u8) -> i32 {
         if worker.applied_index > worker.published_applied_index && worker.responses_out >= 0 {
             let sys = &*worker.syscalls;
             // Payload `[partition_id:u16][term:u64][index:u64]` (18 bytes).
-            // The partition leads so the router fences per-partition; a
-            // reader written before this field expected 16 bytes, but the
-            // only consumer is this repo's router, updated in lockstep.
+            // The partition leads so the router fences per-partition.
             let mut env = [0u8; 21];
             env[0] = MSG_APP_APPLIED_POS;
             env[1] = 18;
@@ -5777,10 +6022,11 @@ unsafe fn drain_retirements(worker: &mut WorkerState) {
 /// Bounded-starvation watchdog: enforce that no exclusion fence holds
 /// off the write path for more than `DISK_FENCE_STALL_BUDGET` steps.
 ///
-/// See that constant for the reasoning. In short: `apply` and `flush`
-/// are refused with `Backpressure` while a capture, install or
-/// compaction is active, and an abandoned install stream leaves that
-/// fence latched with nothing left to clear it. Every fence is safely
+/// See that constant for the reasoning. In short: a snapshot capture or
+/// an install refuses `apply` and `flush` with `Backpressure` (a transfer
+/// capture refuses neither), a compaction refuses a flush once it stands
+/// at its manifest, and an abandoned install stream leaves its fence
+/// latched with nothing left to clear it. Every fence is safely
 /// abortable and every one of those operations is retryable, so the
 /// fence loses the tie against serving writes.
 ///
@@ -5791,9 +6037,10 @@ unsafe fn drain_retirements(worker: &mut WorkerState) {
 ///
 /// A CHUNKED FLUSH IS DELIBERATELY NOT A FENCE HERE, and this is the
 /// load-bearing consequence of chunking. The three fences are watched
-/// because they REFUSE `apply` — they stop the graph serving writes. A
-/// flush no longer does: `apply` is accepted throughout, right up to
-/// the memtable's capacity. So a flush in flight is not starving
+/// because they hold off the write path — `apply` refused outright, or
+/// the flush a full memtable waits for. A flush does not: `apply` is
+/// accepted throughout, right up to the memtable's capacity. So a flush
+/// in flight is not starving
 /// anything and must not be counted against the stall budget, or this
 /// watchdog would abort a perfectly healthy 12-chunk flush partway
 /// through and orphan its run file every single time.
@@ -6556,7 +6803,7 @@ unsafe fn drain_snapshot_ctl(worker: &mut WorkerState) {
             // a superseding export left a higher pending index and waits
             // for its own ack, and an ack for a snapshot this worker never
             // labelled (pending == 0) is ignored. Under-advancing is safe;
-            // over-advancing past a non-durable snapshot is the bug.
+            // over-advancing past a non-durable snapshot is never safe.
             if worker.gc_snapshot_pending_index != 0 && index >= worker.gc_snapshot_pending_index {
                 worker.gc_snapshot_revision = worker.gc_snapshot_pending_revision;
                 worker.gc_snapshot_pending_index = 0;

@@ -1470,10 +1470,11 @@ impl FeedCore {
             source: CLAIM_SOURCE_WATCH,
             claim_id: self.feed_id as u64,
             floor_revision: self.ck_durable_revision,
-            // The budget IS the expiry: when the pump dies, the claim
-            // goes stale on its own and the GC side stops honouring
-            // it — release without cooperation, enforced by
-            // ClaimTable's existing expiry fencing.
+            // The budget is the claim's freshness. A pump that stops
+            // re-publishing leaves its claim stale; GC keeps honouring
+            // the floor it last named (`ClaimTable::candidate_floor`: a
+            // stale claim never raises the floor), so a stopped pump
+            // holds history until it resumes or its claim is replaced.
             expiry_unix_ms: now_ms.wrapping_add(self.retention_budget_ms as u64),
             seq: self.claim_seq,
         };

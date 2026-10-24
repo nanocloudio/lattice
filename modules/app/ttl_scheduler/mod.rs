@@ -132,9 +132,15 @@ struct TtlState {
     // metrics` order (0=scheduled, 1=expired).
     m_scheduled: u64,
     m_expired: u64,
+    /// Registrations the full queue could not keep (2=overflowed).
+    m_overflowed: u64,
     step_ctr: u64,
 
     queue: TtlQueue<QUEUE_CAP>,
+    /// KV deadlines given up by a full queue: the earliest and the latest
+    /// (0: none). A table sweep is owed at each (see [`schedule`]).
+    owed_from_ms: u64,
+    owed_to_ms: u64,
     /// An envelope read whole: header room, then the payload.
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
@@ -157,7 +163,10 @@ impl TtlState {
         self.now_ms = 0;
         self.m_scheduled = 0;
         self.m_expired = 0;
+        self.m_overflowed = 0;
         self.step_ctr = 0;
+        self.owed_from_ms = 0;
+        self.owed_to_ms = 0;
         self.queue.init();
     }
 }
@@ -312,6 +321,61 @@ fn handle_tick(sched: &mut TtlState, payload: &[u8]) {
             emit_expired(&*sys, expire_out, entry)
         });
     sched.m_expired += fired as u64;
+    // SAFETY: the module's own syscall table, checked inside.
+    unsafe { sweep_owed(sched) };
+}
+
+/// Queue `entry`. A full queue keeps the soonest deadlines: the entry
+/// expiring last — the new one, or the latest queued — is given up and
+/// counted. A given-up KV deadline is owed a table sweep: the worker's
+/// memory store reclaims every expired record on any expiry event, so a
+/// sweep at the earliest and at the latest deadline given up reclaims each
+/// of those records by its latest deadline, without naming them. (A lease
+/// deadline here only mirrors `lease_manager`'s, which expires the lease
+/// itself; giving one up costs nothing but the count.)
+fn schedule(sched: &mut TtlState, entry: ExpiryEntry) {
+    let Some(dropped) = sched.queue.insert_keeping_soonest(entry) else {
+        sched.m_scheduled += 1;
+        return;
+    };
+    if dropped != entry {
+        sched.m_scheduled += 1;
+    }
+    sched.m_overflowed += 1;
+    if dropped.kind == EXPIRY_KIND_KV {
+        let d = dropped.deadline_ms.max(1);
+        if sched.owed_from_ms == 0 || d < sched.owed_from_ms {
+            sched.owed_from_ms = d;
+        }
+        if d > sched.owed_to_ms {
+            sched.owed_to_ms = d;
+        }
+    }
+}
+
+/// The table sweep a full queue owes, once its earliest given-up deadline
+/// has passed: one KV expiry event naming no record (key hash 0, which a
+/// sweep reclaims only if it has expired anyway). Then the latest is owed,
+/// if any later deadline was given up.
+unsafe fn sweep_owed(sched: &mut TtlState) {
+    if sched.owed_from_ms == 0 || sched.now_ms < sched.owed_from_ms {
+        return;
+    }
+    if sched.expire_out < 0 || sched.syscalls.is_null() {
+        sched.owed_from_ms = 0;
+        sched.owed_to_ms = 0;
+        return;
+    }
+    let sweep = ExpiryEntry::new(sched.owed_from_ms, EXPIRY_KIND_KV, 0);
+    if !emit_expired(&*sched.syscalls, sched.expire_out, &sweep) {
+        return;
+    }
+    if sched.owed_to_ms > sched.now_ms {
+        sched.owed_from_ms = sched.owed_to_ms;
+    } else {
+        sched.owed_from_ms = 0;
+    }
+    sched.owed_to_ms = 0;
 }
 
 /// Write one expiry event: `[kind:1][payload:8]`. Returns whether the
@@ -343,10 +407,10 @@ fn handle_lease_deadline(sched: &mut TtlState, payload: &[u8]) {
             // Grant or keepalive: (re)insert with `now + ttl`.
             let _ = sched.queue.remove(EXPIRY_KIND_LEASE, lease_id);
             let deadline = sched.now_ms.saturating_add(u64::from(ttl_ms));
-            let _ = sched
-                .queue
-                .insert(ExpiryEntry::new(deadline, EXPIRY_KIND_LEASE, lease_id));
-            sched.m_scheduled += 1;
+            schedule(
+                sched,
+                ExpiryEntry::new(deadline, EXPIRY_KIND_LEASE, lease_id),
+            );
         }
         1 => {
             let _ = sched.queue.remove(EXPIRY_KIND_LEASE, lease_id);
@@ -411,10 +475,7 @@ fn handle_kv_expiry(sched: &mut TtlState, payload: &[u8]) {
         let _ = sched.queue.remove(EXPIRY_KIND_KV, key_hash);
     } else {
         let _ = sched.queue.remove(EXPIRY_KIND_KV, key_hash);
-        let _ = sched
-            .queue
-            .insert(ExpiryEntry::new(deadline, EXPIRY_KIND_KV, key_hash));
-        sched.m_scheduled += 1;
+        schedule(sched, ExpiryEntry::new(deadline, EXPIRY_KIND_KV, key_hash));
     }
 }
 
@@ -534,7 +595,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             telemetry::emit_counters(
                 &*sched.syscalls,
                 sched.metrics_out,
-                &[sched.m_scheduled, sched.m_expired],
+                &[sched.m_scheduled, sched.m_expired, sched.m_overflowed],
             );
         }
     }

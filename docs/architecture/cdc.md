@@ -23,10 +23,12 @@ store bounds that walk per step (`SCAN_STEP_BLOCKS` run blocks) and
 holds its position, and the state worker re-drives the paused page one
 slice per step. Other commands keep flowing between slices — except a
 second versioned scan, which waits at the channel head (and queues the
-commands behind it) until the held one answers; a window at the
-store's high-water mark is answered empty without opening a run. A
-large table therefore costs the pump page latency, never the worker
-its step deadline.
+commands behind it) until the held one answers. The memtable-resident
+part of a walk is bounded per step too (`SCAN_STEP_RECORDS`), and a
+window starting at or above the store's durable high-water mark is
+answered from the memtable alone, without opening a run. A large table
+therefore costs the pump page latency, never the worker its step
+deadline.
 
 ## Events
 
@@ -50,7 +52,7 @@ broadcast to every ordering unit: a consumer that has seen
 The pump is a requester of fluxor's exchange contract
 (`contracts/exchange.rs` in the fluxor SDK): `request_out` and
 `response_in` wire to the `request_in` and `response_out` of any module
-declaring a `stream.ordered_ack` capability. Each event is one
+declaring the `stream.ordered_ack.sink` capability. Each event is one
 `METHOD_PUBLISH` exchange carried whole in its request HEAD:
 
 | Part | Value |
@@ -99,7 +101,11 @@ the protocol in `modules/common/cdc_subscribe.rs`.
 
 The feed reports its state on a gauge: created, backfill, streaming,
 stalled, needs-backfill, wedged, halted. While it runs it holds a
-retention claim with `compaction_coordinator` so MVCC garbage
-collection cannot outrun an in-flight feed — but the claim carries a
-budget and expires on its own, so a dead pump's hold lapses without
-cooperation and compaction resumes.
+retention claim with `compaction_coordinator` (source `WATCH`,
+refreshed with an expiry `retention_budget_ms` ahead, default 60 s) so
+MVCC garbage collection cannot outrun an in-flight feed. An expired
+claim does not release the floor: the coordinator keeps honouring the
+last floor a source asked for (and, with `WATCH` among its
+`required_sources`, stops advancing until the source is fresh again),
+so a pump that stops for good holds compaction at the position it
+last claimed until it runs again.

@@ -188,6 +188,109 @@ impl EventJournal {
     }
 }
 
+// ── Key log ───────────────────────────────────────────────────────────
+
+/// Bytes of keys one command may stage in its [`KeyLog`].
+pub const KEYLOG_BYTES: usize = 32 * 1024;
+/// A key-log entry's bytes besides its key: `[rev u64][hint u8][kl u8]`.
+pub const KEYLOG_ENTRY_FIXED: usize = 10;
+/// A key-log entry's hint: what the write did to the key, as far as the
+/// store saw (`storage.namespace`'s change kinds).
+pub const KEY_CREATED: u8 = 0;
+pub const KEY_MODIFIED: u8 = 1;
+pub const KEY_DELETED: u8 = 2;
+
+/// The keys one command changed, key-only, staged while it applies and
+/// handed whole to the store provider's change log once the command
+/// stands (or dropped with it when it is undone). Unlike the watch journal
+/// it holds no values, and it is fed by the materializer itself — every
+/// create, overwrite and removal of a record in either store notes its key
+/// (the store's own bookkeeping records, and a live record's expiry, lease
+/// or flags rewritten in place, are not changes of its content) — so no
+/// op the interpreter grows can bypass it.
+///
+/// A command whose keys do not fit, or that clears the keyspace whole
+/// (`FLUSH`), is marked [`overflow`](Self::overflow): its key list is not
+/// whole, and the provider takes it as a gap rather than a list.
+///
+/// Only the keyspace the provider serves is noted ([`want`](Self::want)):
+/// another keyspace's writes are not its changes.
+pub struct KeyLog {
+    pub buf: [u8; KEYLOG_BYTES],
+    pub len: usize,
+    /// A key did not fit, or the keyspace was cleared whole: the list is
+    /// not this command's every change.
+    pub overflow: bool,
+    /// Whether keys are noted at all (a store provider is served here).
+    pub on: bool,
+    /// The keyspace noted: `(tenant, database, keyspace)`.
+    pub want: (u32, u32, u32),
+}
+
+impl KeyLog {
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.overflow = false;
+    }
+
+    /// Note that a write at `rev` did `hint` to `key` in `identity`.
+    pub fn note(&mut self, identity: (u32, u32, u32), rev: u64, hint: u8, key: &[u8]) {
+        if !self.on || identity != self.want || self.overflow {
+            return;
+        }
+        let at = self.len;
+        let end = at + KEYLOG_ENTRY_FIXED + key.len();
+        if key.len() > u8::MAX as usize || end > KEYLOG_BYTES {
+            self.overflow = true;
+            return;
+        }
+        self.buf[at..at + 8].copy_from_slice(&rev.to_le_bytes());
+        self.buf[at + 8] = hint;
+        self.buf[at + 9] = key.len() as u8;
+        self.buf[at + KEYLOG_ENTRY_FIXED..end].copy_from_slice(key);
+        self.len = end;
+    }
+
+    /// Note that `identity`'s keyspace was changed whole (`FLUSH`).
+    pub fn whole(&mut self, identity: (u32, u32, u32)) {
+        if self.on && identity == self.want {
+            self.overflow = true;
+        }
+    }
+
+    /// The staged entries, in the order they were noted: `(rev, hint, key)`.
+    pub fn entries(&self) -> KeyLogEntries<'_> {
+        KeyLogEntries {
+            buf: &self.buf[..self.len],
+            at: 0,
+        }
+    }
+}
+
+/// [`KeyLog::entries`].
+pub struct KeyLogEntries<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for KeyLogEntries<'a> {
+    type Item = (u64, u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<(u64, u8, &'a [u8])> {
+        let at = self.at;
+        let head = self.buf.get(at..at + KEYLOG_ENTRY_FIXED)?;
+        let rev = u64::from_le_bytes([
+            head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+        ]);
+        let kl = head[9] as usize;
+        let key = self
+            .buf
+            .get(at + KEYLOG_ENTRY_FIXED..at + KEYLOG_ENTRY_FIXED + kl)?;
+        self.at = at + KEYLOG_ENTRY_FIXED + kl;
+        Some((rev, head[8], key))
+    }
+}
+
 /// Remove `key`, journaling the version it deletes when the provider
 /// journals.
 fn remove_noted<M: Materializer>(store: &mut M, key: &[u8], now_ms: u64) -> Option<bool> {
@@ -289,8 +392,8 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 // `internal_key`'s 12-byte prefix `[tenant:4 BE][database:4 BE]
 // [keyspace:4 BE]`, so the disk provider simply passes the triple to
 // `internal_key::encode`, and the memory provider prepends the same 12
-// bytes to its stored key. The default `(0, 0, 0)` reproduces the
-// historical single-tenant layout exactly.
+// bytes to its stored key. The default `(0, 0, 0)` is the single-tenant
+// layout: a store serving one tenant keys everything under it.
 
 /// Width of the canonical identity prefix — `internal_key`'s.
 pub const IDENT_LEN: usize = internal_key::IDENTITY_PREFIX_LEN;
@@ -330,8 +433,8 @@ pub struct KvStore {
     pub revision: u64,
     pub used_count: u32,
     /// Canonical identity prefix for the command in flight, set
-    /// per command by the worker. Zeroed = the historical single-tenant
-    /// `(0, 0, 0)` layout. Not part of the snapshot: it is per-command
+    /// per command by the worker. Zeroed = the single-tenant `(0, 0, 0)`
+    /// layout. Not part of the snapshot: it is per-command
     /// state, re-established before every apply, never persisted.
     pub key_identity: [u8; IDENT_LEN],
     /// MVCC commit timestamp for the command in flight.
@@ -345,6 +448,9 @@ pub struct KvStore {
     /// Per-command state, never persisted.
     pub journaling: bool,
     pub events: EventJournal,
+    /// The keys the commands in flight changed, for a store provider's
+    /// change log. Never persisted.
+    pub keylog: KeyLog,
     /// The revision a Compact retired history below. The memory provider
     /// holds no history, so it only answers repeat and future compacts.
     pub compact_rev: u64,
@@ -363,6 +469,8 @@ impl KvStore {
         self.batch = 0;
         self.journaling = false;
         self.events.clear();
+        self.keylog.clear();
+        self.keylog.on = false;
         self.compact_rev = 0;
         let mut i = 0;
         while i < MAX_KEYS {
@@ -375,7 +483,7 @@ impl KvStore {
     /// prefix followed by `user_key`. `None` if it would exceed a slot
     /// (the prefix costs 12 of `MAX_KEY_LEN`). The default identity
     /// yields `[0; 12] ++ user_key`, which is what the memory provider
-    /// now stores for every single-tenant key.
+    /// stores for every single-tenant key.
     fn compose_key<'b>(&self, user_key: &[u8], buf: &'b mut [u8; MAX_KEY_LEN]) -> Option<&'b [u8]> {
         let total = IDENT_LEN + user_key.len();
         if total > MAX_KEY_LEN {
@@ -1267,7 +1375,7 @@ fn format_decimal_i64(n: i64, out: &mut [u8]) -> usize {
 // materialization providers selected at graph construction. The
 // interpreter performs every materialization read/write through this
 // small trait; the two implementations are the bounded in-memory hash
-// table (`KvStore`, the historical behaviour, byte-for-byte) and the
+// table (`KvStore`) and the
 // ordered disk provider (`DiskMaterializer` over `disk_store.rs`).
 // The trait carries no command semantics — comparisons, flag
 // evaluation, revision policy and result encoding all live in the
@@ -1349,9 +1457,9 @@ pub trait Materializer {
     /// Bind the canonical identity `(tenant, database, keyspace)`
     /// for the command about to be applied. Every physical key this
     /// materializer reads or writes until the next call is scoped to it,
-    /// so two tenants sharing a user key never collide. Default no-op
-    /// keeps the historical single-tenant `(0, 0, 0)` behaviour for any
-    /// provider that does not model identity.
+    /// so two tenants sharing a user key never collide. The default no-op
+    /// keeps the single-tenant `(0, 0, 0)` layout for any provider that
+    /// does not model identity.
     fn set_key_identity(&mut self, _tenant: u32, _database: u32, _keyspace: u32) {}
     /// The identity bound by [`set_key_identity`](Self::set_key_identity).
     fn key_identity(&self) -> (u32, u32, u32) {
@@ -1368,6 +1476,26 @@ pub trait Materializer {
     /// keeps one ([`EventJournal`]). Default: none.
     fn journal(&mut self) -> Option<&mut EventJournal> {
         None
+    }
+    /// The key log this command's changed keys are staged in, when the host
+    /// keeps one ([`KeyLog`]). Default: none.
+    fn keylog(&mut self) -> Option<&mut KeyLog> {
+        None
+    }
+    /// Note one changed key in the key log, if any: the write at `rev` did
+    /// `hint` to `key` in the bound identity.
+    fn note_key(&mut self, rev: u64, hint: u8, key: &[u8]) {
+        let identity = self.key_identity();
+        if let Some(k) = self.keylog() {
+            k.note(identity, rev, hint, key);
+        }
+    }
+    /// Note that the bound identity's keyspace is being changed whole.
+    fn note_whole(&mut self) {
+        let identity = self.key_identity();
+        if let Some(k) = self.keylog() {
+            k.whole(identity);
+        }
     }
     /// Current engine revision (returned in `MSG_KV_APPLIED`).
     fn revision(&self) -> u64;
@@ -1562,9 +1690,8 @@ pub trait Materializer {
 /// Apply one op to the (memory) store. Reads typed body, writes typed
 /// result body into `out_body`, returns `(result_code, body_byte_count)`.
 ///
-/// Thin wrapper over [`apply_mat`] with the memory provider — kept so
-/// the historical call sites (worker memory path, host tests) stay
-/// source-identical.
+/// Thin wrapper over [`apply_mat`] with the memory provider: the worker's
+/// memory path and the host tests apply to a [`KvStore`] directly.
 ///
 /// `now_ms` is the wall-clock millisecond reading (monotonic is fine
 /// in production; tests typically pass `0` to disable TTL filtering
@@ -1785,6 +1912,10 @@ impl Materializer for KvStore {
         }
     }
 
+    fn keylog(&mut self) -> Option<&mut KeyLog> {
+        Some(&mut self.keylog)
+    }
+
     fn compact_revision(&self) -> u64 {
         self.compact_rev
     }
@@ -1842,27 +1973,39 @@ impl Materializer for KvStore {
     }
 
     fn insert_new(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let user = key;
+        let rev = self.op_revision();
         let mut kbuf = [0u8; MAX_KEY_LEN];
         let Some(key) = self.compose_key(key, &mut kbuf) else {
             return false;
         };
-        match self.lookup(key) {
+        let done = match self.lookup(key) {
             // The interpreter only inserts keys it just observed as
             // absent; a present key here is a logic fault — fail closed.
             Ok(_) => false,
             Err(idx) => self.insert_fresh(idx, key, value),
+        };
+        if done {
+            self.note_key(rev, KEY_CREATED, user);
         }
+        done
     }
 
     fn update_existing(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let user = key;
+        let rev = self.op_revision();
         let mut kbuf = [0u8; MAX_KEY_LEN];
         let Some(key) = self.compose_key(key, &mut kbuf) else {
             return false;
         };
-        match self.lookup(key) {
+        let done = match self.lookup(key) {
             Ok(idx) => self.update_value(idx, value),
             Err(_) => false,
+        };
+        if done {
+            self.note_key(rev, KEY_MODIFIED, user);
         }
+        done
     }
 
     fn set_expiry(&mut self, key: &[u8], expiry_ms: u64) -> bool {
@@ -1972,14 +2115,20 @@ impl Materializer for KvStore {
     }
 
     fn remove(&mut self, key: &[u8], now_ms: u64) -> Option<bool> {
+        let user = key;
+        let rev = self.op_revision();
         let mut kbuf = [0u8; MAX_KEY_LEN];
         let Some(key) = self.compose_key(key, &mut kbuf) else {
             return Some(false);
         };
-        match lookup_live(self, key, now_ms) {
-            Some(idx) => Some(self.delete_at(idx)),
-            None => Some(false),
+        let removed = match lookup_live(self, key, now_ms) {
+            Some(idx) => self.delete_at(idx),
+            None => false,
+        };
+        if removed {
+            self.note_key(rev, KEY_DELETED, user);
         }
+        Some(removed)
     }
 
     fn scan_op(&mut self, body: &[u8], out: &mut [u8], now_ms: u64) -> (u8, usize) {
@@ -2123,6 +2272,7 @@ impl Materializer for KvStore {
     }
 
     fn flush_all(&mut self) -> bool {
+        self.note_whole();
         // FLUSH clears THIS identity's keys only. Delete every slot
         // whose stored key carries the current identity prefix; the
         // probe-chain compaction in `delete_at` keeps the table valid as
@@ -2538,6 +2688,9 @@ pub struct DiskMaterializer<'a, S: RunStorage> {
     /// Where this command's watch events are journaled, when the host
     /// keeps a journal.
     pub events: Option<&'a mut EventJournal>,
+    /// Where this command's changed keys are staged, when the host serves a
+    /// store provider.
+    pub keylog: Option<&'a mut KeyLog>,
 }
 
 impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
@@ -2557,6 +2710,7 @@ impl<'a, S: RunStorage> DiskMaterializer<'a, S> {
             pending_commit_ts: 0,
             batch: 0,
             events: None,
+            keylog: None,
         }
     }
 
@@ -2891,6 +3045,10 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         self.events.as_deref_mut()
     }
 
+    fn keylog(&mut self) -> Option<&mut KeyLog> {
+        self.keylog.as_deref_mut()
+    }
+
     fn compact_revision(&self) -> u64 {
         self.store.state.compact_revision
     }
@@ -2974,6 +3132,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         }
         self.revision = ts;
         self.batch_taken();
+        self.note_key(ts, KEY_CREATED, key);
         true
     }
 
@@ -3009,6 +3168,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         }
         self.revision = ts;
         self.batch_taken();
+        self.note_key(ts, KEY_MODIFIED, key);
         true
     }
 
@@ -3136,6 +3296,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 let payload_bytes = cts.to_le_bytes();
                 let tomb: &[u8] = if cts != 0 { &payload_bytes } else { &[] };
                 if self.put_version(key, ts, ValueKind::PointTombstone, tomb) {
+                    self.note_key(ts, KEY_DELETED, key);
                     Some(true)
                 } else {
                     None
@@ -3679,6 +3840,7 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
         if self.fault {
             return false;
         }
+        self.note_whole();
         // Tombstone every currently-visible key at revision + 1, then
         // publish the bump — the disk equivalent of the memory
         // provider's clear-plus-bump. Bounded by the provider's
@@ -3831,8 +3993,8 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
             }
             Err(StoreError::NotFound) => HistOutcome::Absent,
             // The floor can advance between the check above and here
-            // (it never advances mid-command today, but the provider is
-            // the authority either way) — carry its refusal through.
+            // (it does not advance mid-command, but the provider is the
+            // authority either way) — carry its refusal through.
             Err(StoreError::Compacted) => HistOutcome::Compacted,
             Err(_) => {
                 self.fault = true;

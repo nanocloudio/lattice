@@ -113,8 +113,8 @@ use types::{
     KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, PROTO_INTERNAL_SQL, PUT_FLAG_NX,
 };
 use wire::{
-    MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_SQL_REQUEST, MSG_SQL_RESPONSE, MSG_TXN_SUBMIT,
-    MSG_TXN_SUBMIT_RESULT, TXN_SUBMIT_ABORTED, TXN_SUBMIT_COMMITTED,
+    MSG_KV_PENDING, MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_SQL_REQUEST, MSG_SQL_RESPONSE,
+    MSG_TXN_SUBMIT, MSG_TXN_SUBMIT_RESULT, TXN_SUBMIT_ABORTED, TXN_SUBMIT_COMMITTED,
 };
 
 // ── Capacities ────────────────────────────────────────────────────────
@@ -363,8 +363,8 @@ impl Queued {
 
 /// Concurrent multi-statement transactions the executor can hold open.
 /// Small on purpose: the serial executor is not a high-concurrency
-/// transaction engine, and a fourth open transaction refuses rather than
-/// grows unbounded state.
+/// transaction engine, and a transaction opened past this many refuses
+/// rather than grows unbounded state.
 const MAX_TXN_SLOTS: usize = 2;
 /// Accumulation budget for one open transaction's comparisons or PUTs.
 /// The COMMIT must still fit every hop's 4 KiB scratch, so the assembled
@@ -1172,6 +1172,19 @@ fn kv_send(exec: &mut ExecState, op: u8, body_len: usize, next_phase: u8) {
     } else {
         reply_simple(exec, ERR_STORE, TAG_EMPTY, 0);
     }
+}
+
+/// The store is still working on the KV exchange in flight (the router's
+/// `MSG_KV_PENDING`, `[corr_id u64][conn_id u8]` in `exec.scratch`): the
+/// watchdog starts again. It reclaims a statement whose reply is never
+/// coming, not one a loaded store is taking long to decide.
+fn on_kv_pending(exec: &mut ExecState, now: u64) {
+    let corr = u64::from_le_bytes(exec.scratch[..8].try_into().unwrap_or([0; 8]));
+    if !exec.busy() || corr != exec.kv_corr || now == 0 {
+        return;
+    }
+    exec.inflight_since_ms = now;
+    arm_watchdog(exec);
 }
 
 /// Arm the one-shot wake timer for `WEDGE_TIMER_MS`. Its firing makes the
@@ -5971,6 +5984,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut tmp = [0u8; KV_IN_BUF];
                 tmp[..len].copy_from_slice(&exec.scratch[..len]);
                 on_kv_response(exec, &tmp[..len]);
+            } else if mt == MSG_KV_PENDING && len == wire::KV_PENDING_LEN {
+                on_kv_pending(exec, dev_millis(sys));
             }
         }
         // Cross-range 2PC outcome from txn_coordinator (only wired in a

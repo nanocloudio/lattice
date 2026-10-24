@@ -7,9 +7,12 @@ substrate. Protocol anchor modules translate client wire protocols
 RESP models, Prometheus metrics — into one KV request envelope; a
 router shards by key
 and drives writes through Raft commit; a deterministic MVCC state
-machine applies them in log order. Durability, quorum, leadership,
-and snapshots belong to the substrate; lattice never writes a
-durable channel of its own.
+machine applies them in log order. In a replicated graph,
+durability, quorum, leadership, and snapshots belong to the
+substrate; a single-node disk worker keeps its own write-ahead
+command log. The state worker can also serve fluxor's store
+contracts, so a graph's connectors keep the store they reach by
+contract while lattice holds it.
 
 ## Start here
 
@@ -25,8 +28,12 @@ durable channel of its own.
 - [architecture/specification.md](architecture/specification.md) —
   the normative reference: invariants, terminology, partitioning
   and routing epochs, LIN-BOUND read semantics, snapshots and
-  compaction, TTL/lease/watch, error mapping, and the explicit list
-  of design targets not yet wired
+  compaction, TTL/lease/watch, error mapping, and the design targets
+  that are not wired
+- [architecture/store_provider.md](architecture/store_provider.md) —
+  lattice as fluxor's store: the `storage.object` and
+  `storage.namespace` contracts, write answers, subscriptions and the
+  change log, the replicated store, and how slow stores are waited on
 - [architecture/cdc.md](architecture/cdc.md) — change data capture:
   the event format, the ordered-ack sink contract, checkpointing,
   and retention

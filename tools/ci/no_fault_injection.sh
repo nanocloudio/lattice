@@ -4,12 +4,13 @@
 # and `fault_slow_write_ms`/`fault_slow_write_every` (every state worker;
 # docs/architecture/limit_register.md "Test-only fault injection") make the
 # store answer reads EAGAIN, hold its writes' log records, or keep its
-# writes waiting as a slow device, on purpose. A graph
-# config outside tests/ that sets it — copied from a test, or left in after
-# a debugging session — fails CI here rather than slowing a deployment's
-# every read. Test graphs (tests/**) and generated E2E configs (written to
-# scratch, never tracked) are where it belongs. Wired as `[ci.test] scripts`
-# in fluxor.toml (CI phase 3.5).
+# writes waiting as a slow device, on purpose. A graph config outside tests/
+# that sets any of them — copied from a test, or left in after a debugging
+# session — fails CI here rather than slowing a deployment's reads and
+# writes. Test graphs (tests/**) and generated E2E configs (written to
+# scratch, never tracked) are where they belong. Scans every YAML and JSON
+# file outside tests/, target/ and the git directories. Wired as a
+# `[ci.test] scripts` gate in fluxor.toml (fluxor ci's project-e2e phase).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 hits=$(find . \( -path ./tests -o -name target -o -name .git -o -name .git-shadow \) -prune -o \

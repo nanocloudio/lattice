@@ -5,9 +5,8 @@
 //!
 //! Lattice MSG_* constants live in the 0xC0..=0xEF range to avoid
 //! colliding with Clustor's (0x01..=0x6F) and Quantum's (0x90..=0xBF)
-//! ranges, and continue in 0xF0..=0xFF now that range is full (0xC9 was
-//! its last free id; no contract in fluxor, clustor or quantum names a
-//! message in 0xF0..=0xFF). See ~/Development/nanocloudio/standards/wire-registry.md once
+//! ranges, and continue in 0xF0..=0xFF (no contract in fluxor, clustor or
+//! quantum names a message there). See ~/Development/nanocloudio/standards/wire-registry.md once
 //! the registry stabilises.
 //!
 //! ## Stability — DRAFT
@@ -138,8 +137,8 @@ pub const MSG_KV_COMMAND: u8 = 0xC2;
 ///
 /// The generation trails the body for the same reason the fence tail
 /// trails MSG_KV_RESPONSE's: the router reads `body_len` at a fixed
-/// offset and slices, so appending was invisible to it until it was
-/// taught to look.
+/// offset and slices, so a field after the body is seen only by a reader
+/// that looks past it.
 pub const MSG_KV_APPLIED: u8 = 0xC3;
 
 /// Worker → router (`responses` → `kv_in`): the command at the head of the
@@ -148,11 +147,13 @@ pub const MSG_KV_APPLIED: u8 = 0xC3;
 /// driven on. Payload: `[kpg_id:u16 LE][corr_id:u64 LE]`.
 ///
 /// Sent at most once per `KV_WORKING_INTERVAL_MS` while such a command
-/// waits. The worker answers its commands in channel order, so every direct
-/// command routed to that partition is at or behind the head, and is being
+/// waits. The worker takes its commands in channel order and answers each
+/// one it takes (a paused walk from its hold slot), so every direct command
+/// routed to that partition is held, at the head or behind it, and is being
 /// worked on: the router keeps each in flight (its deadline renewed) and
 /// tells in-graph callers (`MSG_KV_PENDING`). A command no one is working on
-/// — a worker that stopped — hears no notice, and the deadline answers it.
+/// — a worker that stopped, a store quarantined — hears no notice, and the
+/// deadline answers it.
 pub const MSG_KV_WORKING: u8 = 0xF4;
 pub const KV_WORKING_LEN: usize = 10;
 /// How often a worker says a waiting command is still being worked on: well
@@ -588,17 +589,18 @@ pub const CONSENSUS_PROPOSAL_BODY_MAX: usize = 2040;
 /// forged admin command on write 173 and a forged config change on
 /// write 204, and on write 460 the C_new path removes the node from its
 /// own voter set. Writes then stop permanently while reads keep serving
-/// from local state. Verified on the pi5-a rig 2026-07-27: `[raft]
-/// removed self` at exactly the 460th SET, reproducible, and
-/// independent of request rate, credit wiring and `segment_bytes`.
+/// from local state: on the rig, `[raft] removed self` at exactly the
+/// 460th SET, reproducibly, independent of request rate, credit wiring
+/// and `segment_bytes`.
 ///
 /// Prefixing the body with a constant that is neither marker makes the
 /// collision structurally impossible. `lattice_apply_bridge` strips this
 /// byte before re-emitting `MSG_KV_COMMAND` to the worker.
 ///
-/// The real fix belongs upstream — a log entry needs an explicit type
-/// field rather than a sniffed prefix — but that is a clustor WAL
-/// format change. This keeps lattice correct against clustor as it is.
+/// An explicit type field in the log entry, rather than a sniffed
+/// prefix, would remove the hazard at its source; that is a clustor WAL
+/// format change, and this tag keeps lattice correct against the entry
+/// format clustor has.
 pub const LATTICE_ENTRY_TAG: u8 = 0x4C; // 'L'
 
 /// Leading byte of a lattice-replicated **record** entry body — the
@@ -670,7 +672,7 @@ pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 // 0xE0 retention floor, 0xE1 compaction floor, 0xE2 ttl map update,
 // 0xE3/0xE4/0xE6/0xE7 timestamp-allocator lease traffic (see
 // `modules/common/mvcc.rs`), 0xE5 applied position, 0xE8/0xE9 adapter
-// metrics. 0xEA..0xEF were free; three are allocated here. (The CDC
+// metrics. Three of 0xEA..0xEF are allocated here. (The CDC
 // pump and its sink speak the fluxor SDK exchange contract — records, not
 // MSG_* codes — so no code in this band is theirs.)
 //

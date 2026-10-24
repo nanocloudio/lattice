@@ -294,29 +294,78 @@ unsafe fn count_keys(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 
     -5
 }
 
-/// The changes under `prefix` after revision `since`, or a negative errno.
+/// The keys changed under `prefix` after revision `since` (CHANGES, paged
+/// to its end), or a negative errno.
 unsafe fn count_changes(sys: &SyscallTable, prefix: &[u8], since: u64, page: &mut [u8]) -> i32 {
-    let mut arg = [0u8; 64];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    arg[p..p + 8].copy_from_slice(&since.to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(page.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 4].copy_from_slice(&(page.len() as u32).to_le_bytes());
-    p += 4;
-    p += 10; // no fence
-    let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), p);
-    if n < 5 {
-        return if n < 0 { n } else { -5 };
+    let mut token = [0u8; 320];
+    let mut tlen = 8usize;
+    token[..8].copy_from_slice(&since.to_le_bytes());
+    let mut fence = [0u8; 62];
+    let mut count = 0i32;
+    loop {
+        let mut arg = [0u8; 64 + 320];
+        let mut p = 0usize;
+        arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
+        p += 2;
+        arg[p..p + prefix.len()].copy_from_slice(prefix);
+        p += prefix.len();
+        arg[p..p + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        p += 4;
+        arg[p..p + 2].copy_from_slice(&(tlen as u16).to_le_bytes());
+        p += 2;
+        arg[p..p + tlen].copy_from_slice(&token[..tlen]);
+        p += tlen;
+        arg[p..p + 8].copy_from_slice(&(page.as_mut_ptr() as u64).to_le_bytes());
+        p += 8;
+        arg[p..p + 4].copy_from_slice(&(page.len() as u32).to_le_bytes());
+        p += 4;
+        arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
+        p += 8;
+        arg[p..p + 2].copy_from_slice(&(fence.len() as u16).to_le_bytes());
+        p += 2;
+        let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), p);
+        // `[status][more][safe_rev u64][count u32]` records `[token_len u16][token]`.
+        if n < 16 {
+            return if n < 0 { n } else { -5 };
+        }
+        let Some(got) = page.get(..n as usize) else {
+            return -5;
+        };
+        if got[0] != 0 {
+            return -32; // the history no longer reaches it
+        }
+        let Some((records, token_at)) = changes_trailer(got) else {
+            return -5;
+        };
+        count = count.saturating_add(records as i32);
+        let tail = &got[token_at..];
+        if tail.len() > token.len() {
+            return -5;
+        }
+        tlen = tail.len();
+        token[..tlen].copy_from_slice(tail);
+        if got[1] == 0 {
+            return count;
+        }
     }
-    if page[0] != 0 {
-        return -32; // the history no longer reaches it
+}
+
+/// A CHANGES page's record count, and where its trailer's token begins —
+/// the records walked, the trailer's length checked to end the page.
+/// `None` for a page that does not parse whole.
+fn changes_trailer(got: &[u8]) -> Option<(u32, usize)> {
+    let rd16 = |at: usize| Some(u16::from_le_bytes(got.get(at..at + 2)?.try_into().ok()?));
+    let rd32 = |at: usize| Some(u32::from_le_bytes(got.get(at..at + 4)?.try_into().ok()?));
+    let records = rd32(10)?;
+    let mut at = 14usize;
+    for _ in 0..records {
+        // `[rev u64][kind u8][klen u16][vlen u32][key][value]`.
+        let kl = rd16(at + 9)? as usize;
+        let vl = rd32(at + 11)? as usize;
+        at = at.checked_add(15 + kl)?.checked_add(vl)?;
     }
-    u32::from_le_bytes([page[1], page[2], page[3], page[4]]) as i32
+    let tlen = rd16(at)? as usize;
+    (at + 2 + tlen == got.len()).then_some((records, at + 2))
 }
 
 /// Build write `at`'s request: `/probe/n<node>/<at>` = `v<node>-<at>`.
@@ -458,9 +507,11 @@ unsafe fn step_verify(s: &mut ProbeState, sys: &SyscallTable) {
         s.keys_done = true;
     }
     let keys = s.pass_keys;
-    // Every change since the first revision: a write applied twice is a
-    // key with two. A read of the whole history is the costliest call
-    // here, so it is made once the keys have stopped arriving.
+    // Every key changed since the first revision, each reported once
+    // (CHANGES collapses a key's versions to the present; a write applied
+    // twice is caught by the store's version history, which the replicated
+    // contract tests read). A read of the whole window is the costliest
+    // call here, so it is made once the keys have stopped arriving.
     if !s.changes_done && keys == s.keys_seen && keys > 0 {
         let changes = count_changes(sys, b"/probe/", 1, page);
         if changes == EAGAIN {

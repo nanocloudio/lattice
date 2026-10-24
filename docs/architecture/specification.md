@@ -3,12 +3,13 @@
 Lattice is a multi-protocol data store built as a set of fluxor PIC
 modules on the clustor Raft consensus substrate. There is no
 standalone binary: a node is a `fluxor run` over a graph config.
-Lattice maps client protocols onto one KV state machine and one
-durability contract.
+Lattice maps client protocols onto one KV state machine.
 
-Clustor stays authoritative for Raft, durability modes, the WAL and
-snapshots, read gates, strict fallback, and ledger ordering. Lattice
-does not redefine any of them, provides no separate edge daemon
+On the replicated path Clustor is authoritative for Raft, durability
+modes, the WAL and snapshots, read gates, strict fallback, and ledger
+ordering, and Lattice does not redefine any of them. A single-node
+disk worker that nothing orders keeps its own write-ahead command
+log instead. Lattice provides no separate edge daemon
 (listeners are per-config PIC anchors), and inherits the crash-only
 fault model.
 
@@ -20,9 +21,14 @@ else is present-tense fact with its defining source file.
 ## Invariants
 
 - **KVSOURCE** — every observable KV effect on the replicated path
-  derives from committed log entries or installed snapshots. Lattice
-  modules write no durable channel of their own; the WAL belongs to
-  the substrate's `durability` module.
+  derives from committed log entries or installed snapshots; that
+  WAL belongs to the substrate's `durability` module. The one durable
+  channel Lattice writes itself is the command log of a single-node
+  disk worker (`kv_state_worker` param `command_log: 1`,
+  `modules/common/command_log.rs`): every op that is not a pure read
+  is made durable before it is answered and replayed over the
+  recovered runs after a restart. It is refused on a worker that
+  consensus orders.
 - **REV-MONOTONE** — the store revision strictly increases per
   partition; every mutation records a unique `mod_revision`.
   Source: `modules/common/kv_store.rs`.
@@ -79,7 +85,10 @@ mode, and listen ports are module params in that graph.
 Each partition hosts one MVCC KV store
 (`modules/common/kv_store.rs`), in memory or on disk
 (`kv_state_worker` param `state_store`: 0 memory, 1 ordered disk
-runs with recovery before serving).
+runs with recovery before serving). The `kv_state_worker_store`
+build of the worker also serves fluxor's `storage.object` and
+`storage.namespace` contracts over its store
+([store_provider.md](store_provider.md)).
 
 - **KV record** — key → value plus `create_revision`,
   `mod_revision`, `version` (increments per mutation), and an
@@ -214,11 +223,13 @@ instance, so that combination is refused at init.
 
 Two consequences worth stating plainly:
 
-- Reads are serializable by default on every surface. The shipped
-  anchors stamp reads `REQ_SERIALIZABLE`; the fence engages only
-  when the router is configured with `lin_reads: 1` (all reads take
-  the fence) — there is no per-request linearizable read flag on the
-  Redis, Memcached, or etcd wire today.
+- A read takes the fence when it asks to be linearizable or the
+  router runs with `lin_reads: 1` (every read fenced), and the graph
+  wires the router's `lin_read_out` / `read_release` pair; otherwise
+  it is served from local state. The etcd anchor stamps a Range
+  `REQ_LINEARIZABLE` unless the client sets `serializable`; the Redis
+  and Memcached anchors stamp reads `REQ_SERIALIZABLE` and carry no
+  per-request linearizable flag.
 - On a follower, writes are refused (`NOT_LEADER` through the
   gateway reject edge, surfaced as the protocol's authority error)
   and direct reads are served from local applied state.
@@ -349,7 +360,7 @@ renders them on its own wire. The conditions clients most often see:
 | Condition | Redis | Memcached | etcd v3 |
 |---|---|---|---|
 | Routing epoch advanced / stale map | `-MOVED routing epoch advanced` | `NOT_STORED` | status 14, "etcdserver: leader changed" |
-| No authority for a fenced operation | `-CLUSTERDOWN no authority available for this operation` | `SERVER_ERROR backpressure` | status 14, "etcdserver: request timed out" |
+| No authority for a fenced operation | `-CLUSTERDOWN no authority available for this operation` | `NOT_STORED` | status 14, "etcdserver: request timed out" |
 | A request or answer past what its path carries (a value over one log entry is stored as chunks first) | `-ERR value too large` | `SERVER_ERROR object too large for cache` | status 3, "etcdserver: request is too large" |
 | A command that cannot apply to a large value (APPEND, INCR over one) | `-ERR the command does not apply to a large value` | — | — |
 | Wrong value type | `-WRONGTYPE Operation against a key holding the wrong kind of value` | `CLIENT_ERROR cannot increment or decrement non-numeric value` | — |
@@ -361,7 +372,11 @@ The Redis `-MOVED`/`-CLUSTERDOWN` strings reuse the closest standard
 client-retry signals so an unmodified client re-resolves routing on
 an epoch flip; they are not Redis Cluster redirection and carry no
 slot or address. The Memcached ASCII surface has no dedicated
-routing or linearizability strings. The etcd surface answers with
+routing or linearizability strings: both conditions answer the
+command's ordinary failure reply — `NOT_STORED` for a storage
+command, a miss for a get, `NOT_FOUND` for delete, incr and decr;
+`SERVER_ERROR backpressure` is the anchor's answer when it cannot
+hand the request to the router. The etcd surface answers with
 etcd's own status and `grpc-message` text (the full table is in
 [the etcd guide](../guides/etcd.md#errors)); the routing-epoch and
 no-authority results are UNAVAILABLE, which etcd's clients retry, and
@@ -371,12 +386,15 @@ cross-range refusal on the Redis surface is a known gap.
 ## Multi-tenancy
 
 The key layout, the request envelope, and the quota and auth tables
-all carry tenant identity, but every shipped anchor stamps tenant 0:
-a node today is single-tenant, and whole-store operations
+all carry tenant identity. The protocol anchors (Redis, Memcached,
+etcd, SQL) stamp tenant 0, so their traffic shares one tenant, and
+whole-store operations
 (`FLUSHALL`, memcached `flush_all`) affect the one shared keyspace
 across all anchors in the graph. `AUTH` authenticates a connection
 (constant-time `requirepass` comparison on the Redis surface); it
-does not select a tenant.
+does not select a tenant. The data surface (`lattice_data_anchor`) carries each
+request's tenant, database and keyspace into the key layout and
+refuses tenant 0.
 
 ## Observability
 
@@ -392,16 +410,16 @@ telemetry ring rather than the metrics port. Lattice app modules fan in through
 `adapter_metrics`; substrate modules feed `operations` directly,
 which serves the binary `/metrics` export and `/readyz` (one byte;
 200 when telemetry is fresh and every Raft instance reports ready).
-`tools/load` ships `lattice-scrape` to decode the export.
+`tools/load/lattice-bench` ships `lattice-scrape` to decode the export.
 `telemetry/catalog.json` names the intended stable metric surface;
-it is a catalogue, not yet a wired exporter format.
+it is a catalogue, not a wired exporter format.
 
 ## Design targets (not wired)
 
 **Status: design target, not wired.** The following are contract
 points the implementation has not reached. They are listed here so
 the rest of this document can stay strictly factual; none of them is
-observable behaviour today.
+observable behaviour.
 
 - **Tenant identity on connections** — per-connection tenant
   resolution (from credentials or transport identity), tenant
@@ -410,22 +428,24 @@ observable behaviour today.
 - **Control-plane policy** — a real control-plane feed driving
   routing plans, cache freshness (fresh/cached/stale/expired) with
   strict fallback on staleness, command allowlists, feature gates,
-  and PKI. The `control_plane` substrate module currently emits a
-  synthetic proof on a fixed schedule, and the router's control-plane
-  input ports are not yet consumed.
+  and PKI. The `control_plane` substrate module emits a synthetic
+  proof on a fixed schedule, and the router's control-plane input
+  ports are not consumed.
 - **Quota enforcement on live traffic** — the per-tenant token
   bucket (`modules/common/quota_bucket.rs`) and its
   throttle/disconnect envelopes exist, but no producer drives the
   refill tick in a shipped graph.
 - **Per-request read consistency on the Redis wire** — a Redis-side
   linearizable read opt-in mapped to the fence path per request (etcd's
-  `serializable` flag is honoured already).
+  `serializable` flag is honoured).
 - **Idempotent retry ledger** — a keyed table of acknowledged
-  outcomes so adapter retries are deduplicated; today only an
-  idempotency-key field exists on the data-surface envelope.
+  outcomes so adapter retries are deduplicated; the data-surface
+  envelope carries an idempotency-key field that nothing consumes.
 - **Distinct error strings on the Memcached surface** — dedicated
-  routing-epoch and linearizability errors in place of the generic
-  `NOT_STORED` / `SERVER_ERROR backpressure`.
-- **Cross-partition transactions** — the two-phase protocol exists
-  as a config-driven demonstrator (`txn_coordinator`); it is not a
-  client-facing transaction API.
+  routing-epoch and linearizability errors in place of each command's
+  ordinary failure reply.
+- **General transactions** — `txn_coordinator`'s two-phase commit
+  serves SQL INSERT batches and `BEGIN` … `COMMIT` INSERT blocks that
+  span ranges; reads, UPDATE and DELETE inside a transaction are
+  refused, and no other surface offers a cross-partition
+  transaction.

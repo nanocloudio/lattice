@@ -18,15 +18,17 @@
 //! read back whole through the large-value layer (`kv_large.rs`), in the
 //! call.
 //!
-//! Subscriptions are notify + pull: after every write (the provider's own,
-//! and each command the worker applies — the worker calls [`pump`]) the
-//! changes since the last pump are read from the store's history, put in
-//! revision order, and each is pushed, as the host pushes it, to every
-//! subscriber whose prefix holds its key. A subscriber whose channel is
-//! full is owed a LOST sentinel (read again) and is told as soon as its
-//! channel has room. An event carries a value of at most one chunk; a
-//! larger one is announced with [`EVENT_FLAG_VALUE_ELIDED`] and read by key
-//! (every consumer takes an event as a wake-up).
+//! Subscriptions are level-triggered doorbells: a subscription names the
+//! subscriber's own kernel event, and the provider never writes a
+//! consumer's channel. Every command that stands notes the keys it changed
+//! (`kv_store::KeyLog`); the provider takes them into its change log
+//! (`change_ring.rs`) when it pumps, matches each against the registry of
+//! watched prefixes (`store_registry.rs`), and rings each matching
+//! subscriber once — a rung bit, and a signal — until the subscriber takes
+//! it (`TAKE_RUNG`) and reads what changed (`CHANGES`, one bounded page per
+//! call, served from the change log, or from the store's history across a
+//! gap). Nothing is ever pushed, copied per subscriber, or lost to a full
+//! channel.
 //!
 //! On a replica of a replicated store a write is not applied in the call:
 //! it is proposed to the group's log under this replica's origin
@@ -37,31 +39,38 @@
 //! the caller and the request's bytes. Reads, LIST, CHANGES and
 //! subscriptions are this replica's, at the revision it has applied.
 //!
-//! History is the store's: CHANGES and subscriptions need a store that
-//! keeps it (the disk provider). The memory provider answers every
-//! question about the past LOST — honestly, and uselessly for a change
-//! feed — so a worker on it does not take the provider role.
+//! The change log answers for the revisions since it began (or since its
+//! last gap); before that, history is the store's: the disk provider keeps
+//! it, the memory provider answers every question about the past LOST —
+//! honestly, and uselessly across a gap — so a worker on it does not take
+//! the provider role.
 //!
-//! Handles: object read slots are `0..SLOTS`, subscriptions from `SLOTS`,
-//! so a fence query (`QUERY_OP`, which both contracts carry and which
-//! reaches the provider with its tag stripped) names one thing.
+//! Handles: object read slots are `0..SLOTS`, subscriptions from
+//! [`SUB_BAND`] (`SUB_BAND + id`, a registry id), so a fence query
+//! (`QUERY_OP`, which both contracts carry and which reaches the provider
+//! with its tag stripped) names one thing. Every handle answers the owner
+//! that opened it alone: to any other caller a read slot or subscription is
+//! as if it were not open, as the host stores answer. (The system owner's record is all zero — slot 0,
+//! generation 0 — so all zero is an owner like any other.)
 //!
 //! Fault injection (TEST ONLY, off unless configured): [`Provider::
 //! fault_read_eagain_every`] makes the provider answer reads `EAGAIN` the
 //! way a board's store does while its device is busy, so a Linux E2E can
 //! prove its consumers never read "not yet" as absence. See [`Fault`].
 //!
-//! Mounted beside `types.rs`, `kv_large.rs`, `doc_tree.rs` and `origin.rs`
-//! (reached as `super::…`).
+//! Mounted beside `types.rs`, `kv_large.rs`, `doc_tree.rs`, `origin.rs`,
+//! `change_ring.rs` and `store_registry.rs` (reached as `super::…`).
 //! No allocation and no panic path: the worker twin that mounts it is a
 //! PIC module.
 
+use super::change_ring::{ChangeRing, Cursor, ORD_END};
 use super::doc_tree::utf8_is_valid;
 use super::kv_large::kv_chunks::{
     sha256_of, Builder, Hash, Manifest, CHUNK_MAX, DATA_MAX, HASH_LEN, MANIFEST_LEN,
 };
 use super::kv_large::{self, Expander, Need};
 use super::origin::{self, Outcome, Record, IMPORT_MARK_LEN, NO_OUTCOME, RING};
+use super::store_registry::{Registry, Table, NIL as SUB_NIL};
 use super::types::{
     KV_OP_DELETE, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_IMPORT, KV_OP_ORIGIN_REGISTER,
     KV_OP_ORIGIN_WRITE, KV_OP_PUT, KV_OP_PUT_MANIFEST, KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS,
@@ -86,6 +95,8 @@ pub const NS_LIST: u32 = 0x1302;
 pub const NS_SUBSCRIBE: u32 = 0x1305;
 pub const NS_CLOSE: u32 = 0x1306;
 pub const NS_CHANGES: u32 = 0x1307;
+/// Which of the caller's subscriptions on an event have rung.
+pub const NS_TAKE_RUNG: u32 = 0x1309;
 pub const NS_CAPS: u32 = 0x13FF;
 /// `fence::QUERY_OP`: the fence of what a handle observed.
 pub const QUERY_OP: u32 = 0x00FE;
@@ -118,11 +129,6 @@ const SLOT_MASK: i32 = (1 << TAG_SHIFT) - 1;
 pub const SOURCE: [u8; 16] = *b"fluxor-cp-store\0";
 /// One store, one durability domain (the host store's constant).
 pub const STORE_DEVICE_ID: u64 = 1;
-pub const CT_NAMESPACE_CHANGE: u8 = 0x23;
-pub const EVENT_HEAD: usize = 32;
-/// An event's header `flags`: the change's value is not carried (it is
-/// larger than an event holds); read it by key.
-pub const EVENT_FLAG_VALUE_ELIDED: u8 = 0x01;
 pub const KIND_ADDED: u8 = 0;
 pub const KIND_MODIFIED: u8 = 1;
 pub const KIND_DELETED: u8 = 2;
@@ -151,32 +157,70 @@ const TRAILER_MAX: usize = 3 + KEY_MAX;
 
 /// Longest key: a LIST entry and a cursor carry its length in a byte.
 pub const KEY_MAX: usize = 255;
-/// Read slots open at once (the host store's count).
-pub const SLOTS: usize = 32;
-/// Subscriptions at once (the host store's count).
-pub const SUBSCRIPTIONS: usize = 256;
+/// Read slots open at once, at most: a format bound (a slot's index is its
+/// handle). Slots are made from the heap as reads open, so the count in use
+/// is the memory they hold, not this figure.
+pub const SLOTS: usize = 4096;
+/// Subscription handles' band in the slot field: `SUB_BAND + id`.
+pub const SUB_BAND: usize = 1 << 24;
+/// SUBSCRIBE flag bit 0: ring once now.
+const SUB_RING_NOW: u8 = 1;
+/// A workload owner's subscriptions at most, by default (the worker's
+/// `store_sub_quota` param sets it). The system owner is not held to it.
+pub const DEFAULT_SUB_QUOTA: u32 = 256;
+/// A key-log hint: the write created the key (`kv_store::KEY_CREATED`).
+pub const KEY_CREATED: u8 = 0;
+/// A key-log hint: the write deleted the key (`kv_store::KEY_DELETED`).
+pub const KEY_DELETED: u8 = 2;
+/// TAKE_RUNG's answer head: `[more u8][count u16]`.
+const TAKE_HEAD: usize = 3;
+/// A CHANGES page: head `[status][more][safe_rev u64][count u32]`, a
+/// record's fixed bytes, the trailer's fixed bytes (`[token_len u16]`).
+const CH_HEAD: usize = 14;
+const CH_REC: usize = 15;
+const CH_TRAILER: usize = 2;
+/// The longest CHANGES token, and a bare revision token's length.
+const TOKEN_MAX: usize = 320;
+const TOKEN_REV: usize = 8;
+/// Tokens this provider issues: inside the change log, a relist, a history
+/// walk.
+const T_LOG: u8 = 1;
+const T_RELIST: u8 = 2;
+const T_HIST: u8 = 3;
+/// Change-log entries one CHANGES call scans at most.
+const LOG_SCAN_MAX: u32 = 4096;
+/// Store versions one CHANGES call's history walk visits at most, and all
+/// callers' walks in one worker step.
+const HIST_VISIT_MAX: u32 = 1024;
+pub const WALK_STEP_BUDGET: u32 = 4096;
+/// A history page's key scratch: `[kl u8][key KEY_MAX][rev u64][kind u8]`
+/// per key.
+const HIST_ENTRY_FIXED: usize = 10;
+const HIST_KEYS: usize = 32;
+/// Change-log entries one pump matches at most, and subscribers a gap
+/// rings in one pump.
+const PUMP_MAX: u32 = 4096;
+const GAP_RING_MAX: usize = 512;
 /// A value a read slot or an event holds itself: one chunk's worth.
 pub const INLINE_MAX: usize = DATA_MAX;
 /// Entries one store page asks for (LIST, CHANGES, pumps).
 const PAGE_KEYS: u16 = 64;
-/// A CHANGES answer's index entry while it is put in revision order.
-const ORDER_ENTRY: usize = 16;
 /// Re-drives of one paused store walk before the provider gives up on it
 /// (each moves the walk on by the store's step budget).
 const REDRIVE_MAX: u32 = 1 << 20;
-/// A pump record's kind, marked: its value was not carried.
-const KIND_ELIDED: u8 = 0x80;
-/// The largest event: header, change head, key and an inline value.
-pub const EVENT_MAX: usize = EVENT_HEAD + 15 + KEY_MAX + INLINE_MAX;
-/// The request buffer's floor: the largest request built (a write with an
-/// inline value) or event.
-pub const REQ_MIN: usize = EVENT_MAX + 64;
+/// The request buffer's floor: the largest request built — a guarded put
+/// of an inline value ([`txn`]), which carries its key twice, in the
+/// comparison and in the put: three `u16` counts, 11 bytes of comparison
+/// besides its key, and 18 of put besides its key and value. A chunk upload
+/// (`[hash][len u16][chunk]`) and every read's body are smaller.
+pub const REQ_MIN: usize = 3 * 2 + 11 + 18 + 2 * KEY_MAX + INLINE_MAX;
+const _: () = assert!(REQ_MIN >= HASH_LEN + 2 + CHUNK_MAX);
 /// The answer buffer's floor: a store page of one entry with an inline
 /// value.
 pub const ANS_MIN: usize = 4096;
-/// The feed buffer's floor: one pump's changes, in order. A pump whose
-/// changes outgrow the feed tells its subscribers to read again.
-pub const FEED_MIN: usize = 16 * EVENT_MAX;
+/// The change log's bytes by default (the worker's `store_change_log`
+/// param sets it): a few seconds of a busy control plane's writes.
+pub const CHANGE_LOG_DEFAULT: usize = 256 * 1024;
 /// The most an origin entry's op body may be: the largest proposal the
 /// replicated path carries (`wire::CONSENSUS_PROPOSAL_BODY_MAX`, 2040)
 /// less the entry tag and the command head (the worker holds it to them).
@@ -194,7 +238,7 @@ pub const IDLE_STEPS: u32 = 60_000;
 /// ([`Provider::answers`]): one for each caller writing at the same time.
 /// Full, a new write is not taken (`EINPROGRESS`) until one is collected or
 /// expires — never by dropping another caller's.
-pub const LOCAL_ANSWERS: usize = 16;
+pub const LOCAL_ANSWERS: usize = 1024;
 
 // ── What the provider runs on ────────────────────────────────────────
 
@@ -251,6 +295,42 @@ pub trait Backend {
             durable: false,
         }
     }
+    /// The module occupancy whose call is being served (`CALLER_MODULE`:
+    /// `[idx u16][0][generation u32]`, which may be all zero — module 0,
+    /// generation 0); `None` when there is none.
+    fn module(&self) -> Option<[u8; 8]> {
+        None
+    }
+    /// Whether a module occupancy still stands (`MODULE_LIVE`).
+    fn module_live(&self, _module: [u8; 8]) -> bool {
+        false
+    }
+    /// The module occupancy owning event `event` (`EVENT_OWNER`).
+    fn event_owner(&self, _event: i32) -> Option<[u8; 8]> {
+        None
+    }
+    /// Signal event `event` (`event::SIGNAL`): 0, or negative.
+    fn signal(&mut self, _event: i32) -> i32 {
+        ENOSYS
+    }
+    /// `bytes` of fresh heap that live as long as the provider (registry
+    /// pages), or null when the heap is spent.
+    fn alloc(&mut self, _bytes: usize) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    /// The keys the commands that stood since the last call changed, in the
+    /// order they changed (`f(rev, hint, key)`, the key log's entries), and
+    /// cleared: `Some((complete, rev))` — `rev` the revision every one of
+    /// them is settled up to, `complete` false when the list is not whole (a
+    /// command's keys overflowed, or it changed the keyspace whole). `None`
+    /// while a command is mid-way or its record is not yet durable: nothing
+    /// is taken.
+    fn take_keys<F: FnMut(u64, u8, &[u8])>(&mut self, _f: F) -> Option<(bool, u64)> {
+        None
+    }
+    /// Count a subscription refused for want of capacity against the
+    /// kernel's ledger (`resource::LEDGER_DENY` on `store_subs`).
+    fn ledger_deny(&mut self) {}
 }
 
 /// The group a replicated store is one replica of.
@@ -275,15 +355,16 @@ pub struct Bufs<'b> {
     /// An answer expanded (large values whole): the largest object and
     /// its page. Also the value a large read slot holds.
     pub cache: &'b mut [u8],
-    /// One pump's changes ([`FEED_MIN`] at least).
-    pub feed: &'b mut [u8],
 }
 
-/// An open read: the value of `key` at revision `rev`.
+/// An open read: the value of `key` at revision `rev`, answering only the
+/// owner that opened it.
 #[derive(Clone, Copy)]
 struct Slot {
     used: bool,
     large: bool,
+    /// The opener's owner record ([`Backend::caller`]).
+    owner: [u8; 8],
     key_len: u8,
     rev: u64,
     len: u32,
@@ -294,6 +375,7 @@ struct Slot {
 const NO_SLOT: Slot = Slot {
     used: false,
     large: false,
+    owner: [0; 8],
     key_len: 0,
     rev: 0,
     len: 0,
@@ -301,35 +383,41 @@ const NO_SLOT: Slot = Slot {
     inline: [0; INLINE_MAX],
 };
 
-/// A subscriber: the prefix it watches, the channel it reads, the next
-/// event's sequence, and whether it is owed a LOST sentinel.
-#[derive(Clone, Copy)]
-struct Sub {
-    used: bool,
-    lost: bool,
-    /// The scope's head on every key it hears (a scoped prefix): stripped
-    /// from each event's key.
-    strip: u8,
-    prefix_len: u8,
-    sink: i32,
-    seq: u32,
-    prefix: [u8; KEY_MAX],
+impl Slot {
+    /// Whether this slot is open and `caller` opened it: a slot answers its
+    /// opener alone, and to anyone else is as if it were not open (the host
+    /// stores' answer, which says nothing of another owner's handles).
+    fn opened_by(&self, caller: [u8; 8]) -> bool {
+        self.used && self.owner == caller
+    }
 }
 
-const NO_SUB: Sub = Sub {
-    used: false,
-    lost: false,
-    strip: 0,
-    prefix_len: 0,
-    sink: -1,
-    seq: 0,
-    prefix: [0; KEY_MAX],
-};
+/// The provider's counts (telemetry).
+#[derive(Clone, Copy, Default)]
+pub struct Counters {
+    /// Subscribers rung, rung bits taken, gaps rung to every subscriber,
+    /// subscriptions dropped (their module or event gone), subscriptions
+    /// refused (capacity or quota), SUBSCRIBEs naming an event not the
+    /// caller's, history reads refused for the step's walk budget.
+    pub rung: u32,
+    pub taken: u32,
+    pub gaps: u32,
+    pub reaped: u32,
+    pub refused: u32,
+    pub owner_checks_failed: u32,
+    pub walk_refused: u32,
+}
 
-impl Sub {
-    fn watches(&self, key: &[u8]) -> bool {
-        self.used && key.starts_with(self.prefix.get(..self.prefix_len as usize).unwrap_or(&[]))
-    }
+impl Counters {
+    const ZERO: Counters = Counters {
+        rung: 0,
+        taken: 0,
+        gaps: 0,
+        reaped: 0,
+        refused: 0,
+        owner_checks_failed: 0,
+        walk_refused: 0,
+    };
 }
 
 // ── Scope: a node's private records ──────────────────────────────────
@@ -394,23 +482,39 @@ impl Scope {
 
 /// The provider's state, in the worker's.
 pub struct Provider {
-    slots: [Slot; SLOTS],
-    subs: [Sub; SUBSCRIPTIONS],
-    /// Delivery, counted (telemetry): pumps whose history read came back
-    /// incomplete (every subscriber then told LOST), events told, events a
-    /// subscriber's channel refused.
-    pub m_pump_partial: u32,
-    pub m_told: u32,
-    pub m_refused: u32,
-    /// The revision subscribers have been told of.
-    seen: u64,
-    /// The store is serving: subscribers are told of changes from `seen`
-    /// on. Before, a subscription is only registered (see
-    /// [`needs_store`]).
+    slots: Table<Slot, SLOTS>,
+    /// Subscriptions: watched prefixes and their subscribers.
+    reg: Registry,
+    /// The change log subscriptions are rung from and CHANGES is served
+    /// from.
+    ring: ChangeRing,
+    /// The pump's place in the change log, and the log's gap count it last
+    /// rang.
+    pump_at: Cursor,
+    pump_gaps: u32,
+    /// A gap is being rung to every subscriber, a batch a pump: the last one
+    /// rung.
+    gap_ringing: bool,
+    gap_at: u32,
+    /// The worker's steps (from 1), the step whose refused readers were last
+    /// rung again, the history-walk budget left this step, and the readers
+    /// holding first claim on it this step.
+    epoch: u32,
+    deferred_epoch: u32,
+    walk_left: u32,
+    prio_pending: u32,
+    /// A workload owner's subscriptions at most (0: [`DEFAULT_SUB_QUOTA`]).
+    quota: u32,
+    /// A history page's keys, gathered before their present state is read.
+    hist_keys: [u8; HIST_KEYS * (HIST_ENTRY_FIXED + KEY_MAX)],
+    /// Counted (telemetry).
+    pub m: Counters,
+    /// The store is serving: the change log starts at its revision. Before,
+    /// a subscription is only registered (see [`needs_store`]).
     opened: bool,
     /// The large slot whose value `Bufs::cache` holds (index + 1; 0:
     /// none), and where in it the value lies.
-    cached: u8,
+    cached: u32,
     cache_at: u32,
     /// Writes through the group's log (a replica's).
     rep: Replication,
@@ -421,10 +525,10 @@ pub struct Provider {
     /// collects it: keyed by the caller and the request's bytes as a
     /// replica keys its writes, so asking again is a second look at the
     /// same write, whoever else wrote meanwhile (see [`local_write`]).
-    answers: [Answer; LOCAL_ANSWERS],
+    answers: Table<Answer, LOCAL_ANSWERS>,
     /// The identity of each caller's latest write request, so an identical
     /// re-ask is known without hashing its value again ([`identity`]).
-    idents: [Ident; LOCAL_ANSWERS],
+    idents: Table<Ident, LOCAL_ANSWERS>,
     /// What the identities' checksums are keyed with (set at `open`).
     ident_seed: u64,
     /// Write requests hashed whole (telemetry: once per request, not per
@@ -445,25 +549,27 @@ pub struct Provider {
 /// With `every = N` (N >= 2), one step of the store in N is BUSY: from the
 /// worker's step that opens it ([`Provider::step`], every Nth) to its
 /// next, every read the provider is asked — `GET`, `HEAD`, `RANGE_GET`,
-/// `LIST`, `CHANGES` and a `SUBSCRIBE` with an initial listing, by any
-/// module — answers `EAGAIN`, as the board's store answers every read while
-/// its device is taken by a write. A read answered so has moved nothing: no
-/// handle is opened, none is closed (a `RANGE_GET`'s handle stays valid, at
-/// the offset it was asked), no page is written, no fence is written, no
-/// subscription is registered, and nothing else of the provider's state
-/// changes. So a busy step is invisible to a consumer that keeps the
-/// contract — it holds the read and asks again on a later step — and fatal
-/// to one that reads `EAGAIN` as absent, empty or failed (a NotFound for a
-/// key it has just written), or asks again inside the same step (it spins:
-/// the step stays busy until the worker steps, which it never does while
-/// the spinner holds the core).
+/// `LIST` and `CHANGES`, by any module — answers `EAGAIN`, as the board's
+/// store answers every read while its device is taken by a write. A read
+/// answered so has moved nothing: no handle is opened, none is closed (a
+/// `RANGE_GET`'s handle stays valid, at the offset it was asked), no page
+/// is written, no fence is written, and nothing else of the provider's
+/// state changes — but for what the contract asks of a waiting read: a
+/// `CHANGES` that names one of the caller's subscriptions has it rung again
+/// once the wait clears. So a busy step is invisible to a consumer that
+/// keeps the contract — it holds the read and asks again on a later step,
+/// or when its event rings — and fatal to one that reads `EAGAIN` as
+/// absent, empty or failed (a NotFound for a key it has just written), or
+/// asks again inside the same step (it spins: the step stays busy until the
+/// worker steps, which it never does while the spinner holds the core).
 ///
 /// Whole steps, not every Nth read: every module meets the wait alike (a
 /// read count would land on whichever modules step late in the order, every
 /// step, and starve them), and N - 1 steps in N are clear, so a pass that
-/// restarts from its first read still gets through. Writes, `CLOSE`, the
-/// fence query and `CAPS` are never faulted: a write has its own "not yet"
-/// (`EINPROGRESS`) and `EAGAIN` on a write means an etag was lost.
+/// restarts from its first read still gets through. Every other call —
+/// writes, `CLOSE`, `SUBSCRIBE`, `TAKE_RUNG`, the fence query and `CAPS` —
+/// is never faulted: a write has its own "not yet" (`EINPROGRESS`), and
+/// `EAGAIN` on a write means an etag was lost.
 /// Deterministic: busy steps are the worker's step count modulo N, from the
 /// knob's setting. `every = 1` would make every step busy and never let a
 /// read through: refused. 0 is off.
@@ -612,19 +718,27 @@ const NO_STAGE: Stage = Stage {
 impl Provider {
     pub const fn new() -> Self {
         Provider {
-            slots: [NO_SLOT; SLOTS],
-            subs: [NO_SUB; SUBSCRIPTIONS],
-            m_pump_partial: 0,
-            m_told: 0,
-            m_refused: 0,
-            seen: 0,
+            slots: Table::new(),
+            reg: Registry::new(),
+            ring: ChangeRing::new(),
+            pump_at: Cursor::START,
+            pump_gaps: 0,
+            gap_ringing: false,
+            gap_at: SUB_NIL,
+            epoch: 0,
+            deferred_epoch: 0,
+            walk_left: 0,
+            prio_pending: 0,
+            quota: 0,
+            hist_keys: [0; HIST_KEYS * (HIST_ENTRY_FIXED + KEY_MAX)],
+            m: Counters::ZERO,
             opened: false,
             cached: 0,
             cache_at: 0,
             rep: NO_REPLICATION,
             scope: NO_SCOPE,
-            answers: [NO_ANSWER; LOCAL_ANSWERS],
-            idents: [NO_IDENT; LOCAL_ANSWERS],
+            answers: Table::new(),
+            idents: Table::new(),
             ident_seed: 0,
             m_ident_hashed: 0,
             stage: NO_STAGE,
@@ -665,23 +779,30 @@ impl Provider {
     /// record is a step nearer settling, and an answer nobody asks for a
     /// step nearer expiring.
     pub fn step(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+        self.walk_left = WALK_STEP_BUDGET;
+        self.prio_pending = 0;
         let f = &mut self.fault;
         if f.every != 0 {
             f.steps = f.steps.wrapping_add(1);
             f.busy = f.steps.is_multiple_of(f.every);
         }
         f.held = f.held.saturating_sub(1);
-        for x in self.idents.iter_mut().filter(|x| x.used) {
-            x.idle = x.idle.saturating_add(1);
-        }
-        for x in self.answers.iter_mut().filter(|x| x.used) {
-            x.idle = x.idle.saturating_add(1);
-            if x.idle > IDLE_STEPS {
-                // Its caller stopped asking: the write stands (it is in the
-                // log), only its answer goes uncollected.
-                *x = NO_ANSWER;
+        self.idents.each_mut(|x| {
+            if x.used {
+                x.idle = x.idle.saturating_add(1);
             }
-        }
+        });
+        self.answers.each_mut(|x| {
+            if x.used {
+                x.idle = x.idle.saturating_add(1);
+                if x.idle > IDLE_STEPS {
+                    // Its caller stopped asking: the write stands (it is in
+                    // the log), only its answer goes uncollected.
+                    *x = NO_ANSWER;
+                }
+            }
+        });
     }
 
     /// Reads answered `EAGAIN` by injection, and whether it is on.
@@ -696,20 +817,15 @@ impl Provider {
 
     /// Whether, and where, this read meets an injected wait: the step is
     /// busy.
-    fn fault_read(&mut self, op: u32, a: &[u8]) -> Injected {
+    fn fault_read(&mut self, op: u32, _a: &[u8]) -> Injected {
         let f = &mut self.fault;
         if !f.busy {
             return Injected::No;
         }
-        let read = match op {
-            OBJ_GET | OBJ_HEAD | OBJ_RANGE_GET | NS_LIST | NS_CHANGES => true,
-            // Only a subscription with an initial listing reads the store.
-            NS_SUBSCRIBE => field16(a, &mut 0)
-                .map(|p| 2 + p.len() + 4)
-                .and_then(|at| a.get(at))
-                .is_some_and(|fl| fl & 1 != 0),
-            _ => false,
-        };
+        let read = matches!(
+            op,
+            OBJ_GET | OBJ_HEAD | OBJ_RANGE_GET | NS_LIST | NS_CHANGES
+        );
         if !read {
             return Injected::No;
         }
@@ -731,22 +847,90 @@ impl Provider {
         core::ptr::write_bytes(p, 0, 1);
     }
 
-    /// Start at the store's revision: subscribers hear of what happens
-    /// from here on.
+    /// Start at the store's revision: the change log answers for what
+    /// happens from here on, and every subscriber registered before is rung
+    /// to read (it may have missed anything before now).
     pub fn open<B: Backend>(&mut self, b: &B) {
-        self.seen = b.revision();
+        self.ring.reset(b.revision());
+        self.pump_at = self.ring.tip();
+        self.pump_gaps = self.ring.gaps;
+        self.gap_ringing = self.reg.counts().0 > 0;
+        self.gap_at = SUB_NIL;
         self.opened = true;
         self.ident_seed = b.revision() ^ (self as *const Self as usize as u64).rotate_left(17);
     }
 
-    /// Subscriptions held.
-    pub fn subscriptions(&self) -> usize {
-        self.subs.iter().filter(|s| s.used).count()
+    /// Give the change log its bytes: `cap` of them at `buf`, from the
+    /// worker's heap, for the provider's life.
+    ///
+    /// # Safety
+    /// `buf` must be valid for `cap` bytes for as long as the provider is.
+    pub unsafe fn attach_log(&mut self, buf: *mut u8, cap: usize) {
+        self.ring.attach(buf, cap);
     }
 
-    /// Subscriptions owed a LOST sentinel.
-    pub fn owed(&self) -> usize {
-        self.subs.iter().filter(|s| s.used && s.lost).count()
+    /// Hold a workload owner to `quota` subscriptions (0: the default).
+    pub fn set_quota(&mut self, quota: u32) {
+        self.quota = quota;
+    }
+
+    /// Subscriptions held.
+    pub fn subscriptions(&self) -> usize {
+        self.reg.counts().0 as usize
+    }
+
+    /// Subscriptions rung and not yet taken.
+    pub fn rung(&self) -> usize {
+        let mut n = 0;
+        self.reg.each_sub(|id| {
+            n += usize::from(self.reg.sub(id).is_some_and(|s| s.rung));
+            true
+        });
+        n
+    }
+
+    /// The change log: its base and frontier, and the bytes it holds.
+    pub fn log_span(&self) -> (u64, u64, u64) {
+        (self.ring.base(), self.ring.frontier(), self.ring.used())
+    }
+
+    /// Registry pages held (each [`store_registry::PAGE`] bytes of heap).
+    pub fn registry_pages(&self) -> usize {
+        self.reg.counts().2
+    }
+
+    /// A gap the worker knows of (an install, an import): changes up to
+    /// `rev` are not all in the change log, and every subscriber reads
+    /// again.
+    pub fn log_gap(&mut self, rev: u64) {
+        if self.opened {
+            self.ring.gap(rev);
+        }
+    }
+
+    /// An owner is released: its subscriptions go now (the lazy checks
+    /// before every signal would drop them anyway; this returns their
+    /// memory early).
+    pub fn owner_released(&mut self, owner: [u8; 8]) -> u32 {
+        let mut gone = 0;
+        let mut dead = [SUB_NIL; 64];
+        loop {
+            let mut n = 0;
+            self.reg.each_sub(|id| {
+                if self.reg.sub(id).is_some_and(|s| s.owner == owner) && n < dead.len() {
+                    dead[n] = id;
+                    n += 1;
+                }
+                n < dead.len()
+            });
+            if n == 0 {
+                return gone;
+            }
+            for &id in &dead[..n] {
+                self.reg.remove_sub(id);
+            }
+            gone += n as u32;
+        }
     }
 
     /// Keep the keys under `prefixes` (comma-separated, each from `/`) as
@@ -1432,17 +1616,23 @@ fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B, &Hash) -> Result<(),
     apply: F,
 ) -> i32 {
     let caller = b.caller();
-    let id = identity(pv, caller, w);
-    if let Some(k) = pv.answers.iter().position(|x| x.used && x.id == id) {
-        pv.answers[k].idle = 0;
-        if !pv.answers[k].durable {
+    let id = identity(pv, b, caller, w);
+    if let Some(k) = pv.answers.position(|x| x.used && x.id == id) {
+        let durable = pv.answers.get_mut(k).is_none_or(|x| {
+            x.idle = 0;
+            x.durable
+        });
+        if !durable {
             if log_pending(pv, b) {
                 return EINPROGRESS;
             }
             settled(pv);
         }
-        let x = pv.answers[k];
-        pv.answers[k] = NO_ANSWER;
+        let Some(slot) = pv.answers.get_mut(k) else {
+            return ERROR;
+        };
+        let x = *slot;
+        *slot = NO_ANSWER;
         if x.rc == 0 {
             // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
             unsafe { write_fence(write_fence_kind(b), x.rev, w.fence_ptr, w.fence_cap) };
@@ -1456,13 +1646,16 @@ fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B, &Hash) -> Result<(),
     settled(pv);
     // A room for its answer, should its record wait: one of this caller's
     // own (it asks something else now) or a free one.
-    let room = pv
-        .answers
-        .iter()
-        .position(|x| x.used && x.caller == caller)
-        .or_else(|| pv.answers.iter().position(|x| !x.used));
+    let room = match pv.answers.position(|x| x.used && x.caller == caller) {
+        Some(k) => Some(k),
+        None => {
+            let mut alloc = |n: usize| b.alloc(n);
+            pv.answers.take(&mut alloc, NO_ANSWER, |x| x.used)
+        }
+    };
     let Some(room) = room else {
-        // Every answer held is another caller's, uncollected: not taken.
+        // Every answer held is another caller's, uncollected, and the heap
+        // holds no room for another: not taken.
         return EINPROGRESS;
     };
     let rc = match apply(pv, b, &id) {
@@ -1475,16 +1668,17 @@ fn local_write<B: Backend, F: FnOnce(&mut Provider, &mut B, &Hash) -> Result<(),
         return EINPROGRESS;
     }
     // Taken: this caller's earlier answers go uncollected.
-    for x in pv
-        .answers
-        .iter_mut()
-        .filter(|x| x.used && x.caller == caller)
-    {
-        *x = NO_ANSWER;
-    }
+    pv.answers.each_mut(|x| {
+        if x.used && x.caller == caller {
+            *x = NO_ANSWER;
+        }
+    });
     pv.fault.held = pv.fault.hold;
     if log_pending(pv, b) {
-        pv.answers[room] = Answer {
+        let Some(slot) = pv.answers.get_mut(room) else {
+            return EINPROGRESS;
+        };
+        *slot = Answer {
             used: true,
             durable: false,
             rc,
@@ -1511,9 +1705,11 @@ fn log_pending<B: Backend>(pv: &Provider, b: &mut B) -> bool {
 
 /// The log has settled: every answer held is durable.
 fn settled(pv: &mut Provider) {
-    for x in pv.answers.iter_mut().filter(|x| x.used) {
-        x.durable = true;
-    }
+    pv.answers.each_mut(|x| {
+        if x.used {
+            x.durable = true;
+        }
+    });
 }
 
 /// Put `value` at `key` under a precondition (`pre`, and the revision an
@@ -1711,8 +1907,8 @@ pub fn import_record<B: Backend>(
     };
     let key = name.get(..n).unwrap_or(&[]);
     let mut mark = [0u8; IMPORT_MARK_LEN];
-    mark[..8].copy_from_slice(&offset.to_le_bytes());
-    mark[8..].copy_from_slice(&crc.to_le_bytes());
+    copy(&mut mark, &offset.to_le_bytes());
+    copy(mark.get_mut(8..).unwrap_or(&mut []), &crc.to_le_bytes());
     replicated_write(
         pv,
         b,
@@ -1769,7 +1965,9 @@ fn obj_get<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
     if a.is_empty() || !key_ok(a) {
         return EINVAL;
     }
-    let Some(i) = pv.slots.iter().position(|s| !s.used) else {
+    let owner = b.caller();
+    let mut alloc = |n: usize| b.alloc(n);
+    let Some(i) = pv.slots.take(&mut alloc, NO_SLOT, |s| s.used) else {
         return ENOMEM;
     };
     let (modr, at, len) = match read_value(b, bufs, a) {
@@ -1781,15 +1979,18 @@ fn obj_get<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, a: &[u
         return EOVERFLOW;
     };
     let large = len > INLINE_MAX;
-    let s = &mut pv.slots[i];
+    let Some(s) = pv.slots.get_mut(i) else {
+        return ENOMEM;
+    };
     s.used = true;
+    s.owner = owner;
     s.large = large;
     s.rev = modr;
     s.len = len32;
     s.key_len = a.len() as u8;
     copy(&mut s.key, a);
     if large {
-        pv.cached = (i + 1) as u8;
+        pv.cached = (i + 1) as u32;
         pv.cache_at = at as u32;
     } else {
         copy(&mut s.inline, bufs.cache.get(at..at + len).unwrap_or(&[]));
@@ -1809,7 +2010,7 @@ fn recache<B: Backend>(
     bufs: &mut Bufs<'_>,
     i: usize,
 ) -> Result<(), i32> {
-    let s = pv.slots[i];
+    let s = *pv.slots.get(i).ok_or(ERROR)?;
     let key = s.key.get(..s.key_len as usize).ok_or(ERROR)?;
     let Some((modr, at, len)) = read_value(b, bufs, key)? else {
         pv.cached = 0;
@@ -1819,7 +2020,7 @@ fn recache<B: Backend>(
         pv.cached = 0;
         return Err(ERROR);
     }
-    pv.cached = (i + 1) as u8;
+    pv.cached = (i + 1) as u32;
     pv.cache_at = at as u32;
     Ok(())
 }
@@ -1832,20 +2033,22 @@ fn obj_range_get<B: Backend>(
     slot: usize,
     a: &[u8],
 ) -> i32 {
-    if slot >= SLOTS || !pv.slots[slot].used {
+    if !pv.slots.get(slot).is_some_and(|s| s.opened_by(b.caller())) {
         return ENOSYS;
     }
     let (Some(off), Some(len), Some(out_ptr)) = (rd64(a, 0), rd32(a, 8), rd64(a, 12)) else {
         return EINVAL;
     };
-    let s = pv.slots[slot];
+    let Some(&s) = pv.slots.get(slot) else {
+        return ENOSYS;
+    };
     let total = u64::from(s.len);
     if off >= total {
         return 0;
     }
     let n = (len as u64).min(total - off) as usize;
     let from = off as usize;
-    if s.large && pv.cached != (slot + 1) as u8 {
+    if s.large && pv.cached != (slot + 1) as u32 {
         if let Err(e) = recache(pv, b, bufs, slot) {
             return e;
         }
@@ -1854,7 +2057,10 @@ fn obj_range_get<B: Backend>(
         let at = pv.cache_at as usize + from;
         bufs.cache.get(at..at + n).unwrap_or(&[])
     } else {
-        pv.slots[slot].inline.get(from..from + n).unwrap_or(&[])
+        pv.slots
+            .get(slot)
+            .and_then(|s| s.inline.get(from..from + n))
+            .unwrap_or(&[])
     };
     if src.len() != n {
         return ERROR;
@@ -1970,287 +2176,6 @@ fn ns_list<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
     at as i32
 }
 
-/// One change, `[rev][kind][klen u16][vlen u32][key][value]`.
-fn change_into(
-    out: &mut [u8],
-    at: &mut usize,
-    rev: u64,
-    kind: u8,
-    key: &[u8],
-    val: &[u8],
-) -> Option<()> {
-    put(out, at, &rev.to_le_bytes())?;
-    put(out, at, &[kind])?;
-    put(out, at, &(key.len() as u16).to_le_bytes())?;
-    put(out, at, &(val.len() as u32).to_le_bytes())?;
-    put(out, at, key)?;
-    put(out, at, val)
-}
-
-/// `[prefix_len u16][prefix][since u64][out_ptr u64][out_cap u32]
-/// [fence_ptr u64][fence_cap u16]`: `[status][count u32]`, then every
-/// change after `since` (since 0: every entry now, as Added). Status 1
-/// (LOST, no changes) when the history no longer reaches `since`. The
-/// whole answer fits `out_cap` or it is `ENOMEM`.
-fn ns_changes<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
-    let mut p = 0usize;
-    let Some(prefix) = field16(a, &mut p).filter(|k| key_ok(k)) else {
-        return EINVAL;
-    };
-    let (Some(since), Some(out_ptr), Some(out_cap), Some(fence_ptr), Some(fence_cap)) = (
-        rd64(a, p),
-        rd64(a, p + 8),
-        rd32(a, p + 16),
-        rd64(a, p + 20),
-        rd16(a, p + 28),
-    ) else {
-        return EINVAL;
-    };
-    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
-    let out = unsafe { caller_out(out_ptr, out_cap) };
-    let mut end = [0u8; KEY_MAX + 1];
-    let en = prefix_end(prefix, &mut end);
-    let now = b.revision();
-    let (lost, count, at) = if since == 0 {
-        // The present: every entry, in key order, as Added.
-        let mut at = 5usize;
-        let mut count = 0u32;
-        let walked = current(
-            b,
-            bufs,
-            prefix,
-            &end[..en],
-            now,
-            false,
-            &mut |_, _, rev, key, val| {
-                count += 1;
-                change_into(out, &mut at, rev, KIND_ADDED, key, val).is_some()
-            },
-        );
-        match walked {
-            Ok(Walk::Done) => (false, count, at),
-            Ok(Walk::Lost) => (true, 0, 5),
-            Ok(Walk::Stopped) => return ENOMEM,
-            Err(e) => return e,
-        }
-    } else if b.history() > 0 && since < now.saturating_sub(b.history()) {
-        (true, 0, 5)
-    } else {
-        match changes_in_order(b, bufs, prefix, &end[..en], since, now, out) {
-            Ok(Some((count, at))) => (false, count, at),
-            Ok(None) => (true, 0, 5),
-            Err(e) => return e,
-        }
-    };
-    let mut h = 0usize;
-    if put(out, &mut h, &[u8::from(lost)]).is_none()
-        || put(out, &mut h, &count.to_le_bytes()).is_none()
-    {
-        return ENOMEM;
-    }
-    // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
-    unsafe { write_fence(FENCE_VIEW_CONSISTENT, now, fence_ptr, fence_cap) };
-    at as i32
-}
-
-/// Every change in `[start, end)` within `(since, now]` into `out` from
-/// byte 5, oldest first (a revision's changes in the store's walk order):
-/// `Some((count, end))`, `None` when the history no longer reaches `since`.
-///
-/// The store walks a window key by key, so the answer is laid out, not
-/// sorted in place: a first walk notes each change's revision and size in
-/// an index at the far end of `out` (16 bytes a change), the index is put
-/// in revision order and turned into each change's place, and a second
-/// walk writes every change straight to its place. Nothing but `out`
-/// holds it, so an answer is as large as the caller's buffer allows.
-fn changes_in_order<B: Backend>(
-    b: &mut B,
-    bufs: &mut Bufs<'_>,
-    start: &[u8],
-    end: &[u8],
-    since: u64,
-    now: u64,
-    out: &mut [u8],
-) -> Result<Option<(u32, usize)>, i32> {
-    // Pass 1: `(rev, ordinal, length)` per change, from the end of `out`.
-    let cap = out.len();
-    let mut count = 0usize;
-    let mut total = 0usize;
-    let mut room = true;
-    let walked = history(
-        b,
-        bufs,
-        start,
-        end,
-        since,
-        now,
-        &mut |_, _, rev, _, key, val| {
-            let len = 15 + key.len() + val.len();
-            total += len;
-            count += 1;
-            let need = 5 + total + count * ORDER_ENTRY;
-            if need > cap {
-                room = false;
-                return false;
-            }
-            let entry = (u128::from(rev) << 64) | ((count as u128 - 1) << 32) | len as u128;
-            let slot = cap - count * ORDER_ENTRY;
-            if let Some(d) = out.get_mut(slot..slot + ORDER_ENTRY) {
-                copy(d, &entry.to_le_bytes());
-            }
-            true
-        },
-    );
-    match walked {
-        Ok(Walk::Done) => {}
-        Ok(Walk::Lost) => return Ok(None),
-        Ok(Walk::Stopped) if !room => return Err(ENOMEM),
-        Ok(Walk::Stopped) => return Err(ERROR),
-        Err(e) => return Err(e),
-    }
-    let n = count;
-    let Some(index) = out.get_mut(cap - n * ORDER_ENTRY..) else {
-        return Err(ERROR);
-    };
-    // The index was written from the end backwards: ordinal 0 is last.
-    // Revision order (walk order within a revision)…
-    heap_sort(index, n);
-    // …gives each change its place; re-keyed by ordinal, sorted back.
-    let mut place = 5u64;
-    for i in 0..n {
-        let e = entry(index, i);
-        let ordinal = (e >> 32) as u32;
-        let len = e as u32;
-        set_entry(index, i, (u128::from(ordinal) << 64) | u128::from(place));
-        place += u64::from(len);
-    }
-    heap_sort(index, n);
-    // Pass 2: every change to its place.
-    let mut i = 0usize;
-    let mut ok = true;
-    let walked = history(
-        b,
-        bufs,
-        start,
-        end,
-        since,
-        now,
-        &mut |_, _, rev, kind, key, val| {
-            let e = entry(index_of(out, cap, n), i);
-            i += 1;
-            let mut at = e as u64 as usize;
-            if i > n || change_into(out, &mut at, rev, kind, key, val).is_none() {
-                ok = false;
-                return false;
-            }
-            true
-        },
-    );
-    match walked {
-        Ok(Walk::Done) if ok && i == n => Ok(Some((n as u32, 5 + total))),
-        // The window is fixed (`now` pinned), so the second walk sees what
-        // the first did; anything else is the store failing.
-        Ok(Walk::Lost) => Ok(None),
-        Err(e) => Err(e),
-        _ => Err(ERROR),
-    }
-}
-
-/// The index `changes_in_order` keeps at the end of `out`.
-fn index_of(out: &[u8], cap: usize, n: usize) -> &[u8] {
-    out.get(cap - n * ORDER_ENTRY..).unwrap_or(&[])
-}
-
-/// Put `count` change records (`[rev][kind][klen u16][vlen u32][key]
-/// [value]`, all of `records`) in revision order, oldest first, keeping
-/// the walk's order within one revision. `scratch` holds an index and a
-/// copy of the records; `false` when it cannot.
-fn by_revision(records: &mut [u8], count: usize, scratch: &mut [u8]) -> bool {
-    let body = records.len();
-    let fits = count
-        .checked_mul(ORDER_ENTRY)
-        .and_then(|n| n.checked_add(body))
-        .is_some_and(|n| n <= scratch.len());
-    if !fits {
-        return false;
-    }
-    let (index, sorted) = scratch.split_at_mut(count * ORDER_ENTRY);
-    // Each record's `(rev, offset, length)`, packed so that ordering the
-    // numbers orders the records.
-    let mut p = 0usize;
-    for i in 0..count {
-        let (Some(rev), Some(kl), Some(vl)) = (
-            rd64(records, p),
-            rd16(records, p + 9),
-            rd32(records, p + 11),
-        ) else {
-            return false;
-        };
-        let len = 15 + kl + vl;
-        let entry = (u128::from(rev) << 64) | ((p as u128) << 32) | len as u128;
-        set_entry(index, i, entry);
-        p += len;
-    }
-    if p != body {
-        return false;
-    }
-    heap_sort(index, count);
-    let mut q = 0usize;
-    for i in 0..count {
-        let e = entry(index, i);
-        let (off, len) = ((e >> 32) as u32 as usize, e as u32 as usize);
-        if put(sorted, &mut q, records.get(off..off + len).unwrap_or(&[])).is_none() {
-            return false;
-        }
-    }
-    copy(records, sorted.get(..q).unwrap_or(&[]));
-    true
-}
-
-fn entry(index: &[u8], i: usize) -> u128 {
-    let at = i * ORDER_ENTRY;
-    index
-        .get(at..at + ORDER_ENTRY)
-        .and_then(|b| b.try_into().ok())
-        .map_or(0, u128::from_le_bytes)
-}
-
-fn set_entry(index: &mut [u8], i: usize, v: u128) {
-    let at = i * ORDER_ENTRY;
-    if let Some(d) = index.get_mut(at..at + ORDER_ENTRY) {
-        copy(d, &v.to_le_bytes());
-    }
-}
-
-/// Heap sort, ascending, of `n` index entries: no recursion, no heap.
-fn heap_sort(index: &mut [u8], n: usize) {
-    let sift = |index: &mut [u8], mut root: usize, end: usize| loop {
-        let mut child = 2 * root + 1;
-        if child >= end {
-            return;
-        }
-        if child + 1 < end && entry(index, child) < entry(index, child + 1) {
-            child += 1;
-        }
-        let (r, c) = (entry(index, root), entry(index, child));
-        if r >= c {
-            return;
-        }
-        set_entry(index, root, c);
-        set_entry(index, child, r);
-        root = child;
-    };
-    for start in (0..n / 2).rev() {
-        sift(index, start, n);
-    }
-    for end in (1..n).rev() {
-        let (a, z) = (entry(index, 0), entry(index, end));
-        set_entry(index, 0, z);
-        set_entry(index, end, a);
-        sift(index, 0, end);
-    }
-}
-
 /// How a walk ended.
 enum Walk {
     Done,
@@ -2359,205 +2284,432 @@ fn history<B: Backend, F: FnMut(&mut B, &mut [u8], u64, u8, &[u8], &[u8]) -> boo
     }
 }
 
-// ── Subscriptions ────────────────────────────────────────────────────
+// ── Subscriptions: doorbells on the subscriber's own event ───────────
 
-/// One event to `s`, built in `ev`: `true` when its channel took it
-/// whole.
-fn event_to<B: Backend>(
-    s: &mut Sub,
-    b: &mut B,
-    ev: &mut [u8],
-    rev: u64,
-    kind: u8,
-    key: &[u8],
-    val: &[u8],
-) -> bool {
-    if val.len() > INLINE_MAX {
-        return event_with(s, b, ev, rev, kind, key, &[], EVENT_FLAG_VALUE_ELIDED);
-    }
-    event_with(s, b, ev, rev, kind, key, val, 0)
+/// Whether `handle`'s slot names a subscription: its record id.
+fn sub_id(slot: usize) -> Option<u32> {
+    slot.checked_sub(SUB_BAND)
+        .and_then(|i| u32::try_from(i).ok())
 }
 
-/// One event to `s` with header `flags`.
-#[allow(clippy::too_many_arguments, reason = "an event's fields")]
-fn event_with<B: Backend>(
-    s: &mut Sub,
-    b: &mut B,
-    ev: &mut [u8],
-    rev: u64,
-    kind: u8,
-    key: &[u8],
-    val: &[u8],
-    flags: u8,
-) -> bool {
-    // A scoped subscription hears its keys in the graph's names.
-    let key = key.get(s.strip as usize..).unwrap_or(key);
-    let payload = (15 + key.len() + val.len()) as u16;
-    let mut at = 0usize;
-    let framed = put(ev, &mut at, &SOURCE).is_some()
-        && put(ev, &mut at, &s.seq.to_le_bytes()).is_some()
-        && put(ev, &mut at, &0u64.to_le_bytes()).is_some()
-        && put(ev, &mut at, &[CT_NAMESPACE_CHANGE, flags]).is_some()
-        && put(ev, &mut at, &payload.to_le_bytes()).is_some()
-        && change_into(ev, &mut at, rev, kind, key, val).is_some();
-    if !framed || b.write(s.sink, &ev[..at]) != at as i32 {
+/// Ring subscriber `id`: set its rung bit and signal its event, once until
+/// it is taken. Before every signal the subscriber's module occupancy must
+/// still stand and its event still be that module's — a subscription whose
+/// module is gone, or whose event slot another module now holds, is dropped
+/// and never signalled. `false` when it was dropped.
+fn ring_sub<B: Backend>(reg: &mut Registry, m: &mut Counters, b: &mut B, id: u32) -> bool {
+    let Some(s) = reg.sub(id) else {
         return false;
-    }
-    s.seq = s.seq.wrapping_add(1);
-    true
-}
-
-/// Bring subscribers up to the store: every change since the last pump,
-/// oldest first, to each subscriber whose prefix holds its key (one whose
-/// channel is full is owed LOST instead, and hears nothing more until
-/// told); then the LOST sentinel (kind Deleted, empty key, at the store's
-/// revision) to each owed one, as its channel takes it. The provider's
-/// writes pump themselves; the worker pumps after every command it
-/// applies, and on its step.
-pub fn pump<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>) {
-    pump_to(pv, b, bufs);
-}
-
-/// [`pump`]: `false` when the store made its history read wait — nothing
-/// told and nobody owed LOST for it, the same changes pumped next time.
-fn pump_to<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>) -> bool {
-    if !pv.opened {
+    };
+    if s.rung {
         return true;
     }
-    let now = b.revision();
-    if now > pv.seen && pv.subs.iter().any(|s| s.used && !s.lost) {
-        // The pages go through the cache.
-        pv.cached = 0;
-        let fed = feed(pv, b, bufs, now);
-        if fed == Fed::Waited {
-            return false;
-        }
-        if fed == Fed::Partial {
-            pv.m_pump_partial = pv.m_pump_partial.wrapping_add(1);
-            // What happened is not (or no longer) wholly readable here:
-            // every subscriber reads again.
-            for s in pv.subs.iter_mut().filter(|s| s.used) {
-                s.lost = true;
-            }
-        }
+    let (module, event) = (s.module, s.event);
+    if !b.module_live(module) || b.event_owner(event) != Some(module) || b.signal(event) < 0 {
+        reg.remove_sub(id);
+        m.reaped = m.reaped.wrapping_add(1);
+        return false;
     }
-    pv.seen = now;
-    for s in pv.subs.iter_mut().filter(|s| s.used && s.lost) {
-        if event_to(s, b, bufs.req, now, KIND_DELETED, &[], &[]) {
-            s.lost = false;
-        }
+    if let Some(s) = reg.sub_mut(id) {
+        s.rung = true;
     }
+    m.rung = m.rung.wrapping_add(1);
     true
 }
 
-/// How a pump's changes went: all told, not all readable (every
-/// subscriber is owed LOST), or the store made the read wait (nothing
-/// told, nothing owed).
-#[derive(PartialEq, Eq)]
-enum Fed {
-    Whole,
-    Partial,
-    Waited,
+/// `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now): a
+/// subscription that rings the caller's event whenever something under the
+/// prefix changes. Idempotent on (owner, module occupancy, event, prefix).
+/// `EINVAL` for an event that is not the calling module's, or one that
+/// refuses the signal a ring-now sends (the subscription is not kept).
+fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize) -> i32 {
+    let mut p = 0usize;
+    let Some(prefix) = field16(a, &mut p).filter(|k| key_ok(k)) else {
+        return EINVAL;
+    };
+    let (Some(event), Some(&flags)) = (rd32(a, p), a.get(p + 4)) else {
+        return EINVAL;
+    };
+    if a.len() != p + 5 {
+        return EINVAL;
+    }
+    let event = event as i32;
+    let owner = b.caller();
+    let Some(module) = b.module() else {
+        return EINVAL;
+    };
+    // The event must be the calling module's own: a subscription never
+    // wakes anyone else.
+    if b.event_owner(event) != Some(module) {
+        pv.m.owner_checks_failed = pv.m.owner_checks_failed.wrapping_add(1);
+        return EINVAL;
+    }
+    let ring_now = flags & SUB_RING_NOW != 0;
+    // The same subscription asked again: the same handle.
+    if let Some(w) = pv.reg.find_watch(prefix) {
+        let mut s = pv.reg.watch(w).map_or(SUB_NIL, |w| w.subs);
+        while let Some(rec) = pv.reg.sub(s) {
+            if rec.owner == owner
+                && rec.module == module
+                && rec.event == event
+                && rec.strip == strip as u8
+            {
+                if ring_now {
+                    if let Some(r) = pv.reg.sub_mut(s) {
+                        r.rung = false;
+                    }
+                    // Its event refused the signal: the subscription is
+                    // gone, and no handle names it.
+                    if !ring_sub(&mut pv.reg, &mut pv.m, b, s) {
+                        return EINVAL;
+                    }
+                }
+                return tagged(TAG_NAMESPACE, SUB_BAND + s as usize);
+            }
+            s = rec.next;
+        }
+    }
+    // A workload owner's quota (the system owner, slot 0, holds the node's
+    // own controllers): its dead subscriptions are swept before it is told
+    // no.
+    if owner[0] != 0 || owner[1] != 0 {
+        let quota = if pv.quota == 0 {
+            DEFAULT_SUB_QUOTA
+        } else {
+            pv.quota
+        };
+        if owned_subs(&mut pv.reg, b, owner) >= quota {
+            pv.m.refused = pv.m.refused.wrapping_add(1);
+            b.ledger_deny();
+            return ENOMEM;
+        }
+    }
+    let Provider { reg, m, .. } = pv;
+    let mut alloc = |n: usize| b.alloc(n);
+    let added = reg.watch_for(prefix, &mut alloc).and_then(|w| {
+        reg.add_sub(w, &mut alloc, |s| {
+            s.owner = owner;
+            s.module = module;
+            s.event = event;
+            s.strip = strip as u8;
+        })
+    });
+    let Ok(id) = added else {
+        m.refused = m.refused.wrapping_add(1);
+        b.ledger_deny();
+        return ENOMEM;
+    };
+    if ring_now && !ring_sub(reg, m, b, id) {
+        return EINVAL;
+    }
+    tagged(TAG_NAMESPACE, SUB_BAND + id as usize)
 }
 
-/// One pump's changes, `(seen, now]`: collected into the feed (only those
-/// a subscriber watches, values past an event's elided), put in revision
-/// order, and told: none is told before all are read.
-fn feed<B: Backend>(pv: &mut Provider, b: &mut B, bufs: &mut Bufs<'_>, now: u64) -> Fed {
-    let Bufs {
-        req,
-        ans,
-        cache,
-        feed,
-    } = bufs;
-    let mut walk = Bufs {
-        req,
-        ans,
-        cache,
-        feed: &mut [],
-    };
-    let subs = &pv.subs;
-    let mut fed = 0usize;
-    let mut count = 0usize;
-    let walked = history(
-        b,
-        &mut walk,
-        &[],
-        &[],
-        pv.seen,
-        now,
-        &mut |_, _, rev, kind, key, val| {
-            if !subs.iter().any(|s| !s.lost && s.watches(key)) {
-                return true;
+/// The subscriptions `owner` holds, after dropping those whose module is
+/// gone.
+fn owned_subs<B: Backend>(reg: &mut Registry, b: &mut B, owner: [u8; 8]) -> u32 {
+    let mut dead = [SUB_NIL; 32];
+    loop {
+        let mut n = 0u32;
+        let mut nd = 0usize;
+        reg.each_sub(|id| {
+            if let Some(s) = reg.sub(id) {
+                if s.owner == owner {
+                    if !b.module_live(s.module) && nd < dead.len() {
+                        dead[nd] = id;
+                        nd += 1;
+                    } else {
+                        n += 1;
+                    }
+                }
             }
-            let (kind, val) = if val.len() > INLINE_MAX {
-                (kind | KIND_ELIDED, &[][..])
-            } else {
-                (kind, val)
-            };
-            count += 1;
-            change_into(feed, &mut fed, rev, kind, key, val).is_some()
-        },
-    );
-    match walked {
-        Ok(Walk::Done) => {}
-        Err(EAGAIN) => return Fed::Waited,
-        _ => return Fed::Partial,
+            true
+        });
+        if nd == 0 {
+            return n;
+        }
+        for &id in &dead[..nd] {
+            reg.remove_sub(id);
+        }
     }
-    let records = feed.get_mut(..fed).unwrap_or(&mut []);
-    if !by_revision(records, count, walk.cache) {
-        return Fed::Partial;
+}
+
+/// `[event i32][out_ptr u64][out_cap u32]`: the caller's subscriptions on
+/// `event` that have rung since it last asked, their bits cleared —
+/// `[more u8][count u16][handle i32]…`. When they do not all fit, `more`
+/// is set and the event signalled again, so the rest is taken on the next
+/// wake.
+fn ns_take_rung<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8]) -> i32 {
+    let (Some(event), Some(out_ptr), Some(out_cap)) = (rd32(a, 0), rd64(a, 4), rd32(a, 12)) else {
+        return EINVAL;
+    };
+    if a.len() != 16 || out_ptr == 0 {
+        return EINVAL;
     }
-    let mut p = 0usize;
-    for _ in 0..count {
-        let Some((rev, kind, key, val, next)) = record_at(records, p) else {
-            return Fed::Partial;
+    let event = event as i32;
+    if out_cap < TAKE_HEAD + 4 {
+        return ENOMEM;
+    }
+    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
+    let out = unsafe { caller_out(out_ptr, out_cap) };
+    let owner = b.caller();
+    let Some(module) = b.module() else {
+        return EINVAL;
+    };
+    let room = (out.len() - TAKE_HEAD) / 4;
+    let mut count = 0usize;
+    let mut more = false;
+    let reg = &pv.reg;
+    reg.each_sub(|id| {
+        let Some(s) = reg.sub(id) else {
+            return true;
         };
-        p = next;
-        for s in pv.subs.iter_mut().filter(|s| !s.lost && s.watches(key)) {
-            let told = if kind & KIND_ELIDED != 0 {
-                elided_to(s, b, walk.req, rev, kind & !KIND_ELIDED, key)
-            } else {
-                event_to(s, b, walk.req, rev, kind, key, val)
-            };
-            if told {
-                pv.m_told = pv.m_told.wrapping_add(1);
-            } else {
-                pv.m_refused = pv.m_refused.wrapping_add(1);
-                s.lost = true;
+        if !(s.rung && s.event == event && s.owner == owner && s.module == module) {
+            return true;
+        }
+        if count == room {
+            more = true;
+            return false;
+        }
+        let h = tagged(TAG_NAMESPACE, SUB_BAND + id as usize);
+        let at = TAKE_HEAD + count * 4;
+        copy(&mut out[at..at + 4], &h.to_le_bytes());
+        count += 1;
+        true
+    });
+    for i in 0..count {
+        let at = TAKE_HEAD + i * 4;
+        let h = rd32(out, at).unwrap_or(0) as i32;
+        if let Some(id) = sub_id(slot_of(h)) {
+            if let Some(s) = pv.reg.sub_mut(id) {
+                s.rung = false;
             }
         }
     }
-    Fed::Whole
+    pv.m.taken = pv.m.taken.wrapping_add(count as u32);
+    out[0] = u8::from(more);
+    copy(&mut out[1..3], &(count as u16).to_le_bytes());
+    if more {
+        let _ = b.signal(event);
+    }
+    (TAKE_HEAD + count * 4) as i32
 }
 
-/// A change record `[rev][kind][klen u16][vlen u32][key][value]` at `at`,
-/// and where the next begins.
-fn record_at(b: &[u8], at: usize) -> Option<(u64, u8, &[u8], &[u8], usize)> {
-    let rev = rd64(b, at)?;
-    let kind = *b.get(at + 8)?;
-    let kl = rd16(b, at + 9)?;
-    let vl = rd32(b, at + 11)?;
-    let key = b.get(at + 15..at + 15 + kl)?;
-    let val = b.get(at + 15 + kl..at + 15 + kl + vl)?;
-    Some((rev, kind, key, val, at + 15 + kl + vl))
+/// Bring subscribers up to the change log: take the keys the worker's
+/// commands settled, ring every subscriber whose prefix holds one, ring
+/// everyone after a gap, and re-ring the subscribers whose reads were
+/// refused for now. Bounded per call; the worker pumps after every command
+/// it applies and on its step, and the provider's own writes pump
+/// themselves.
+pub fn pump<B: Backend>(pv: &mut Provider, b: &mut B, _bufs: &mut Bufs<'_>) {
+    if !pv.ring.attached() {
+        return;
+    }
+    take(pv, b);
+    if !pv.opened {
+        return;
+    }
+    // A refused read's subscriber, once a step: rung again, with first
+    // claim on this step's walk budget.
+    if pv.deferred_epoch != pv.epoch {
+        pv.deferred_epoch = pv.epoch;
+        let epoch = pv.epoch;
+        let Provider {
+            reg,
+            m,
+            prio_pending,
+            ..
+        } = pv;
+        reg.drain_deferred(|reg: &mut Registry, id| {
+            if let Some(s) = reg.sub_mut(id) {
+                s.rung = false;
+                s.prio = epoch;
+            }
+            if ring_sub(reg, m, b, id) {
+                *prio_pending += 1;
+            }
+        });
+    }
+    // A gap: every subscriber reads again.
+    if pv.ring.gaps != pv.pump_gaps {
+        pv.pump_gaps = pv.ring.gaps;
+        pv.pump_at = pv.ring.tip();
+        pv.gap_ringing = true;
+        pv.gap_at = SUB_NIL;
+        pv.m.gaps = pv.m.gaps.wrapping_add(1);
+    }
+    if pv.gap_ringing {
+        let mut batch = [SUB_NIL; GAP_RING_MAX];
+        let n = pv.reg.subs_after(pv.gap_at, &mut batch);
+        for &id in &batch[..n] {
+            pv.gap_at = id;
+            ring_sub(&mut pv.reg, &mut pv.m, b, id);
+        }
+        if n < GAP_RING_MAX {
+            pv.gap_ringing = false;
+        }
+    }
+    // The log's new entries, each to the subscribers whose prefix holds it.
+    let mut key = [0u8; KEY_MAX];
+    for _ in 0..PUMP_MAX {
+        let kl = match pv.ring.next(&mut pv.pump_at) {
+            Some(e) => {
+                copy(&mut key, e.key);
+                e.key.len()
+            }
+            None => break,
+        };
+        let Provider { reg, m, .. } = &mut *pv;
+        reg.matches_mut(&key[..kl], |reg, id| {
+            ring_sub(reg, m, b, id);
+        });
+    }
+    if pv.pump_at.lost {
+        // The pump fell behind the ring's eviction: what it missed cannot be
+        // matched, so everyone reads again.
+        pv.pump_at = pv.ring.tip();
+        pv.gap_ringing = true;
+        pv.gap_at = SUB_NIL;
+        pv.m.gaps = pv.m.gaps.wrapping_add(1);
+    }
 }
 
-/// A change whose value an event does not carry, announced.
-fn elided_to<B: Backend>(
-    s: &mut Sub,
-    b: &mut B,
-    ev: &mut [u8],
+/// Take the keys the worker's settled commands changed into the change log
+/// (nothing is rung: the next pump does that). The worker calls it after
+/// every command that stands, outside any provider call, so a step that
+/// applies many commands never holds more than one command's keys staged;
+/// [`pump`] calls it first.
+pub fn take<B: Backend>(pv: &mut Provider, b: &mut B) {
+    if !pv.ring.attached() {
+        return;
+    }
+    let Provider { ring, opened, .. } = pv;
+    let taken = b.take_keys(|rev, hint, key| {
+        if *opened && !ring.append(rev, hint, key) {
+            ring.gap(rev);
+        }
+    });
+    if let Some((complete, rev)) = taken {
+        if pv.opened {
+            if complete {
+                pv.ring.advance(rev);
+            } else {
+                pv.ring.gap(rev);
+            }
+        }
+    }
+}
+
+// ── CHANGES: one bounded page per call ───────────────────────────────
+
+/// One `CHANGES` page being written: `[status][more][safe_rev u64]
+/// [count u32]`, records, then `[token_len u16][token]` — the head last,
+/// with room for the trailer kept in reserve so a page can always end.
+struct PageOut<'a> {
+    out: &'a mut [u8],
+    pos: usize,
+    count: u32,
+    /// Bytes a record may not use: the trailer's.
+    reserve: usize,
+    /// Bytes of the scope's head every record's key loses.
+    strip: usize,
+}
+
+impl<'a> PageOut<'a> {
+    fn new(out: &'a mut [u8], token_reserve: usize, strip: usize) -> Option<Self> {
+        let reserve = CH_TRAILER + token_reserve;
+        (out.len() >= CH_HEAD + reserve).then_some(PageOut {
+            out,
+            pos: CH_HEAD,
+            count: 0,
+            reserve,
+            strip,
+        })
+    }
+
+    /// Append a record; `false` when it does not fit beside the trailer.
+    fn push(&mut self, mod_rev: u64, kind: u8, key: &[u8], val: &[u8]) -> bool {
+        self.push_then(mod_rev, kind, key, val, 0)
+    }
+
+    /// [`push`](Self::push), keeping room for a token of `token_after`
+    /// bytes should the page end after this record (a cursor naming it).
+    fn push_then(
+        &mut self,
+        mod_rev: u64,
+        kind: u8,
+        key: &[u8],
+        val: &[u8],
+        token_after: usize,
+    ) -> bool {
+        let key = key.get(self.strip..).unwrap_or(key);
+        let end = self.pos + CH_REC + key.len() + val.len();
+        if end + self.reserve.max(CH_TRAILER + token_after) > self.out.len() {
+            return false;
+        }
+        let mut at = self.pos;
+        if change_into(self.out, &mut at, mod_rev, kind, key, val).is_none() {
+            return false;
+        }
+        self.pos = at;
+        self.count += 1;
+        true
+    }
+
+    fn finish(self, more: bool, safe_rev: u64, token: &[u8]) -> i32 {
+        let o = self.out;
+        o[0] = 0;
+        o[1] = u8::from(more);
+        copy(&mut o[2..10], &safe_rev.to_le_bytes());
+        copy(&mut o[10..14], &self.count.to_le_bytes());
+        let mut at = self.pos;
+        if put(o, &mut at, &(token.len() as u16).to_le_bytes()).is_none()
+            || put(o, &mut at, token).is_none()
+        {
+            return ENOMEM;
+        }
+        at as i32
+    }
+}
+
+/// A LOST page.
+fn page_lost(out: &mut [u8]) -> i32 {
+    let Some(o) = out.get_mut(..CH_HEAD + CH_TRAILER) else {
+        return ENOMEM;
+    };
+    o.fill(0);
+    o[0] = 1;
+    (CH_HEAD + CH_TRAILER) as i32
+}
+
+/// One change record, `[rev][kind][klen u16][vlen u32][key][value]`.
+fn change_into(
+    out: &mut [u8],
+    at: &mut usize,
     rev: u64,
     kind: u8,
     key: &[u8],
-) -> bool {
-    event_with(s, b, ev, rev, kind, key, &[], EVENT_FLAG_VALUE_ELIDED)
+    val: &[u8],
+) -> Option<()> {
+    put(out, at, &rev.to_le_bytes())?;
+    put(out, at, &[kind])?;
+    put(out, at, &(key.len() as u16).to_le_bytes())?;
+    put(out, at, &(val.len() as u32).to_le_bytes())?;
+    put(out, at, key)?;
+    put(out, at, val)
 }
 
-/// `[prefix_len u16][prefix][sink u32][flags u8]` (bit 0: every entry
-/// now first, as Added): a subscription.
-fn ns_subscribe<B: Backend>(
+/// `[prefix_len u16][prefix][sub i32][token_len u16][token][out_ptr u64]
+/// [out_cap u32][fence_ptr u64][fence_cap u16]`: what changed under the
+/// prefix from the token on, one bounded page (the contract's `CHANGES`).
+///
+/// The token says where: empty, a relist (every entry now, by key); eight
+/// bytes, a bare revision `since`; else one this provider issued — `[T_LOG]
+/// [rev][ord]` inside the change log, `[T_RELIST][pinned][cursor]` inside a
+/// relist, `[T_HIST][since][to][cursor]` inside a history walk. A window the
+/// change log answers is served from it; one it cannot (below its base: a
+/// gap) from the store's history, a page at a time; past that, LOST.
+fn ns_changes<B: Backend>(
     pv: &mut Provider,
     b: &mut B,
     bufs: &mut Bufs<'_>,
@@ -2568,58 +2720,488 @@ fn ns_subscribe<B: Backend>(
     let Some(prefix) = field16(a, &mut p).filter(|k| key_ok(k)) else {
         return EINVAL;
     };
-    let Some(sink) = rd32(a, p) else {
+    let Some(sub) = rd32(a, p).map(|s| s as i32) else {
         return EINVAL;
     };
-    let initial = a.get(p + 4).is_some_and(|f| f & 1 != 0);
-    if initial && !pv.opened {
+    p += 4;
+    let Some(token) = field16(a, &mut p).filter(|t| t.len() <= TOKEN_MAX) else {
+        return EINVAL;
+    };
+    if a.len() != p + 22 {
+        return EINVAL;
+    }
+    let (Some(out_ptr), Some(out_cap), Some(fence_ptr), Some(fence_cap)) =
+        (rd64(a, p), rd32(a, p + 8), rd64(a, p + 12), rd16(a, p + 20))
+    else {
+        return EINVAL;
+    };
+    if out_ptr == 0 || fence_ptr == 0 || fence_cap < FENCE_WIRE_MAX {
+        return EINVAL;
+    }
+    // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
+    let out = unsafe { caller_out(out_ptr, out_cap) };
+    let sub = reader_sub(pv, b.caller(), sub);
+    let rc = if !pv.opened || !pv.ring.attached() {
+        EAGAIN
+    } else {
+        match token.len() {
+            0 => relist_page(pv, b, bufs, prefix, pv.ring.frontier(), &[], out, strip),
+            TOKEN_REV => {
+                let since = rd64(token, 0).unwrap_or(0);
+                from_revision(pv, b, bufs, prefix, since, ORD_END, sub, out, strip)
+            }
+            _ => match token[0] {
+                T_LOG if token.len() == 13 => {
+                    let rev = rd64(token, 1).unwrap_or(0);
+                    let ord = rd32(token, 9).unwrap_or(0) as u32;
+                    from_revision(pv, b, bufs, prefix, rev, ord, sub, out, strip)
+                }
+                T_RELIST if token.len() >= 9 => {
+                    let pinned = rd64(token, 1).unwrap_or(0);
+                    relist_page(pv, b, bufs, prefix, pinned, &token[9..], out, strip)
+                }
+                T_HIST if token.len() >= 17 => {
+                    let since = rd64(token, 1).unwrap_or(0);
+                    let to = rd64(token, 9).unwrap_or(0);
+                    hist_page(
+                        pv,
+                        b,
+                        bufs,
+                        prefix,
+                        since,
+                        to,
+                        &token[17..],
+                        sub,
+                        out,
+                        strip,
+                    )
+                }
+                _ => EINVAL,
+            },
+        }
+    };
+    if rc == EAGAIN {
+        if let Some(id) = sub {
+            pv.reg.defer(id);
+        }
         return EAGAIN;
     }
-    // Everyone else first: the new subscriber hears only what follows. A
-    // store that makes that wait has the subscription asked again — taken
-    // now, it would hear changes from before it.
-    if !pump_to(pv, b, bufs) {
-        return EAGAIN;
+    if rc >= 0 {
+        // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
+        unsafe { write_fence(FENCE_VIEW_CONSISTENT, b.revision(), fence_ptr, fence_cap) };
     }
-    let Some(i) = pv.subs.iter().position(|s| !s.used) else {
+    rc
+}
+
+/// The subscription a `CHANGES` read names (`sub`, its handle), when it is
+/// `owner`'s: a read refused for now rings it again once the cause clears.
+fn reader_sub(pv: &Provider, owner: [u8; 8], sub: i32) -> Option<u32> {
+    sub_id(slot_of(sub)).filter(|&id| pv.reg.sub(id).is_some_and(|s| s.owner == owner))
+}
+
+/// From `(rev, ord)` on: the change log when it answers; the store's history
+/// when the window starts below its base; LOST past the frontier.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one read's prefix, place, subscriber and page"
+)]
+fn from_revision<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    prefix: &[u8],
+    rev: u64,
+    ord: u32,
+    sub: Option<u32>,
+    out: &mut [u8],
+    strip: usize,
+) -> i32 {
+    let f = pv.ring.frontier();
+    if rev > f {
+        // Not a point this provider ever stood at.
+        return page_lost(out);
+    }
+    if pv.ring.answers(rev, ord) {
+        return log_page(pv, b, bufs, prefix, rev, ord, out, strip);
+    }
+    // Below the base: a gap. The store's history may still hold the
+    // window; a walk covers whole revisions, so one resumed inside `rev`
+    // walks all of it again (reporting twice is harmless).
+    let since = if ord == ORD_END {
+        rev
+    } else {
+        rev.saturating_sub(1)
+    };
+    hist_page(pv, b, bufs, prefix, since, f, &[], sub, out, strip)
+}
+
+/// One page of the change log from `(rev, ord)`: a record for every entry
+/// under the prefix, read at the store's current state — present, at the
+/// entry that last wrote it (its `mod_rev`), with its value; absent, at the
+/// entry that deleted it, as Deleted. An entry whose key a later write has
+/// since changed is left to that write's entry, so no record's revision is
+/// past what the page delivered. Never omitted, and applying them by key is
+/// idempotent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one read's prefix, place and page"
+)]
+fn log_page<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    prefix: &[u8],
+    rev: u64,
+    ord: u32,
+    out: &mut [u8],
+    strip: usize,
+) -> i32 {
+    let Some(mut cur) = pv.ring.seek(rev, ord) else {
+        return page_lost(out);
+    };
+    let Some(mut page) = PageOut::new(out, 13, strip) else {
         return ENOMEM;
     };
-    let mut s = NO_SUB;
-    s.used = true;
-    s.strip = strip as u8;
-    s.sink = sink as i32;
-    s.prefix_len = prefix.len() as u8;
-    copy(&mut s.prefix, prefix);
-    if initial {
-        let mut end = [0u8; KEY_MAX + 1];
-        let en = prefix_end(prefix, &mut end);
-        let now = b.revision();
-        let walked = current(
-            b,
-            bufs,
-            prefix,
-            &end[..en],
-            now,
-            false,
-            &mut |b, ev, rev, key, val| event_to(&mut s, b, ev, rev, KIND_ADDED, key, val),
-        );
-        match walked {
-            Ok(Walk::Done) => {}
-            // A watcher set up on part of the state would believe it had
-            // seen all of it: refused, as the host store refuses.
-            Ok(_) => return EAGAIN,
-            // The store made the listing wait before any of it was told:
-            // nothing moved, asked again.
-            Err(EAGAIN) if s.seq == 0 => return EAGAIN,
-            // ... or after some was: told is told, so the subscription is
-            // taken, owed LOST — it reads again, as one whose channel
-            // filled does, and never believes it saw all of the state.
-            Err(EAGAIN) => s.lost = true,
-            Err(e) => return e,
+    let frontier = pv.ring.frontier();
+    let mut key = [0u8; KEY_MAX];
+    // The last entry consumed, and whether the page stopped before the log's
+    // end (where the next read resumes).
+    let mut resume: Option<(u64, u32)> = None;
+    for _ in 0..LOG_SCAN_MAX {
+        let before = cur;
+        let (erev, eord, hint, kl) = match pv.ring.next(&mut cur) {
+            Some(e) if e.rev <= frontier => {
+                copy(&mut key, e.key);
+                (e.rev, e.ord, e.hint, e.key.len())
+            }
+            _ => break,
+        };
+        let k = &key[..kl];
+        if k.starts_with(prefix) {
+            let fits = match read_value(b, bufs, k) {
+                Err(e) => return e,
+                Ok(Some((modr, at, len))) if modr == erev => {
+                    let kind = if hint == KEY_CREATED {
+                        KIND_ADDED
+                    } else {
+                        KIND_MODIFIED
+                    };
+                    let val = bufs.cache.get(at..at + len).unwrap_or(&[]);
+                    page.push(modr, kind, k, val)
+                }
+                // Changed again since: that write's entry says it.
+                Ok(Some(_)) => true,
+                Ok(None) if hint == KEY_DELETED => page.push(erev, KIND_DELETED, k, &[]),
+                // Absent, but this entry did not delete it: the entry that
+                // did comes later.
+                Ok(None) => true,
+            };
+            if !fits {
+                if page.count == 0 {
+                    return ENOMEM;
+                }
+                resume = Some((erev, eord));
+                cur = before;
+                break;
+            }
         }
     }
-    pv.subs[i] = s;
-    tagged(TAG_NAMESPACE, SLOTS + i)
+    if resume.is_none() {
+        // Stopped on the scan budget (or the end): resume at the next
+        // unread entry, if there is one.
+        let mut peek = cur;
+        if let Some(e) = pv.ring.next(&mut peek) {
+            if e.rev <= frontier {
+                resume = Some((e.rev, e.ord));
+            }
+        }
+    }
+    match resume {
+        Some((r, o)) => {
+            // Delivered whole: every revision before the one it resumes in.
+            let mut t = [0u8; 13];
+            t[0] = T_LOG;
+            copy(&mut t[1..9], &r.to_le_bytes());
+            copy(&mut t[9..13], &o.to_le_bytes());
+            page.finish(true, r.saturating_sub(1), &t)
+        }
+        None => page.finish(false, frontier, &frontier.to_le_bytes()),
+    }
+}
+
+/// One page of a relist: every entry under the prefix now, in key order,
+/// from just past `cursor`, as Added with its value. `pinned` is the log's
+/// frontier when the relist began — the revision it resumes `CHANGES` from.
+/// An entry written after `pinned` is passed over: the `CHANGES` from
+/// `pinned` that follows the relist reports it (from the log, or across a
+/// gap from history), so no relist record carries a `mod_rev` past the
+/// revision the relist hands back.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one read's prefix, place and page"
+)]
+fn relist_page<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    prefix: &[u8],
+    pinned: u64,
+    cursor: &[u8],
+    out: &mut [u8],
+    strip: usize,
+) -> i32 {
+    if !cursor.is_empty() && (!key_ok(cursor) || !cursor.starts_with(prefix)) {
+        return EINVAL;
+    }
+    // Room for the shortest token; a record keeps room for the cursor that
+    // would name it.
+    let Some(mut page) = PageOut::new(out, TOKEN_REV, strip) else {
+        return ENOMEM;
+    };
+    let mut end = [0u8; KEY_MAX + 1];
+    let en = prefix_end(prefix, &mut end);
+    // Strictly after the cursor.
+    let mut from = [0u8; KEY_MAX + 1];
+    let from_len = if cursor.is_empty() {
+        copy(&mut from, prefix);
+        prefix.len()
+    } else {
+        copy(&mut from, cursor);
+        from[cursor.len()] = 0;
+        cursor.len() + 1
+    };
+    // The last key the page holds, in the store's names: where the next
+    // page resumes.
+    let mut lastk = [0u8; KEY_MAX];
+    let mut last_len = 0usize;
+    let mut overflow = false;
+    let read_rev = b.revision();
+    let walked = current(
+        b,
+        bufs,
+        &from[..from_len],
+        &end[..en],
+        read_rev,
+        false,
+        &mut |_, _, modr, key, val| {
+            if key.len() > KEY_MAX {
+                overflow = true;
+                return false;
+            }
+            if modr > pinned {
+                return true;
+            }
+            if !page.push_then(modr, KIND_ADDED, key, val, 9 + key.len()) {
+                return false;
+            }
+            last_len = key.len();
+            copy(&mut lastk, key);
+            true
+        },
+    );
+    let _ = pv;
+    match walked {
+        Ok(_) if overflow => EOVERFLOW,
+        Ok(Walk::Stopped) if page.count == 0 => ENOMEM,
+        Ok(Walk::Stopped) => {
+            let mut t = [0u8; 9 + KEY_MAX];
+            t[0] = T_RELIST;
+            copy(&mut t[1..9], &pinned.to_le_bytes());
+            copy(&mut t[9..9 + last_len], &lastk[..last_len]);
+            // Nothing is delivered whole until the relist ends.
+            page.finish(true, 0, &t[..9 + last_len])
+        }
+        Ok(_) => page.finish(false, pinned, &pinned.to_le_bytes()),
+        Err(e) => e,
+    }
+}
+
+/// One page of a history walk over `(since, to]`, key by key from `cursor`:
+/// the store's versions say which keys changed; each is reported as the log
+/// would (present, at its last write — or left to `CHANGES` from `to` when
+/// written again since; absent, at its delete). Pages stop at a key boundary
+/// within this call's and this step's walk budgets; the token moves to `to`
+/// only when the walk is done.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one read's prefix, window, subscriber and page"
+)]
+fn hist_page<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    prefix: &[u8],
+    since: u64,
+    to: u64,
+    cursor: &[u8],
+    sub: Option<u32>,
+    out: &mut [u8],
+    strip: usize,
+) -> i32 {
+    if !cursor.is_empty() && (!key_ok(cursor) || !cursor.starts_with(prefix)) {
+        return EINVAL;
+    }
+    if b.history() > 0 && since < b.revision().saturating_sub(b.history()) {
+        return page_lost(out);
+    }
+    // The step's walk budget, first claim to the subscribers refused last
+    // step.
+    let prio = sub
+        .and_then(|id| pv.reg.sub(id))
+        .is_some_and(|s| s.prio == pv.epoch && s.prio != 0);
+    if pv.walk_left == 0 || (pv.prio_pending > 0 && !prio) {
+        pv.m.walk_refused = pv.m.walk_refused.wrapping_add(1);
+        return EAGAIN;
+    }
+    if prio {
+        pv.prio_pending = pv.prio_pending.saturating_sub(1);
+        if let Some(s) = sub.and_then(|id| pv.reg.sub_mut(id)) {
+            s.prio = 0;
+        }
+    }
+    let mut end = [0u8; KEY_MAX + 1];
+    let en = prefix_end(prefix, &mut end);
+    let start = if cursor.is_empty() { prefix } else { cursor };
+    // Collect the window's keys (each with its latest version in it) into
+    // the provider's scratch: a walk's page holds the cache, so their present
+    // state is read only after it.
+    let scratch = &mut pv.hist_keys;
+    let mut used = 0usize;
+    let mut keys = 0usize;
+    let mut visits = 0u32;
+    let budget = pv.walk_left.min(HIST_VISIT_MAX);
+    let mut next_key = [0u8; KEY_MAX];
+    let mut next_len = usize::MAX;
+    let mut overflow = false;
+    let walked = history(
+        b,
+        bufs,
+        start,
+        &end[..en],
+        since,
+        to,
+        &mut |_, _, rev, kind, key, _| {
+            visits += 1;
+            if key.len() > KEY_MAX {
+                overflow = true;
+                return false;
+            }
+            // The same key as the last one noted: its newer version.
+            let last_at = used.checked_sub(HIST_ENTRY_FIXED + KEY_MAX);
+            if keys > 0 {
+                if let Some(at) = last_at {
+                    let kl = scratch[at] as usize;
+                    if &scratch[at + 1..at + 1 + kl] == key {
+                        // Its newest version in the window wins.
+                        if rev >= rd64(scratch, at + 1 + KEY_MAX).unwrap_or(0) {
+                            copy(
+                                &mut scratch[at + 1 + KEY_MAX..at + 9 + KEY_MAX],
+                                &rev.to_le_bytes(),
+                            );
+                            scratch[at + 9 + KEY_MAX] = kind;
+                        }
+                        return true;
+                    }
+                }
+            }
+            // A new key: stop here when a budget is spent, so the next page
+            // starts at it whole.
+            if visits > budget || used + HIST_ENTRY_FIXED + KEY_MAX > scratch.len() {
+                next_len = key.len();
+                copy(&mut next_key, key);
+                return false;
+            }
+            scratch[used] = key.len() as u8;
+            copy(&mut scratch[used + 1..used + 1 + key.len()], key);
+            copy(
+                &mut scratch[used + 1 + KEY_MAX..used + 9 + KEY_MAX],
+                &rev.to_le_bytes(),
+            );
+            scratch[used + 9 + KEY_MAX] = kind;
+            used += HIST_ENTRY_FIXED + KEY_MAX;
+            keys += 1;
+            true
+        },
+    );
+    pv.walk_left = pv.walk_left.saturating_sub(visits);
+    let done = match walked {
+        // A key no token can name: the window cannot be paged past it.
+        Ok(_) if overflow => return EOVERFLOW,
+        Ok(Walk::Done) => true,
+        Ok(Walk::Stopped) => false,
+        Ok(Walk::Lost) => return page_lost(out),
+        Err(e) => return e,
+    };
+    // Room for the shortest token; a record keeps room for a cursor naming
+    // whichever key the page may end before once it is in — any key
+    // gathered after it, or the one the walk stopped at — so a page that
+    // holds a record can always end. `later[i]`: the longest of those for
+    // record `i`.
+    let Some(mut page) = PageOut::new(out, TOKEN_REV, strip) else {
+        return ENOMEM;
+    };
+    let stride = HIST_ENTRY_FIXED + KEY_MAX;
+    let mut later = [0u8; HIST_KEYS];
+    let mut longest = if next_len == usize::MAX {
+        0
+    } else {
+        next_len as u8
+    };
+    for (i, l) in later.iter_mut().enumerate().take(keys).rev() {
+        *l = longest;
+        longest = longest.max(pv.hist_keys.get(i * stride).copied().unwrap_or(0));
+    }
+    let mut resume_key = [0u8; KEY_MAX];
+    let mut resume_len = usize::MAX;
+    let mut key = [0u8; KEY_MAX];
+    for i in 0..keys {
+        let at = i * stride;
+        // 0: no key follows, and a page that ends here ends the walk.
+        let token_after = match later.get(i).map_or(KEY_MAX, |&l| usize::from(l)) {
+            0 => 0,
+            l => 17 + l,
+        };
+        let kl = pv.hist_keys[at] as usize;
+        copy(&mut key, &pv.hist_keys[at + 1..at + 1 + kl]);
+        let vrev = rd64(&pv.hist_keys, at + 1 + KEY_MAX).unwrap_or(0);
+        let vkind = pv.hist_keys[at + 9 + KEY_MAX];
+        let k = &key[..kl];
+        let fits = match read_value(b, bufs, k) {
+            Err(e) => return e,
+            Ok(Some((modr, at, len))) if modr == vrev => {
+                let val = bufs.cache.get(at..at + len).unwrap_or(&[]);
+                page.push_then(modr, vkind, k, val, token_after)
+            }
+            Ok(Some(_)) => true,
+            Ok(None) if vkind == KIND_DELETED => {
+                page.push_then(vrev, KIND_DELETED, k, &[], token_after)
+            }
+            Ok(None) => true,
+        };
+        if !fits {
+            if page.count == 0 {
+                return ENOMEM;
+            }
+            resume_len = kl;
+            copy(&mut resume_key, k);
+            break;
+        }
+    }
+    if resume_len == usize::MAX && !done && next_len != usize::MAX {
+        resume_len = next_len;
+        copy(&mut resume_key, &next_key[..next_len]);
+    }
+    if resume_len == usize::MAX {
+        // The walk is done: the window is delivered whole, and the next read
+        // goes on from `to`.
+        return page.finish(false, to, &to.to_le_bytes());
+    }
+    let mut t = [0u8; 17 + KEY_MAX];
+    t[0] = T_HIST;
+    copy(&mut t[1..9], &since.to_le_bytes());
+    copy(&mut t[9..17], &to.to_le_bytes());
+    copy(&mut t[17..17 + resume_len], &resume_key[..resume_len]);
+    page.finish(true, since, &t[..17 + resume_len])
 }
 
 // ── Writes through the group's log ───────────────────────────────────
@@ -2860,7 +3442,8 @@ fn replicated_write<B: Backend>(pv: &mut Provider, b: &mut B, w: &WriteArgs<'_>)
     if pv.rep.superseded {
         return ERROR;
     }
-    let id = identity(pv, b.caller(), w);
+    let caller = b.caller();
+    let id = identity(pv, b, caller, w);
     let rep = &mut pv.rep;
     let found = rep
         .writes
@@ -2921,12 +3504,12 @@ fn replicated_write<B: Backend>(pv: &mut Provider, b: &mut B, w: &WriteArgs<'_>)
 /// an identical re-ask — the same caller, operation, precondition, key and
 /// value length, and a value with the same checksum — is the request its
 /// caller's [`Ident`] already names, and its identity is not hashed again
-/// (SHA-256 over a 1 MiB value, every re-ask, is what kept a loaded store's
+/// (SHA-256 over a 1 MiB value on every re-ask would keep a loaded store's
 /// callers waiting). The checksum is two 64-bit lanes keyed per provider:
 /// it tells a re-ask from a caller's buffer reused for a different value,
 /// the one case the exact fields cannot. A request not matched is hashed
 /// whole and replaces its caller's (or the least recently asked) entry.
-fn identity(pv: &mut Provider, caller: [u8; 8], w: &WriteArgs<'_>) -> Hash {
+fn identity<B: Backend>(pv: &mut Provider, b: &mut B, caller: [u8; 8], w: &WriteArgs<'_>) -> Hash {
     let value = w.value.unwrap_or(&[]);
     let check = checksum(pv.ident_seed, value);
     let mark = w.mark.unwrap_or([0; IMPORT_MARK_LEN]);
@@ -2942,19 +3525,27 @@ fn identity(pv: &mut Provider, caller: [u8; 8], w: &WriteArgs<'_>) -> Hash {
             && x.check == check
             && x.key.get(..x.key_len as usize) == Some(w.key)
     };
-    if let Some(x) = pv.idents.iter_mut().find(|x| same(x)) {
-        x.idle = 0;
-        return x.id;
+    if let Some(k) = pv.idents.position(|x| same(x)) {
+        if let Some(x) = pv.idents.get_mut(k) {
+            x.idle = 0;
+            return x.id;
+        }
     }
     let id = write_id(&caller, w);
     pv.m_ident_hashed = pv.m_ident_hashed.wrapping_add(1);
     if w.key.len() <= KEY_MAX {
-        let k = pv
-            .idents
-            .iter()
-            .position(|x| x.used && x.caller == caller)
-            .or_else(|| pv.idents.iter().position(|x| !x.used))
-            .or_else(|| (0..LOCAL_ANSWERS).max_by_key(|&k| pv.idents.get(k).map_or(0, |x| x.idle)));
+        let k = match pv.idents.position(|x| x.used && x.caller == caller) {
+            Some(k) => Some(k),
+            None => {
+                let mut alloc = |n: usize| b.alloc(n);
+                pv.idents
+                    .take(&mut alloc, NO_IDENT, |x| x.used)
+                    // The heap holds no more: the longest unasked goes.
+                    .or_else(|| {
+                        (0..pv.idents.len()).max_by_key(|&k| pv.idents.get(k).map_or(0, |x| x.idle))
+                    })
+            }
+        };
         if let Some(x) = k.and_then(|k| pv.idents.get_mut(k)) {
             *x = Ident {
                 used: true,
@@ -3028,7 +3619,7 @@ fn write_id(caller: &[u8], w: &WriteArgs<'_>) -> Hash {
 fn write_body(x: &mut Write, w: &WriteArgs<'_>, what: Option<&Put<'_>>) -> Option<usize> {
     let at = match w.mark {
         Some(m) => {
-            x.body.get_mut(..IMPORT_MARK_LEN)?.copy_from_slice(&m);
+            copy(x.body.get_mut(..IMPORT_MARK_LEN)?, &m);
             IMPORT_MARK_LEN
         }
         None => 0,
@@ -3455,36 +4046,20 @@ pub fn store_log_head(h: &[u8]) -> Option<(u8, usize, usize)> {
 // ── Dispatch ─────────────────────────────────────────────────────────
 
 /// Whether a call needs the store (its data or history). One that does
-/// not — a subscription with no initial listing, a close, the caps — is
-/// served while the store is still recovering, so a consumer that
-/// subscribes at start is registered, not refused (it would not ask
-/// again, and would never be woken).
+/// not — a subscription (it only registers and rings), a take, a close,
+/// the caps — is served while the store is still recovering, so a consumer
+/// that subscribes at start is registered, not refused (it would not ask
+/// again, and would never be woken), and reads once the store serves.
 ///
 /// # Safety
 /// `arg` names `arg_len` bytes (or is null).
-pub unsafe fn needs_store(op: u32, arg: *const u8, arg_len: usize) -> bool {
-    match op {
-        OBJ_CLOSE | NS_CLOSE | NS_CAPS => false,
-        NS_SUBSCRIBE => {
-            let a: &[u8] = if arg.is_null() {
-                &[]
-            } else {
-                core::slice::from_raw_parts(arg, arg_len)
-            };
-            // `[plen u16][prefix][sink u32][flags u8]`: bit 0 lists first.
-            let flags = rd16(a, 0).and_then(|pl| a.get(2 + pl + 4)).copied();
-            flags.is_some_and(|f| f & 1 != 0)
-        }
-        _ => true,
-    }
+pub unsafe fn needs_store(op: u32, _arg: *const u8, _arg_len: usize) -> bool {
+    !matches!(
+        op,
+        OBJ_CLOSE | NS_CLOSE | NS_CAPS | NS_SUBSCRIBE | NS_TAKE_RUNG
+    )
 }
 
-/// A contract call, answered in the call. `handle` arrives with its tag
-/// stripped.
-///
-/// # Safety
-/// `arg` names `arg_len` bytes; the pointers the arguments carry name
-/// what the contract says they do (the caller's buffers).
 /// The most a key-bearing argument takes once its names are the store's.
 const SCOPED_ARG_MAX: usize = 1024;
 
@@ -3576,35 +4151,12 @@ fn strip_list(out: &mut [u8], len: usize, head: usize) -> usize {
     w
 }
 
-/// A CHANGES answer in the graph's names: `head` bytes off every change's
-/// key. Its new length.
-fn strip_changes(out: &mut [u8], len: usize, head: usize) -> usize {
-    let count = match out.get(1..5).and_then(|c| c.try_into().ok()) {
-        Some(c) => u32::from_le_bytes(c),
-        None => return len,
-    };
-    let (mut r, mut w) = (5usize, 5usize);
-    for _ in 0..count {
-        let (Some(kl), Some(vl)) = (rd16(out, r + 9), rd32(out, r + 11)) else {
-            break;
-        };
-        let keep = kl.saturating_sub(head);
-        shift_down(out, w, r, 9);
-        let k = (keep as u16).to_le_bytes();
-        if let Some(x) = out.get_mut(w + 9) {
-            *x = k[0];
-        }
-        if let Some(x) = out.get_mut(w + 10) {
-            *x = k[1];
-        }
-        shift_down(out, w + 11, r + 11, 4);
-        shift_down(out, w + 15, r + 15 + (kl - keep), keep + vl);
-        r += 15 + kl + vl;
-        w += 15 + keep + vl;
-    }
-    w
-}
-
+/// A contract call, answered in the call. `handle` arrives with its tag
+/// stripped.
+///
+/// # Safety
+/// `arg` names `arg_len` bytes; the pointers the arguments carry name
+/// what the contract says they do (the caller's buffers).
 pub unsafe fn dispatch<B: Backend>(
     pv: &mut Provider,
     b: &mut B,
@@ -3644,7 +4196,19 @@ pub unsafe fn dispatch<B: Backend>(
     // met by the read in the store itself.
     match pv.fault_read(op, a) {
         Injected::No => serve(pv, b, bufs, handle, op, a, strip, arg, arg_len),
-        Injected::AtDispatch => EAGAIN,
+        Injected::AtDispatch => {
+            // Nothing moves, but what the contract asks of a waiting read:
+            // the subscription a CHANGES names is rung again once the step
+            // clears, as a store that waits rings it.
+            if op == NS_CHANGES {
+                let mut p = 0usize;
+                let sub = field16(a, &mut p).and_then(|_| rd32(a, p));
+                if let Some(id) = sub.and_then(|s| reader_sub(pv, b.caller(), s as i32)) {
+                    pv.reg.defer(id);
+                }
+            }
+            EAGAIN
+        }
         Injected::InStore => serve(
             pv,
             &mut StoreBusy(b),
@@ -3698,6 +4262,39 @@ impl<B: Backend> Backend for StoreBusy<'_, B> {
     fn group(&self) -> Group {
         self.0.group()
     }
+    fn module(&self) -> Option<[u8; 8]> {
+        self.0.module()
+    }
+    fn module_live(&self, module: [u8; 8]) -> bool {
+        self.0.module_live(module)
+    }
+    fn event_owner(&self, event: i32) -> Option<[u8; 8]> {
+        self.0.event_owner(event)
+    }
+    fn signal(&mut self, event: i32) -> i32 {
+        self.0.signal(event)
+    }
+    fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        self.0.alloc(bytes)
+    }
+    fn take_keys<F: FnMut(u64, u8, &[u8])>(&mut self, f: F) -> Option<(bool, u64)> {
+        self.0.take_keys(f)
+    }
+    fn ledger_deny(&mut self) {
+        self.0.ledger_deny()
+    }
+}
+
+/// A call's raw argument bytes.
+///
+/// # Safety
+/// `arg` names `arg_len` bytes (or is null).
+unsafe fn raw_arg<'a>(arg: *mut u8, arg_len: usize) -> &'a [u8] {
+    if arg.is_null() {
+        &[]
+    } else {
+        core::slice::from_raw_parts(arg as *const u8, arg_len)
+    }
 }
 
 /// Serve one call, its argument in the store's names (`strip`: the scope
@@ -3730,10 +4327,17 @@ unsafe fn serve<B: Backend>(
             if arg.is_null() || arg_len < FENCE_WIRE_MAX {
                 return EINVAL;
             }
-            let sub = slot.checked_sub(SLOTS).and_then(|i| pv.subs.get(i));
-            let rev = if slot < SLOTS && pv.slots[slot].used {
-                pv.slots[slot].rev
-            } else if sub.is_some_and(|s| s.used) {
+            let caller = b.caller();
+            let module = b.module();
+            let sub = sub_id(slot).and_then(|id| pv.reg.sub(id));
+            let read = pv
+                .slots
+                .get(slot)
+                .filter(|s| s.opened_by(caller))
+                .map(|s| s.rev);
+            let rev = if let Some(rev) = read {
+                rev
+            } else if sub.is_some_and(|s| s.owner == caller && Some(s.module) == module) {
                 b.revision()
             } else {
                 return ENOSYS;
@@ -3746,47 +4350,45 @@ unsafe fn serve<B: Backend>(
         OBJ_HEAD => obj_head(b, bufs, a),
         OBJ_DELETE => obj_delete(pv, b, bufs, a),
         OBJ_CLOSE => {
-            if slot < SLOTS {
-                pv.slots[slot].used = false;
-                if pv.cached == (slot + 1) as u8 {
+            let caller = b.caller();
+            if let Some(s) = pv.slots.get_mut(slot).filter(|s| s.opened_by(caller)) {
+                s.used = false;
+                if pv.cached == (slot + 1) as u32 {
                     pv.cached = 0;
                 }
             }
             0
         }
         NS_CAPS => NS_CAPS_SERVED,
-        NS_LIST | NS_CHANGES => {
-            let rc = if op == NS_LIST {
-                ns_list(b, bufs, a)
-            } else {
-                ns_changes(b, bufs, a)
-            };
+        NS_LIST => {
+            let rc = ns_list(b, bufs, a);
             if rc <= 0 || strip == 0 {
                 return rc;
             }
-            // `[prefix][cursor (a LIST's)][out_ptr u64][out_cap u32]…`
+            // `[prefix][cursor][out_ptr u64][out_cap u32]…`
             let mut p = 0usize;
             let _ = field16(a, &mut p);
-            if op == NS_LIST {
-                let _ = field16(a, &mut p);
-            } else {
-                p += 8;
-            }
+            let _ = field16(a, &mut p);
             let (Some(out_ptr), Some(out_cap)) = (rd64(a, p), rd32(a, p + 8)) else {
                 return rc;
             };
             let out = caller_out(out_ptr, out_cap);
-            let n = if op == NS_LIST {
-                strip_list(out, rc as usize, strip)
-            } else {
-                strip_changes(out, rc as usize, strip)
-            };
-            n as i32
+            strip_list(out, rc as usize, strip) as i32
         }
-        NS_SUBSCRIBE => ns_subscribe(pv, b, bufs, a, strip),
+        // A page's keys are written in the graph's names as it is built.
+        NS_CHANGES => ns_changes(pv, b, bufs, a, strip),
+        NS_SUBSCRIBE => ns_subscribe(pv, b, a, strip),
+        NS_TAKE_RUNG => ns_take_rung(pv, b, raw_arg(arg, arg_len)),
         NS_CLOSE => {
-            if let Some(s) = slot.checked_sub(SLOTS).and_then(|i| pv.subs.get_mut(i)) {
-                *s = NO_SUB;
+            let (caller, module) = (b.caller(), b.module());
+            if let Some(id) = sub_id(slot) {
+                if pv
+                    .reg
+                    .sub(id)
+                    .is_some_and(|s| s.owner == caller && Some(s.module) == module)
+                {
+                    pv.reg.remove_sub(id);
+                }
             }
             0
         }

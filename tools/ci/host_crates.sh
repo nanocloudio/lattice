@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# The host crates' fmt/clippy/build + the wire/ and telemetry/ catalog gates,
-# AS A CI GATE.
+# The host crates' fmt/clippy/build/test + the wire/ and telemetry/ catalog
+# gates and the committed-clock shape gate, AS A CI GATE.
 #
-# Lattice has no root cargo workspace (retired along with crates/lattice-common;
-# the cores live in modules/common and are #[path]-mounted, not linked). That
-# changes what `fluxor ci` runs:
-#   * phases 1.1/1.2 see no root Cargo.toml and fmt-check + clippy the PIC
-#     module sources directly — a gain, since modules/** was linted by neither.
-#   * phase 4's built-in cargo-test (harness) covers tests/harness (via
-#     [ci.cargo] host_tools_crate), so the suites run — but the standalone
-#     tools/* crates would be built and linted by nothing, and the wire_lint /
-#     telemetry_guard / clock_lint checks would never run as gates (they used to
-#     run ONLY from the old hand-written Makefile lint recipe).
-# This closes both holes. Modelled on wave/spectra tools/ci/host_crates.sh.
+# Lattice has no root cargo workspace: the cores live in modules/common and are
+# #[path]-mounted, not linked. That shapes what `fluxor ci` covers by itself:
+#   * the fmt-check (modules) and clippy (modules) phases see no root
+#     Cargo.toml and check the PIC module sources directly.
+#   * the `cargo-test (harness)` integration phase compiles and runs
+#     tests/harness after the module build. fluxor.toml deliberately sets no
+#     `[ci.cargo] host_tools_crate` — that would run the artefact-dependent
+#     harness a second time as the unit phase, before any .fmod exists.
+#   * nothing builds or lints the standalone tools/* crates, and nothing runs
+#     the wire_lint / telemetry_guard / clock_lint checks.
+# This script covers that last gap; fluxor.toml runs it from `[ci.test]`.
+# Modelled on wave/spectra tools/ci/host_crates.sh.
 #
 # tests/harness is intentionally NOT clippy'd here: clippy on a crate that
-# #[path]-mounts 70+ modules/common sources would lint every mounted file, which
-# is a separate triage. ci phase 4 compiles and runs the harness suites; a
-# follow-up can add a scoped clippy once mounted-source warnings are addressed
-# at their own sites (the way wave/spectra silence theirs at the mount).
+# #[path]-mounts 70+ modules/common sources would lint every mounted file, and
+# those warnings belong at their own sites (the way wave/spectra silence theirs
+# at the mount), not in a harness-wide gate.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -42,15 +42,14 @@ for c in "${!PKG[@]}"; do
     || { echo "host_crates: clippy FAILED in $c"; fail=1; }
   ( cd "$dir" && cargo build --all-targets ) >/dev/null 2>&1 \
     || { echo "host_crates: build FAILED in $c"; fail=1; }
-  # Unit tests here (not a cargo `[ci.cargo]` phase 2): these crates are
-  # artefact-free, so their tests run before the module build without issue —
-  # unlike tests/harness, which is why phase 2 is omitted (see fluxor.toml).
+  # Unit tests run here rather than in fluxor's unit phase: these crates are
+  # artefact-free, so their tests need no module build — unlike tests/harness,
+  # which is why fluxor.toml names no `[ci.cargo] host_tools_crate`.
   ( cd "$dir" && cargo test --all-targets --all-features ) >/dev/null 2>&1 \
     || { echo "host_crates: tests FAILED in $c"; fail=1; }
 done
 
-# The wire/ and telemetry/ catalog gates — previously only reachable via the
-# hand-written Makefile, now real `fluxor ci` gates.
+# The wire/ and telemetry/ catalog gates.
 ( cd "$ROOT/tools/ci/wire_lint" && cargo run -q -- --wire-dir "$ROOT/wire" ) \
   || { echo "host_crates: wire_lint gate FAILED"; fail=1; }
 ( cd "$ROOT/tools/ci/telemetry_guard" && cargo run -q -- --catalog "$ROOT/telemetry/catalog.json" ) \
@@ -65,4 +64,4 @@ if [ "$fail" -ne 0 ]; then
   echo "host_crates: FAILED"
   exit 1
 fi
-echo "host_crates: 4 crate(s) fmt/clippy/built/tested, wire_lint + telemetry_guard + clock_lint gates passed"
+echo "host_crates: ${#PKG[@]} crate(s) fmt/clippy/built/tested, wire_lint + telemetry_guard + clock_lint gates passed"

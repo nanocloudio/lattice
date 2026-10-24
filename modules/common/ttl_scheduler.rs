@@ -207,6 +207,36 @@ impl<const N: usize> TtlQueue<N> {
         Some(unsafe { self.entries[0].assume_init_ref() })
     }
 
+    /// Remove the entry that expires last (the highest deadline).
+    pub fn pop_latest(&mut self) -> Option<ExpiryEntry> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: the slot was initialised while `len` covered it.
+        Some(unsafe { self.entries[self.len].assume_init_read() })
+    }
+
+    /// Insert `entry`, keeping the soonest deadlines when full: the entry
+    /// that expires last — `entry` itself, or the latest queued — is
+    /// given up and returned. `None`: everything is kept.
+    pub fn insert_keeping_soonest(&mut self, entry: ExpiryEntry) -> Option<ExpiryEntry> {
+        if self.insert(entry).is_ok() {
+            return None;
+        }
+        let Some(last) = self.len.checked_sub(1) else {
+            return Some(entry);
+        };
+        // SAFETY: `last` < `len`, so the slot is initialised.
+        let latest = unsafe { self.entries[last].assume_init_ref() }.deadline_ms;
+        if latest <= entry.deadline_ms {
+            return Some(entry);
+        }
+        let given_up = self.pop_latest();
+        let _ = self.insert(entry);
+        given_up
+    }
+
     /// Pop the next-to-expire entry unconditionally.
     pub fn pop(&mut self) -> Option<ExpiryEntry> {
         if self.len == 0 {

@@ -40,8 +40,8 @@ include!("resp_core.rs");
 include!("redis_core.rs");
 
 use redis_codec::{
-    build_op_body, enc_array_header, enc_bulk, enc_error, enc_raw, enc_simple_str, eq_ascii_ci,
-    parse_one, Built, ParseStep,
+    build_op_body, enc_array_header, enc_bulk, enc_error, enc_line_text, enc_raw, enc_simple_str,
+    eq_ascii_ci, parse_one, Built, ParseStep,
 };
 
 /// Longest structured command one request carries (`redis_client`'s).
@@ -142,7 +142,7 @@ pub fn plan(
     }
     if is_session_command(name) {
         let _ = enc_raw(reply, &mut len, b"-ERR '");
-        let _ = enc_raw(reply, &mut len, name);
+        let _ = enc_line_text(reply, &mut len, name);
         let _ = enc_raw(
             reply,
             &mut len,
@@ -166,7 +166,7 @@ pub fn plan(
         }
         Built::Unknown => {
             let _ = enc_raw(reply, &mut len, b"-ERR unknown command '");
-            let _ = enc_raw(reply, &mut len, name);
+            let _ = enc_line_text(reply, &mut len, name);
             let _ = enc_raw(reply, &mut len, b"'\r\n");
             Plan::Reply(len)
         }

@@ -51,14 +51,20 @@ grants the credit for the rest at once.
 | 413 | a body over 4096 bytes, a target over 64, headers over 256 | empty |
 | 502 | a result set over 8192 bytes (refused whole, never truncated), an executor answer that does not decode | empty |
 | 503 | four requests already held, or draining | empty |
-| 504 | the executor did not answer within 15 s | empty |
+| 504 | the executor did not answer within 15 s (the statement's effect is unknown) | empty |
 
 The body streams under the requester's response credit. Statements run one
 at a time, in arrival order, on one executor session (as `pg_client` holds
 one connection), so a `BEGIN` … `COMMIT` sent as successive requests is one
-session's block, as it is over `pg_client`'s connection. There is no backend link to lose: the front writes no LINK
-record. Where `pg_client` answers 502 for a server it cannot reach, the
-front refuses to construct without its executor pair wired.
+session's block, as it is over `pg_client`'s connection. Besides the
+statement being performed, the front holds four requests; with all four
+held and complete it stops reading request records (the requester's
+backpressure), and a request that opens while one of the four is still
+receiving its body is answered 503. Draining answers every held request
+503 and lets the one being performed finish. There is no backend link to
+lose: the front writes no LINK record. Where `pg_client` answers 502 for a
+server it cannot reach, the front refuses to construct without its
+executor pair wired.
 
 The front's statements carry correlation ids in a namespace of their own
 and run on executor session `0xFE`, apart from the sessions the edge
@@ -95,9 +101,11 @@ headers ignored; body exactly one STRUCTURED command, little-endian,
 | 413 | — | a body over 4096 bytes, a command whose RESP form exceeds 8192 bytes |
 | 502 | — | a reply over 8192 bytes |
 | 503 | — | four requests already held, or draining |
-| 504 | — | no answer from the store within 15 s |
+| 504 | — | no answer from the store within 15 s (the command's effect is unknown) |
 
-Commands run one at a time, in arrival order. `PING`, `ECHO` and `COMMAND`
+Commands run one at a time, in arrival order, held as the SQL front holds
+its statements. A value past one replicated entry goes to the store as
+chunks under a manifest, as the Redis connector sends one. `PING`, `ECHO` and `COMMAND`
 are answered by the front. A command whose meaning is a connection's state —
 `AUTH`, `HELLO`, `SELECT`, `CLIENT`, `QUIT`, `RESET`, `MULTI`, `EXEC`,
 `DISCARD`, `WATCH`, `UNWATCH`, `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`,
@@ -146,13 +154,13 @@ whole.
 |---|---|
 | 200 `HOLD\|MORE` | the subscription is open |
 | 400 | another method, a request body, a target that is not `/cdc/<hex>` of a legal prefix, a malformed `after`, `feed-id` or `table-id` |
-| 410 | the `after` position is no longer retained: the store compacted past it (the worker's `history_revisions`) |
+| 410 | the `after` position is not retained: the store compacted past it (the worker's `history_revisions`) |
 | 413 | a target over 517 bytes, headers over 256 |
-| 502 | the store kept failing the feed read, or the keyrange holds a large value (stored as chunks), which the envelope cannot carry |
+| 502 | the store failed 16 feed reads in a row, or the keyrange holds a large value (stored as chunks), which the envelope cannot carry |
 | 503 | four subscriptions already held, or draining |
 | 504 | the store did not answer the opening read within 15 s |
 
-Every status but 410 is marked `RAISED`. **Ending.** The subscriber ends a
+Every refusal but 410 is marked `RAISED` (a refusal the front raises itself; 410 answers the position asked for); the `200` head is not. **Ending.** The subscriber ends a
 subscription with ABORT. The front ends one with ABORT `STALLED` when the
 store compacted past the position the subscriber had reached (re-subscribing
 `after` it answers 410), `FAILED` for the 502 conditions, `DRAINING` when it
@@ -163,10 +171,13 @@ held stream that only an ABORT ends.
 pair (the etcd pair by default, its `proto` param naming it), as `cdc_pump`
 is: `KV_OP_SCAN_VERSIONS` windows `(from, to]` of the keyrange, and a
 `KV_OP_GET` of the prefix key for the head revision a subscription without
-`after` starts from. The provider walks a window in key order, so a window
-past one page (16 changes) is narrowed — its upper bound halved toward
-`from` — until it fits, and its page is delivered sorted by revision. A
-caught-up subscription polls every 100 ms. The keyrange needs a store that
+`after` starts from. One KV request is in flight at a time, shared by the
+subscriptions round-robin, and one unanswered for 3 s is issued again. The
+store walks a window in key order, so a window past one page (16 changes)
+is narrowed — its upper bound halved toward `from` — until it fits, and
+its page is delivered sorted by revision; a window of one revision too
+large for a page is walked page by page. A caught-up subscription polls
+every 100 ms. The keyrange needs a store that
 keeps history: the disk store (`state_store: 1`).
 
 **One module, not a pump mode.** `cdc_pump` is a REQUESTER that owns its
@@ -202,8 +213,12 @@ wired to them.
 | `kv_response_out` | `kv_front.response_out` | its `response_in` |
 | `cdc_request_in` | `cdc_front.request_in` | a subscriber's `request_out` |
 | `cdc_response_out` | `cdc_front.response_out` | its `response_in` |
-| `pump_kv_in` | `kv_request_router.memcached_in` | a `cdc_pump`'s `kv_out` (`proto: 3`) |
-| `pump_kv_out` | `kv_request_router.memcached_out` | that pump's `kv_in` |
+| `pump_kv_in` | `router.memcached_in` | a `cdc_pump`'s `kv_out` (`proto: 3`) |
+| `pump_kv_out` | `router.memcached_out` | that pump's `kv_in` |
+
+The stack's router instance is `router` (a `kv_request_router`). The
+includer creates `store_dir` beforehand, and the graph needs an FS provider
+(the Linux target supplies one).
 
 ```yaml
 target: linux
@@ -212,7 +227,8 @@ include:
     as: store
     params: { store_dir: data/store }
 modules:
-  - name: app                        # any exchange requester
+  - name: app
+    type: exchange_cli               # or any exchange requester
 wiring:
   - { from: app.request_out, to: store.sql_request_in }
   - { from: store.sql_response_out, to: app.response_in }
@@ -240,8 +256,8 @@ stack, and so is a peer link with optional PKI modules (nanocloud's
 replica composition).
 
 Check either alone with `fluxor build --check packaging/stack/<file>`, and
-a graph that includes one with `fluxor build --check <graph>`. Lattice's
-own graphs include them by path or by name. Another project lists
+a graph that includes one with `fluxor build --check <graph>`. The graphs in
+`examples/store_fronts/` include them by path. Another project lists
 `lattice` under `[dependencies]` and includes the stack by name; the
 include is the reference, and `fluxor update` pins the published stack and
 the modules it composes.

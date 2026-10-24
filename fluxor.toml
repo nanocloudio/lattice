@@ -1,8 +1,7 @@
 # Lattice project config consumed by the `fluxor` CLI.
 
-# Project identity. Required for
-# `fluxor publish`; downstream projects reference lattice by this
-# name. Version is held on the 0.x pre-release line.
+# Project identity. Required for `fluxor publish`; downstream projects
+# reference lattice by this name. Version is on the 0.x pre-release line.
 [project]
 name    = "lattice"
 version = "0.0.1"
@@ -11,7 +10,7 @@ version = "0.0.1"
 # `fluxor` supplies the kernel, ABI, SDK source crates, and the
 # foundation fmod palette (linux_net, tls, ip, …). `clustor` supplies
 # the Raft / WAL / placement substrate that lattice modules attach
-# to (consensus, consensus, control_plane, …). Resolution goes
+# to (consensus, durability, gateway, control_plane, …). Resolution goes
 # through the local OCI store (`$FLUXOR_STORE`, default
 # `~/.local/share/fluxor/store`); digest pins live in fluxor.lock.
 # Workspace membership (`~/.fluxor/workspace.toml`) supports
@@ -23,34 +22,33 @@ fluxor  = "0.0.1"
 wave   = "0.0.1"
 clustor = "0.0.1"
 # The bare-metal CDC composition (configs/bare-metal-pi5-cdc.yaml)
-# consumes quantum's mqtt_sink as its `stream.ordered_ack` provider.
+# consumes quantum's mqtt_sink as its `stream.ordered_ack.sink` provider.
 quantum = "0.0.1"
 
 [ci]
-# Module targets to build in CI phase 3. Lattice ships to high-throughput
-# server environments first (pi5-class and bare-metal ARM64); rp2350 is
-# omitted until the protocol surface can be slimmed down for embedded.
+# Module targets the modules-build phase builds. Lattice ships to
+# server-class environments (pi5-class and bare-metal ARM64); rp2350 is
+# not a target: the protocol surface is not sized for embedded memory.
 targets = ["bcm2712"]
 
 # The limit register (docs/architecture/limit_register.md) covers every
 # ceiling-shaped constant in the files it names: an unregistered one is a
-# defect, not a warning. Fails CI until the coverage list is empty.
+# defect, so the limit-register phase fails on any that is neither
+# registered nor exempt.
 limit_register_coverage = "fail"
 
 # No root cargo manifest — the cores live in `modules/common` and are
-# `#[path]`-mounted, not linked, matching wave/spectra. CI phases 1.1/1.2
-# fmt-check + clippy the PIC module sources directly, which no cargo
+# `#[path]`-mounted, not linked, matching wave/spectra. The fmt-check and
+# clippy phases check the PIC module sources directly, which no cargo
 # workspace would otherwise cover.
 #
-# No `[ci.cargo] host_tools_crate`: lattice's `tests/harness` runs the
-# node-spawning live/contract suites, which need the ci-phase-3 `.fmod`
-# module artefacts. Pointing ci phase 2 at it would run those heavy tests
-# BEFORE the artefacts exist (and duplicate ci phase 4). So — like wave (its
-# harness is heavy too) — ci phase 2 is omitted and the harness runs only in
-# ci phase 4's built-in
-# `cargo-test (harness)`, after the module build. The standalone `tools/*`
-# crates — their unit tests, fmt, clippy, and the wire_lint / telemetry_guard
-# gates — are covered by `tools/ci/host_crates.sh` in `[ci.test]`.
+# No `[ci.cargo] host_tools_crate`: lattice's `tests/harness` (the
+# node-spawning live and contract suites, which load the built `.fmod`
+# artefacts) runs in the `cargo-test (harness)` integration phase, after
+# the module build; naming it here would run it a second time as the unit
+# phase. The standalone `tools/*` crates — their unit tests, fmt, clippy,
+# and the wire_lint / telemetry_guard / clock_lint gates — are covered by
+# `tools/ci/host_crates.sh` in `[ci.test]`.
 #
 # No `[[ci.lints.exemption]]`: the opt-in audit matches exemptions against
 # workspace-member PATHS and is moot without a root manifest — each standalone
@@ -85,29 +83,30 @@ no_std cores and codecs, each suite using a subset (dead_code, duplicate_mod, \
 unused_imports)."""
 
 [ci.test]
-# CI phase 3.5 project gates, in order:
+# Project gates, run in order by the project-e2e phase (after the module
+# build):
 #   1. shadow_guard.sh — shadow-checkout hard-fail:
 #      tests/, benches/, examples/, perf/ are shadow-tracked in
 #      .git-shadow/, so a primary-only checkout has zero files there and the
 #      test phases would pass vacuously. The guard fails CI instead.
 #   2. host_crates.sh — with no root workspace, nothing else fmt/clippy/builds
-#      the three standalone tools/* crates, and the wire_lint / telemetry_guard
-#      catalog gates would never run.
+#      the standalone tools/* crates, and the wire_lint / telemetry_guard /
+#      clock_lint gates would never run.
 #   3. no_fault_injection.sh — the store provider's test-only fault knobs
 #      (`fault_read_eagain_every`, `fault_busy_reaches_store`,
 #      `fault_log_hold_steps`, `fault_slow_write_ms`/`_every`) are set by no
 #      graph outside tests/.
-#   4. e2e/store_fronts.sh — the store fragment's in-graph fronts live (SQL,
+#   4. e2e/store_fronts.sh — the store stacks' in-graph fronts live (SQL,
 #      KV, CDC subscriptions, a three-voter group on ports 19490..19492); no
 #      docker, no server.
 scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh", "tools/ci/no_fault_injection.sh", "tools/e2e/store_fronts.sh"]
 
 [ci.templates]
-# Lattice's graph configs use `__SELF_ID__` / `__LISTEN_PORT__` /
-# `__PEER*_ADDR__` placeholders for the multi-3node template; the
-# template renderer fills them per node before launching `fluxor run`.
-# The defaults below let the CI template-render gate pass — they are
-# *not* the production values used when actually launching a node.
+# The multi-node graph templates (`configs/multi-*.yaml`) use
+# `__SELF_ID__`, `__LISTEN_PORT__`, `__PEERn_HOST__` / `__PEERn_PORT__`
+# and similar placeholders; the test harness fills them per node before
+# launching `fluxor run`. The values below let the template-render gate
+# pass — they are not the values a launched node uses.
 dir  = "configs"
 # The map/span placeholders (RANGE_MAP, INIT_MAP, CUTOVER_MAP, SPAN_START,
 # SURVEY_MAP)
@@ -115,11 +114,11 @@ dir  = "configs"
 # the render gate only checks that no placeholder is left unresolved (it
 # does not parse the map), so a non-empty stand-in is all it needs. PEER3_*
 # extend the peer list for the four-node relocation template.
-vars = { SELF_ID = "0", LISTEN_PORT = "6379", REDIS_PORT = "6379", DATA_PORT = "6380", LIN_READS = "0", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", PEER3_PORT = "9093", PEER0_ADDR = "127.0.0.1:7000", PEER1_ADDR = "127.0.0.1:7001", PEER2_ADDR = "127.0.0.1:7002", PEER0_HOST = "127.0.0.1", PEER1_HOST = "127.0.0.1", PEER2_HOST = "127.0.0.1", PEER3_HOST = "127.0.0.1", HTTP_PORT = "19090", WAL_DIR = "/tmp/lattice/0/wal", SNAP_DIR = "/tmp/lattice/0/snap", RANGE_MAP = "00", INIT_MAP = "00", CUTOVER_MAP = "00", SPAN_START = "00", SURVEY_MAP = "00", A_BOOT_MAP = "00", A_CUTOVER_MAP = "00", B_MAP = "00", COURIER_EP = "127.0.0.1:7452", PROBE_WRITES = "32", PROBE_BIG = "0" }
+vars = { SELF_ID = "0", LISTEN_PORT = "6379", REDIS_PORT = "6379", DATA_PORT = "6380", LIN_READS = "0", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", PEER3_PORT = "9093", PEER0_HOST = "127.0.0.1", PEER1_HOST = "127.0.0.1", PEER2_HOST = "127.0.0.1", PEER3_HOST = "127.0.0.1", HTTP_PORT = "19090", RANGE_MAP = "00", INIT_MAP = "00", CUTOVER_MAP = "00", SPAN_START = "00", SURVEY_MAP = "00", A_BOOT_MAP = "00", A_CUTOVER_MAP = "00", B_MAP = "00", COURIER_EP = "127.0.0.1:7452", PROBE_WRITES = "32", PROBE_BIG = "0" }
 
 [required]
-# Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps only
-# when fluxor's `modules/sdk/wire.rs::ABI_VERSION` changes (module
-# headers / channel hints / contract ids break). The installed `fluxor`
-# CLI must implement this exact ABI version.
+# Wire-ABI pin enforced by `fluxor ci`'s version-skew phase: the
+# installed `fluxor` CLI must implement this exact ABI version
+# (fluxor's `modules/sdk/wire/wire.rs::ABI_VERSION`, which moves when module
+# headers, channel hints or contract ids change).
 fluxor = { abi = 1 }

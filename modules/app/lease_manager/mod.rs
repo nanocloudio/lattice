@@ -81,6 +81,12 @@ use wire::{
 
 const SCRATCH_BUF_SIZE: usize = 4096;
 const MAX_LEASES: usize = 256;
+/// Leases granted with no session (a client-supplied lease the anchor never
+/// sessionized). Kept apart from the session slots: a session's lease lives
+/// at its session slot's index, and a session may attach to any free slot,
+/// so a sessionless lease sharing that index space would be overwritten.
+const SESSIONLESS_LEASES: usize = 256;
+const LEASE_TABLE: usize = MAX_LEASES + SESSIONLESS_LEASES;
 const REVOKE_PER_TICK: usize = 32;
 
 const LEASE_CTRL_GRANT: u8 = 0;
@@ -164,9 +170,11 @@ struct LeaseManagerState {
     m_expiries: u64,
     step_ctr: u64,
 
-    /// One lease record per session slot (index-aligned with `sw`).
-    leases: [LeaseRecord; MAX_LEASES],
-    expiry: TtlQueue<MAX_LEASES>,
+    /// One lease record per session slot (`[..MAX_LEASES]`, index-aligned
+    /// with `sw`), then the sessionless leases (`[MAX_LEASES..]`).
+    leases: [LeaseRecord; LEASE_TABLE],
+    /// One deadline per lease held: never more entries than the table.
+    expiry: TtlQueue<LEASE_TABLE>,
     sw: SessionWorker<MAX_LEASES>,
 
     /// An envelope read whole: header room, then the payload.
@@ -200,7 +208,7 @@ impl LeaseManagerState {
         self.m_expiries = 0;
         self.step_ctr = 0;
         let mut i = 0;
-        while i < MAX_LEASES {
+        while i < LEASE_TABLE {
             self.leases[i] = LeaseRecord::free();
             i += 1;
         }
@@ -373,12 +381,25 @@ fn grant(
         return;
     }
     // Where does the record live? On the session slot if attached; else
-    // the first free lease slot with no session.
+    // the first free sessionless slot. With none free the grant is
+    // answered GONE — the anchor's allocation failure — never dropped.
     let slot = match idx {
+        // A session holds one lease, at its slot: a second would replace
+        // the first, which then never expires and is never revoked.
+        Some(i) if mgr.leases[i].lease_id != 0 => {
+            emit_state(mgr, sid, epoch, id, LEASE_STATE_GONE, 0, 0, 0);
+            return;
+        }
         Some(i) => i,
-        None => match mgr.leases.iter().position(|r| r.lease_id == 0) {
-            Some(i) => i,
-            None => return,
+        None => match mgr.leases[MAX_LEASES..]
+            .iter()
+            .position(|r| r.lease_id == 0)
+        {
+            Some(i) => MAX_LEASES + i,
+            None => {
+                emit_state(mgr, sid, epoch, id, LEASE_STATE_GONE, 0, 0, 0);
+                return;
+            }
         },
     };
     let now = mgr.now_ms;
@@ -542,14 +563,12 @@ fn handle_tick(mgr: &mut LeaseManagerState, payload: &[u8]) {
         }
         if let Some(slot) = known {
             // The lease expired. If a session fronts it, the anchor
-            // learns from the DETACH the module issues; if not, the
-            // slot is just freed.
-            let sid = *mgr.sw.slots[slot].session_id();
-            if mgr.sw.slots[slot].in_use {
+            // learns from the DETACH the module issues; a sessionless
+            // lease's slot is just freed.
+            if slot < MAX_LEASES && mgr.sw.slots[slot].in_use {
                 let mut sink = ctrl_sink!(mgr);
                 let _ = mgr.sw.declare_drained(slot, &mut sink); // no-op if not draining
                 mgr.sw.forget(slot);
-                let _ = sid;
             }
             mgr.leases[slot] = LeaseRecord::free();
             mgr.m_expiries += 1;

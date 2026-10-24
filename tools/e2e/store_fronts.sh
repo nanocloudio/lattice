@@ -6,7 +6,8 @@
 #   sql   a round trip (CREATE, INSERT, SELECT), the executor's refusal as
 #         400 with its message, an empty statement refused 400
 #   kv    SET/GET, an array reply whole, an unknown command as 400 with the
-#         server's error text, a connection command refused
+#         server's error text, a connection command refused 400, a 3072-byte
+#         value SET as chunks and read back whole
 #   cdc   a held subscription receiving the INSERT's change event (the
 #         cdc_pump envelope, decoded and checked), then ended by the
 #         requester's ABORT; after a restart, a resume `after: 0` receiving
@@ -34,10 +35,22 @@ want() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac }
 
 mkdir -p "$ROOT/target"
 SANDBOX=$(mktemp -d "$ROOT/target/e2e-store-fronts.XXXXXX")
-# LEAK GUARD: `fluxor run` spawns fluxor-linux as a CHILD; reap any survivor
-# from this repo's target dir on exit, and drop the sandbox.
-# A failed run keeps its sandbox (each case's graph.log) for diagnosis.
-trap 'pkill -KILL -f "$ROOT/target/.*fluxor-linux" 2>/dev/null
+
+# Signal $1 to every fluxor-linux this script started: `fluxor run` spawns it
+# as a CHILD that can outlive its parent, and each runs in a case directory
+# inside the sandbox — so the working directory picks out this run's, never
+# another suite's graphs running from the same target dir.
+reap() {
+  local pid cwd
+  for pid in $(pgrep -f "$ROOT/target/.*fluxor-linux"); do
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    case "$cwd" in "$SANDBOX"/*) kill "-$1" "$pid" 2>/dev/null ;; esac
+  done
+}
+
+# LEAK GUARD: reap any survivor on exit, and drop the sandbox. A failed run
+# keeps its sandbox (each case's graph.log) for diagnosis.
+trap 'reap KILL
   if [ "$fail" -eq 0 ]; then rm -rf -- "$SANDBOX"; else echo "sandbox kept: $SANDBOX"; fi' EXIT
 
 # Render the example into case directory $1 (created fresh unless $3 says
@@ -63,7 +76,7 @@ run_case() {
   pid=$!
   i=$(( ${3:-20} * 2 ))
   while kill -0 "$pid" 2>/dev/null && [ "$i" -gt 0 ]; do sleep 0.5; i=$((i - 1)); done
-  pkill -TERM -f "$ROOT/target/.*fluxor-linux" 2>/dev/null
+  reap TERM
   kill "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   out=$(cat "$t")
@@ -236,17 +249,40 @@ cdc() {
   fi
 }
 
-# Replica $1's stdin: wait (up to 60 s) until the group has elected a
-# leader; the leader's writes through its fronts, the followers' nothing (a
-# write reaches the group through its leader's router).
+# The replica leading at the highest term any replica has logged
+# (`[raft] leader p=<partition> t=<term>`), or nothing before an election.
+# Two replicas can each log leadership — a candidate wins term 1 and another
+# term 2 a moment later — so the leader is the one with the highest term,
+# never merely one that logged the line.
+leader_now() {
+  local n t best=-1 who=
+  for n in 0 1 2; do
+    t=$(grep -o '\[raft\] leader p=[0-9]* t=[0-9]*' "$SANDBOX/group$n/graph.log" 2>/dev/null |
+      sed 's/.* t=//' | sort -n | tail -1)
+    if [ -n "$t" ] && [ "$t" -gt "$best" ]; then best=$t; who=$n; fi
+  done
+  printf '%s' "$who"
+}
+
+# Replica $1's stdin: wait (up to 60 s) until the group's leadership has held
+# for 3 s — no replica has logged a newer leadership in that time — then the
+# leader's writes through its fronts, the followers' nothing (a write
+# reaches the group through its leader's router).
 group_input() {
-  local i=0
-  until grep -qs '\[raft\] leader' "$SANDBOX"/group*/graph.log || [ "$i" -ge 120 ]; do
+  local i=0 lead= seen= steady=0
+  while [ "$i" -lt 120 ]; do
+    lead=$(grep -hs '\[raft\] leader' "$SANDBOX"/group*/graph.log | wc -l)
+    if [ "$lead" -gt 0 ] && [ "$lead" = "$seen" ]; then
+      steady=$((steady + 1))
+      [ "$steady" -ge 6 ] && break
+    else
+      steady=0
+    fi
+    seen=$lead
     sleep 0.5
     i=$((i + 1))
   done
-  sleep 3
-  if ! grep -qs '\[raft\] leader' "$SANDBOX/group$1/graph.log"; then
+  if [ "$(leader_now)" != "$1" ]; then
     sleep 100
     return
   fi
@@ -289,15 +325,13 @@ group() {
     sleep 0.5
     i=$((i + 1))
   done
-  pkill -TERM -f "$ROOT/target/.*fluxor-linux" 2>/dev/null
+  reap TERM
   for n in "${pids[@]}"; do
     pkill -TERM -P "$n" 2>/dev/null
     kill "$n" 2>/dev/null
   done
   wait "${pids[@]}" 2>/dev/null
-  for n in 0 1 2; do
-    if grep -qs '\[raft\] leader' "$SANDBOX/group$n/graph.log"; then leader=$n; fi
-  done
+  leader=$(leader_now)
   r=$(cat "$SANDBOX/group${leader:-0}/out.txt")
   if [ -n "$leader" ] && want "$r" "$(printf 'one\nOK\nv')"; then
     ok "group (SQL and KV through the leader's fronts, committed on the group)"

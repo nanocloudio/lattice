@@ -37,7 +37,7 @@ big     | feature = "big"
 | In-memory physical-key slot | Shape | `MAX_KEY_LEN` | modules/common/kv_store.rs | 2584 | Derived: the 12-byte identity, a keyspace, and the longest model key (a document index entry at `MAX_DOCUMENT_ID_KEY`, worst-case escaped); a contract test holds it to the derivation. A longer composed key is rejected; what one replicated write carries is the consensus entry's bound. |
 | In-memory value bytes | Shape | `MAX_VALUE_LEN` | modules/common/kv_store.rs | 4096 | Rejects the operation. |
 | State-worker scratch | Capacity | `SCRATCH_BUF_SIZE` | modules/app/kv_state_worker/mod.rs | 8192 | A command frame whose payload is longer is discarded whole (never half-read) and counted; an over-budget memory snapshot export is refused, the WAL remaining authoritative. |
-| App-snapshot body | Shape | `SNAPSHOT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as 8164 bytes (`SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`); this binds before Clustor's 16384-byte snapshot body. A memory store's whole-state snapshot is one body within it; a span copy streams as a run of bodies, each within it, so a span of any size moves. |
+| App-snapshot body | Shape | `SNAPSHOT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as 8164 bytes (`SCRATCH_BUF_SIZE - APP_SNAPSHOT_HDR`); Clustor streams the body to its snapshot in 4 KiB chunks with no body cap of its own, so this is the bound. A memory store's whole-state snapshot is one body within it; a span copy streams as a run of bodies, each within it, so a span of any size moves. |
 | Worker answer body | Shape | `RESULT_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | The smaller of `APPLIED_BODY_MAX` and `KV_RESPONSE_BODY_MAX` (8132 bytes): the store answers into exactly what reaches the caller, so no answer is built that would go unsent; a byte-bound page (`KV_OP_RANGE_SCAN`) comes back short of its `limit` instead. |
 | Applied-answer room | Shape | `APPLIED_BODY_MAX` | modules/app/kv_state_worker/mod.rs | — | Derived as `SCRATCH_BUF_SIZE` less the `MSG_KV_APPLIED` envelope (8151 bytes): the room an answer has leaving the worker. |
 | KV response body | Shape | `KV_RESPONSE_BODY_MAX` | modules/common/wire.rs | — | Derived as `FRAME_PAYLOAD_MAX` less the response head and fence tail (8132 bytes): one `MSG_KV_RESPONSE` frame's body. A caller reading KV responses into `ENVELOPE_HDR + FRAME_PAYLOAD_MAX` takes every answer whole. |
@@ -50,42 +50,63 @@ big     | feature = "big"
 | Memtable entries | Capacity | `MEMTABLE_MAX_ENTRIES` | modules/common/disk_store.rs | 512 | Backpressures mutation while flush catches up. |
 | Memtable flush watermark | Pacing | `MEMTABLE_FLUSH_WATERMARK` | modules/common/disk_store.rs | 384 | Starts flush early; not a refusal ceiling. |
 | Run-block cache | Capacity | `BLOCK_CACHE_SLOTS` | modules/common/disk_store.rs | 256 | Blocks of immutable runs kept for re-reads (~1.2 MiB of state, CLOCK eviction): a store-with-history's hot read set. A miss costs one storage call; a version scan counts cached blocks toward its step budget like loaded ones. |
+| Run sparse index | Capacity | `SPARSE_INDEX_ENTRIES` | modules/common/disk_store.rs | 256 | Block boundaries one run's index keeps, each with 76 bytes of encoded key (`INDEX_KEY_BYTES`: the 12-byte identity and 64 bytes of escaped user key): dense enough that keys sharing long prefixes, as an API server's do (`/events/default/…`), seek to one block instead of walking a region. A run of more blocks is not refused: the index keeps every other entry and doubles its stride, so a seek may start up to a stride of blocks early and walk forward — more reads, never a wrong answer. |
 | Version-scan blocks per step | Pacing | `SCAN_STEP_BLOCKS` | modules/common/disk_store.rs | 2 | Blocks crossed per call, from storage or the block cache alike; the walk pauses holding its position and the worker re-drives it next step. Bounds work per step, not the window. |
 | Version-scan records per step | Pacing | `SCAN_STEP_RECORDS` | modules/common/disk_store.rs | — | Derived as `MEMTABLE_MAX_ENTRIES` (512); bounds the memtable-resident part of a walk, which loads no blocks. |
 | Range walk stale-version skip | Pacing | `SKIP_STALE_VERSIONS` | modules/common/disk_store.rs | 4 | Older versions of one key a current-value range walk passes over in a row before it seeks every source past the key through its sparse index; below it the versions share the loaded block. |
 | Parked version-scan page | Capacity | `SCAN_PAGE_MAX` | modules/common/disk_store.rs | 8192 | The reply prefix kept across a pause. The engine caps every page at this budget, so a park can never be refused; the cap therefore bounds one command's reply, not a refusal path. |
 | Version-scan entry shrink | Shape | `VERSIONS_TRANSCODE_SLACK` | modules/common/kv_store.rs | 6 | The least a reply entry is smaller than its raw record; the engine sizes each store request by it, so a record the store hands over always fits the page (an overflow record is stashed against the held ordinal, so the cursor never runs ahead of the caller). |
-| Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held; the request times out upstream and is re-issued. Only `KV_OP_SCAN_VERSIONS` pauses, and its frame is bounded well under this. |
+| Held command frame | Shape | `HELD_FRAME_MAX` | modules/app/kv_state_worker/mod.rs | 1024 | A pausable command larger than this is not held (counted): it gets no answer, the caller's timeout answers it, and a re-issue of the same scan fails the same way. Only `KV_OP_SCAN_VERSIONS` pauses; its frame fits while its two keys total at most 958 bytes. |
 | Command-log answer room | Shape | `CLOG_OUT_MAX` | modules/app/kv_state_worker/mod.rs | 65536 | The largest answer room an op is applied with (a store-provider call's); a logged op replays with the room it first had, capped here. |
 | Imported host-log record | Shape | `IMPORT_RECORD_MAX` | modules/app/kv_state_worker/mod.rs | 3149824 | One record of a fluxor host `store.log` being imported (`kv_state_worker_store`): the largest object (3 MiB) and its key. A larger record stops the import and quarantines the store rather than skip it. |
-| Held single-store write answers | Capacity | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 16 | Answers of single-store writes applied while their log records were not yet durable, each kept for its caller under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. Full of other callers' answers, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped. The same count bounds the request identities kept (one per caller writing; a new caller's replaces the least recently asked), so a re-ask is known by its fields and a checksum of its value rather than hashed whole again; an identity let go costs only one hash on its next ask. |
+| Held single-store write answers | Format bound | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 1024 | The most single-store write answers (and request identities) the provider can index: each is a record made from the worker's heap as a caller's write waits on its log record, kept under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. The heap, not this figure, is the working ceiling: spent, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped — and a new caller's identity replaces the least recently asked (an identity let go costs one hash on its next ask). |
+| Store read slots | Format bound | `SLOTS` | modules/common/store_provider.rs | 4096 | The most `GET`-opened read slots the provider can index (a slot's index is its handle, below `SUB_BAND`). Each slot is made from the worker's heap as a read opens and reused once closed; spent heap refuses the open `ENOMEM`. |
+| Subscription handle band | Format bound | `SUB_BAND` | modules/common/store_provider.rs | — | Where subscription handles start in the 26-bit handle slot field: `SUB_BAND + id`, apart from read slots, so a fence query or `CLOSE` names one thing. |
+| Workload subscription quota | Policy | `DEFAULT_SUB_QUOTA` | modules/common/store_provider.rs | — | Typed `u32`, 256. Subscriptions one workload owner may hold unless the `store_sub_quota` param says otherwise; the system owner (the node's own controllers) is not held to it. Past it SUBSCRIBE is `ENOMEM`, counted and reported to the kernel ledger against `store_subs`, after the owner's dead subscriptions are swept. |
+| Store change log | Sized | `CHANGE_LOG_DEFAULT` | modules/common/store_provider.rs | — | Bytes of the key-only change log (`change_ring.rs`) subscriptions are rung from and `CHANGES` is served from, when the `store_change_log` param names none. Overrun evicts the oldest entries and raises the log's base: a read from before it walks the store's history (or is LOST on a store without one), never an empty answer. |
+| CHANGES scan per call | Pacing | `LOG_SCAN_MAX` | modules/common/store_provider.rs | — | Typed `u32`, 4096. Change-log entries one `CHANGES` call scans; spent, the page ends with a continuation token and the caller asks again. |
+| History visits per call | Pacing | `HIST_VISIT_MAX` | modules/common/store_provider.rs | — | Typed `u32`, 1024. Store versions one `CHANGES` call's history walk visits (a window from before the change log's base); spent, the page ends at a key boundary with a continuation. |
+| History visits per step | Pacing | `WALK_STEP_BUDGET` | modules/common/store_provider.rs | — | Typed `u32`, 4096. Store versions all callers' history walks visit in one worker step. Spent, a read answers `EAGAIN` and its subscription is rung again next step, with first claim on that step's budget. |
+| Pump matches per call | Pacing | `PUMP_MAX` | modules/common/store_provider.rs | — | Typed `u32`, 4096. Change-log entries one pump matches against the subscription registry; the rest wait for the next pump (after the next command, or the next step). |
+| Gap rings per pump | Pacing | `GAP_RING_MAX` | modules/common/store_provider.rs | 512 | Subscribers a gap (an install, a log overrun) rings in one pump; a larger registry is rung across pumps from where the last stopped. |
+| CHANGES token | Shape | `TOKEN_MAX` | modules/common/store_provider.rs | 320 | The longest `CHANGES` continuation token (fluxor's `namespace::changes::TOKEN_MAX`): a kind byte, revisions and a key cursor. A longer token is refused `EINVAL`. |
+| Registry pages | Format bound | `MAX_PAGES` | modules/common/store_registry.rs | 4096 | Pages the subscription registry can address: the page part of a registry id is 12 bits. Pages come from the worker's heap as subscriptions need them (sized at pack time by `heap_per_demand`); the heap binds long before this. |
+| Registry index pages | Format bound | `MAX_INDEX_PAGES` | modules/common/store_registry.rs | 64 | Pages of the sorted prefix index (each `IDX_PER_PAGE` watch ids): 65,536 distinct watched prefixes. Past it SUBSCRIBE on a new prefix is `ENOMEM`. |
+| Watched prefix | Shape | `PREFIX_MAX` | modules/common/store_registry.rs | 255 | The longest prefix a watch holds (the store's `KEY_MAX`). |
+| Change-log checkpoints | Shape | `CHECKPOINTS` | modules/common/change_ring.rs | 512 | Seek points kept into the change log, one per `CHECK_EVERY` entries: a seek scans at most that many entries past the nearest. Older checkpoints are overwritten as the log moves on. |
+| Key log per command | Capacity | `KEYLOG_BYTES` | modules/common/kv_store.rs | — | Bytes of keys one command may stage for the store provider's change log. A command whose keys overflow it (or that clears the keyspace, `FLUSH`) is a gap: every subscriber reads again and the log answers only from after it — never a silent loss. |
 | Store key | Shape | `KEY_MAX` | modules/common/store_provider.rs | 255 | The longest key the `storage.object`/`storage.namespace` provider takes (a LIST entry and a cursor carry its length in a byte). A longer key is refused `EINVAL` before the store is touched. |
-| Store inline value | Shape | `INLINE_MAX` | modules/common/store_provider.rs | — | Derived: one chunk's data (`kv_chunks::DATA_MAX`). A value up to it is stored and evented whole; a larger one is uploaded as chunks under a manifest, and its events carry no value (the value-elided flag). |
-| Store event | Shape | `EVENT_MAX` | modules/common/store_provider.rs | — | Derived: event head, change head, `KEY_MAX` and `INLINE_MAX`. The largest event a subscriber's channel is written; every event fits it by construction. |
+| Store inline value | Shape | `INLINE_MAX` | modules/common/store_provider.rs | — | Derived: one chunk's data (`kv_chunks::DATA_MAX`). A value up to it is stored whole and a read slot holds it inline; a larger one is uploaded as chunks under a manifest and read back through the value cache. |
 | Store fence buffer | Shape | `FENCE_WIRE_MAX` | modules/common/store_provider.rs | 62 | fluxor's `fence::WIRE_MAX_LEN`: a fence query's buffer holds any fence. A caller's fence buffer shorter than a fence gets none written, never a partial one. |
 | Store LIST trailer | Shape | `TRAILER_MAX` | modules/common/store_provider.rs | — | Derived: `3 + KEY_MAX`, the page trailer and the longest cursor. An entry that would leave the page no room for it ends the page there, that entry's key its cursor (the next page starts at it). |
 | Store walk re-drives | Pacing | `REDRIVE_MAX` | modules/common/store_provider.rs | — | `1 << 20` re-drives of one paused store walk in a call. Spent, the read answers `EAGAIN` (nothing moved; the store keeps its place and the re-ask continues it). |
 | Replica proposal body | Shape | `ENTRY_BODY_MAX` | modules/common/store_provider.rs | — | Derived: `kv_large::ENTRY_BODY_MAX`, the largest origin entry body a replicated write proposes (a chunk entry fills it). A larger body is never built: values past it go as chunks. |
+| Replica writes held | Capacity | `PENDING_WRITES` | modules/common/store_provider.rs | 32 | Writes a replica holds for its callers at once: queued, uploading chunks, in the group's log, or decided and not yet collected. Only `WINDOW` of them are in the log undecided at once, because the origin record keeps outcomes for `origin::RING` (16) writes per origin and a write past what it keeps cannot be decided from it (it is refused); the rest wait queued for a seq. Past 32 a new write is not taken (`EINPROGRESS`, taken when asked again once one is collected, or let go after `IDLE_STEPS` unasked); a held write is never dropped to make room. |
+| Replica writes in the log | Capacity | `WINDOW` | modules/common/store_provider.rs | 8 | Writes a replica has offered to the group's log, undecided, at once; asserted no more than `origin::RING`, so every write in the log can be decided from the origin record. Past it a write waits queued for its seq (its caller answered `EINPROGRESS`). It also keeps a replica within its share of what a leader takes uncommitted: a leader past that drops what it is relayed, and the window makes such a loss cost one offer again after `REOFFER_STEPS`. |
+| Replica chunks in flight | Capacity | `CHUNK_WINDOW` | modules/common/store_provider.rs | 4 | A large value's chunks offered and not yet applied here, for the one upload a replica runs at a time. Full, the upload cuts no more until one applies (its caller answered `EINPROGRESS`); none applying for `REOFFER_STEPS`, they are offered again in upload order. The manifest is offered only once every chunk has applied. |
 | Scope name | Shape | `SCOPE_NAME_MAX` | modules/common/store_provider.rs | 63 | The `scope` param's node name; longer, the scope is refused and the worker registers no contract (logged). |
 | Scoped prefixes | Shape | `SCOPED_MAX` | modules/common/store_provider.rs | 512 | The `scoped` param's comma-separated prefixes; longer, the scope is refused as `SCOPE_NAME_MAX` is. |
 | Scope key head | Shape | `SCOPE_HEAD_MAX` | modules/common/store_provider.rs | — | Derived: `/~node/` and `SCOPE_NAME_MAX`, the most a scope adds in front of a key. |
 | Scoped argument | Shape | `SCOPED_ARG_MAX` | modules/common/store_provider.rs | 1024 | A key-bearing call's argument once its names are the store's; one that would not fit is refused `EINVAL`. |
 | Skipped origin entries named | Pacing | `ORIGIN_SKIP_LOG_MAX` | modules/app/kv_state_worker/mod.rs | 32 | Origin entries a replica skips as stale or out of order are logged by name up to this many; the rest are counted (`oskip=` on the store heartbeat), so a diverging replica says where without flooding the log. |
 | Immutable runs | Capacity | `MAX_RUNS` | modules/common/disk_store.rs | 16 | Backpressures until compaction frees a run slot. |
-| Manifest files | Capacity | `MAX_MANIFEST_FILES` | modules/common/disk_store.rs | 8 | Bounds retained manifest generations; rotation/reclamation must keep pace. |
-| Runs returned by listing | Capacity | `MAX_LISTED_RUNS` | modules/common/disk_store.rs | 1024 | Rejects/flags an inventory that cannot be represented; never silently truncates authoritative run state. Sized for the orphans a crash can leave of undrained retirements (recovery deletes them only if it can list them); 4 KB of stack, once, at recovery. |
+| Manifest files | Capacity | `MAX_MANIFEST_FILES` | modules/common/disk_store.rs | 8 | Declared, not used: manifests are a fixed A/B slot pair, so no manifest generations accumulate. |
+| Runs returned by listing | Capacity | `MAX_LISTED_RUNS` | modules/common/disk_store.rs | 1024 | A listing past it is not truncated: recovery deletes the listed runs neither manifest slot names (`SWEEP_BATCH` per pass) and lists again; with no orphan to delete, recovery fails as a storage fault. 4 KB of stack, once, at recovery. |
 | Open run descriptors | Capacity | `SLOTS` | modules/common/fd_cache.rs | 5 | Evicts the least-recently-used descriptor; data remains on disk. This can dominate cold-read latency. |
 | Filesystem store path | Shape | `PATH_MAX` | modules/common/fs_run_storage.rs | 145 | Bounds the internally encoded store/run path: a named store directory (`DIR_MAX`), `/`, and an 8.3 name. |
 | Named store directory | Shape | `DIR_MAX` | modules/common/fs_run_storage.rs | 128 | A worker's `store_dir`; a longer one refuses construction. |
-| Replica command | Shape | `MAX_COMMAND_BYTES` | modules/common/replica_facade.rs | 4096 | Rejects a larger command locally, although Clustor's 2048-byte WAL entry binds first on the current replicated graph. |
-| Replica response | Shape | `MAX_RESPONSE_BYTES` | modules/common/replica_facade.rs | 4096 | Rejects an oversized response rather than truncating it. |
-| Replica watch event | Shape | `MAX_WATCH_EVENT_BYTES` | modules/common/replica_facade.rs | 4096 | Rejects an oversized event rather than truncating it. |
+| Replica command | Shape | `MAX_COMMAND_BYTES` | modules/common/replica_facade.rs | 4096 | Declared, not enforced: the replicated command bound that applies is `wire::CONSENSUS_PROPOSAL_BODY_MAX` (2040), inside Clustor's 2048-byte WAL entry. |
+| Replica response | Shape | `MAX_RESPONSE_BYTES` | modules/common/replica_facade.rs | 4096 | Declared, not enforced: the KV response bound that applies is `wire::KV_RESPONSE_BODY_MAX`. |
+| Replica watch event | Shape | `MAX_WATCH_EVENT_BYTES` | modules/common/replica_facade.rs | 4096 | Declared, not enforced: the watch event bound that applies is `WATCH_EVENT_MAX`. |
 
-The raw in-memory store is therefore the fastest mode but it is deliberately
-small and non-durable. Putting that store behind Clustor adds ordering,
-replication, failover, and snapshot recovery, but does not remove the 1024-key
-or 4096-byte-value bounds. Disk mode removes the key-count ceiling from live
-state, subject to filesystem capacity and the finite memtable/run pipeline.
+The raw in-memory store is the fastest mode, small and non-durable. Behind
+Clustor it gains ordering, replication and failover, and a snapshot only while
+its whole state fits one 8164-byte body (beyond that the WAL alone recovers
+it). A value past one data chunk (`kv_chunks::DATA_MAX`, 1969 bytes) is stored
+as chunks under a manifest, so the 4096-byte bound is one stored record's, not
+a value's, and in memory mode a large value spends records out of the 1024
+`MAX_KEYS` alike. Disk mode removes the key-count ceiling, subject to
+filesystem capacity and the finite memtable/run pipeline.
 
 ## Routing, placement, and transactions
 
@@ -93,24 +114,27 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 |---|---|---|---|---:|---|
 | Hash slots | Topology | `SLOT_COUNT` | modules/common/partition_map.rs | 1024 | Fixed mapping granularity, not a key-count limit. |
 | Partition-map key bound | Shape | `MAX_KEY_BOUND_LEN` | modules/common/partition_map.rs | 256 | Rejects an unrepresentable range boundary. |
-| Replicas in placement | Topology | `MAX_REPLICAS` | modules/common/partition_map.rs | 5 | Rejects/clamps larger placement; also below Clustor's seven-node identifier envelope. |
+| Replicas in placement | Topology | `MAX_REPLICAS` | modules/common/partition_map.rs | 5 | Rejects a larger placement; also below Clustor's seven-node identifier envelope. |
 | Ranges in a partition map | Topology | `MAX_RANGES` | modules/common/partition_map.rs | 64 | Rejects an overfull map. Scale beyond it by composing partition groups/maps, not by adding replicas to one group. |
-| Partition ports on one request router | Topology | `MAX_PARTITION_PORTS` | modules/app/kv_request_router/mod.rs | 2 | Map load refuses any binding to port 2 or above. With `partition_fanout` enabled, keyed traffic for partitions beyond 0 shares one tagged port and `partition_demux` fans it out, so the keyed-path ceiling becomes the demux's; targeted lifecycle operations still address the direct ports and keep this bound. |
-| Local partitions behind one demux | Topology | `MAX_LOCAL_PARTITIONS` | modules/app/partition_demux/mod.rs | 8 | A frame tagged at or above the configured partition count is dropped and counted; its port is not wired. |
-| Concurrent routed requests | Capacity | `MAX_INFLIGHT` | modules/app/kv_request_router/mod.rs | 256 | Rejects busy; caller retries. |
-| Commands waiting for a worker | Capacity | `KV_STASH_SLOTS` | modules/app/kv_request_router/mod.rs | 4 | A command the worker's channel has no room for waits, in order; while any waits no new request is taken, so backpressure reaches the anchors. Past it (internal re-dispatch only) the op is refused busy, never dropped silently. |
+| Map-update rebinds per frame | Shape | `MAP_UPDATE_MAX_ENTRIES` | modules/common/partition_map.rs | 256 | Slot rebinds one `MSG_MAP_UPDATE` frame carries (3,076 bytes encoded, inside every module's 4 KiB scratch and the u16 envelope length). The encoder refuses a larger batch, so a wider remap goes as several frames (all 1024 slots is four); a frame claiming more, or none, is applied not at all — never partly. |
+| Partition ports on one request router | Topology | `MAX_PARTITION_PORTS` | modules/app/kv_request_router/mod.rs | 2 | Map load refuses any binding of a partition at or above 2. With `partition_fanout` enabled, keyed traffic for partitions beyond 0 shares one tagged port and `partition_demux` fans it out, so the keyed-path ceiling becomes the demux's; targeted lifecycle operations still address the direct ports and keep this bound. |
+| Request ingress ports | Topology | `INGRESS_PORTS` | modules/app/kv_request_router/mod.rs | 9 | The router's request ingresses — etcd, Redis, memcached stream and datagram, and the internal watch, SQL, lifecycle, job and data callers — one envelope inbox each. They take nine of the router's sixteen input ports and all sixteen are declared (`gateway_reject` is the last), so a further request ingress needs an input freed first: fluxor's per-module port cap, not this count, is what binds. |
+| Local partitions behind one demux | Topology | `MAX_LOCAL_PARTITIONS` | modules/app/partition_demux/mod.rs | 8 | A `partitions` count above 8 refuses construction. A frame tagged at or above the configured partition count, or whose partition port has no room, is dropped and counted. |
+| Concurrent routed requests | Capacity | `MAX_INFLIGHT` | modules/app/kv_request_router/mod.rs | 256 | A request arriving with the table full is refused retryably (`KV_RESULT_QUOTA`: Redis `BUSY`, a retryable SQL error), never dropped. |
+| Commands waiting for a worker | Capacity | `KV_STASH_SLOTS` | modules/app/kv_request_router/mod.rs | 4 | A command the worker's channel has no room for waits, in order; while any waits no new pass of requests is taken, so backpressure reaches the anchors. Past it (a later ingress in the same pass, or a held request's replay) the op is refused `KV_RESULT_QUOTA` (busy), never dropped silently. |
+| Working notices per renewal | Capacity | `TOLD_PER_NOTICE` | modules/app/kv_request_router/mod.rs | 32 | In-graph callers (SQL and data surface, on `compute_out`) told `MSG_KV_PENDING` when a worker reports `MSG_KV_WORKING`: more than wait on one store at once in any composition, each executor having one exchange in flight. Every direct op on that partition is renewed in the router regardless; a caller past the 32nd hears nothing from that notice, so its own wedge timer may answer it before the store does. A notice the channel has no room for is skipped the same way; the next (one a second while the store works) carries it. |
 | Waiting command frame | Shape | `KV_STASH_FRAME` | modules/app/kv_request_router/mod.rs | — | Derived: the largest command the router builds and a partition tag. |
-| Linearizable-read slots | Semantic | `LIN_READ_SLOTS` | modules/app/kv_request_router/mod.rs | 32 | Current code falls back to the snapshot path when full. That silently weakens a requested guarantee and should be changed to backpressure or explicit failure before claiming strict linearizability under load. |
-| Linearizable-read response bytes | Shape | `LIN_READ_BUF` | modules/app/kv_request_router/mod.rs | 300 | Oversize read state cannot use the linearizable fast path. |
-| Held migration operations | Capacity | `HOLD_SLOTS` | modules/app/kv_request_router/mod.rs | 48 | Rejects busy when migration hold space is exhausted. |
-| Migration help operations | Capacity | `HELP_SLOTS` | modules/app/kv_request_router/mod.rs | 8 | Defers help; increases convergence latency. |
+| Linearizable-read slots | Semantic | `LIN_READ_SLOTS` | modules/app/kv_request_router/mod.rs | 32 | Full (or with the fence write backpressured), a linearizable read is served from the snapshot path unfenced: the requested guarantee is silently weakened, so strict linearizability holds only while fewer than 32 fenced reads are in flight. |
+| Linearizable-read response bytes | Shape | `LIN_READ_BUF` | modules/app/kv_request_router/mod.rs | 300 | A fenced GET whose command exceeds 300 bytes (a key over about 270 bytes) is served unfenced from the snapshot path. |
+| Held session-order requests | Capacity | `HOLD_SLOTS` | modules/app/kv_request_router/mod.rs | 48 | Requests parked behind their connection's in-flight fence or path change, replayed in order. Full (or a request over `HOLD_BUF`, 1088 bytes), the request is answered `KV_RESULT_LIN_BOUND` (the protocol's unavailability error), never reordered. |
+| Cross-partition intent helps | Capacity | `HELP_SLOTS` | modules/app/kv_request_router/mod.rs | 8 | Helps that move a reader past a cross-partition transaction intent left by a dead coordinator. Full, a help is not started; the blocked reader's retry may start it once one frees. |
 | Read-release payload | Shape | `READ_RELEASE_PAYLOAD_MAX` | modules/app/kv_request_router/mod.rs | 64 | The largest payload taken on `read_release_in` (a read grant, an internal reject or a write ack, all under 20 bytes); a longer envelope is discarded whole and counted. |
 | Gateway response frame | Shape | `GATEWAY_RESPONSE_FRAME` | modules/app/kv_request_router/mod.rs | 256 | The largest envelope on `gateway_reject_in`, the gateway's own response frame; every reject it sends is taken whole. |
-| Migration help key | Shape | `HELP_KEY_MAX` | modules/app/kv_request_router/mod.rs | 64 | Cannot represent larger keys on this path despite the store accepting user keys through 244 bytes. |
-| Encoded range-map parameter | Shape | `RANGE_MAP_PARAM_MAX` | modules/app/kv_request_router/mod.rs | 2048 | Rejects an oversized map update. |
-| Tracked ranges for router metrics | Observability | `MAX_TRACKED_RANGES` | modules/app/kv_request_router/mod.rs | 8 | Additional ranges still route but lose per-range telemetry; this is not a data-plane topology limit. |
+| Intent-help key | Shape | `HELP_KEY_MAX` | modules/app/kv_request_router/mod.rs | 64 | A blocking key longer than this is not helped; its intent resolves through its coordinator or a same-partition reader. |
+| Encoded range-map parameter | Shape | `RANGE_MAP_PARAM_MAX` | modules/app/kv_request_router/mod.rs | 2048 | The decoded `range_map` init param (4096 hex characters); a larger one refuses module construction. Runtime map updates are bounded by `MAP_UPDATE_DRAIN_BUF` and dropped whole (counted) past it. |
+| Tracked ranges for router metrics | Observability | `MAX_TRACKED_RANGES` | modules/app/kv_request_router/mod.rs | 8 | Additional ranges still route but lose per-range telemetry. The same eight slots (partition id modulo 8) hold each partition's applied index for the read fence, which is sound while partition ids stay below 8, as `partition_demux` enforces. |
 | Hot-key telemetry slots | Observability | `HOT_KEY_SLOTS` | modules/app/kv_request_router/mod.rs | 4 | Evicts/aggregates observations; requests are unaffected. |
-| Lifecycle ranges per operation | Shape | `MAX_LIFECYCLE_RANGES` | modules/common/range_lifecycle.rs | 2 | Bounds split/merge lifecycle payloads; larger changes must be decomposed. |
+| Lifecycle ranges per operation | Shape | `MAX_LIFECYCLE_RANGES` | modules/common/range_lifecycle.rs | 2 | Bounds split/merge lifecycle payloads; a change over more ranges is not representable as one operation. |
 | Nodes in a relocation survey | Topology | `MAX_NODES` | modules/common/placement.rs | 32 | Distinct leaseholder nodes beyond the table are left out of the load tally; an untallied node cannot be recommended as busiest or quietest. |
 | Rebalancer range-map parameter | Shape | `RANGE_MAP_PARAM_MAX` | modules/app/rebalancer/mod.rs | 2048 | Rejects an oversized encoded map. |
 | Elastic-split span bound | Shape | `KEY_MAX` | modules/app/elastic_split_driver/mod.rs | 256 | Rejects a longer span boundary key. |
@@ -120,24 +144,28 @@ state, subject to filesystem capacity and the finite memtable/run pipeline.
 | Courier reassembly buffer | Capacity | `RASM_BUF` | modules/app/span_courier/mod.rs | — | Derived as `2 * FRAME_MAX` (16384). Overflow drops the inbound stream whole; the install aborts on the gap. |
 | Dial authority | Shape | `AUTHORITY_MAX` | modules/common/authority.rs | 64 | A longer `host[:port]` refuses construction of the connector; a name is never truncated into a different name. |
 | Transaction participants | Topology | `MAX_PARTICIPANTS` | modules/common/txn.rs | 8 | Rejects a wider transaction. |
+| Coordinator participants | Topology | `PARTICIPANTS` | modules/app/txn_coordinator/mod.rs | 2 | Participants the coordinator declares, or splits a submitted transaction into. The decision machine takes `MAX_PARTICIPANTS`, but the router's two `MAX_PARTITION_PORTS` are all a graph can address, and a third would name a partition with no port. A submitted `KV_OP_TXN` with more rows than this (or index entries beside its rows) reports `TXN_SUBMIT_ERROR` and stages nothing: declined, never mis-split. |
 | Transaction operand | Shape | `OPERAND_MAX` | modules/app/txn_coordinator/mod.rs | 64 | Rejects an oversized coordinator operand. |
-| Timestamp-allocation holds | Capacity | `HOLD_CAPACITY` | modules/app/timestamp_allocator/mod.rs | 32 | Backpressures/defer allocation while held work drains. |
+| Timestamp-allocation holds | Capacity | `HOLD_CAPACITY` | modules/app/timestamp_allocator/mod.rs | 32 | Requests held while an advance commits, in order; full, a request is refused `REJECT_QUEUE_FULL`. |
 
-`TxnLimits::DEFAULT` in `modules/common/txn.rs` is part of the public policy even
-though it is represented as fields rather than independent constants: 1024
-keys, 1 MiB total bytes, 128 read spans, 8 participants, 30 s lifetime, 1 s
-heartbeat, 4096 intents per range, 8 retries, and 4 priority pushes. Deployments
-must expose any overrides and keep them consistent at every participant.
+`TxnLimits::DEFAULT` in `modules/common/txn.rs` holds the transaction policy as
+fields rather than constants: 1024 keys, 1 MiB total bytes, 128 read spans, 8
+participants, 30 s lifetime, 1 s heartbeat, 4096 intents per range, 8 retries,
+and 4 priority pushes. It is what `bounds_check` applies, which the contract
+tests exercise; no module applies it on a running graph, where the bounds that
+hold are `MAX_PARTICIPANTS` (the record's own) and `PARTICIPANTS`.
 
 ## Watches, leases, retention, backup, and CDC
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
 | Watches | Capacity | `MAX_WATCHES` | modules/common/watch_hub.rs | 256 | Rejects watch registration. |
-| Watch key | Shape | `WATCH_KEY_MAX` | modules/common/watch_hub.rs | 96 | Rejects a larger key; narrower than the core 244-byte user-key ceiling. |
-| Leases | Capacity | `MAX_LEASES` | modules/app/lease_manager/mod.rs | 256 | Rejects lease creation. |
-| TTL scheduling queue | Capacity | `QUEUE_CAP` | modules/app/ttl_scheduler/mod.rs | 1024 | Rejects/backpressures another scheduled expiry; callers must not accept a lease whose expiry cannot be represented. |
-| Pending watch plans | Capacity | `MAX_PENDING_PLANS` | modules/app/watch_fanout/mod.rs | 16 | Backpressures/defer fan-out planning. |
+| Watch key | Shape | `WATCH_KEY_MAX` | modules/common/watch_hub.rs | 96 | Rejects a watch whose key and range end together exceed it; far narrower than the 2584-byte store key. |
+| Leases | Capacity | `MAX_LEASES` | modules/app/lease_manager/mod.rs | 256 | One lease per session, held at its session slot; a session at the bound is refused by the session layer, and a second grant on a session that holds one is answered GONE (the etcd anchor's allocation failure). |
+| Sessionless leases | Capacity | `SESSIONLESS_LEASES` | modules/app/lease_manager/mod.rs | 256 | Client-supplied leases granted without a session, kept apart from the session slots; a grant with every one taken is answered GONE, never dropped. |
+| Lease table | Capacity | `LEASE_TABLE` | modules/app/lease_manager/mod.rs | — | Derived: `MAX_LEASES + SESSIONLESS_LEASES` (512), every lease the manager holds; its expiry queue is the same size, one deadline per lease, so it never fills. |
+| TTL scheduling queue | Capacity | `QUEUE_CAP` | modules/app/ttl_scheduler/mod.rs | 1024 | Full, the queue keeps the soonest deadlines: the one expiring last is given up and counted (`overflowed`). A given-up KV deadline is owed a memory-store table sweep, run when the earliest and again when the latest given-up deadline passes, so each such record is reclaimed by then; reads never see an expired record either way, and the disk store reclaims through compaction. Lease deadlines here mirror `lease_manager`'s, which expires the lease itself. |
+| Pending watch plans | Capacity | `MAX_PENDING_PLANS` | modules/app/watch_fanout/mod.rs | 16 | Past it a reconnect's backfill plan is dropped, counted (`replays_unserviceable`) and acked as replayed with zero frames; the watch goes on from the plan's end without that window's backfill. |
 | Replay window bytes | Capacity | `WINDOW_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | A backfill larger than this cannot be sent in revision order: refused as compacted (the client relists), never sent out of order or cut. |
 | Replay window frames | Capacity | `WINDOW_FRAMES` | modules/app/watch_fanout/mod.rs | 256 | As `WINDOW_BYTES`. |
 | Replay replaced-version bytes | Capacity | `PREV_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | The versions a backfill's events replaced that lie below its window; past it the backfill is refused as compacted (the client relists), never sent without its prev_kv. |
@@ -145,16 +173,16 @@ must expose any overrides and keep them consistent at every participant.
 | Replicated proposal body | Shape | `CONSENSUS_PROPOSAL_BODY_MAX` | modules/common/wire.rs | 2040 | One clustor log entry body less the gateway's correlation tag; a larger replicated write is refused as too large in each protocol's own words (etcd "request is too large", memcached "SERVER_ERROR object too large for cache"). |
 | Channel frame payload | Shape | `FRAME_PAYLOAD_MAX` | modules/common/wire.rs | 8189 | One channel frame (the SDK's CHANNEL_BUFFER_SIZE, a cross-core slot) less the envelope header; a message past it crosses as MSG_PART parts. |
 | Message part bytes | Shape | `PART_BYTES_MAX` | modules/common/wire.rs | — | Derived: one frame less a part's head; a logical message's size is its receiver's policy, not this. |
-| Retention consumers | Capacity | `MAX_SOURCES` | modules/common/compaction_floor.rs | 4 | Cannot track another independent retention source safely. |
+| Retention consumers | Capacity | `MAX_SOURCES` | modules/common/compaction_floor.rs | 4 | A floor or claim from a source id at or above it is ignored. |
 | Retention key/partition groups | Capacity | `MAX_KPG` | modules/common/compaction_floor.rs | 32 | Refuses/holds floor advancement rather than compacting required history. |
-| Retention claims | Capacity | `MAX_RETENTION_CLAIMS` | modules/common/db_ops.rs | 64 | Rejects another claim. |
-| Backup ranges | Topology | `MAX_BACKUP_RANGES` | modules/common/db_ops.rs | — | Derived from `MAX_RANGES` (64); larger maps require multiple backup coordinators. |
+| Retention claims | Capacity | `MAX_RETENTION_CLAIMS` | modules/common/db_ops.rs | 64 | A floor computation (`effective_floor`) given more claims refuses whole (`TooManyClaims`) and the floor does not advance. |
+| Backup ranges | Topology | `MAX_BACKUP_RANGES` | modules/common/db_ops.rs | — | Derived as `range_lifecycle::MAX_RANGES` (64), so one manifest names every range of a map. |
 | Successor cursors | Capacity | `MAX_SUCCESSOR_CURSORS` | modules/common/db_ops.rs | 2 | Rejects another concurrent successor scan. |
-| Backup key | Shape | `KEY_MAX` | modules/app/backup_coordinator/mod.rs | 128 | Rejects larger keys on backup even when storage accepts them. |
-| Backup page buffer | Capacity | `PAGE_BUF` | modules/app/backup_coordinator/mod.rs | 3584 | Splits/defer pages; a single unrepresentable item fails explicitly. |
+| Backup key | Shape | `KEY_MAX` | modules/app/backup_coordinator/mod.rs | 128 | Bounds the coordinator's own manifest and artifact keys. Backed-up keys are held up to 512 bytes; a longer one faults the backup (`scan page corrupt`). |
+| Backup page buffer | Capacity | `PAGE_BUF` | modules/app/backup_coordinator/mod.rs | 3584 | One artifact page (up to 24 records); records whose bytes overflow it fault the backup (`artifact page overflow`), and a restore record longer than it faults the restore. Pages are not split. |
 | Unacknowledged CDC batches | Capacity | `UNACKED_CAP` | modules/common/cdc_feed.rs | 16 | The in-flight window of publish exchanges; backpressures the feed until the sink answers 200. |
 | CDC publish request record | Shape | `PUBLISH_RECORD_MAX` | modules/common/cdc_feed.rs | — | The request HEAD, the ordering key and the worst-case envelope; fits one exchange record, so an event is never split. |
-| CDC key | Shape | `KEY_MAX` | modules/common/cdc_feed.rs | 256 | Rejects malformed/oversized events. |
+| CDC key | Shape | `KEY_MAX` | modules/common/cdc_feed.rs | 256 | An event whose key exceeds it cannot be published (its sink message key does not fit); the feed re-reads that page and stalls at the event rather than skip it. |
 | CDC wire key | Shape | `CDC_MAX_KEY_LEN` | modules/common/cdc_wire.rs | 2584 | Any key the store holds; encoder/decoder reject rather than truncate. |
 | Chunk | Shape | `CHUNK_MAX` | modules/common/kv_chunks.rs | 1970 | Derived (a contract test holds it): the largest payload one replicated `KV_OP_PUT_CHUNK` carries — the 2040-byte proposal body less the entry tag, the 35-byte command head and the op's hash and length. Nothing that travels is larger. |
 | Large values per request | Shape | `MAX_LARGE_PER_REQUEST` | modules/common/kv_large.rs | 64 | A TXN with more large values is refused before any chunk is sent; one document insert batch is at most `doc_exec::MAX_INSERT_DOCS` (64). |
@@ -180,16 +208,18 @@ must expose any overrides and keep them consistent at every participant.
 | Placement voters | Topology | `MAX_VOTERS` | modules/common/data_surface.rs | — | Typed value 5; must agree with `MAX_REPLICAS`. |
 | Native server connections | Capacity | `MAX_CONNS` | modules/app/lattice_data_anchor/mod.rs | 16 | Drops/refuses excess accepts. |
 | Native server requests | Capacity | `MAX_INFLIGHT` | modules/app/lattice_data_anchor/mod.rs | 128 | Rejects busy. |
-| Native client requests | Capacity | `MAX_INFLIGHT` | modules/app/lattice_data_client/mod.rs | 128 | Backpressures/rejects locally. |
+| Native client requests | Capacity | `MAX_INFLIGHT` | modules/app/lattice_data_client/mod.rs | 128 | A request past it is answered `KV_RESULT_QUOTA` locally, never sent. |
 | Redis connections | Capacity | `MAX_CONNS` | modules/app/redis_edge_anchor/mod.rs | 64 | Drops/refuses excess accepts. |
-| Redis queued commands per connection | Capacity | `MAX_QUEUED` | modules/app/redis_edge_anchor/mod.rs | 32 | Stops reading/backpressures the connection. |
-| Redis subscriptions per connection | Capacity | `MAX_SUBS` | modules/app/redis_edge_anchor/mod.rs | 16 | Rejects another subscription. |
+| Redis subscriptions per connection | Capacity | `MAX_SUBS` | modules/app/redis_edge_anchor/mod.rs | 16 | The subscription count the worker-less local acknowledgement reports (a graph with no pub/sub worker), saturating; no subscription is refused. |
+| Redis reply depth per connection | Capacity | `RO_DEPTH` | modules/app/redis_edge_anchor/mod.rs | 256 | Replies in flight in one connection's reorder ring. The command loop forwards a whole receive burst before any reply drains, so the ring holds the pipeline, not just its out-of-order tail: a 4 KiB receive buffer is about 128 minimal commands, and 256 matches the router's `MAX_INFLIGHT`. A client pipelining deeper is closed (fail closed), never buffered without bound or answered out of order. |
+| Redis PUBLISH fan-outs awaiting counts | Semantic | `PUB_PENDING` | modules/app/redis_edge_anchor/mod.rs | 16 | PUBLISHes whose receiver counts the anchor is still summing across the pub/sub workers. Full, the message is still delivered (it was already written to the workers) but the publisher is answered `:0` rather than its receiver count, so it is never left hanging; a PUBLISH no worker took is answered `-BUSY pubsub worker backpressured`. |
+| Redis large-value expansions at once | Capacity | `RLG_SESSIONS` | modules/app/redis_edge_anchor/mod.rs | 4 | Answers holding a large value expanded through the large-value layer together (GET, MGET, GETSET). One that finds every session busy is parked in arrival order in `PARK_BYTES` (32 KiB) and takes the next free session; with the park full it answers `-BUSY large values backlogged, retry`. It also sizes the reorder arena (`RO_ARENA`). |
 | Memcached stream connections | Capacity | `MAX_CONNS` | modules/app/memcached_stream_anchor/mod.rs | 64 | Drops/refuses excess accepts. |
-| Memcached stream requests | Capacity | `MAX_INFLIGHT` | modules/app/memcached_stream_anchor/mod.rs | 256 | Rejects busy. |
-| Memcached datagram requests | Capacity | `MAX_INFLIGHT` | modules/app/memcached_datagram_anchor/mod.rs | 512 | Drops/rejects when the request table is full. |
+| Memcached stream requests | Capacity | `MAX_INFLIGHT` | modules/app/memcached_stream_anchor/mod.rs | 256 | Answers `SERVER_ERROR backpressure`. |
+| Memcached datagram requests | Capacity | `MAX_INFLIGHT` | modules/app/memcached_datagram_anchor/mod.rs | 512 | The request datagram is dropped unanswered; the client's retransmit is the retry. |
 | Memcached command tokens | Shape | `MAX_TOKENS` | modules/common/memcached_codec.rs | 32 | Rejects a command with more tokens. |
 | etcd connections | Capacity | `MAX_CONNS` | modules/app/etcd_edge_anchor/mod.rs | 64 | Drops/refuses excess accepts. |
-| etcd streams per connection | Capacity | `MAX_STREAMS_PER_CONN` | modules/app/etcd_edge_anchor/mod.rs | 8 | Refuses another stream. |
+| etcd streams per connection | Capacity | `MAX_STREAMS_PER_CONN` | modules/app/etcd_edge_anchor/mod.rs | 8 | Advertised as `SETTINGS_MAX_CONCURRENT_STREAMS`; a client opening one more is sent GOAWAY (PROTOCOL_ERROR) and closed. |
 | etcd stream body | Shape | `STREAM_BODY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 4608 | A larger request is refused as etcd refuses one ("request is too large"); the connection stays up. |
 | etcd watches per stream | Capacity | `WATCHES_PER_STREAM` | modules/app/etcd_edge_anchor/mod.rs | 8 | Refuses another watch on the stream (created and canceled at once). |
 | ended leases awaiting key deletion | Capacity | `LEASE_END_QUEUE` | modules/app/etcd_edge_anchor/mod.rs | 32 | Leaves further `MSG_LEASE_REVOKE`s queued on the channel until a deletion completes. |
@@ -218,12 +248,12 @@ must expose any overrides and keep them consistent at every participant.
 | Document connections | Capacity | `MAX_CONNS` | modules/app/doc_edge_anchor/mod.rs | 8 | Drops/refuses excess accepts. |
 | Document collection/name | Shape | `NAME_MAX` | modules/app/doc_edge_anchor/mod.rs | 64 | Rejects longer names. |
 | Mongo reply | Shape | `SEND_BUF` | modules/app/doc_edge_anchor/mod.rs | 24576 | The largest reply and a slot's unsent bytes; a slot that overflows is closed. |
-| Mongo open cursors | Capacity | `MAX_CURSORS` | modules/app/doc_edge_anchor/mod.rs | 4 | A find past them answers its first batch and no cursor. |
+| Mongo open cursors | Capacity | `MAX_CURSORS` | modules/app/doc_edge_anchor/mod.rs | 4 | Open getMore cursors, anchor-wide; a find whose result needs one when all are open is refused (`too many open cursors`), never answered short. |
 | Mongo batch documents | Pacing | `BATCH_DOCS` | modules/app/doc_edge_anchor/mod.rs | 101 | The default batch; `getMore` continues. |
 | BSON expansion of a tree | Semantic | `BSON_EXPANSION` | modules/app/doc_edge_anchor/mod.rs | 6 | Sizes the document budget a list asks for, so a batch always renders whole. |
-| Document/BSON message | Shape | `MAX_BSON` | modules/common/doc_server_codec.rs | 4096 | Rejects a larger document payload. |
+| Document/BSON message | Shape | `MAX_BSON` | modules/common/doc_server_codec.rs | 4096 | Advertised in `hello` (`maxBsonObjectSize`; `maxMessageSizeBytes` is 64 more); an OP_MSG longer than it is a framing error and the connection is closed. |
 | Wide-column connections | Capacity | `MAX_CONNS` | modules/app/wide_edge_anchor/mod.rs | 8 | Drops/refuses excess accepts. |
-| Wide-column result rows | Shape | `MAX_RESULT_ROWS` | modules/app/wide_edge_anchor/mod.rs | 16 | Returns `result exceeds one batch`; it does not silently truncate, but paging beyond this batch is not yet provided here. |
+| Wide-column result rows | Shape | `MAX_RESULT_ROWS` | modules/app/wide_edge_anchor/mod.rs | 16 | Returns `result exceeds one batch`, never a truncated result; CQL paging state is not implemented, so a SELECT matching more is refused. |
 | CQL columns | Shape | `CQL_MAX_COLS` | modules/common/cql_server_codec.rs | 16 | Rejects a wider CQL schema/result. |
 | CQL name bytes | Shape | `CQL_NAME_MAX` | modules/common/cql_server_codec.rs | 48 | Rejects a longer CQL identifier. |
 | CQL clustering columns | Shape | `CQL_MAX_CLUSTERING` | modules/common/cql_server_codec.rs | 4 | Rejects a wider clustering key at the protocol boundary. |
@@ -244,10 +274,12 @@ must expose any overrides and keep them consistent at every participant.
 | Redis command arguments | Shape | `MAX_ARGS` | modules/common/redis_codec.rs | 32 | Rejects a command with more arguments. |
 
 Connection limits are per anchor module instance, not process-wide promises.
-Fluxor's target-wide TCP table (currently 256 on host/aarch64 profiles) can bind
-before the sum of several anchors. Receive/send buffers also impose protocol
-message limits: Redis 4096/4096, Memcached 8192/8192, etcd 4096/4096,
-PostgreSQL 8192/32768, MySQL 8192/32768, and the Prometheus HTTP
+Fluxor's connection table is target-wide (on Linux the `linux_net` built-in's
+`max_conns`, default 128, settable 2..=65535; 65536 on the bare-metal aarch64
+profile) and can bind before the sum of several anchors. Receive/send buffers
+also impose protocol message limits: Redis 4096/4096, Memcached 8192/8192
+(datagram 2048/2048), etcd 20489/32768 with a 4608-byte request body per
+stream, PostgreSQL 8192/32768, MySQL 8192/32768, and the Prometheus HTTP
 anchor 16384/20480 bytes.
 
 ## In-graph fronts
@@ -261,6 +293,7 @@ application that swaps one for the other meets the same refusals.
 |---|---|---|---|---:|---|
 | SQL front statement | Shape | `QUERY_MAX` | modules/app/sql_front/mod.rs | 4096 | A longer body is refused 413 whole, as `pg_client` refuses one. |
 | SQL front target | Shape | `TARGET_MAX` | modules/app/sql_front/mod.rs | 64 | A longer target is refused 413; any non-empty one 400. |
+| SQL front requests held | Capacity | `SLOTS` | modules/app/sql_front/mod.rs | 4 | Requests collected or queued at once, besides the one being performed. Full with none still collecting, request records are left unread (the requester's backpressure); full while one is still collecting, a new request is answered 503. The answer queue (8) holds a refusal per slot, one read's record and the LINK pair. |
 | SQL front statement envelope | Shape | `REQ_ENV_MAX` | modules/app/sql_front/mod.rs | — | Derived: the envelope header, `MSG_SQL_REQUEST`'s head and `QUERY_MAX`; every statement taken fits it. |
 | SQL front executor answer | Shape | `RESP_ENV_MAX` | modules/app/sql_front/mod.rs | — | Derived: the executor's `RESP_BUF` (28672) behind the envelope header, the largest answer it writes; a larger envelope is discarded whole by the inbox and the statement answers 504 at its deadline. |
 | SQL answer body | Shape | `ANSWER_MAX` | modules/common/sql_answer.rs | 8192 | `pg_client`'s result buffer: a result set past it is refused 502 whole, never cut to the rows that fit. |
@@ -271,11 +304,12 @@ application that swaps one for the other meets the same refusals.
 | KV front operation body | Shape | `OP_BODY_MAX` | modules/common/kv_front_core.rs | — | Derived: `COMMAND_MAX` and the operation's fixed fields; a body that would not fit is the connector's `ERR` refusal (400). |
 | KV front reply render | Shape | `REPLY_RENDER_MAX` | modules/common/kv_front_core.rs | — | Derived: twice `REPLY_MAX` and slack, room for any store answer framed as RESP before it is judged against `REPLY_MAX`. |
 | KV front target | Shape | `TARGET_MAX` | modules/app/kv_front/mod.rs | 64 | A longer target is refused 413; any non-empty one 400. |
+| KV front requests held | Capacity | `SLOTS` | modules/app/kv_front/mod.rs | 4 | As the SQL front's: four collected or queued besides the one being performed; full, request records are left unread, or a request opening while one is still collecting is answered 503. |
 | KV front marked request | Shape | `WORK_MAX` | modules/app/kv_front/mod.rs | — | Derived: `kv_large::mark_room(OP_BODY_MAX)`, the request as it goes out marked or rewritten, and each chunk exchange. |
 | KV front expanded value | Shape | `EXPAND_MAX` | modules/app/kv_front/mod.rs | — | Derived: `REPLY_MAX`. A large value that expands past it is answered as the connector answers one (`ERR value too large`, 400), never cut. |
 | KV front request envelope | Shape | `KV_ENV_MAX` | modules/app/kv_front/mod.rs | — | Derived: envelope header, `MSG_KV_REQUEST` head and `WORK_MAX`. |
 | KV front answer envelope | Shape | `KV_IN_MAX` | modules/app/kv_front/mod.rs | — | Derived: one channel frame behind the envelope header; every router answer fits. |
-| RESP nesting | Semantic | `RESP_DEPTH_MAX` | modules/common/resp_core.rs | 8 | An array reply nested deeper never frames complete: `redis_client` fills its reply buffer and answers 502. |
+| RESP nesting | Semantic | `RESP_DEPTH_MAX` | modules/common/resp_core.rs | 8 | An array reply nested deeper never frames complete: `kv_front`, holding the whole reply, answers it 502 at once; `redis_client` reads until its reply buffer fills, then answers 502. |
 | CDC subscriptions | Capacity | `SUBS` | modules/common/cdc_subscribe.rs | 4 | A further subscription is refused 503 until one ends. |
 | CDC subscription prefix | Shape | `PREFIX_MAX` | modules/common/cdc_subscribe.rs | 256 | `cdc_pump`'s keyrange bound: a longer prefix makes the target past `TARGET_MAX`, refused 413. |
 | CDC subscription target | Shape | `TARGET_MAX` | modules/common/cdc_subscribe.rs | — | Derived: `/cdc/` and `PREFIX_MAX` in hex (517 bytes); longer is refused 413. |
@@ -307,17 +341,18 @@ application that swaps one for the other meets the same refusals.
 | Key columns | Shape | `MAX_KEY_COLUMNS` | modules/common/relational.rs | 8 | Rejects a wider key. |
 | Text literal bytes | Shape | `MAX_TEXT_LEN` | modules/common/relational.rs | 120 | Rejects a larger literal. |
 | Row bytes | Shape | `MAX_ROW_BYTES` | modules/common/relational.rs | 4096 | Rejects a larger row. |
-| Foreign-key probes | Shape | `MAX_FK_PROBES` | modules/common/relational.rs | 2 | Rejects/decomposes work requiring more probes. |
+| Foreign-key probes | Shape | `MAX_FK_PROBES` | modules/common/relational.rs | 2 | A write needing more referential probes is refused (`OutOfBounds`). |
 | Sort rows | Capacity | `MAX_SORT_ROWS` | modules/app/relational_executor/mod.rs | 512 | Returns result-too-large; does not silently truncate. |
 | Table indexes | Shape | `MAX_TABLE_INDEXES` | modules/app/relational_executor/mod.rs | 4 | Rejects another index. |
 | Executor queue depth | Capacity | `QUEUE_DEPTH` | modules/app/relational_executor/mod.rs | 4 | Returns busy. |
+| SQL delete/update page | Pacing | `DELETE_PAGE` | modules/app/relational_executor/mod.rs | 32 | Rows a DELETE or UPDATE scans and writes per page, and keys one `KV_OP_DELETE` of a `DROP TABLE` removes: the per-transaction write cap, so a page never holds more rows than one write takes (UPDATE advances its cursor by the whole page, so a larger page would skip the rows past the cap unwritten). The statement goes on from the cursor with the next page; it is never refused for size. |
 | Aggregate items | Shape | `MAX_AGG_ITEMS` | modules/app/relational_executor/mod.rs | 8 | Rejects a wider aggregate. |
 | Aggregate groups | Capacity | `MAX_GROUPS` | modules/app/relational_executor/mod.rs | 32 | Returns result-too-large. |
 | Model id bytes | Shape | `MAX_MODEL_ID_LEN` | modules/common/models.rs | 48 | Rejects a longer identifier. |
 | Document index value | Shape | `MAX_DOC_INDEX_VALUE_LEN` | modules/common/models.rs | 256 | Rejects a larger indexed value. |
 | Wide-column clustering columns | Shape | `MAX_CLUSTERING_COLUMNS` | modules/common/models.rs | — | Derived from `MAX_KEY_COLUMNS` (8); rejects a wider clustering key. |
 | Graph vertex id | Shape | `MAX_VERTEX_ID_LEN` | modules/common/models.rs | 32 | Rejects a longer id. |
-| Synchronous graph indexes | Shape | `MAX_GRAPH_SYNC_INDEXES` | modules/common/models.rs | 4 | Rejects/defer additional index maintenance. |
+| Synchronous graph indexes | Shape | `MAX_GRAPH_SYNC_INDEXES` | modules/common/models.rs | 4 | An edge write declaring more indexes is refused; nothing is deferred. |
 | Search term bytes | Shape | `MAX_TERM_LEN` | modules/common/models.rs | 48 | Rejects a longer term. |
 | Document tree depth | Shape | `MAX_DEPTH` | modules/common/doc_tree.rs | 32 | Rejects a document (or edit result) nesting deeper. |
 | Document path segments | Shape | `MAX_PATH_SEGMENTS` | modules/common/doc_tree.rs | 32 | Rejects a longer path. |
@@ -373,12 +408,12 @@ application that swaps one for the other meets the same refusals.
 | Followed watch request | Shape | `FOLLOW_REQ_MAX` | modules/app/document_executor/mod.rs | 1024 | A longer watch request cannot be followed: answered too-large. |
 | KV request payload | Shape | `KV_REQUEST_PAYLOAD_MAX` | modules/common/wire.rs | 4160 | The router carries no larger request; an executor refuses a transaction past it (a document insert batch is one) as too-large. |
 
-The SQL surface is useful but is not yet SQLite-equivalent. Loam can compose a
-single-node embedded profile around Lattice's relational primitives, but today
-there is no SQLite file/API compatibility, full SQL grammar, joins, arbitrary
-expressions, triggers, views, PRAGMAs, mature query planner, or equivalent ACID
-and durability validation. Calling this “SQLite-style” is reasonable only for a
-bounded embedded relational/KV application profile, not as a drop-in database.
+The SQL surface is a bounded relational subset, not SQLite: there is no SQLite
+file/API compatibility, full grammar, arbitrary expressions, triggers, views,
+PRAGMAs or cost-based planner, and a SELECT joins at most once (an inner
+equi-join, its outer side buffered up to `MAX_JOIN_ROWS`). It suits a bounded
+embedded relational/KV profile, such as one Loam composes around these
+primitives, not a drop-in database.
 
 ## Identity and tenancy
 
@@ -387,7 +422,7 @@ bounded embedded relational/KV application profile, not as a drop-in database.
 | Principals | Capacity | `MAX_PRINCIPALS` | modules/common/auth_table.rs | 64 | Rejects another principal. |
 | Principal name bytes | Shape | `PRINCIPAL_NAME_MAX` | modules/common/auth_table.rs | 32 | Rejects a longer name. |
 | Credential bytes | Shape | `CRED_MAX` | modules/common/auth_table.rs | 96 | Rejects a larger credential representation. |
-| Tenant quota buckets | Capacity | `MAX_TENANTS` | modules/common/quota_bucket.rs | 64 | Rejects/untracks another tenant; callers must fail closed. |
+| Tenant quota buckets | Capacity | `MAX_TENANTS` | modules/common/quota_bucket.rs | 64 | A tenant past it gets no bucket: every request it makes is denied (fail closed), with no disconnect strike. |
 | Metrics rollup counters | Observability | `MAX_COUNTERS` | modules/common/metrics_rollup.rs | 32 | Allocation returns none, so additional protocol/op pairs are untracked; stored data is unaffected. |
 
 These are per module instance. Multi-tenant scale needs sharding/composition;
@@ -395,8 +430,8 @@ raising them blindly increases fixed memory in every instance.
 
 ## Pacing bounds
 
-These do not refuse a finite workload, but determine latency and throughput and
-must be performance-tested: disk flush 32 records/step, disk compaction 32,
+These do not refuse a finite workload, but determine latency and throughput,
+and are what performance tests measure: disk flush 32 records/step, disk compaction 32,
 version scan 2 run blocks/step, watch replay 32, backup 24, CDC 16, index
 backfill 16, range copy 16, SQL scan 64, SQL delete 32, and lease revoke 32. A pacing loop that cannot be rescheduled
 is a correctness bug, not merely a performance issue.
@@ -406,8 +441,7 @@ is a correctness bug, not merely a performance issue.
 Not a bound, and never set in a shipped graph: `kv_state_worker_store`'s
 `fault_read_eagain_every: N` param (id 20, default 0 = off) makes one store
 step in N busy — from that worker step to its next, every read the provider
-is asked (`GET`, `HEAD`, `RANGE_GET`, `LIST`, `CHANGES`, an initial-listing
-`SUBSCRIBE`), by any module, answers `EAGAIN` with nothing moved: a board
+is asked (`GET`, `HEAD`, `RANGE_GET`, `LIST`, `CHANGES`), by any module, answers `EAGAIN` with nothing moved: a board
 store whose device is taken by a write, reproduced on Linux
 (`store_provider::Fault`). `N = 1` is refused (every step busy). Enabled,
 the worker logs `[kvw] FAULT INJECTION ON (test only)` at construction and
@@ -437,53 +471,51 @@ flight (the worker's `MSG_KV_WORKING`) rather than answered fail-closed.
   among them. `MAX_REPLICAS=5` is the Lattice placement ceiling and Clustor
   permits seven node ids, but larger replica groups primarily add quorum cost.
   Horizontal capacity comes from more groups. The router's two partition ports
-  and 64-range map are currently the first explicit control-plane constraints.
-- On the replicated write path, Lattice's 4096-byte value/command aspirations
-  meet Clustor's 2048-byte WAL-entry body. Unless the command is chunked above
-  consensus, the smaller entry body binds first.
-- Lattice's 8164-byte memory snapshot binds before Clustor's 16384-byte body.
-  A 1024-key memory store cannot generally snapshot full 4096-byte values into
-  that envelope, so large replicated in-memory deployments depend on WAL replay
-  or need a chunked/logical snapshot design.
-- Fluxor currently supplies 16 output ports per module and target-wide resource
-  tables. Module composition can multiply a per-instance table, but it consumes
-  ports, modules, channels, memory, and target-wide sockets; those must be sized
-  as one deployment envelope.
-- “Unlimited” scans/results are not present. SQL sort/group buffers, wide-row
-  pages, vector top-k, time-series buckets, protocol send buffers, and client
-  page sizes all impose a first binder. APIs should expose pagination/cursors or
-  explicit result-too-large errors consistently.
+  (lifted for keyed traffic by `partition_fanout` and `partition_demux`, kept
+  for lifecycle operations and transaction participants) and the 64-range map
+  are the first explicit control-plane constraints.
+- On the replicated write path each entry meets Clustor's 2048-byte WAL-entry
+  body: a command is at most `wire::CONSENSUS_PROPOSAL_BODY_MAX` (2040), and a
+  value past one data chunk travels as chunks of at most `kv_chunks::CHUNK_MAX`
+  (1970) under a manifest, each one entry.
+- Lattice's 8164-byte app-snapshot body binds: a memory store whose encoded
+  state exceeds it refuses the snapshot (counted, logged once as
+  `[kvw] snap body over budget`) and is recovered by WAL replay; a disk store
+  answers with a marker, its runs being the snapshot.
+- Fluxor gives a module 16 ports per direction (the port byte's 4-bit field)
+  and target-wide resource tables. Module composition can multiply a
+  per-instance table, but it consumes ports, modules, channels, memory, and
+  target-wide sockets; those must be sized as one deployment envelope.
+- No scan or result is unbounded. SQL sort/group buffers, wide-row pages,
+  vector top-k, time-series buckets, protocol send buffers, and client page
+  sizes each impose a first binder, and each refuses with result-too-large or
+  pages with a cursor rather than truncate.
 
-## Known incompleteness and priorities
+## Known gaps
 
-1. Fix linearizable-read slot exhaustion so it cannot silently fall back to a
-   weaker read mode; test the full table and oversized-response cases.
-2. Make the partition router/group composition scalable beyond two local ports,
-   with hierarchical routing and map distribution tested beyond three nodes.
-3. Reconcile replicated command/value and snapshot envelopes across Lattice and
-   Clustor, preferably with chunking rather than larger fixed buffers.
-4. Make every protocol expose limit discovery, pagination, retry/backpressure,
-   and stable error mapping. Several anchors currently have narrower keys,
-   results, or connections than the core.
-5. Add deployment profiles for raw memory cache, replicated memory, single-node
-   durable log, and partitioned cluster, with benchmarked capacity envelopes.
-6. Define the intended Loam embedded relational contract before describing it
-   as SQLite-like; add crash/transaction/compatibility suites for that contract.
-7. A PromQL driver and Chronicle-based OpenTelemetry collector are future work.
-   They need a time-series label model, range/instant query semantics, staleness,
-   aggregation/pushdown budgets, remote-write ingestion, retention/cardinality
-   controls, and visualization-facing APIs. Current model/RESP time-series
-   primitives and 64-bucket result cap are foundations, not PromQL support.
+1. A full `LIN_READ_SLOTS` table, an oversized fenced command
+   (`LIN_READ_BUF`) or a backpressured fence write serves a linearizable read
+   unfenced from the snapshot path.
+2. Lifecycle operations and transaction participants address at most the
+   router's two partition ports.
+3. A memory store's snapshot is one 8164-byte body; a larger state relies on
+   WAL replay.
+4. Limit discovery, pagination and retry signalling differ per protocol:
+   CQL has no paging state, Mongo cursors are four per anchor, and several
+   anchors take narrower keys, results or connections than the core.
+5. The metrics surface has no OpenTelemetry (OTLP) ingest and no retention or
+   cardinality controls.
 
 ## Maintenance contract
 
-The host limit-register test checks documented literal values against source.
-That is necessary but not sufficient: it proves doc-to-source consistency, not
-source-to-doc completeness. Reviews must treat every new fixed table, bounded
-buffer, `MAX_*`, slot/depth/capacity constant, truncation, eviction, fallback,
-and target-specific resource table as a register change or an explicitly
-documented pacing exemption. CI should gain a reverse source scan; until it
-does, omission detection remains a review obligation.
+The `fluxor ci` limit-register gate checks every machine-checked row's value
+against its source and, with `limit_register_coverage = "fail"` in
+`fluxor.toml`, fails on any ceiling-shaped constant in a register-named file
+that is neither registered nor exempt: a name starting `MAX_` or ending in a
+capacity word, or any constant sizing a fixed array of records. A bound in a
+file the register does not name, and every truncation, eviction or fallback,
+remain review obligations: each is a register change or a documented pacing
+exemption.
 
 ## Module-internal bounds
 
@@ -499,35 +531,35 @@ checked.
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
-| Agg Key Max | Shape | `AGG_KEY_MAX` | modules/app/relational_executor/mod.rs | 48 | Rejects an input longer than this bound. |
-| Catalog Name Key Max | Shape | `CATALOG_NAME_KEY_MAX` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
+| Agg Key Max | Shape | `AGG_KEY_MAX` | modules/app/relational_executor/mod.rs | 48 | A GROUP BY value whose canonical encoding exceeds 48 bytes answers result-too-large. |
+| Catalog Name Key Max | Shape | `CATALOG_NAME_KEY_MAX` | modules/common/relational.rs | — | Derived: a 5-byte head and a `MAX_NAME_LEN` name; every legal name's catalog key fits. |
 | Cdc Envelope Max | Shape | `CDC_ENVELOPE_MAX` | modules/common/cdc_wire.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Disk Batch Max | Shape | `DISK_BATCH_MAX` | modules/common/kv_store.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Key Max | Shape | `KEY_MAX` | modules/app/model_edge_anchor/mod.rs | 512 | Rejects an input longer than this bound. |
 | Key Max | Shape | `KEY_MAX` | modules/app/prometheus_edge_anchor/mod.rs | 512 | Rejects an input longer than this bound. |
 | Key Max | Shape | `KEY_MAX` | modules/app/wide_edge_anchor/mod.rs | 512 | Rejects an input longer than this bound. |
-| Max Cached Name | Shape | `MAX_CACHED_NAME` | modules/app/relational_executor/mod.rs | 64 | Rejects an input longer than this bound. |
+| Max Cached Name | Shape | `MAX_CACHED_NAME` | modules/app/relational_executor/mod.rs | 64 | Longest table name the SELECT name cache holds; a longer name is looked up in the catalog each time, never refused. |
 | Max Decimal Precision | Shape | `MAX_DECIMAL_PRECISION` | modules/common/relational.rs | — | Maximum NUMERIC/DECIMAL precision; a wider declaration is rejected. |
 | Max Index Value Len | Shape | `MAX_INDEX_VALUE_LEN` | modules/common/db_ops.rs | 256 | Rejects an input longer than this bound. |
-| Max Kv Key | Shape | `MAX_KV_KEY` | modules/app/relational_executor/mod.rs | — | Rejects an input longer than this bound. |
+| Max Kv Key | Shape | `MAX_KV_KEY` | modules/app/relational_executor/mod.rs | — | Derived: the keyspace prefix and the wider of a primary-key composite and a catalog name key; the longest key the executor builds. |
 | Max Name Len | Shape | `MAX_NAME_LEN` | modules/common/relational.rs | 64 | Rejects an input longer than this bound. |
-| Max Ordered Value Len | Shape | `MAX_ORDERED_VALUE_LEN` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
+| Max Ordered Value Len | Shape | `MAX_ORDERED_VALUE_LEN` | modules/common/relational.rs | — | Derived: the order-preserving encoding of the widest value (escaped text doubles); every legal value fits. |
 | Max Plain Value Len | Shape | `MAX_PLAIN_VALUE_LEN` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
 | Max Primary Key Len | Shape | `MAX_PRIMARY_KEY_LEN` | modules/common/db_ops.rs | — | Rejects an input longer than this bound. |
 | Max Probe Key Len | Shape | `MAX_PROBE_KEY_LEN` | modules/common/relational.rs | — | Rejects an input longer than this bound. |
 | Max Record Len | Shape | `MAX_RECORD_LEN` | modules/common/disk_store.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Max Split Key Len | Shape | `MAX_SPLIT_KEY_LEN` | modules/common/range_lifecycle.rs | — | Rejects an input longer than this bound. |
-| Max Wire Version | Shape | `MAX_WIRE_VERSION` | modules/common/doc_server_codec.rs | — | The highest Mongo wire protocol version the codec advertises and accepts. |
-| Password Max | Shape | `PASSWORD_MAX` | modules/app/mysql_edge_anchor/mod.rs | 64 | Rejects an input longer than this bound. |
-| Password Max | Shape | `PASSWORD_MAX` | modules/app/pg_edge_anchor/mod.rs | 64 | Rejects an input longer than this bound. |
-| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 20489 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Max Wire Version | Shape | `MAX_WIRE_VERSION` | modules/common/doc_server_codec.rs | — | The wire version advertised in `hello`; nothing is checked against it. |
+| Password Max | Shape | `PASSWORD_MAX` | modules/app/mysql_edge_anchor/mod.rs | 64 | A longer `password` param refuses the anchor at construction (logged): a truncated secret would admit anyone knowing only its prefix. |
+| Password Max | Shape | `PASSWORD_MAX` | modules/app/pg_edge_anchor/mod.rs | 64 | A longer `password` param refuses the anchor at construction (logged): a truncated secret would admit anyone knowing only its prefix. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 20489 | One maximal HTTP/2 frame (16384 + 9) and the next frame's start; a larger frame or an overflow is GOAWAY (PROTOCOL_ERROR) and close. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_client/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Requirepass Max | Shape | `REQUIREPASS_MAX` | modules/app/redis_edge_anchor/mod.rs | 128 | Rejects an input longer than this bound. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | A request that does not fit answers `SERVER_ERROR overflow` and the connection is closed. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | A command that does not fit it answers `-ERR receive buffer full` and the connection is closed. |
+| Requirepass Max | Shape | `REQUIREPASS_MAX` | modules/app/redis_edge_anchor/mod.rs | 128 | A longer `requirepass` param refuses the anchor at construction (logged): a truncated secret would admit anyone knowing only its prefix. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/kv_request_router/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/kv_request_router/mod.rs | — | Derived as `wire::KV_REQUEST_PAYLOAD_MAX`: the largest request taken; a longer envelope is discarded whole by its ingress inbox (counted), unanswered. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/lattice_data_client/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/lease_manager/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
@@ -535,12 +567,12 @@ checked.
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/ttl_scheduler/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_fanout/mod.rs | 8832 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 32768 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 32768 | A response that does not fit is answered gRPC RESOURCE_EXHAUSTED (8), never split. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Store Id Max | Shape | `STORE_ID_MAX` | modules/common/fs_run_storage.rs | — | Rejects an input longer than this bound. |
-| Ts Request Size | Shape | `TS_REQUEST_SIZE` | modules/app/kv_state_worker/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | A reply waits in the reorder arena until it fits; never dropped. |
+| Store Id Max | Shape | `STORE_ID_MAX` | modules/common/fs_run_storage.rs | — | Typed `u8`, 9: the highest `store_id` the Linux layout names (`kv1/`…`kv9/`); a higher one refuses construction. |
+| Ts Request Size | Shape | `TS_REQUEST_SIZE` | modules/app/kv_state_worker/mod.rs | — | Commit timestamps one lease asks the allocator for (it may grant fewer), asked when fewer than `TS_LOW_WATER` remain. |
 | Watch Export Max | Shape | `WATCH_EXPORT_MAX` | modules/common/watch_hub.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Wide Schema Max | Shape | `WIDE_SCHEMA_MAX` | modules/common/cql_server_codec.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 
@@ -548,16 +580,15 @@ checked.
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
-| Agg Max | Capacity | `AGG_MAX` | modules/app/relational_executor/mod.rs | — | Rejects work beyond this count. |
 | Max Cols | Capacity | `MAX_COLS` | modules/app/pg_edge_anchor/mod.rs | 32 | Columns per row the Postgres codec encodes; a wider row is refused. |
-| Max Edge Plan Entries | Capacity | `MAX_EDGE_PLAN_ENTRIES` | modules/common/models.rs | — | Rejects work beyond this count. |
-| Max Groups | Capacity | `MAX_GROUPS` | modules/common/tsquery_core.rs | 128 | Distinct groups a metrics query aggregates; beyond it the query is refused. |
+| Max Edge Plan Entries | Capacity | `MAX_EDGE_PLAN_ENTRIES` | modules/common/models.rs | — | Derived: two adjacency entries and `MAX_GRAPH_SYNC_INDEXES` index entries; the refusal happens at that bound. |
+| Max Groups | Capacity | `MAX_GROUPS` | modules/common/tsquery_core.rs | 128 | The contract ceiling consumers size against; the core does not check it (`TooManyGroups` is never returned), and the anchor's `MAX_SERIES_Q` binds first. |
 | Max Join Rows | Capacity | `MAX_JOIN_ROWS` | modules/app/relational_executor/mod.rs | 128 | Rows materialised for a join side; a larger join is refused. |
-| Max Per Reject | Capacity | `MAX_PER_REJECT` | modules/app/kv_request_router/mod.rs | 32 | Rejects work beyond this count. |
-| Max Series | Capacity | `MAX_SERIES` | modules/common/tsquery_core.rs | 256 | Series a metrics query tracks; beyond it the query is refused. |
+| Max Per Reject | Capacity | `MAX_PER_REJECT` | modules/app/kv_request_router/mod.rs | 32 | Consensus ops of one connection failed (`KV_RESULT_LIN_BOUND`) per NOT_LEADER reject; any beyond are answered by the deadline sweep. |
+| Max Series | Capacity | `MAX_SERIES` | modules/common/tsquery_core.rs | 256 | The contract ceiling consumers size against; the core does not check it (`TooManySeries` is never returned), and the anchor's `MAX_SERIES_Q` binds first. |
 | Max Txn Slots | Capacity | `MAX_TXN_SLOTS` | modules/app/relational_executor/mod.rs | 2 | Concurrent coordinator transactions; a further BEGIN is refused. |
-| Ps Max | Capacity | `PS_MAX` | modules/app/redis_edge_anchor/mod.rs | 64 | Pattern subscriptions per Redis connection; a further PSUBSCRIBE is refused. |
-| Reject Body Max | Capacity | `REJECT_BODY_MAX` | modules/app/kv_request_router/mod.rs | 4 | Rejects work beyond this count. |
+| Redis pub/sub sessions | Capacity | `PS_MAX` | modules/app/redis_edge_anchor/mod.rs | 64 | Pub/sub sessions the anchor fronts, one per subscribing connection (equal to `MAX_CONNS`); a SUBSCRIBE finding none free answers `-ERR no pub/sub session is free; try again later` and leaves the connection out of subscriber mode, and its next SUBSCRIBE tries again. |
+| Router refusal body | Shape | `REJECT_BODY_MAX` | modules/app/kv_request_router/mod.rs | 4 | Longest body a router refusal carries (the cross-domain redirect's domain id); every other refusal is empty. |
 | Scan Cursor Provider Max | Capacity | `SCAN_CURSOR_PROVIDER_MAX` | modules/common/partition_map.rs | — | Rejects work beyond this count. |
 | Txn Acc Max | Capacity | `TXN_ACC_MAX` | modules/app/relational_executor/mod.rs | 3600 | Rejects work beyond this count. |
 | Txn Body Max | Capacity | `TXN_BODY_MAX` | modules/app/relational_executor/mod.rs | 3800 | Rejects work beyond this count. |
@@ -566,9 +597,9 @@ checked.
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
-| Disk Compact Step Cap | Pacing | `DISK_COMPACT_STEP_CAP` | modules/common/kv_store.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
-| Disk Fence Stall Budget | Pacing | `DISK_FENCE_STALL_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
-| Disk Hard Fault Budget | Pacing | `DISK_HARD_FAULT_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Disk Compact Step Cap | Pacing | `DISK_COMPACT_STEP_CAP` | modules/common/kv_store.rs | — | Compaction steps one cycle may take; past it the cycle fails closed as a provider bug. |
+| Disk Fence Stall Budget | Pacing | `DISK_FENCE_STALL_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Steps a disk fence (snapshot, install, compaction) may keep writes waiting before it is aborted and retried; writes are never starved. |
+| Disk Hard Fault Budget | Pacing | `DISK_HARD_FAULT_BUDGET` | modules/app/kv_state_worker/mod.rs | — | Hard flush or compaction faults retried before the store quarantines; a recovery fault quarantines at once. |
 | Max Per Sweep | Pacing | `MAX_PER_SWEEP` | modules/app/kv_request_router/mod.rs | 32 | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Page Limit | Pacing | `PAGE_LIMIT` | modules/app/backup_coordinator/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Page Limit | Pacing | `PAGE_LIMIT` | modules/app/rebalancer/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
@@ -582,11 +613,12 @@ checked.
 | Per Tick Net Budget | Pacing | `PER_TICK_NET_BUDGET` | modules/app/memcached_stream_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Per Tick Net Budget | Pacing | `PER_TICK_NET_BUDGET` | modules/app/redis_edge_anchor/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Per Tick Router Budget | Pacing | `PER_TICK_ROUTER_BUDGET` | modules/app/kv_request_router/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
+| Datagram drain rounds | Pacing | `BUDGET` | modules/app/memcached_datagram_anchor/mod.rs | — | Typed `u32`, 32 rounds per step, each taking at most one request datagram and one routed reply (`memcached_stream_anchor`'s shape); the rest wait on their channels for the next step. |
 | Reap Budget | Pacing | `REAP_BUDGET` | modules/app/kv_state_worker/mod.rs | 64 | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Replay Page Limit | Pacing | `REPLAY_PAGE_LIMIT` | modules/app/watch_fanout/mod.rs | — | Bounds work per step; the held remainder is re-driven on the next tick. |
-| Ro Stall Limit | Pacing | `RO_STALL_LIMIT` | modules/app/redis_edge_anchor/mod.rs | — | Read-only stall ticks before the anchor reconnects its link. |
+| Ro Stall Limit | Pacing | `RO_STALL_LIMIT` | modules/app/redis_edge_anchor/mod.rs | — | Steps a connection's reply-reorder head may wait un-ready (a lost reply) before the connection's pending replies are dropped and it is closed (fail closed). |
 | Ttl Resume Budget | Pacing | `TTL_RESUME_BUDGET` | modules/app/kv_state_worker/mod.rs | 32 | Bounds work per step; the held remainder is re-driven on the next tick. |
-| Wedge Budget | Pacing | `WEDGE_BUDGET` | modules/common/cdc_feed.rs | — | Consecutive wedge retries before a feed reports STALLED. |
+| Wedge Budget | Pacing | `WEDGE_BUDGET` | modules/common/cdc_feed.rs | — | Consecutive internal-error answers before the feed goes WEDGED (terminal; distinct from STALLED). |
 | Held read range ask | Pacing | `RANGE_ASK_MAX` | modules/common/held_read.rs | — | The most one `RANGE_GET` of a held whole-value read asks for; the read asks again for the rest, in the same step unless the store answers `EAGAIN` (then on a later one, same handle, same offset). |
 
 ### Module topology bounds
@@ -628,6 +660,7 @@ MAX_VALUE_LEN | modules/common/disk_store.rs | -
 MEMTABLE_MAX_ENTRIES | modules/common/disk_store.rs | 512
 MEMTABLE_FLUSH_WATERMARK | modules/common/disk_store.rs | 384
 BLOCK_CACHE_SLOTS | modules/common/disk_store.rs | 256
+SPARSE_INDEX_ENTRIES | modules/common/disk_store.rs | 256
 SCAN_STEP_BLOCKS | modules/common/disk_store.rs | 2
 SCAN_STEP_RECORDS | modules/common/disk_store.rs | -
 SKIP_STALE_VERSIONS | modules/common/disk_store.rs | 4
@@ -636,14 +669,31 @@ VERSIONS_TRANSCODE_SLACK | modules/common/kv_store.rs | 6
 HELD_FRAME_MAX | modules/app/kv_state_worker/mod.rs | 1024
 CLOG_OUT_MAX | modules/app/kv_state_worker/mod.rs | 65536
 IMPORT_RECORD_MAX | modules/app/kv_state_worker/mod.rs | 3149824
-LOCAL_ANSWERS | modules/common/store_provider.rs | 16
+LOCAL_ANSWERS | modules/common/store_provider.rs | 1024
+SLOTS | modules/common/store_provider.rs | 4096
+SUB_BAND | modules/common/store_provider.rs | 1 << 24
+DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 256
+CHANGE_LOG_DEFAULT | modules/common/store_provider.rs | 256 * 1024
+LOG_SCAN_MAX | modules/common/store_provider.rs | 4096
+HIST_VISIT_MAX | modules/common/store_provider.rs | 1024
+WALK_STEP_BUDGET | modules/common/store_provider.rs | 4096
+PUMP_MAX | modules/common/store_provider.rs | 4096
+GAP_RING_MAX | modules/common/store_provider.rs | 512
+TOKEN_MAX | modules/common/store_provider.rs | 320
+MAX_PAGES | modules/common/store_registry.rs | 4096
+MAX_INDEX_PAGES | modules/common/store_registry.rs | 64
+PREFIX_MAX | modules/common/store_registry.rs | 255
+CHECKPOINTS | modules/common/change_ring.rs | 512
+KEYLOG_BYTES | modules/common/kv_store.rs | 32 * 1024
 KEY_MAX | modules/common/store_provider.rs | 255
 INLINE_MAX | modules/common/store_provider.rs | -
-EVENT_MAX | modules/common/store_provider.rs | -
 FENCE_WIRE_MAX | modules/common/store_provider.rs | 62
 TRAILER_MAX | modules/common/store_provider.rs | -
 REDRIVE_MAX | modules/common/store_provider.rs | -
 ENTRY_BODY_MAX | modules/common/store_provider.rs | -
+PENDING_WRITES | modules/common/store_provider.rs | 32
+WINDOW | modules/common/store_provider.rs | 8
+CHUNK_WINDOW | modules/common/store_provider.rs | 4
 SCOPE_NAME_MAX | modules/common/store_provider.rs | 63
 SCOPED_MAX | modules/common/store_provider.rs | 512
 SCOPE_HEAD_MAX | modules/common/store_provider.rs | -
@@ -662,10 +712,13 @@ SLOT_COUNT | modules/common/partition_map.rs | 1024
 MAX_KEY_BOUND_LEN | modules/common/partition_map.rs | 256
 MAX_REPLICAS | modules/common/partition_map.rs | 5
 MAX_RANGES | modules/common/partition_map.rs | 64
+MAP_UPDATE_MAX_ENTRIES | modules/common/partition_map.rs | 256
 MAX_PARTITION_PORTS | modules/app/kv_request_router/mod.rs | 2
+INGRESS_PORTS | modules/app/kv_request_router/mod.rs | 9
 MAX_LOCAL_PARTITIONS | modules/app/partition_demux/mod.rs | 8
 MAX_INFLIGHT | modules/app/kv_request_router/mod.rs | 256
 KV_STASH_SLOTS | modules/app/kv_request_router/mod.rs | 4
+TOLD_PER_NOTICE | modules/app/kv_request_router/mod.rs | 32
 KV_STASH_FRAME | modules/app/kv_request_router/mod.rs | -
 LIN_READ_SLOTS | modules/app/kv_request_router/mod.rs | 32
 LIN_READ_BUF | modules/app/kv_request_router/mod.rs | 300
@@ -687,11 +740,14 @@ PEND_BUF | modules/app/span_courier/mod.rs | 16384
 RASM_BUF | modules/app/span_courier/mod.rs | -
 AUTHORITY_MAX | modules/common/authority.rs | 64
 MAX_PARTICIPANTS | modules/common/txn.rs | 8
+PARTICIPANTS | modules/app/txn_coordinator/mod.rs | 2
 OPERAND_MAX | modules/app/txn_coordinator/mod.rs | 64
 HOLD_CAPACITY | modules/app/timestamp_allocator/mod.rs | 32
 MAX_WATCHES | modules/common/watch_hub.rs | 256
 WATCH_KEY_MAX | modules/common/watch_hub.rs | 96
 MAX_LEASES | modules/app/lease_manager/mod.rs | 256
+SESSIONLESS_LEASES | modules/app/lease_manager/mod.rs | 256
+LEASE_TABLE | modules/app/lease_manager/mod.rs | -
 QUEUE_CAP | modules/app/ttl_scheduler/mod.rs | 1024
 MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 16
 WINDOW_BYTES | modules/app/watch_fanout/mod.rs | 65536
@@ -733,8 +789,10 @@ MAX_CONNS | modules/app/lattice_data_anchor/mod.rs | 16
 MAX_INFLIGHT | modules/app/lattice_data_anchor/mod.rs | 128
 MAX_INFLIGHT | modules/app/lattice_data_client/mod.rs | 128
 MAX_CONNS | modules/app/redis_edge_anchor/mod.rs | 64
-MAX_QUEUED | modules/app/redis_edge_anchor/mod.rs | 32
 MAX_SUBS | modules/app/redis_edge_anchor/mod.rs | 16
+RO_DEPTH | modules/app/redis_edge_anchor/mod.rs | 256
+PUB_PENDING | modules/app/redis_edge_anchor/mod.rs | 16
+RLG_SESSIONS | modules/app/redis_edge_anchor/mod.rs | 4
 MAX_CONNS | modules/app/memcached_stream_anchor/mod.rs | 64
 MAX_INFLIGHT | modules/app/memcached_stream_anchor/mod.rs | 256
 MAX_INFLIGHT | modules/app/memcached_datagram_anchor/mod.rs | 512
@@ -806,6 +864,7 @@ MAX_FK_PROBES | modules/common/relational.rs | 2
 MAX_SORT_ROWS | modules/app/relational_executor/mod.rs | 512
 MAX_TABLE_INDEXES | modules/app/relational_executor/mod.rs | 4
 QUEUE_DEPTH | modules/app/relational_executor/mod.rs | 4
+DELETE_PAGE | modules/app/relational_executor/mod.rs | 32
 MAX_AGG_ITEMS | modules/app/relational_executor/mod.rs | 8
 MAX_GROUPS | modules/app/relational_executor/mod.rs | 32
 MAX_MODEL_ID_LEN | modules/common/models.rs | 48
@@ -863,7 +922,6 @@ STORE_ID_MAX | modules/common/fs_run_storage.rs | -
 TS_REQUEST_SIZE | modules/app/kv_state_worker/mod.rs | -
 WATCH_EXPORT_MAX | modules/common/watch_hub.rs | -
 WIDE_SCHEMA_MAX | modules/common/cql_server_codec.rs | -
-AGG_MAX | modules/app/relational_executor/mod.rs | -
 MAX_COLS | modules/app/pg_edge_anchor/mod.rs | 32
 MAX_EDGE_PLAN_ENTRIES | modules/common/models.rs | -
 MAX_GROUPS | modules/common/tsquery_core.rs | 128
@@ -892,6 +950,7 @@ PER_TICK_NET_BUDGET | modules/app/lattice_data_anchor/mod.rs | -
 PER_TICK_NET_BUDGET | modules/app/memcached_stream_anchor/mod.rs | -
 PER_TICK_NET_BUDGET | modules/app/redis_edge_anchor/mod.rs | -
 PER_TICK_ROUTER_BUDGET | modules/app/kv_request_router/mod.rs | -
+BUDGET | modules/app/memcached_datagram_anchor/mod.rs | 32
 REAP_BUDGET | modules/app/kv_state_worker/mod.rs | 64
 REPLAY_PAGE_LIMIT | modules/app/watch_fanout/mod.rs | -
 RO_STALL_LIMIT | modules/app/redis_edge_anchor/mod.rs | -
@@ -955,6 +1014,7 @@ KV_REQUEST_PAYLOAD_MAX | modules/common/wire.rs | 4160
 RANGE_ASK_MAX | modules/common/held_read.rs | -
 QUERY_MAX | modules/app/sql_front/mod.rs | 4096
 TARGET_MAX | modules/app/sql_front/mod.rs | 64
+SLOTS | modules/app/sql_front/mod.rs | 4
 REQ_ENV_MAX | modules/app/sql_front/mod.rs | -
 RESP_ENV_MAX | modules/app/sql_front/mod.rs | -
 ANSWER_MAX | modules/common/sql_answer.rs | 8192
@@ -965,6 +1025,7 @@ REPLY_MAX | modules/common/kv_front_core.rs | 8192
 OP_BODY_MAX | modules/common/kv_front_core.rs | -
 REPLY_RENDER_MAX | modules/common/kv_front_core.rs | -
 TARGET_MAX | modules/app/kv_front/mod.rs | 64
+SLOTS | modules/app/kv_front/mod.rs | 4
 WORK_MAX | modules/app/kv_front/mod.rs | -
 EXPAND_MAX | modules/app/kv_front/mod.rs | -
 KV_ENV_MAX | modules/app/kv_front/mod.rs | -
@@ -999,4 +1060,7 @@ FIELD_LIMIT | modules/common/doc_exec.rs | a request field tag (the list limit a
 NUM_MAX | modules/common/doc_exec.rs | a mutation sub-operation (take the maximum), not a bound
 P_WATCH_SIZE | modules/app/document_executor/mod.rs | a phase (the watch's sizing pass), not a bound
 KVS_MORE_LIMIT | modules/common/types.rs | an answer's `more` code (matches lie past the request's limit), not a bound
+PREV_WINDOW | modules/app/watch_fanout/mod.rs | a tag (a replayed event's prev_kv is the window frame `prev_ref` names, beside PREV_NONE and PREV_STORED), not a bound
+AGG_MAX | modules/app/relational_executor/mod.rs | the MAX aggregate function's tag, not a bound
+CLAIM_SOURCE_COUNT | modules/common/db_ops.rs | the number of `ClaimSource` kinds (eight, sizing the per-source floor state); a byte naming no kind decodes as none, so nothing can exceed it — a count, not a bound
 ```

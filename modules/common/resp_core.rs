@@ -1,8 +1,8 @@
 // Bounded, no_std, no-alloc RESP reply framing. Like the other `*_core.rs`
 // files it carries NO inner attributes and NO test module, so it is `include!`d
-// verbatim by both this crate (`lib.rs`) and the on-device Fluxor module
-// (`modules/foundation/tcp_client/mod.rs`) — one source of truth, host and
-// device.
+// verbatim by the on-device `redis_client` module and by `kv_front_core.rs`
+// (and through it the `kv_front` module and the host suite's
+// `contract_kv_front.rs`) — one source of truth, host and device.
 //
 // Redis keeps a connection open across replies, so a client must know when one
 // reply is complete rather than waiting for TCP close. `resp_reply_len` reports
@@ -76,27 +76,31 @@ pub fn resp_crlf(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Parse a signed decimal integer from ASCII bytes (a RESP bulk length line).
+/// Parse a signed decimal integer from ASCII bytes (a RESP integer or length
+/// line). `None` for anything that is not digits after an optional `-`, and for
+/// a value outside `i64` (`-9223372036854775808` is inside it).
 pub fn resp_parse_int(bytes: &[u8]) -> Option<i64> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let (neg, digits) = if bytes[0] == b'-' {
-        (true, &bytes[1..])
-    } else {
-        (false, bytes)
+    let (neg, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(_) => (false, bytes),
+        None => return None,
     };
     if digits.is_empty() {
         return None;
     }
-    let mut v: i64 = 0;
+    let mut v: u64 = 0;
     for &c in digits {
         if !c.is_ascii_digit() {
             return None;
         }
-        v = v.wrapping_mul(10).wrapping_add((c - b'0') as i64);
+        v = v.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
     }
-    Some(if neg { -v } else { v })
+    if neg {
+        // Magnitudes up to 2^63; 2^63 itself is `i64::MIN`.
+        (v <= 1 << 63).then(|| (v as i64).wrapping_neg())
+    } else {
+        i64::try_from(v).ok()
+    }
 }
 
 /// Write `v` as decimal ASCII into `out`; returns the length, or `None` if `out`

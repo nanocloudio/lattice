@@ -4,13 +4,16 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 
 # exchange_cli — a REQUESTER of the fluxor exchange contract for the
-# standalone client examples (examples/*_client/linux.yaml): each record
-# on `body_in` (one stdin chunk from the linux `cli_in` built-in) becomes
-# one request whose body it is, sent whole in the HEAD; each answer is
-# written to `text_out` as text — the body and a newline for a 200, else
-# `<status> <body>` and a newline — and each LINK record as a `LINK DOWN`
-# or `LINK UP` line. One exchange in flight at a time; one held across a
-# LINK DOWN is sent again after LINK UP.
+# standalone client examples (examples/*_client/linux.yaml,
+# examples/store_fronts/): each record on `body_in` (one stdin chunk from
+# the linux `cli_in` built-in; with `select`, only the chunks carrying its
+# prefix, the prefix dropped) becomes one request whose body it is, sent
+# whole in the HEAD; each answer is written to `text_out` as text — the
+# body and a newline for a 200, else `<status> <body>` and a newline — and
+# each LINK record as a `LINK DOWN` or `LINK UP` line. One exchange in
+# flight at a time; one held across a LINK DOWN is sent again after LINK
+# UP. With `hold: 1` it sends one bodiless request at start and prints the
+# held answer record by record (see mod.rs).
 
 [[ports]]
 name = "body_in"

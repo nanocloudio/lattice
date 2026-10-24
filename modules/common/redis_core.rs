@@ -1,7 +1,8 @@
 // Bounded, no_std, no-alloc REDIS protocol core. Like the other `*_core.rs`
 // files it carries no inner attributes and no test module, so it is `include!`d
-// verbatim by both this crate (for host tests) and the on-device `redis` .fmod —
-// one source of truth. Builds on `resp_core.rs`.
+// verbatim by the on-device `redis_client` module and by `kv_front_core.rs`
+// (the `kv_front` module and its host suite) — one source of truth. Builds on
+// `resp_core.rs`.
 //
 // This is the piece that makes a GENUINE connector, not a codec: it owns RESP
 // command construction, reply classification, AND the connection state machine —
@@ -9,7 +10,7 @@
 // handshake (send AUTH, branch on the server's `+OK`/`-ERR`, only then serve
 // requests) is exactly what a stateless encode/decode bytecode program cannot
 // express: it is reply-dependent and spans round trips. Keeping it here as a pure
-// function makes the protocol logic host-testable; the `.fmod` is just the I/O
+// function makes the protocol logic host-testable; `redis_client` is just the I/O
 // pump that maps actions to net_proto frames.
 
 /// Encode a RESP command from a STRUCTURED command frame — `[nargs:u8]` then per

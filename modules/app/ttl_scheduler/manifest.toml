@@ -91,4 +91,4 @@ content_type = "OctetStream"
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.
 [observability]
-metrics = ["scheduled", "expired"]
+metrics = ["scheduled", "expired", "overflowed"]

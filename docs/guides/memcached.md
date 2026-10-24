@@ -74,8 +74,8 @@ strings; those conditions surface as generic responses:
 
 | Condition | Reply |
 |---|---|
-| Routing epoch mismatch / store refused | `NOT_STORED` |
-| No authority / flow control | `SERVER_ERROR backpressure` |
+| Routing epoch mismatch, no authority, store refused | the command's failure reply: `NOT_STORED` (storage commands), a miss (`get`), `NOT_FOUND` (`delete`, `incr`, `decr`) |
+| The anchor cannot hand the request to the router, or `MAX_INFLIGHT` requests are open | `SERVER_ERROR backpressure` |
 | Command or value over the buffer budget | `SERVER_ERROR command too large` |
 | Flush refused | `SERVER_ERROR flush failed` |
 | Malformed line | `CLIENT_ERROR bad command line` |

@@ -324,6 +324,25 @@ pub fn enc_raw(send: &mut [u8], send_len: &mut usize, bytes: &[u8]) -> bool {
     true
 }
 
+/// Client-supplied text inside a status or error line: copied with each CR
+/// and LF replaced by a space, as Redis writes it, so a command name such
+/// as `"a\r\nb"` cannot end the line early and split the reply into two.
+pub fn enc_line_text(send: &mut [u8], send_len: &mut usize, bytes: &[u8]) -> bool {
+    let n = *send_len;
+    let Some(out) = send.get_mut(n..n + bytes.len()) else {
+        return false;
+    };
+    for (d, b) in out.iter_mut().zip(bytes) {
+        *d = if matches!(*b, b'\r' | b'\n') {
+            b' '
+        } else {
+            *b
+        };
+    }
+    *send_len = n + bytes.len();
+    true
+}
+
 pub fn enc_simple_str(send: &mut [u8], send_len: &mut usize, s: &[u8]) -> bool {
     enc_raw(send, send_len, b"+") && enc_raw(send, send_len, s) && enc_raw(send, send_len, b"\r\n")
 }

@@ -18,14 +18,15 @@
 //! A `target`, `headers` or `select` past its bound refuses construction. A
 //! body that does not fit one request record is written to `text_out` as
 //! `413 request too large` and never sent. The module grants 8192 bytes of
-//! response credit per request, so an answer is at most that.
+//! response credit per request, so an answer that is not held is at most that.
 //!
 //! # Held answers
 //!
 //! With `hold: 1` the module issues its one request when it starts and
 //! prints a held answer as it streams: its HEAD as `HOLD <status>` and its
 //! header lines (one space between them), every BODY record as `BODY ` and the
-//! record's bytes in hex, a provider ABORT as `ABORT <reason>`, and the
+//! record's bytes in hex, a provider ABORT as `ABORT <reason>` (the reason
+//! code in three digits, `ABORT 005` for `DRAINING`), and the
 //! ABORT it sends itself after `abort_after` records as `ABORTED`. Each
 //! BODY's bytes are granted back as CREDIT once printed, so the window the
 //! HEAD opened stays open. An answer that is not held prints as any other.
