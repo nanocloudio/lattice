@@ -332,7 +332,12 @@ the lease. Watch delivery
 (`watch_registry` + `watch_fanout`) replays a revision window
 through versioned scans: every version in `(from, to]` is delivered
 in order, tombstones included, and a compacted answer abandons the
-backfill rather than delivering a partial tail. While a watch's replay
+backfill rather than delivering a partial tail. A replay the fanout
+cannot take (its plan queue full, or no history provider wired) is
+refused the same way, and a mutation matching more watches than the
+registry's per-mutation match budget reaches resyncs the rest: each such
+client is cancelled with a compacted revision and relists, never left
+short of a window. While a watch's replay
 is open nothing is matched live for it; when the replay closes, what
 committed meanwhile is delivered first (from the registry's recent
 mutations, or by a further replay), so a watch sees revisions in order

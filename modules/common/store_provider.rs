@@ -45,13 +45,31 @@
 //! honestly, and uselessly across a gap — so a worker on it does not take
 //! the provider role.
 //!
+//! A subscription may be durable (`SUB_DURABLE`, naming an owner key and a
+//! shard): the provider keeps its cursor — the revision the subscriber has
+//! safely reached — in the store itself (`watch_cursor.rs`, at
+//! `\x00lattice/watch-cursor/<owner>/<shard>`, written by CAS on its
+//! `mod_revision` witness), advancing it each time the subscriber asks
+//! `CHANGES` under its prefix on from a token: asking on from a token is
+//! the subscriber's word that everything before it is held, and a cursor
+//! never passes the store's revision. After a
+//! restart of either side the subscriber subscribes again with the same
+//! owner key and asks `CHANGES` with the cursor token (`[T_CURSOR]`): the
+//! page answers from the cursor on — from the log, or across the restart's
+//! gap from the store's history — or is `RESYNC_REQUIRED` with its reason
+//! (no cursor yet, history compacted past it, cursor past the store,
+//! record corrupt, another holder advanced it). Never a page with a hole
+//! in it, and never LOST, which stays the answer for a window the
+//! subscriber named itself that compaction took.
+//!
 //! Handles: object read slots are `0..SLOTS`, subscriptions from
 //! [`SUB_BAND`] (`SUB_BAND + id`, a registry id), so a fence query
 //! (`QUERY_OP`, which both contracts carry and which reaches the provider
 //! with its tag stripped) names one thing. Every handle answers the owner
 //! that opened it alone: to any other caller a read slot or subscription is
-//! as if it were not open, as the host stores answer. (The system owner's record is all zero — slot 0,
-//! generation 0 — so all zero is an owner like any other.)
+//! as if it were not open, as the host stores answer. (The system owner's
+//! record is all zero — slot 0, generation 0 — so all zero is an owner like
+//! any other.)
 //!
 //! Fault injection (TEST ONLY, off unless configured): [`Provider::
 //! fault_read_eagain_every`] makes the provider answer reads `EAGAIN` the
@@ -59,10 +77,15 @@
 //! prove its consumers never read "not yet" as absence. See [`Fault`].
 //!
 //! Mounted beside `types.rs`, `kv_large.rs`, `doc_tree.rs`, `origin.rs`,
-//! `change_ring.rs` and `store_registry.rs` (reached as `super::…`).
+//! `change_ring.rs`, `store_registry.rs` and `watch_cursor.rs` (reached as
+//! `super::…`).
 //! No allocation and no panic path: the worker twin that mounts it is a
 //! PIC module.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "capacity profiles: `profile_rp2350` / `profile_server` are features the [[variant]]s of the modules that build them declare; a module without variants builds the Pi 5 default and declares neither"
+)]
 use super::change_ring::{ChangeRing, Cursor, ORD_END};
 use super::doc_tree::utf8_is_valid;
 use super::kv_large::kv_chunks::{
@@ -70,15 +93,16 @@ use super::kv_large::kv_chunks::{
 };
 use super::kv_large::{self, Expander, Need};
 use super::origin::{self, Outcome, Record, IMPORT_MARK_LEN, NO_OUTCOME, RING};
-use super::store_registry::{Registry, Table, NIL as SUB_NIL};
+use super::store_registry::{Registry, Table, NIL as SUB_NIL, OWNER_KEY_MAX};
 use super::types::{
-    KV_OP_DELETE, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_IMPORT, KV_OP_ORIGIN_REGISTER,
+    KV_OP_CAS, KV_OP_DELETE, KV_OP_ORIGIN_CHUNK, KV_OP_ORIGIN_IMPORT, KV_OP_ORIGIN_REGISTER,
     KV_OP_ORIGIN_WRITE, KV_OP_PUT, KV_OP_PUT_MANIFEST, KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS,
-    KV_OP_TXN, KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_KVS,
-    KV_RESULT_MISSING_CHUNK, KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_TOO_LARGE, KV_RESULT_TXN,
-    KV_RESULT_VERSIONS, RANGE_META_FLAG_MANIFESTS, RECORD_FLAG_MANIFEST, TXN_CMP_MOD_EQUAL,
-    VERSIONS_FLAG_MANIFESTS, VERSIONS_FLAG_META, VERSION_KIND_DELETE,
+    KV_OP_TXN, KV_RESULT_CAS_FAILED, KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_INTERNAL,
+    KV_RESULT_KVS, KV_RESULT_MISSING_CHUNK, KV_RESULT_OK, KV_RESULT_PAUSED, KV_RESULT_TOO_LARGE,
+    KV_RESULT_TXN, KV_RESULT_VERSIONS, RANGE_META_FLAG_MANIFESTS, RECORD_FLAG_MANIFEST,
+    TXN_CMP_MOD_EQUAL, VERSIONS_FLAG_MANIFESTS, VERSIONS_FLAG_META, VERSION_KIND_DELETE,
 };
+use super::watch_cursor::{self, Resume, WatchCursor};
 
 // ── The contracts' wire ─────────────────────────────────────────────
 
@@ -165,9 +189,41 @@ pub const SLOTS: usize = 4096;
 pub const SUB_BAND: usize = 1 << 24;
 /// SUBSCRIBE flag bit 0: ring once now.
 const SUB_RING_NOW: u8 = 1;
+/// SUBSCRIBE flag bit 1: a durable subscription — `[shard u16]
+/// [owner_len u8][owner]` follow the flags, naming the cursor the provider
+/// keeps for it (`watch_cursor.rs`). Refused `ENOSYS` on a replica (a
+/// cursor write there would not be the group's).
+pub const SUB_DURABLE: u8 = 2;
+// A subscription record holds the whole owner name a cursor key carries:
+// a shorter field would cut a name `watch_cursor::owner_ok` admits, and the
+// cursor would be written under another owner's key.
+const _: () = assert!(OWNER_KEY_MAX == watch_cursor::OWNER_MAX);
+/// A CHANGES page's status byte: a page; LOST (a window compaction took);
+/// RESYNC_REQUIRED (a durable resume the provider cannot answer whole: the
+/// page's second byte is the reason, `watch_cursor::REASON_*`, and its
+/// `safe_rev` the cursor's revision).
+pub const CH_OK: u8 = 0;
+pub const CH_LOST: u8 = 1;
+pub const CH_RESYNC_REQUIRED: u8 = 2;
+/// A durable subscription's cursor state: none held yet; held (loaded or
+/// written); the record refused by its decoder; advanced by another
+/// holder since this one read it.
+const CUR_NONE: u8 = 0;
+const CUR_HELD: u8 = 1;
+const CUR_CORRUPT: u8 = 2;
+const CUR_CONFLICT: u8 = 3;
 /// A workload owner's subscriptions at most, by default (the worker's
 /// `store_sub_quota` param sets it). The system owner is not held to it.
+/// By profile: a route-catalogue director holds one subscription per
+/// catalogue shard it serves, 256 shards a tenant, so the Pi 5's 256 is
+/// one tenant's directors and the server's 4,096 sixteen tenants'; the
+/// RP2350 holds 32.
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
 pub const DEFAULT_SUB_QUOTA: u32 = 256;
+#[cfg(feature = "profile_rp2350")]
+pub const DEFAULT_SUB_QUOTA: u32 = 32;
+#[cfg(feature = "profile_server")]
+pub const DEFAULT_SUB_QUOTA: u32 = 4096;
 /// A key-log hint: the write created the key (`kv_store::KEY_CREATED`).
 pub const KEY_CREATED: u8 = 0;
 /// A key-log hint: the write deleted the key (`kv_store::KEY_DELETED`).
@@ -187,6 +243,9 @@ const TOKEN_REV: usize = 8;
 const T_LOG: u8 = 1;
 const T_RELIST: u8 = 2;
 const T_HIST: u8 = 3;
+/// A subscriber's token: `[T_CURSOR]` alone — go on from the durable
+/// cursor of the subscription the read names.
+pub const T_CURSOR: u8 = 4;
 /// Change-log entries one CHANGES call scans at most.
 const LOG_SCAN_MAX: u32 = 4096;
 /// Store versions one CHANGES call's history walk visits at most, and all
@@ -395,6 +454,10 @@ impl Slot {
 /// The provider's counts (telemetry).
 #[derive(Clone, Copy, Default)]
 pub struct Counters {
+    /// Durable cursors written, CAS conflicts met, resyncs answered.
+    pub cursors_written: u32,
+    pub cursor_conflicts: u32,
+    pub resyncs: u32,
     /// Subscribers rung, rung bits taken, gaps rung to every subscriber,
     /// subscriptions dropped (their module or event gone), subscriptions
     /// refused (capacity or quota), SUBSCRIBEs naming an event not the
@@ -410,6 +473,9 @@ pub struct Counters {
 
 impl Counters {
     const ZERO: Counters = Counters {
+        cursors_written: 0,
+        cursor_conflicts: 0,
+        resyncs: 0,
         rung: 0,
         taken: 0,
         gaps: 0,
@@ -2317,12 +2383,29 @@ fn ring_sub<B: Backend>(reg: &mut Registry, m: &mut Counters, b: &mut B, id: u32
     true
 }
 
-/// `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now): a
-/// subscription that rings the caller's event whenever something under the
-/// prefix changes. Idempotent on (owner, module occupancy, event, prefix).
-/// `EINVAL` for an event that is not the calling module's, or one that
-/// refuses the signal a ring-now sends (the subscription is not kept).
-fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize) -> i32 {
+/// A durable subscription as SUBSCRIBE names it: its shard and owner key.
+#[derive(Clone, Copy)]
+struct Durable<'a> {
+    shard: u16,
+    owner: &'a [u8],
+}
+
+/// `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now; bit
+/// 1: durable, then `[shard u16][owner_len u8][owner]`): a subscription
+/// that rings the caller's event whenever something under the prefix
+/// changes. Idempotent on (owner, module occupancy, event, prefix, and
+/// for a durable one its shard and owner key). `EINVAL` for an event that
+/// is not the calling module's, or one that refuses the signal a ring-now
+/// sends (the subscription is not kept); `ENOSYS` for a durable
+/// subscription on a replica. A durable subscription's cursor is read
+/// from the store here (`EAGAIN` while the store is busy: ask again).
+fn ns_subscribe<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    a: &[u8],
+    strip: usize,
+) -> i32 {
     let mut p = 0usize;
     let Some(prefix) = field16(a, &mut p).filter(|k| key_ok(k)) else {
         return EINVAL;
@@ -2330,8 +2413,30 @@ fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize
     let (Some(event), Some(&flags)) = (rd32(a, p), a.get(p + 4)) else {
         return EINVAL;
     };
-    if a.len() != p + 5 {
+    p += 5;
+    let durable = if flags & SUB_DURABLE != 0 {
+        let (Some(shard), Some(&olen)) = (rd16(a, p), a.get(p + 2)) else {
+            return EINVAL;
+        };
+        let Some(owner) = a.get(p + 3..p + 3 + usize::from(olen)) else {
+            return EINVAL;
+        };
+        if !watch_cursor::owner_ok(owner) {
+            return EINVAL;
+        }
+        p += 3 + usize::from(olen);
+        Some(Durable {
+            shard: shard as u16,
+            owner,
+        })
+    } else {
+        None
+    };
+    if a.len() != p {
         return EINVAL;
+    }
+    if durable.is_some() && b.replicated() {
+        return ENOSYS;
     }
     let event = event as i32;
     let owner = b.caller();
@@ -2353,6 +2458,7 @@ fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize
                 && rec.module == module
                 && rec.event == event
                 && rec.strip == strip as u8
+                && same_durable(rec, durable)
             {
                 if ring_now {
                     if let Some(r) = pv.reg.sub_mut(s) {
@@ -2384,6 +2490,15 @@ fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize
             return ENOMEM;
         }
     }
+    // A durable subscription's cursor, read before the record is made: a
+    // read refused for now refuses the SUBSCRIBE for now (nothing made).
+    let loaded = match durable {
+        Some(d) => match load_cursor(b, bufs, d) {
+            Ok(l) => l,
+            Err(e) => return e,
+        },
+        None => Loaded::default(),
+    };
     let Provider { reg, m, .. } = pv;
     let mut alloc = |n: usize| b.alloc(n);
     let added = reg.watch_for(prefix, &mut alloc).and_then(|w| {
@@ -2392,6 +2507,16 @@ fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize
             s.module = module;
             s.event = event;
             s.strip = strip as u8;
+            if let Some(d) = durable {
+                s.durable = true;
+                s.shard = d.shard;
+                s.owner_len = d.owner.len() as u8;
+                copy(&mut s.owner_key, d.owner);
+                s.cursor_state = loaded.state;
+                s.cursor_rev = loaded.rev;
+                s.witness = loaded.witness;
+                s.generation = loaded.generation.wrapping_add(1);
+            }
         })
     });
     let Ok(id) = added else {
@@ -2403,6 +2528,156 @@ fn ns_subscribe<B: Backend>(pv: &mut Provider, b: &mut B, a: &[u8], strip: usize
         return EINVAL;
     }
     tagged(TAG_NAMESPACE, SUB_BAND + id as usize)
+}
+
+/// Whether a subscription record is the durable (or plain) subscription
+/// asked for.
+fn same_durable(rec: &super::store_registry::Sub, d: Option<Durable<'_>>) -> bool {
+    match d {
+        None => !rec.durable,
+        Some(d) => {
+            rec.durable
+                && rec.shard == d.shard
+                && rec.owner_key.get(..usize::from(rec.owner_len)) == Some(d.owner)
+        }
+    }
+}
+
+/// A durable subscription's cursor as read from the store.
+#[derive(Clone, Copy, Default)]
+struct Loaded {
+    state: u8,
+    rev: u64,
+    witness: u64,
+    generation: u32,
+}
+
+/// Read the cursor record `d` names: none (a first subscription), held,
+/// or corrupt. `EAGAIN` while the store is busy.
+fn load_cursor<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, d: Durable<'_>) -> Result<Loaded, i32> {
+    let mut key = [0u8; watch_cursor::KEY_MAX];
+    let n = watch_cursor::key(d.owner, d.shard, &mut key).ok_or(EINVAL)?;
+    let Some((modr, at, len)) = read_value(b, bufs, &key[..n])? else {
+        return Ok(Loaded::default());
+    };
+    let rec = bufs.cache.get(at..at + len).ok_or(ERROR)?;
+    match WatchCursor::decode(rec) {
+        Ok(c) if c.shard == d.shard => Ok(Loaded {
+            state: CUR_HELD,
+            rev: c.last_safe_rev,
+            witness: modr,
+            generation: c.subscription_generation,
+        }),
+        _ => Ok(Loaded {
+            state: CUR_CORRUPT,
+            rev: 0,
+            witness: modr,
+            generation: 0,
+        }),
+    }
+}
+
+/// Advance durable subscription `id`'s cursor to `rev` in the store, by
+/// CAS on the record's witness: the subscriber has asked `CHANGES` on from
+/// `rev`, so it holds everything before. A `rev` past the store's revision
+/// is nothing: no subscriber holds what the store has not reached, and a
+/// cursor that led the store would, once the store passed it, resume past
+/// changes never delivered. Monotonic while the cursor is within the
+/// store: a `rev` at or below it is nothing. A cursor past the store (a
+/// record naming a revision the store never reached) and a record the
+/// decoder refused are each replaced by the next ack, the one after the
+/// resync's relist, so the subscription is durable again. A CAS another holder has beaten is
+/// a conflict the next cursor read reports; a store busy now is tried
+/// again at the next ask (the cursor lags, which costs duplicates, never a
+/// gap).
+fn persist_cursor<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    id: u32,
+    rev: u64,
+) {
+    let Some(s) = pv.reg.sub(id) else {
+        return;
+    };
+    if !s.durable || !matches!(s.cursor_state, CUR_NONE | CUR_HELD | CUR_CORRUPT) {
+        return;
+    }
+    let head = b.revision();
+    if rev > head || (s.cursor_state == CUR_HELD && rev <= s.cursor_rev && s.cursor_rev <= head) {
+        return;
+    }
+    let (shard, generation, witness) = (s.shard, s.generation, s.witness);
+    let mut owner = [0u8; OWNER_KEY_MAX];
+    let Some(held) = s.owner_key.get(..usize::from(s.owner_len)) else {
+        return;
+    };
+    let owner_len = held.len();
+    copy(&mut owner, held);
+    let mut key = [0u8; watch_cursor::KEY_MAX];
+    let Some(kn) = owner
+        .get(..owner_len)
+        .and_then(|o| watch_cursor::key(o, shard, &mut key))
+    else {
+        return;
+    };
+    let mut rec = [0u8; watch_cursor::LEN];
+    let c = WatchCursor {
+        shard,
+        last_safe_rev: rev,
+        subscription_generation: generation,
+    };
+    let Some(rn) = c.encode(&mut rec) else {
+        return;
+    };
+    // CAS body: `[klen u16][key][witness u64][vlen u32][value]`.
+    let mut body = [0u8; 2 + watch_cursor::KEY_MAX + 8 + 4 + watch_cursor::LEN];
+    let mut at = 0usize;
+    if put(&mut body, &mut at, &(kn as u16).to_le_bytes()).is_none()
+        || put(&mut body, &mut at, &key[..kn]).is_none()
+        || put(&mut body, &mut at, &witness.to_le_bytes()).is_none()
+        || put(&mut body, &mut at, &(rn as u32).to_le_bytes()).is_none()
+        || put(&mut body, &mut at, &rec[..rn]).is_none()
+    {
+        return;
+    }
+    let (r, _) = run(b, KV_OP_CAS, &body[..at], bufs.ans);
+    if read_waits(b, r) {
+        return;
+    }
+    let Some(s) = pv.reg.sub_mut(id) else {
+        return;
+    };
+    match r {
+        KV_RESULT_OK => {
+            s.cursor_state = CUR_HELD;
+            s.cursor_rev = rev;
+            // The write just applied is the store's revision: the record's
+            // new `mod_revision`, the next CAS's witness.
+            s.witness = b.revision();
+            pv.m.cursors_written = pv.m.cursors_written.wrapping_add(1);
+        }
+        KV_RESULT_CAS_FAILED => {
+            s.cursor_state = CUR_CONFLICT;
+            pv.m.cursor_conflicts = pv.m.cursor_conflicts.wrapping_add(1);
+        }
+        _ => {}
+    }
+}
+
+/// What a `CHANGES` token acknowledges for a durable subscription: the
+/// revision everything before which the subscriber holds, when asking on
+/// from this token says so. A bare revision: itself. A log token `(rev,
+/// ord)`: every revision before `rev` (the page that issued it delivered
+/// them whole). A history token: its `since`. A relist, the cursor token
+/// or an empty token: nothing yet.
+fn token_acks(token: &[u8]) -> Option<u64> {
+    match token.len() {
+        TOKEN_REV => rd64(token, 0),
+        13 if token[0] == T_LOG => rd64(token, 1).map(|r| r.saturating_sub(1)),
+        n if n >= 17 && token[0] == T_HIST => rd64(token, 1),
+        _ => None,
+    }
 }
 
 /// The subscriptions `owner` holds, after dropping those whose module is
@@ -2678,7 +2953,20 @@ fn page_lost(out: &mut [u8]) -> i32 {
         return ENOMEM;
     };
     o.fill(0);
-    o[0] = 1;
+    o[0] = CH_LOST;
+    (CH_HEAD + CH_TRAILER) as i32
+}
+
+/// A RESYNC_REQUIRED page: `[CH_RESYNC_REQUIRED][reason][cursor rev u64]
+/// [count 0][token_len 0]`.
+fn page_resync(out: &mut [u8], reason: u8, cursor: u64) -> i32 {
+    let Some(o) = out.get_mut(..CH_HEAD + CH_TRAILER) else {
+        return ENOMEM;
+    };
+    o.fill(0);
+    o[0] = CH_RESYNC_REQUIRED;
+    o[1] = reason;
+    copy(&mut o[2..10], &cursor.to_le_bytes());
     (CH_HEAD + CH_TRAILER) as i32
 }
 
@@ -2741,9 +3029,27 @@ fn ns_changes<B: Backend>(
     // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
     let out = unsafe { caller_out(out_ptr, out_cap) };
     let sub = reader_sub(pv, b.caller(), sub);
-    let rc = if !pv.opened || !pv.ring.attached() {
-        EAGAIN
-    } else {
+    if !pv.opened || !pv.ring.attached() {
+        if let Some(id) = sub {
+            pv.reg.defer(id);
+        }
+        return EAGAIN;
+    }
+    // Asking on from a token is the subscriber's word that it holds
+    // everything before it: a durable subscription's cursor moves first —
+    // on a read of the subscription's own prefix only, since a token says
+    // nothing about any other.
+    if let (Some(id), Some(ack)) = (sub, token_acks(token)) {
+        let own = pv
+            .reg
+            .sub(id)
+            .and_then(|s| pv.reg.watch(s.watch))
+            .is_some_and(|w| w.prefix() == prefix);
+        if own {
+            persist_cursor(pv, b, bufs, id, ack);
+        }
+    }
+    let rc = {
         match token.len() {
             0 => relist_page(pv, b, bufs, prefix, pv.ring.frontier(), &[], out, strip),
             TOKEN_REV => {
@@ -2751,6 +3057,7 @@ fn ns_changes<B: Backend>(
                 from_revision(pv, b, bufs, prefix, since, ORD_END, sub, out, strip)
             }
             _ => match token[0] {
+                T_CURSOR if token.len() == 1 => cursor_page(pv, b, bufs, prefix, sub, out, strip),
                 T_LOG if token.len() == 13 => {
                     let rev = rd64(token, 1).unwrap_or(0);
                     let ord = rd32(token, 9).unwrap_or(0) as u32;
@@ -2797,6 +3104,63 @@ fn ns_changes<B: Backend>(
 /// `owner`'s: a read refused for now rings it again once the cause clears.
 fn reader_sub(pv: &Provider, owner: [u8; 8], sub: i32) -> Option<u32> {
     sub_id(slot_of(sub)).filter(|&id| pv.reg.sub(id).is_some_and(|s| s.owner == owner))
+}
+
+/// `[T_CURSOR]`: on from the durable cursor of the subscription the read
+/// names. From the cursor's revision as a bare-revision token would be —
+/// the log, or across a gap the store's history — when
+/// [`watch_cursor::resume`] says the window is answerable; else
+/// RESYNC_REQUIRED with the reason. A history the walk finds compacted
+/// after all answers RESYNC_REQUIRED too, never LOST: the subscriber
+/// asked for its cursor, not a window of its own naming.
+fn cursor_page<B: Backend>(
+    pv: &mut Provider,
+    b: &mut B,
+    bufs: &mut Bufs<'_>,
+    prefix: &[u8],
+    sub: Option<u32>,
+    out: &mut [u8],
+    strip: usize,
+) -> i32 {
+    let Some(s) = sub.and_then(|id| pv.reg.sub(id)).filter(|s| s.durable) else {
+        return page_resync(out, watch_cursor::REASON_NOT_DURABLE, 0);
+    };
+    let (state, rev, shard, generation) = (s.cursor_state, s.cursor_rev, s.shard, s.generation);
+    let cursor = WatchCursor {
+        shard,
+        last_safe_rev: rev,
+        subscription_generation: generation,
+    };
+    let decision = match state {
+        CUR_CORRUPT => Resume::Resync(watch_cursor::ResyncReason::Corrupt(
+            watch_cursor::CursorError::Digest,
+        )),
+        CUR_CONFLICT => Resume::Resync(watch_cursor::ResyncReason::Conflict),
+        CUR_NONE => Resume::Resync(watch_cursor::ResyncReason::NoCursor),
+        _ => {
+            let head = b.revision();
+            let floor = if b.history() == 0 {
+                0
+            } else {
+                head.saturating_sub(b.history())
+            };
+            watch_cursor::resume(Some(&cursor), pv.ring.base(), floor, head)
+        }
+    };
+    match decision {
+        Resume::FromRevision(r) => {
+            let rc = from_revision(pv, b, bufs, prefix, r, ORD_END, sub, out, strip);
+            if rc > 0 && out.first() == Some(&CH_LOST) {
+                pv.m.resyncs = pv.m.resyncs.wrapping_add(1);
+                return page_resync(out, watch_cursor::REASON_HISTORY_COMPACTED, r);
+            }
+            rc
+        }
+        Resume::Resync(reason) => {
+            pv.m.resyncs = pv.m.resyncs.wrapping_add(1);
+            page_resync(out, reason.code(), rev)
+        }
+    }
 }
 
 /// From `(rev, ord)` on: the change log when it answers; the store's history
@@ -4377,7 +4741,7 @@ unsafe fn serve<B: Backend>(
         }
         // A page's keys are written in the graph's names as it is built.
         NS_CHANGES => ns_changes(pv, b, bufs, a, strip),
-        NS_SUBSCRIBE => ns_subscribe(pv, b, a, strip),
+        NS_SUBSCRIBE => ns_subscribe(pv, b, bufs, a, strip),
         NS_TAKE_RUNG => ns_take_rung(pv, b, raw_arg(arg, arg_len)),
         NS_CLOSE => {
             let (caller, module) = (b.caller(), b.module());

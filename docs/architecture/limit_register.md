@@ -26,7 +26,27 @@ at load. A row with no profile holds for every build.
 ```limit-register-profiles
 bounded | not(feature = "big")
 big     | feature = "big"
+pi5     | not(any(feature = "profile_rp2350", feature = "profile_server"))
+rp2350  | feature = "profile_rp2350"
+server  | feature = "profile_server"
 ```
+
+The capacity profiles `pi5` (the default build, neither feature set),
+`rp2350` (`profile_rp2350`) and `server` (`profile_server`) size the
+watch, subscription, replay and partition-map ceilings: `MAX_WATCHES`,
+`DEFAULT_SUB_QUOTA`, `MAX_PENDING_PLANS`, `WINDOW_BYTES`,
+`WINDOW_FRAMES`, `PREV_BYTES` and `MAX_RANGES`. Every module whose
+build includes one of them declares the three as `[[variant]]`s — `pi5`
+(the default), `rp2350` and `server`, or `store`, `store_rp2350` and
+`store_server` for `kv_state_worker_store` — and a graph builds all of
+its modules in one profile, so every holder of a shared bound (a
+partition map) agrees on it. [route_catalogue.md](route_catalogue.md)
+derives the values from the catalogue workloads they serve. A profiled
+row's Value column and the gate's first-declaration check carry the
+`pi5` value, and its prose names the other two; the machine-checked
+block carries one row per profile, and the gate compares the whole set
+pairwise, so a profile added, removed or retuned in source without its
+row fails.
 
 ## Core state and storage
 
@@ -62,7 +82,7 @@ big     | feature = "big"
 | Held single-store write answers | Format bound | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 1024 | The most single-store write answers (and request identities) the provider can index: each is a record made from the worker's heap as a caller's write waits on its log record, kept under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. The heap, not this figure, is the working ceiling: spent, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped — and a new caller's identity replaces the least recently asked (an identity let go costs one hash on its next ask). |
 | Store read slots | Format bound | `SLOTS` | modules/common/store_provider.rs | 4096 | The most `GET`-opened read slots the provider can index (a slot's index is its handle, below `SUB_BAND`). Each slot is made from the worker's heap as a read opens and reused once closed; spent heap refuses the open `ENOMEM`. |
 | Subscription handle band | Format bound | `SUB_BAND` | modules/common/store_provider.rs | — | Where subscription handles start in the 26-bit handle slot field: `SUB_BAND + id`, apart from read slots, so a fence query or `CLOSE` names one thing. |
-| Workload subscription quota | Policy | `DEFAULT_SUB_QUOTA` | modules/common/store_provider.rs | — | Typed `u32`, 256. Subscriptions one workload owner may hold unless the `store_sub_quota` param says otherwise; the system owner (the node's own controllers) is not held to it. Past it SUBSCRIBE is `ENOMEM`, counted and reported to the kernel ledger against `store_subs`, after the owner's dead subscriptions are swept. |
+| Workload subscription quota | Policy | `DEFAULT_SUB_QUOTA` | modules/common/store_provider.rs | — | Typed `u32`: 256 (`pi5`), 32 (`rp2350`), 4,096 (`server`) — a route-catalogue director holds one subscription per catalogue shard it serves (256 shards a tenant): one tenant's on `pi5`, sixteen tenants' on `server`. Subscriptions one workload owner may hold unless the `store_sub_quota` param says otherwise; the system owner (the node's own controllers) is not held to it. Past it SUBSCRIBE is `ENOMEM`, counted and reported to the kernel ledger against `store_subs`, after the owner's dead subscriptions are swept. |
 | Store change log | Sized | `CHANGE_LOG_DEFAULT` | modules/common/store_provider.rs | — | Bytes of the key-only change log (`change_ring.rs`) subscriptions are rung from and `CHANGES` is served from, when the `store_change_log` param names none. Overrun evicts the oldest entries and raises the log's base: a read from before it walks the store's history (or is LOST on a store without one), never an empty answer. |
 | CHANGES scan per call | Pacing | `LOG_SCAN_MAX` | modules/common/store_provider.rs | — | Typed `u32`, 4096. Change-log entries one `CHANGES` call scans; spent, the page ends with a continuation token and the caller asks again. |
 | History visits per call | Pacing | `HIST_VISIT_MAX` | modules/common/store_provider.rs | — | Typed `u32`, 1024. Store versions one `CHANGES` call's history walk visits (a window from before the change log's base); spent, the page ends at a key boundary with a continuation. |
@@ -73,6 +93,9 @@ big     | feature = "big"
 | Registry pages | Format bound | `MAX_PAGES` | modules/common/store_registry.rs | 4096 | Pages the subscription registry can address: the page part of a registry id is 12 bits. Pages come from the worker's heap as subscriptions need them (sized at pack time by `heap_per_demand`); the heap binds long before this. |
 | Registry index pages | Format bound | `MAX_INDEX_PAGES` | modules/common/store_registry.rs | 64 | Pages of the sorted prefix index (each `IDX_PER_PAGE` watch ids): 65,536 distinct watched prefixes. Past it SUBSCRIBE on a new prefix is `ENOMEM`. |
 | Watched prefix | Shape | `PREFIX_MAX` | modules/common/store_registry.rs | 255 | The longest prefix a watch holds (the store's `KEY_MAX`). |
+| Durable owner key | Shape | `OWNER_KEY_MAX` | modules/common/store_registry.rs | 32 | The owner name a durable subscription's registry record holds inline: `watch_cursor::OWNER_MAX`, mirrored (nothing asserts the two equal). SUBSCRIBE refuses `EINVAL` any owner `watch_cursor::owner_ok` refuses, so a held owner always fits. |
+| Durable cursor owner | Shape | `OWNER_MAX` | modules/common/watch_cursor.rs | 32 | The longest owner name a cursor key carries: 1..=32 bytes of printable ASCII (`0x21..=0x7E`) other than `/` (`owner_ok`). A durable SUBSCRIBE naming another is `EINVAL`; no key is built for one. |
+| Durable cursor key | Shape | `KEY_MAX` | modules/common/watch_cursor.rs | — | Derived: the reserved head `\x00lattice/watch-cursor/` (22 bytes), an owner, `/` and four hex digits of shard: 59 bytes (asserted), inside the store's 255-byte key. |
 | Change-log checkpoints | Shape | `CHECKPOINTS` | modules/common/change_ring.rs | 512 | Seek points kept into the change log, one per `CHECK_EVERY` entries: a seek scans at most that many entries past the nearest. Older checkpoints are overwritten as the log moves on. |
 | Key log per command | Capacity | `KEYLOG_BYTES` | modules/common/kv_store.rs | — | Bytes of keys one command may stage for the store provider's change log. A command whose keys overflow it (or that clears the keyspace, `FLUSH`) is a gap: every subscriber reads again and the log answers only from after it — never a silent loss. |
 | Store key | Shape | `KEY_MAX` | modules/common/store_provider.rs | 255 | The longest key the `storage.object`/`storage.namespace` provider takes (a LIST entry and a cursor carry its length in a byte). A longer key is refused `EINVAL` before the store is touched. |
@@ -115,7 +138,7 @@ filesystem capacity and the finite memtable/run pipeline.
 | Hash slots | Topology | `SLOT_COUNT` | modules/common/partition_map.rs | 1024 | Fixed mapping granularity, not a key-count limit. |
 | Partition-map key bound | Shape | `MAX_KEY_BOUND_LEN` | modules/common/partition_map.rs | 256 | Rejects an unrepresentable range boundary. |
 | Replicas in placement | Topology | `MAX_REPLICAS` | modules/common/partition_map.rs | 5 | Rejects a larger placement; also below Clustor's seven-node identifier envelope. |
-| Ranges in a partition map | Topology | `MAX_RANGES` | modules/common/partition_map.rs | 64 | Rejects an overfull map. Scale beyond it by composing partition groups/maps, not by adding replicas to one group. |
+| Ranges in a partition map | Topology | `MAX_RANGES` | modules/common/partition_map.rs | 64 | 64 (`pi5`), 16 (`rp2350`), 128 (`server`); a graph's modules share one profile, so every holder of a map agrees on the bound. Rejects an overfull map. Scale beyond it by composing partition groups/maps, not by adding replicas to one group. |
 | Map-update rebinds per frame | Shape | `MAP_UPDATE_MAX_ENTRIES` | modules/common/partition_map.rs | 256 | Slot rebinds one `MSG_MAP_UPDATE` frame carries (3,076 bytes encoded, inside every module's 4 KiB scratch and the u16 envelope length). The encoder refuses a larger batch, so a wider remap goes as several frames (all 1024 slots is four); a frame claiming more, or none, is applied not at all — never partly. |
 | Partition ports on one request router | Topology | `MAX_PARTITION_PORTS` | modules/app/kv_request_router/mod.rs | 2 | Map load refuses any binding of a partition at or above 2. With `partition_fanout` enabled, keyed traffic for partitions beyond 0 shares one tagged port and `partition_demux` fans it out, so the keyed-path ceiling becomes the demux's; targeted lifecycle operations still address the direct ports and keep this bound. |
 | Request ingress ports | Topology | `INGRESS_PORTS` | modules/app/kv_request_router/mod.rs | 9 | The router's request ingresses — etcd, Redis, memcached stream and datagram, and the internal watch, SQL, lifecycle, job and data callers — one envelope inbox each. They take nine of the router's sixteen input ports and all sixteen are declared (`gateway_reject` is the last), so a further request ingress needs an input freed first: fluxor's per-module port cap, not this count, is what binds. |
@@ -159,16 +182,21 @@ hold are `MAX_PARTICIPANTS` (the record's own) and `PARTICIPANTS`.
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
-| Watches | Capacity | `MAX_WATCHES` | modules/common/watch_hub.rs | 256 | Rejects watch registration. |
-| Watch key | Shape | `WATCH_KEY_MAX` | modules/common/watch_hub.rs | 96 | Rejects a watch whose key and range end together exceed it; far narrower than the 2584-byte store key. |
+| Watches | Capacity | `MAX_WATCHES` | modules/common/watch_hub.rs | 1024 | 1,024 (`pi5`), 64 (`rp2350`), 8,192 (`server`). A route-catalogue director watches one catalogue shard (a service id's leading byte under a tenant, 256 shards a tenant), so `pi5` holds four tenants' directors and `server` thirty-two. Each watch is a 392-byte `WatchRecord` and a 64-byte session slot in `watch_registry`: ~456 KiB, ~29 KiB and ~3.6 MiB of fixed state. Rejects watch registration. |
+| Watch key | Shape | `WATCH_KEY_MAX` | modules/common/watch_hub.rs | 256 | Every profile: a 256-byte key is watched whole, held, exported and replayed uncut (`contract_key_profiles`). Rejects a watch whose key and range end together exceed it (`KeyTooLarge`); the etcd anchor refuses before it, at `WATCH_SPAN_MAX`. Narrower than the 2584-byte store key. |
+| Replay plan key | Shape | `PLAN_KEY_MAX` | modules/common/watch_replay.rs | 256 | A backfill plan's key and range end each: `WATCH_KEY_MAX` (`contract_key_profiles` holds them equal). A plan carrying a longer one fails to parse, and the fanout counts it unserviceable (`replays_unserviceable`) without serving any span. |
+| Replay scan body | Shape | `SCAN_BODY_MAX` | modules/common/watch_replay.rs | — | Derived: a `KV_OP_SCAN_VERSIONS` body over a plan's span at `PLAN_KEY_MAX` (the single-key end one byte longer), with its revisions, cursor and limit. |
 | Leases | Capacity | `MAX_LEASES` | modules/app/lease_manager/mod.rs | 256 | One lease per session, held at its session slot; a session at the bound is refused by the session layer, and a second grant on a session that holds one is answered GONE (the etcd anchor's allocation failure). |
 | Sessionless leases | Capacity | `SESSIONLESS_LEASES` | modules/app/lease_manager/mod.rs | 256 | Client-supplied leases granted without a session, kept apart from the session slots; a grant with every one taken is answered GONE, never dropped. |
 | Lease table | Capacity | `LEASE_TABLE` | modules/app/lease_manager/mod.rs | — | Derived: `MAX_LEASES + SESSIONLESS_LEASES` (512), every lease the manager holds; its expiry queue is the same size, one deadline per lease, so it never fills. |
 | TTL scheduling queue | Capacity | `QUEUE_CAP` | modules/app/ttl_scheduler/mod.rs | 1024 | Full, the queue keeps the soonest deadlines: the one expiring last is given up and counted (`overflowed`). A given-up KV deadline is owed a memory-store table sweep, run when the earliest and again when the latest given-up deadline passes, so each such record is reclaimed by then; reads never see an expired record either way, and the disk store reclaims through compaction. Lease deadlines here mirror `lease_manager`'s, which expires the lease itself. |
-| Pending watch plans | Capacity | `MAX_PENDING_PLANS` | modules/app/watch_fanout/mod.rs | 16 | Past it a reconnect's backfill plan is dropped, counted (`replays_unserviceable`) and acked as replayed with zero frames; the watch goes on from the plan's end without that window's backfill. |
-| Replay window bytes | Capacity | `WINDOW_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | A backfill larger than this cannot be sent in revision order: refused as compacted (the client relists), never sent out of order or cut. |
-| Replay window frames | Capacity | `WINDOW_FRAMES` | modules/app/watch_fanout/mod.rs | 256 | As `WINDOW_BYTES`. |
-| Replay replaced-version bytes | Capacity | `PREV_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | The versions a backfill's events replaced that lie below its window; past it the backfill is refused as compacted (the client relists), never sent without its prev_kv. |
+| Pending watch plans | Capacity | `MAX_PENDING_PLANS` | modules/app/watch_fanout/mod.rs | 16 | 16 (`pi5`), 4 (`rp2350`), 256 (`server`): replay plans queued behind the one in flight, each a reconnecting watch's backfill. Past it a plan is refused as COMPACTED at its lower bound (`watch_replay::plan_disposition`; so is every plan when no history provider is wired): the anchor cancels the client's stream with that revision and the client relists; counted (`replays_unserviceable`). A refused plan is never acked as replayed, so no watch runs on past a window it did not receive. |
+| Drain catch-up read | Pacing | `MUTATION_CATCH_UP` | modules/app/watch_registry/mod.rs | 256 | Mutations a draining registry reads and matches ahead of its cut (`catch_up_mutations`): what one channel holds, so a waiting backlog is matched whole while a producer that never pauses cannot hold the drain off. |
+| Watch matches per batch | Pacing | `MAX_MATCHES_PER_EVENT` | modules/app/watch_registry/mod.rs | 32 | Matching watches gathered per batch for one mutation (`watch_hub::match_event_from`, which resumes at the watch a full batch refused); every batch within `MAX_MATCH_BATCHES` is emitted, so a key many watches cover reaches each of them. A watch whose event the outbound channel has no room for pauses the fan-out at that watch, and the next step goes on from it; nothing is skipped or sent twice. |
+| Watch match batches | Semantic | `MAX_MATCH_BATCHES` | modules/app/watch_registry/mod.rs | — | Typed `u32`, 64: batches one mutation is emitted to (2,048 matching watches, above `MAX_WATCHES` on `pi5` and `rp2350`, so only `server` can reach it). Past it every further matching watch is told to resync — a COMPACTED frame at the mutation's revision, its record ended, the client relists (counted: `resyncs`) — never passed over. |
+| Replay window bytes | Capacity | `WINDOW_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | 64 KiB (`pi5`), 16 KiB (`rp2350`), 1 MiB (`server`): one catalogue shard's records, so a shard's backfill is one window. A backfill larger than this cannot be sent in revision order: refused as compacted (the client relists), never sent out of order or cut. |
+| Replay window frames | Capacity | `WINDOW_FRAMES` | modules/app/watch_fanout/mod.rs | 256 | 256 (`pi5`), 64 (`rp2350`), 4,096 (`server`): a shard's records and their manifests. As `WINDOW_BYTES`. |
+| Replay replaced-version bytes | Capacity | `PREV_BYTES` | modules/app/watch_fanout/mod.rs | 65536 | 64 KiB (`pi5`), 16 KiB (`rp2350`), 1 MiB (`server`). The versions a backfill's events replaced that lie below its window; past it the backfill is refused as compacted (the client relists), never sent without its prev_kv. |
 | Watch event | Shape | `WATCH_EVENT_MAX` | modules/common/wire.rs | 8704 | The largest MSG_WATCH_EVENT payload (a key, a 4 KiB value and the 4 KiB value it replaced, with metadata); every stage of the watch path holds one. |
 | Replicated proposal body | Shape | `CONSENSUS_PROPOSAL_BODY_MAX` | modules/common/wire.rs | 2040 | One clustor log entry body less the gateway's correlation tag; a larger replicated write is refused as too large in each protocol's own words (etcd "request is too large", memcached "SERVER_ERROR object too large for cache"). |
 | Channel frame payload | Shape | `FRAME_PAYLOAD_MAX` | modules/common/wire.rs | 8189 | One channel frame (the SDK's CHANNEL_BUFFER_SIZE, a cross-core slot) less the envelope header; a message past it crosses as MSG_PART parts. |
@@ -241,7 +269,8 @@ hold are `MAX_PARTICIPANTS` (the record's own) and `PARTICIPANTS`.
 | etcd stored key | Shape | `STORE_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 2572 | Any key the store holds (its physical key less the identity; a contract test holds them together): copied whole, never clipped. |
 | etcd large-value requests at once | Capacity | `LG_SESSIONS` | modules/app/etcd_edge_anchor/mod.rs | 8 | Requests carried through the large-value layer together (an upload, an expansion, a Txn that reads); one that finds all busy waits in its stream and is sent when one frees. |
 | etcd watch event value | Shape | `WATCH_VALUE_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived: a large value (and the value it replaced) fetched for a watch event, two of them and a key fitting one encoded response; a larger one cancels the watch with the reason, never a clipped value. |
-| etcd watch key + range | Shape | `WATCH_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 96 | Refuses the watch (created and canceled), never watches a cut key; mirrors `watch_hub::WATCH_KEY_MAX`. |
+| etcd watch key + range | Shape | `WATCH_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 256 | Mirrors `watch_hub::WATCH_KEY_MAX` (`contract_key_profiles` holds them equal); the anchor admits `WATCH_SPAN_MAX`, which it caps. |
+| etcd watch span admitted | Shape | `WATCH_SPAN_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived: the smaller of `WATCH_KEY_MAX` and what the session's ingress hold (`session_anchor::HOLD_BYTES`, 320) takes behind its 3-byte envelope header and the 47-byte define head (270) — so 256 bytes of key and `range_end` together, the whole `WATCH_KEY_MAX`. A watch's define is forwarded the moment its session attaches and waits in that hold, so a longer span is refused (created and canceled), never watched cut and never answered created for a define the hold would drop. |
 | PostgreSQL connections | Capacity | `MAX_CONNS` | modules/app/pg_edge_anchor/mod.rs | 16 | Drops/refuses excess accepts. |
 | MySQL connections | Capacity | `MAX_CONNS` | modules/app/mysql_edge_anchor/mod.rs | 16 | Drops/refuses excess accepts. |
 | MySQL result columns | Shape | `MAX_COLS` | modules/app/mysql_edge_anchor/mod.rs | 32 | Rejects a wider result. |
@@ -311,6 +340,23 @@ application that swaps one for the other meets the same refusals.
 | KV front answer envelope | Shape | `KV_IN_MAX` | modules/app/kv_front/mod.rs | — | Derived: one channel frame behind the envelope header; every router answer fits. |
 | RESP nesting | Semantic | `RESP_DEPTH_MAX` | modules/common/resp_core.rs | 8 | An array reply nested deeper never frames complete: `kv_front`, holding the whole reply, answers it 502 at once; `redis_client` reads until its reply buffer fills, then answers 502. |
 | CDC subscriptions | Capacity | `SUBS` | modules/common/cdc_subscribe.rs | 4 | A further subscription is refused 503 until one ends. |
+| Catalogue record | Shape | `RECORD_MAX` | modules/common/route_catalogue.rs | 4096 | A route or endpoint record (a WHR1 envelope, header and digest included) at most: Lattice's value ceiling, so a record is never chunked. A larger one is refused structurally before the store sees it (`413` at the front); a record must also fit one routed put (`KV_BODY_MAX`). |
+| Catalogue key | Shape | `KEY_MAX` | modules/common/route_catalogue.rs | — | Derived: the policy key, the longest catalogue key: 72 bytes of fixed-width components (asserted; the endpoint key is 69, a declaration's 60, a status's 65, a stream head's 61). Every catalogue key sits under its 37-byte service prefix, so one watch on that prefix — well inside `watch_hub::WATCH_KEY_MAX` with its range end — covers a service's catalogue. |
+| Catalogue page entries | Pacing | `PAGE_LIMIT` | modules/common/route_catalogue.rs | — | Typed `u32`, 8: entries one `KV_OP_RANGE_META` page asks for (a seal's read-back, a snapshot page, a garbage-collection marker listing); a page of eight holds eight small records or one of the largest within the worker's answer. A page that stops says `more`, and the next goes on after its last key. |
+| Catalogue routes | Capacity | `ROUTES_MAX` | modules/common/route_catalogue.rs | 16 | Routes one generation carries (a service's ports by listener family), each in its own directory `r/<r u8>/`; a route index past it is not a catalogue key, a publication declaring more is refused, and a sealed manifest counting more does not decode. |
+| Catalogue delete batch | Pacing | `DELETE_BATCH` | modules/common/route_catalogue.rs | 32 | Keys one garbage-collection delete names (listed keys-only, a batch at a time); a larger generation goes in several batches, its staging marker deleted last, so an interrupted pass leaves a marker the next pass finds. |
+| Catalogue changes window | Pacing | `CHANGES_LIMIT` | modules/common/route_catalogue.rs | 64 | Changes one `KV_OP_SCAN_VERSIONS` window of the front's `changes` call asks for, at least a delete batch so one revision of the catalogue's own writes always fits; a window the store does not answer whole, or whose changes do not fit the page, is halved until it does, and one revision past it is `413`. |
+| Catalogue request body | Shape | `BODY_MAX` | modules/common/route_catalogue.rs | — | Derived: the machines' request buffer, a put of the largest record with its key (asserted to hold a full delete batch too); what is sent is bounded by `KV_BODY_MAX`. |
+| Catalogue routed put | Shape | `KV_BODY_MAX` | modules/common/route_catalogue.rs | — | Derived as 4122: the router's 4,160-byte request ingress (`wire::KV_REQUEST_PAYLOAD_MAX`) less the 3-byte envelope and the 35-byte command head it re-heads a request with (the module shell asserts it against `wire.rs`). The router discards a larger request unanswered, so a put over it is refused before it is sent: an endpoint record over 4,034 bytes, a route record over 4,048 (`413` at the front). Asserted to hold a full delete batch. |
+| Catalogue snapshot token | Shape | `TOKEN_MAX` | modules/common/route_catalogue.rs | — | Derived: the revision, the count, the digest chain and the last key (118 bytes at `KEY_MAX`); a malformed continuation, or one whose revision is not the `at` asked for, is refused (`400` at the front). |
+| Garbage-collection markers | Capacity | `GC_MARKERS` | modules/common/route_catalogue.rs | 64 | Generations one pass reclaims at most: the marker listing stops once this many are doomed, and the rest wait for the next pass, which lists from the start, so none is skipped. |
+| Catalogue front target | Shape | `TARGET_MAX` | modules/common/route_catalogue_front.rs | — | Derived: `/rc/`, two 32-digit hex identities and the verb (79 bytes); longer is `413`. |
+| Catalogue front headers | Shape | `HEADERS_MAX` | modules/common/route_catalogue_front.rs | 512 | A request's header block at most; longer is `413`. |
+| Publication item | Shape | `ITEM_MAX` | modules/common/route_catalogue_front.rs | — | Derived: the kind, the route, the 16-byte id and the largest envelope (4,114 bytes), the request-body credit granted per item; an inline HEAD item over it is `413`. |
+| Catalogue front answer headers | Shape | `RESP_HEADERS` | modules/common/route_catalogue_front.rs | 512 | An answer's header block: asserted to hold a snapshot page's `revision`, `more` and a hex continuation at `TOKEN_MAX`, so no header is ever dropped. |
+| Catalogue front page | Shape | `PAGE_MAX` | modules/common/route_catalogue_front.rs | — | Derived as 7635: an exchange record less its head, content type and `RESP_HEADERS`, the snapshot page one answer carries (asserted to hold the largest record with its key and lengths, and an inline publication item). A page is also capped by the requester's response credit: one that fills stops after its last whole record and continues from it, never cut; a credit too small for one record is `413`. |
+| Catalogue front store answer | Shape | `KV_IN_MAX` | modules/app/route_catalogue_front/mod.rs | — | Derived: one channel frame behind the envelope header; every router answer fits. |
+| Catalogue front store request | Shape | `KV_OUT_MAX` | modules/app/route_catalogue_front/mod.rs | — | Derived: the envelope header, the `MSG_KV_REQUEST` head and `route_catalogue::KV_BODY_MAX`, the largest body the machines send. |
 | CDC subscription prefix | Shape | `PREFIX_MAX` | modules/common/cdc_subscribe.rs | 256 | `cdc_pump`'s keyrange bound: a longer prefix makes the target past `TARGET_MAX`, refused 413. |
 | CDC subscription target | Shape | `TARGET_MAX` | modules/common/cdc_subscribe.rs | — | Derived: `/cdc/` and `PREFIX_MAX` in hex (517 bytes); longer is refused 413. |
 | CDC subscription headers | Shape | `HEADERS_MAX` | modules/common/cdc_subscribe.rs | 256 | A larger header block is refused 413. |
@@ -567,6 +613,7 @@ checked.
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/ttl_scheduler/mod.rs | 4096 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_fanout/mod.rs | 8832 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
+| Registry scratch | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_registry/mod.rs | 8832 | The registry's envelope buffer: a watch event behind its watch id; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 32768 | A response that does not fit is answered gRPC RESOURCE_EXHAUSTED (8), never split. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
@@ -672,7 +719,9 @@ IMPORT_RECORD_MAX | modules/app/kv_state_worker/mod.rs | 3149824
 LOCAL_ANSWERS | modules/common/store_provider.rs | 1024
 SLOTS | modules/common/store_provider.rs | 4096
 SUB_BAND | modules/common/store_provider.rs | 1 << 24
-DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 256
+DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 256 | pi5
+DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 32 | rp2350
+DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 4096 | server
 CHANGE_LOG_DEFAULT | modules/common/store_provider.rs | 256 * 1024
 LOG_SCAN_MAX | modules/common/store_provider.rs | 4096
 HIST_VISIT_MAX | modules/common/store_provider.rs | 1024
@@ -683,6 +732,9 @@ TOKEN_MAX | modules/common/store_provider.rs | 320
 MAX_PAGES | modules/common/store_registry.rs | 4096
 MAX_INDEX_PAGES | modules/common/store_registry.rs | 64
 PREFIX_MAX | modules/common/store_registry.rs | 255
+OWNER_KEY_MAX | modules/common/store_registry.rs | 32
+OWNER_MAX | modules/common/watch_cursor.rs | 32
+KEY_MAX | modules/common/watch_cursor.rs | -
 CHECKPOINTS | modules/common/change_ring.rs | 512
 KEYLOG_BYTES | modules/common/kv_store.rs | 32 * 1024
 KEY_MAX | modules/common/store_provider.rs | 255
@@ -711,7 +763,9 @@ MAX_WATCH_EVENT_BYTES | modules/common/replica_facade.rs | 4096
 SLOT_COUNT | modules/common/partition_map.rs | 1024
 MAX_KEY_BOUND_LEN | modules/common/partition_map.rs | 256
 MAX_REPLICAS | modules/common/partition_map.rs | 5
-MAX_RANGES | modules/common/partition_map.rs | 64
+MAX_RANGES | modules/common/partition_map.rs | 64 | pi5
+MAX_RANGES | modules/common/partition_map.rs | 16 | rp2350
+MAX_RANGES | modules/common/partition_map.rs | 128 | server
 MAP_UPDATE_MAX_ENTRIES | modules/common/partition_map.rs | 256
 MAX_PARTITION_PORTS | modules/app/kv_request_router/mod.rs | 2
 INGRESS_PORTS | modules/app/kv_request_router/mod.rs | 9
@@ -743,20 +797,35 @@ MAX_PARTICIPANTS | modules/common/txn.rs | 8
 PARTICIPANTS | modules/app/txn_coordinator/mod.rs | 2
 OPERAND_MAX | modules/app/txn_coordinator/mod.rs | 64
 HOLD_CAPACITY | modules/app/timestamp_allocator/mod.rs | 32
-MAX_WATCHES | modules/common/watch_hub.rs | 256
-WATCH_KEY_MAX | modules/common/watch_hub.rs | 96
+MAX_WATCHES | modules/common/watch_hub.rs | 1024 | pi5
+MAX_WATCHES | modules/common/watch_hub.rs | 64 | rp2350
+MAX_WATCHES | modules/common/watch_hub.rs | 8192 | server
+WATCH_KEY_MAX | modules/common/watch_hub.rs | 256
+PLAN_KEY_MAX | modules/common/watch_replay.rs | 256
+SCAN_BODY_MAX | modules/common/watch_replay.rs | -
 MAX_LEASES | modules/app/lease_manager/mod.rs | 256
 SESSIONLESS_LEASES | modules/app/lease_manager/mod.rs | 256
 LEASE_TABLE | modules/app/lease_manager/mod.rs | -
 QUEUE_CAP | modules/app/ttl_scheduler/mod.rs | 1024
-MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 16
-WINDOW_BYTES | modules/app/watch_fanout/mod.rs | 65536
-PREV_BYTES | modules/app/watch_fanout/mod.rs | 65536
+MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 16 | pi5
+MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 4 | rp2350
+MAX_PENDING_PLANS | modules/app/watch_fanout/mod.rs | 256 | server
+MUTATION_CATCH_UP | modules/app/watch_registry/mod.rs | 256
+MAX_MATCHES_PER_EVENT | modules/app/watch_registry/mod.rs | 32
+MAX_MATCH_BATCHES | modules/app/watch_registry/mod.rs | -
+WINDOW_BYTES | modules/app/watch_fanout/mod.rs | 65536 | pi5
+WINDOW_BYTES | modules/app/watch_fanout/mod.rs | 16384 | rp2350
+WINDOW_BYTES | modules/app/watch_fanout/mod.rs | 1048576 | server
+PREV_BYTES | modules/app/watch_fanout/mod.rs | 65536 | pi5
+PREV_BYTES | modules/app/watch_fanout/mod.rs | 16384 | rp2350
+PREV_BYTES | modules/app/watch_fanout/mod.rs | 1048576 | server
 WATCH_EVENT_MAX | modules/common/wire.rs | 8704
 FRAME_PAYLOAD_MAX | modules/common/wire.rs | 8189
 PART_BYTES_MAX | modules/common/wire.rs | -
 CONSENSUS_PROPOSAL_BODY_MAX | modules/common/wire.rs | 2040
-WINDOW_FRAMES | modules/app/watch_fanout/mod.rs | 256
+WINDOW_FRAMES | modules/app/watch_fanout/mod.rs | 256 | pi5
+WINDOW_FRAMES | modules/app/watch_fanout/mod.rs | 64 | rp2350
+WINDOW_FRAMES | modules/app/watch_fanout/mod.rs | 4096 | server
 MAX_SOURCES | modules/common/compaction_floor.rs | 4
 MAX_KPG | modules/common/compaction_floor.rs | 32
 MAX_RETENTION_CLAIMS | modules/common/db_ops.rs | 64
@@ -820,7 +889,8 @@ JOURNAL_BYTES | modules/common/kv_store.rs | 16384
 STORE_KEY_MAX | modules/app/etcd_edge_anchor/mod.rs | 2572
 LG_SESSIONS | modules/app/etcd_edge_anchor/mod.rs | 8
 WATCH_VALUE_MAX | modules/app/etcd_edge_anchor/mod.rs | -
-WATCH_KEY_MAX | modules/app/etcd_edge_anchor/mod.rs | 96
+WATCH_KEY_MAX | modules/app/etcd_edge_anchor/mod.rs | 256
+WATCH_SPAN_MAX | modules/app/etcd_edge_anchor/mod.rs | -
 MAX_CONNS | modules/app/pg_edge_anchor/mod.rs | 16
 MAX_CONNS | modules/app/mysql_edge_anchor/mod.rs | 16
 MAX_COLS | modules/app/mysql_edge_anchor/mod.rs | 32
@@ -914,6 +984,7 @@ SCRATCH_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | -
 SCRATCH_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | -
 SCRATCH_BUF_SIZE | modules/app/ttl_scheduler/mod.rs | 4096
 SCRATCH_BUF_SIZE | modules/app/watch_fanout/mod.rs | 8832
+SCRATCH_BUF_SIZE | modules/app/watch_registry/mod.rs | 8832
 SEND_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 32768
 SEND_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
 SEND_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
@@ -1041,6 +1112,23 @@ PAGE_MAX | modules/common/cdc_subscribe.rs | -
 OWED_MAX | modules/common/cdc_subscribe.rs | -
 KV_FRAME_MAX | modules/common/cdc_subscribe.rs | -
 WEDGE_BUDGET | modules/common/cdc_subscribe.rs | 16
+RECORD_MAX | modules/common/route_catalogue.rs | 4096
+ROUTES_MAX | modules/common/route_catalogue.rs | 16
+KEY_MAX | modules/common/route_catalogue.rs | -
+PAGE_LIMIT | modules/common/route_catalogue.rs | -
+DELETE_BATCH | modules/common/route_catalogue.rs | 32
+CHANGES_LIMIT | modules/common/route_catalogue.rs | 64
+BODY_MAX | modules/common/route_catalogue.rs | -
+KV_BODY_MAX | modules/common/route_catalogue.rs | 4160 - 3 - 35
+TOKEN_MAX | modules/common/route_catalogue.rs | -
+GC_MARKERS | modules/common/route_catalogue.rs | 64
+TARGET_MAX | modules/common/route_catalogue_front.rs | -
+HEADERS_MAX | modules/common/route_catalogue_front.rs | 512
+ITEM_MAX | modules/common/route_catalogue_front.rs | -
+RESP_HEADERS | modules/common/route_catalogue_front.rs | 512
+PAGE_MAX | modules/common/route_catalogue_front.rs | -
+KV_IN_MAX | modules/app/route_catalogue_front/mod.rs | -
+KV_OUT_MAX | modules/app/route_catalogue_front/mod.rs | -
 KV_IN_MAX | modules/app/cdc_front/mod.rs | -
 RECORDS_PER_STEP | modules/app/cdc_front/mod.rs | 16
 TARGET_MAX | modules/app/exchange_cli/mod.rs | 128
@@ -1056,6 +1144,8 @@ Constants whose names read like ceilings but are not bounds: the gate's
 reverse scan skips them.
 
 ```limit-register-exempt
+DIGEST_LEN | modules/common/route_catalogue.rs | a digest's width (32), a format, not a bound
+ENVELOPE_MIN | modules/common/route_catalogue.rs | the smallest envelope (a header and a digest), a format floor, not a ceiling
 FIELD_LIMIT | modules/common/doc_exec.rs | a request field tag (the list limit a caller states), not a bound
 NUM_MAX | modules/common/doc_exec.rs | a mutation sub-operation (take the maximum), not a bound
 P_WATCH_SIZE | modules/app/document_executor/mod.rs | a phase (the watch's sizing pass), not a bound

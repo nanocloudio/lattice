@@ -8,6 +8,24 @@ hardware_targets = ["bcm2712", "linux"]
 # back into the KV path. The important property is deterministic
 # replay-safe expiry, not wall-clock convenience.
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
+# others. This module reads no profiled ceiling: its three variants
+# build the same code, so a graph names one profile for every module it
+# builds.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
 # The cluster clock, coming back committed. In a replicated graph this
 # is `lattice_apply_bridge.records_out`; in a graph with no replication
 # it is this module's own `propose_out`, which is then also the command

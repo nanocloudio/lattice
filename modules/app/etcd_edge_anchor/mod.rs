@@ -621,7 +621,31 @@ enum AnchorPhase {
 
 /// A watch's key and range_end together, as the watch hub holds them
 /// (`watch_hub::WATCH_KEY_MAX`).
-const WATCH_KEY_MAX: usize = 96;
+const WATCH_KEY_MAX: usize = 256;
+
+/// The fixed part of a watch's `MSG_WATCH_CTRL` define: the session
+/// header, then `[ctrl:1][watch_id:8][tenant:4][start_rev:8][filters:1]
+/// [progress:1][key_len:2][range_end_len:2]`.
+const WATCH_DEFINE_HEAD: usize = sc::SESSION_HEADER + 1 + 8 + 4 + 8 + 1 + 1 + 2 + 2;
+
+/// The longest key and range_end together a watch is admitted with. A
+/// define is forwarded the moment its session is ATTACHed, before the
+/// registry has answered, so it waits in the session's ingress hold
+/// (`session_anchor::HOLD_BYTES`, each envelope behind its 3-byte header):
+/// a span the hold cannot take would be dropped there, the client told
+/// `created` for a watch that never reaches the registry. The hub's
+/// ceiling when the hold takes it, else what the hold does.
+const WATCH_SPAN_MAX: usize = {
+    let hold = session_anchor::HOLD_BYTES - 3 - WATCH_DEFINE_HEAD;
+    if hold < WATCH_KEY_MAX {
+        hold
+    } else {
+        WATCH_KEY_MAX
+    }
+};
+// The hold takes the hub's whole ceiling: every span the registry can watch
+// is admitted here.
+const _: () = assert!(WATCH_SPAN_MAX == WATCH_KEY_MAX);
 
 /// The longest key the store holds for this surface: the store's
 /// physical key less its 12-byte identity (`kv_store::MAX_KEY_LEN` −
@@ -2156,11 +2180,7 @@ fn handle_data(
     let method = anchor.slots[slot_idx].streams[strm].method;
     let streaming = matches!(method, GrpcMethod::Watch | GrpcMethod::LeaseKeepAlive);
     if streaming && anchor.slots[slot_idx].streams[strm].body_len >= GRPC_FRAME_HEADER_LEN {
-        match method {
-            GrpcMethod::Watch => dispatch_watch_message(anchor, slot_idx, strm),
-            GrpcMethod::LeaseKeepAlive => dispatch_lease_keepalive_message(anchor, slot_idx, strm),
-            _ => {}
-        }
+        dispatch_streaming(anchor, slot_idx, strm, method);
     } else if anchor.slots[slot_idx].streams[strm].end_stream_seen {
         dispatch_request(anchor, slot_idx, strm);
     }
@@ -2262,15 +2282,7 @@ fn dispatch_request(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     // (called per inbound DATA frame, no END_STREAM gate). If we somehow
     // reach here with a body, drain it.
     if matches!(method, GrpcMethod::Watch | GrpcMethod::LeaseKeepAlive) {
-        if anchor.slots[slot_idx].streams[strm].body_len >= GRPC_FRAME_HEADER_LEN {
-            match method {
-                GrpcMethod::Watch => dispatch_watch_message(anchor, slot_idx, strm),
-                GrpcMethod::LeaseKeepAlive => {
-                    dispatch_lease_keepalive_message(anchor, slot_idx, strm)
-                }
-                _ => {}
-            }
-        }
+        dispatch_streaming(anchor, slot_idx, strm, method);
         return;
     }
 
@@ -6012,6 +6024,31 @@ fn write_lease_response_frames(
 ///
 /// After dispatch the request body is consumed so subsequent
 /// WatchRequests on the same stream don't see stale bytes.
+/// Dispatch every complete request a bidi-streaming call's body holds.
+/// One DATA frame can carry several gRPC messages, or the end of one and
+/// the whole of the next; each dispatch consumes one, so a message left
+/// behind would wait for a DATA frame that may never come (a client
+/// creating several watches at once and then only listening).
+fn dispatch_streaming(anchor: &mut AnchorState, slot_idx: usize, strm: usize, method: GrpcMethod) {
+    loop {
+        let before = anchor.slots[slot_idx].streams[strm].body_len;
+        if before < GRPC_FRAME_HEADER_LEN {
+            return;
+        }
+        match method {
+            GrpcMethod::Watch => dispatch_watch_message(anchor, slot_idx, strm),
+            GrpcMethod::LeaseKeepAlive => dispatch_lease_keepalive_message(anchor, slot_idx, strm),
+            _ => return,
+        }
+        // An incomplete message is left whole (nothing consumed); a freed
+        // stream's method is no longer this one.
+        let st = &anchor.slots[slot_idx].streams[strm];
+        if st.body_len >= before || st.method != method {
+            return;
+        }
+    }
+}
+
 fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
     let stream_id = anchor.slots[slot_idx].streams[strm].stream_id;
     let body_len = anchor.slots[slot_idx].streams[strm].body_len;
@@ -6064,9 +6101,10 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
         let mut rb = [0u8; 256];
         let rl = req.range_end.len().min(rb.len());
         rb[..rl].copy_from_slice(&req.range_end[..rl]);
-        // A key or range the hub cannot hold whole is refused, never
-        // watched truncated (a cut key watches a different key).
-        let fits = req.key.len() + req.range_end.len() <= WATCH_KEY_MAX;
+        // A key or range the hub, or the define's wait in the session
+        // hold, cannot take whole is refused, never watched truncated (a
+        // cut key watches a different key).
+        let fits = req.key.len() + req.range_end.len() <= WATCH_SPAN_MAX;
         (
             req.op,
             kb,
@@ -6167,7 +6205,7 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
             // (stamped by forward):
             //   [ctrl=DEFINE:1][watch_id:8][tenant:4][start_rev:8]
             //   [filters:1][progress:1][key_len:2][key][re_len:2]
-            let mut body = [0u8; 384];
+            let mut body = [0u8; WATCH_DEFINE_HEAD + WATCH_KEY_MAX];
             let mut end = sc::SESSION_HEADER;
             let k = key_len;
             body[end] = WATCH_CTRL_DEFINE;
@@ -6193,11 +6231,19 @@ fn dispatch_watch_message(anchor: &mut AnchorState, slot_idx: usize, strm: usize
             end += 2;
             body[end..end + re_len].copy_from_slice(&re_buf[..re_len]);
             end += re_len;
-            {
+            let forwarded = {
                 let mut sink = watch_sink!(anchor);
-                let _ = anchor
+                anchor
                     .wsa
-                    .forward(sess, MSG_WATCH_CTRL, &body[..end], &mut sink);
+                    .forward(sess, MSG_WATCH_CTRL, &body[..end], &mut sink)
+            };
+            if !forwarded {
+                // The define reached neither the registry nor the hold: a
+                // watch answered `created` would never see an event.
+                // Refused as upstream refuses — created and canceled.
+                drop_watch(anchor, slot_idx, strm, free);
+                send_watch_response(anchor, slot_idx, strm, stream_id, client, true, true, None);
+                return;
             }
             send_watch_response(anchor, slot_idx, strm, stream_id, client, true, false, None);
         }

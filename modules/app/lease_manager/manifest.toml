@@ -22,6 +22,24 @@ scope = "fleet"
 #   worker_id  tag 1, u8, default 0 — which of the anchor's workers this
 #              instance is. A single-manager graph leaves it at 0.
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
+# others. This module reads no profiled ceiling: its three variants
+# build the same code, so a graph names one profile for every module it
+# builds.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
 [[ports]]
 # `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved port
 # name. Carries both SessionCtrlV1 frames (0x70..0x9F) and the

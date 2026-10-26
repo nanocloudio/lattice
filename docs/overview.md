@@ -34,6 +34,14 @@ contract while lattice holds it.
   lattice as fluxor's store: the `storage.object` and
   `storage.namespace` contracts, write answers, subscriptions and the
   change log, the replicated store, and how slow stores are waited on
+- [architecture/route_catalogue.md](architecture/route_catalogue.md) —
+  Wormhole's route and endpoint catalogues: the key layout, the
+  envelope check, staged publication and CAS activation, a
+  generation's policies, declarations, gap-free status streams,
+  snapshot-then-watch, explicit readiness, the catalogue across
+  key/partition groups, durable watch cursors, and the capacity
+  profiles (`pi5`, `rp2350`, `server`) that size the watch,
+  subscription, replay and partition-map ceilings
 - [architecture/cdc.md](architecture/cdc.md) — change data capture:
   the event format, the ordered-ack sink contract, checkpointing,
   and retention
@@ -63,5 +71,7 @@ contract while lattice holds it.
   surface: endpoints, the PromQL/MetricsQL/KQL query subsets, bounds
 - [guides/fronts.md](guides/fronts.md) — the in-graph exchange fronts
   (SQL and KV with `pg_client`'s and `redis_client`'s conventions, CDC
-  subscriptions as held exchanges) and the store stacks that compose
-  them
+  subscriptions as held exchanges, the route catalogue's publish,
+  snapshot, garbage-collection, declaration, status and reclaim
+  requests) and the store stacks that
+  compose them

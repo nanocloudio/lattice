@@ -162,11 +162,12 @@ The full mapping is in the
 | Replicated write path | Anchor → router → gateway → consensus → WAL → apply bridge → worker: working, single node and three-node. |
 | Linearizable reads | ReadIndex fence path (`lin_reads`, per-request consistency byte): wired. An etcd Range is linearizable unless `serializable`; the Redis and Memcached surfaces read serializable unless the router runs `lin_reads: 1`. |
 | Partitioning | Ordered key-range and hash-slot maps, routing epochs, range split/merge with cutover barriers: working. |
-| Watch / lease / TTL | In-memory watch registry with revision-window replay, lease table, deterministic tick-driven expiry: working; watch and lease state is held in memory and does not survive a restart. |
+| Watch / lease / TTL | In-memory watch registry with revision-window replay, lease table, deterministic tick-driven expiry: working; etcd watch and lease state is held in memory and does not survive a restart. A replay the fanout cannot serve and a mutation matching more watches than the match budget reaches are explicit resyncs (the client relists), never silent. The watch registry and the etcd surface take a key and range end of up to 256 bytes together in every build; watch capacity is set by the capacity profile: 1,024 watches in the default (`pi5`) build, 64 in `rp2350`, 8,192 in `server`. |
 | Compaction / backup | Claim-based MVCC GC floor and consistent backup/restore at a protected revision: working. |
 | CDC | Ordered-ack egress with backfill, resolved watermarks, retention claims: working. |
 | Multi-tenancy | The protocol anchors (Redis, Memcached, etcd, SQL) stamp tenant 0. The data surface (`lattice_data_anchor`) carries each request's tenant, database and keyspace into the key layout and refuses tenant 0. |
-| Store contracts | `kv_state_worker_store` serves fluxor's `storage.object` and `storage.namespace` (reads, writes, LIST, subscriptions, paged CHANGES) on a single node or as one replica of a group: working. |
+| Store contracts | `kv_state_worker_store` serves fluxor's `storage.object` and `storage.namespace` (reads, writes, LIST, subscriptions, paged CHANGES) on a single node or as one replica of a group: working. A durable subscription keeps its cursor in the store and resumes exactly after it across a restart of either side, or answers `RESYNC_REQUIRED` with its reason; durable subscriptions are single-node (a replica refuses them `ENOSYS`). |
+| Route catalogue | `route_catalogue_front` with `route_catalogue.rs` and `route_catalogue_reader.rs`: staged publication of WHR1 route and endpoint records, sealed manifests, CAS activation that only one of two racing publishers wins, bounded garbage collection, revision-pinned paged snapshots with a verified manifest, and a reader that exposes only whole generations; a generation's policies (opaque placed records keyed by kind and content address, under the seal), declarations that only go forward a generation, gap-free status streams, explicit stale/fresh readiness, and services kept whole within one key/partition group by shard boundaries ([docs/architecture/route_catalogue.md](docs/architecture/route_catalogue.md)): proven by the host suites (`contract_route_catalogue.rs`, `contract_catalogue_records.rs`, `contract_catalogue_kpg.rs`) against the disk store's engine, and live on each of `kv_request_router`'s four client pairs — etcd, redis, memcached, memcached_udp — by `live_catalogue_pairs.rs` and `tools/e2e/store_fronts.sh catalogue_pairs`; no published stack or shipped config wires the module. |
 | Control-plane policy | Quota and auth-principal modules are not driven by a control-plane feed; the substrate's control plane emits a synthetic proof. `placement_advisor` measures range key counts itself and reports; with `auto_execute: 1` it issues the split it recommends. |
 
 ## Not implemented
@@ -207,10 +208,11 @@ The full mapping is in the
   smoke checks.
 - [`docs/overview.md`](docs/overview.md) — index of everything below.
 - [`docs/architecture/`](docs/architecture/) — the specification,
-  the store contracts, CDC, and the limit register.
+  the store contracts, the route catalogue, CDC, and the limit
+  register.
 - [`docs/guides/`](docs/guides/) — deployment, high availability,
   tuning, the per-protocol guides (Redis, Memcached, etcd,
-  metrics), and the in-graph fronts and store stack.
+  documents, metrics), and the in-graph fronts and store stacks.
 
 ## License
 

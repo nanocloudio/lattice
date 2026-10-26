@@ -132,6 +132,10 @@ mod change_ring;
 #[path = "../../common/store_registry.rs"]
 mod store_registry;
 
+#[cfg(feature = "store_provider")]
+#[path = "../../common/watch_cursor.rs"]
+mod watch_cursor;
+
 // Every replica applies a store provider's writes by their origin's
 // record, whether or not it provides the store itself.
 #[path = "../../common/origin.rs"]
@@ -260,14 +264,14 @@ const RUN_MERGE_THRESHOLD: usize = 3;
 /// run to four figures of steps. A purely elapsed budget would abort
 /// those healthy compactions, the worker would restart them from
 /// scratch, and the run set would never drain — a livelock strictly
-/// worse than the wedge being fixed. So every successful storage action
-/// (recover, compact step, flush) resets the counter, and only a fence
-/// that is held while NOTHING advances can trip it.
+/// worse than the wedge the deadline exists to end. So every successful
+/// storage action (recover, compact step, flush) resets the counter, and
+/// only a fence that is held while NOTHING advances can trip it.
 ///
 /// **The invariant: no snapshot, install or compaction activity may
 /// block the write path for more than a bounded number of steps.**
 ///
-/// v1's provider excludes concurrent apply from a capture/install/
+/// The disk provider excludes concurrent apply from a capture/install/
 /// compaction by refusing `apply`/`flush` with `Backpressure`. That is
 /// a safe simplification only while every fence is guaranteed to be
 /// released, and one is not: an install opened by `MSG_APP_SNAPSHOT_
@@ -346,7 +350,7 @@ define_params! {
 
     // Which disk store this worker instance owns. Multi-range graphs
     // run one worker per range in one process; each
-    // needs its own file namespace: 0 = the historical `kv/`,
+    // needs its own file namespace: 0 = the unsuffixed `kv/`,
     // 1..=9 = `kv<id>/`. Refused at init on the FAT32 root layout
     // (root_path = 1) with a non-zero id — two stores at the FS root
     // would silently share file names.
@@ -3389,17 +3393,16 @@ const KS_RELATIONAL_CATALOG_NAME: u32 = 0x8000_0007;
 
 /// Does this command mutate a relational CATALOG keyspace?
 ///
-/// Body layouts are PER-OPCODE, and this function learned that twice:
+/// Body layouts are PER-OPCODE, and two traps sit in them:
 ///
-/// - Its first version read the keyspace at bytes 8..12, from
-///   `internal_key`'s tenant|database|keyspace prefix — but that prefix
-///   is added by the STORE and does not exist in the command body. The
-///   right layout of the wrong layer; nothing ever matched.
-/// - Its second read `[key_len:u16][key…]` for every op — but DELETE is
-///   count-prefixed multi-key (`[count:u16][key_len:u16][key]…`, redis
-///   DEL is variadic), so a DROP TABLE's catalog deletes parsed the
-///   count as a key length and never matched either. CREATE bumped and
-///   DROP did not, which is the worst half-working shape.
+/// - The command body carries the user key only: `internal_key`'s
+///   tenant|database|keyspace prefix is added by the STORE, so the
+///   keyspace is read from the key itself, never from bytes 8..12 of a
+///   composed key.
+/// - DELETE is count-prefixed multi-key (`[count:u16][key_len:u16]
+///   [key]…`, redis DEL is variadic): read as `[key_len:u16][key…]` a DROP
+///   TABLE's catalog deletes would parse the count as a key length and
+///   never match, so CREATE would bump the generation and DROP would not.
 ///
 /// So: single-key ops check their one key; DELETE walks its list; and
 /// ops whose bodies this function does not model (the TXN family, MSET,
@@ -3619,6 +3622,7 @@ impl store_provider::Backend for WorkerBackend<'_> {
                     | types::KV_RESULT_VERSIONS
                     | types::KV_RESULT_COMPACTED
                     | types::KV_RESULT_NOT_FOUND
+                    | types::KV_RESULT_CAS_FAILED
             ) {
                 let mut buf = [0u8; 64];
                 let mut n = write_prefix(&mut buf, 0, b"[kvw] store op=");

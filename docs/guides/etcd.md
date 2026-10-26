@@ -126,7 +126,8 @@ large value is refused.
 | One Range answer | 8 KiB of keys and values | "lattice: the range does not fit one response; set a limit and page" (ResourceExhausted); `count` is always the whole range, `more` means the limit cut it |
 | One response | 16000 bytes | ResourceExhausted |
 | Watch event | a value and its `prev_kv`, each up to about 6.3 KiB once fetched whole | the watch is canceled with the reason |
-| Watch replay window | 64 KiB / 256 events | refused as compacted: the client relists |
+| Watch key | 256 bytes of key and `range_end` together | refused (created and canceled at once) |
+| Watch replay window | 64 KiB / 256 events (the default `pi5` build; 16 KiB / 64 in `rp2350`, 1 MiB / 4096 in `server`) | refused as compacted: the client relists |
 | Users, roles | 32 each; 8 roles per user, 8 permissions per role | ResourceExhausted |
 | Watches per stream | 8 | refused (created and canceled at once) |
 

@@ -18,9 +18,9 @@
 //!   ack per framed event, live or replayed, advances the watch's
 //!   `last_sent_revision` and its delivery cursor in the same step; a
 //!   `REPLAYED` ack closes a replay plan and counts the frames it sent;
-//!   a `COMPACTED` ack ends a watch whose replay window fell behind the
-//!   compaction floor. Acks reach every registry; only the one serving
-//!   the watch counts them.
+//!   a `COMPACTED` ack ends a watch whose replay the fanout refused (the
+//!   window compacted, or one it could not read whole). Acks reach every
+//!   registry; only the one serving the watch counts them.
 //! - **`in_epoch_events`** — the substrate's placement epoch. Held,
 //!   never stamped into a session.
 //!
@@ -97,20 +97,21 @@ mod telemetry;
 
 #[path = "../../common/envelope.rs"]
 mod envelope;
-use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+use envelope::{read_envelope, Chan, Inbox, ENVELOPE_HDR};
 
 use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{placement_event_epoch, worker_id, SessionId, CLASS_WATCH};
 use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
 use watch_hub::{
-    catch_up_step, match_event, CatchUp, MatchedWatch, MutationTail, WatchHub, WatchRecord,
+    catch_up_step, match_event_from, CatchUp, MatchedWatch, MutationTail, WatchHub, WatchRecord,
     MAX_WATCHES, WATCH_EVENT_DELETE, WATCH_EVENT_PUT, WATCH_EXPORT_MAX, WATCH_PHASE_ACTIVE,
     WATCH_PHASE_DRAINED, WATCH_PHASE_DRAINING, WATCH_PHASE_IMPORTED,
 };
 use wire::{
     MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_FLOOR, MSG_WATCH_CTRL, MSG_WATCH_EVENT,
     MSG_WATCH_PROGRESS, MSG_WATCH_REPLAY_PLAN, WATCH_CTRL_DEFINE, WATCH_CTRL_PROGRESS,
-    WATCH_PROGRESS_COMPACTED, WATCH_PROGRESS_DELIVERED, WATCH_PROGRESS_REPLAYED,
+    WATCH_FRAME_OP_COMPACTED, WATCH_PROGRESS_COMPACTED, WATCH_PROGRESS_DELIVERED,
+    WATCH_PROGRESS_REPLAYED,
 };
 
 /// One envelope in or out: the largest watch event behind its watch id
@@ -121,6 +122,13 @@ const SCRATCH_BUF_SIZE: usize = 8832;
 /// what one channel holds, so a backlog is read whole while a producer
 /// that never pauses cannot hold the drain off.
 const MUTATION_CATCH_UP: usize = 256;
+/// Watches one mutation is matched against per batch (the hub is borrowed
+/// while it matches; a batch's matches are emitted between batches), and
+/// batches one mutation may take. Every batch is emitted; a mutation past
+/// the batch budget resyncs the watches it did not reach rather than pass
+/// them over (`handle_mutation`).
+const MAX_MATCHES_PER_EVENT: usize = 32;
+const MAX_MATCH_BATCHES: u32 = 64;
 
 #[repr(C)]
 struct RegistryState {
@@ -151,14 +159,27 @@ struct RegistryState {
 
     // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
-    // metrics` order (0=registered, 1=cancelled).
+    // metrics` order (0=registered, 1=cancelled, 2=resyncs).
     m_registered: u64,
     m_cancelled: u64,
+    /// Watches ended with a COMPACTED frame this registry wrote itself
+    /// (`resync_watch`, `refuse_define`).
+    m_resyncs: u64,
     step_ctr: u64,
 
     /// Highest revision read off `mutations`: every mutation at or below
-    /// it has been matched against the in-service watches.
+    /// it has been matched against the in-service watches — but for one
+    /// whose fan-out is pending (`fan_pending`).
     mutation_head: i64,
+    /// The mutation at the head of `mutations` is part way through its
+    /// fan-out: `events_out` had no room for the event of the watch at
+    /// record `fan_from`. It stays on the channel (looked at, not taken)
+    /// and its fan-out goes on from that record once there is room,
+    /// `fan_batches` of its match-batch budget spent; nothing behind it
+    /// is read meanwhile, so watches see mutations in the order read.
+    fan_pending: bool,
+    fan_from: usize,
+    fan_batches: u32,
 
     hub: WatchHub,
     /// The most recent mutations read, for catching up a watch taken
@@ -198,8 +219,12 @@ impl RegistryState {
         self.worker_ordinal = 0;
         self.m_registered = 0;
         self.m_cancelled = 0;
+        self.m_resyncs = 0;
         self.step_ctr = 0;
         self.mutation_head = 0;
+        self.fan_pending = false;
+        self.fan_from = 0;
+        self.fan_batches = 0;
         self.hub.init();
         self.tail.init();
         self.sw.init(worker_id(CLASS_WATCH, 0));
@@ -268,20 +293,10 @@ fn handle_session_frame(reg: &mut RegistryState, msg_type: u8, payload: &[u8]) {
         WorkerAction::Drain(idx) => {
             let sid = *reg.sw.slots[idx].session_id();
             catch_up_mutations(reg);
-            // The cut is a revision: the importer resumes above it. With
-            // one worker feeding `mutations` they arrive in revision order,
-            // so every revision at or below it has been read. When several
-            // workers' streams fan into one registry they interleave, and
-            // a revision at or below the cut read after it — committed by
-            // one worker before another's higher one reached here — is
-            // matched neither here (the record no longer produces events)
-            // nor by the importer: it is not delivered.
-            let head = reg.mutation_head;
-            if let Some(rec) = reg.hub.find_session_mut(&sid) {
-                rec.begin_drain(head);
-            }
             // Settled already (nothing in flight)? Export right away.
-            try_export(reg, idx);
+            if begin_drain(reg, &sid) {
+                try_export(reg, idx);
+            }
         }
         WorkerAction::Imported(idx) => {
             let blob = reg.sw.import_blob();
@@ -308,9 +323,17 @@ fn handle_session_frame(reg: &mut RegistryState, msg_type: u8, payload: &[u8]) {
         }
         WorkerAction::Reinstated(idx) => {
             // Back in service from where it stopped matching, not from
-            // its last delivered event (`settle_drain`).
+            // its last delivered event (`settle_drain`). A record whose
+            // drain was still waiting on a pending fan-out (`begin_drain`)
+            // never left service: there is nothing to resume.
             let sid = *reg.sw.slots[idx].session_id();
-            enter_service(reg, &sid, true);
+            if reg
+                .hub
+                .find_session(&sid)
+                .is_some_and(|r| r.phase != WATCH_PHASE_ACTIVE)
+            {
+                enter_service(reg, &sid, true);
+            }
         }
         WorkerAction::EpochBumped(idx, new_epoch) => {
             let sid = *reg.sw.slots[idx].session_id();
@@ -321,6 +344,44 @@ fn handle_session_frame(reg: &mut RegistryState, msg_type: u8, payload: &[u8]) {
     }
 }
 
+/// Take `sid`'s record out of service at the registry's mutation head
+/// (the drain's cut), once no mutation's fan-out is pending: a mutation
+/// read but not yet matched against every watch lies at or below the
+/// cut, and the record would neither be sent it here (draining, it
+/// produces no events) nor by the importer (which resumes above the cut).
+/// A pending fan-out is finished first, with the rest of its commit
+/// behind it (the mutations of its revision), so the cut still falls
+/// between whole commits. `false` while it cannot be: the record stays in
+/// service, the session draining, and `try_export` asks again each step.
+///
+/// The cut is a revision: the importer resumes above it. With one worker
+/// feeding `mutations` they arrive in revision order, so every revision at
+/// or below it has been read. When several workers' streams fan into one
+/// registry they interleave, and a revision at or below the cut read after
+/// it — committed by one worker before another's higher one reached here —
+/// is matched neither here nor by the importer: it is not delivered.
+fn begin_drain(reg: &mut RegistryState, sid: &SessionId) -> bool {
+    let in_service = reg
+        .hub
+        .find_session(sid)
+        .is_some_and(|r| r.phase == WATCH_PHASE_ACTIVE);
+    if in_service && reg.fan_pending {
+        while reg.fan_pending || head_mutation_rev(reg).is_some_and(|r| r <= reg.mutation_head) {
+            if !poll_mutation(reg) {
+                if reg.fan_pending {
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+    let head = reg.mutation_head;
+    if let Some(rec) = reg.hub.find_session_mut(sid) {
+        rec.begin_drain(head);
+    }
+    true
+}
+
 /// Declare `idx` drained and export its record once every emitted
 /// event has been acked. Called on DRAIN and again each step while
 /// the session is draining.
@@ -329,6 +390,14 @@ fn try_export(reg: &mut RegistryState, idx: usize) {
         return;
     }
     let sid = *reg.sw.slots[idx].session_id();
+    // A drain still waiting on a pending fan-out (`begin_drain`).
+    let deferred = reg
+        .hub
+        .find_session(&sid)
+        .is_some_and(|r| r.phase == WATCH_PHASE_ACTIVE);
+    if deferred && !begin_drain(reg, &sid) {
+        return;
+    }
     let (settled, out_acked) = match reg.hub.find_session(&sid) {
         Some(rec) => (rec.outbound_settled(), rec.out_acked),
         // No record: nothing to move, export an empty blob so the
@@ -398,6 +467,12 @@ fn enter_service(reg: &mut RegistryState, sid: &SessionId, from_tail: bool) {
     }
     if from_tail && reg.tail.covers(from) {
         catch_up_from_tail(reg, wid, from, head);
+        // Everything read up to the head is delivered from the tail (or
+        // left to the replay it fell back to): a mutation at or below it
+        // whose fan-out is still pending is not sent again live.
+        if let Some(rec) = reg.hub.get_mut(wid) {
+            rec.live_from = rec.live_from.max(head);
+        }
         return;
     }
     emit_replay_plan(reg, wid, from, head);
@@ -433,9 +508,18 @@ fn continue_catch_up(reg: &mut RegistryState, wid: u64, covered: i64) {
 
 /// Emit, for watch `wid`, each mutation in the tail in `(from, to]` that
 /// it is owed.
+///
+/// One `events_out` may not hold them all: at the first the channel has no
+/// room for, the rest of the window is left to a store replay from just
+/// below that revision (`emit_replay_plan`, which holds live matching off
+/// until it closes) — or, when part of that revision has already gone out
+/// (a commit of several keys), which a replay would send again, the watch
+/// is told to resync. Never passed over.
 fn catch_up_from_tail(reg: &mut RegistryState, wid: u64, from: i64, to: i64) {
     let mut at = 0usize;
     let mut payload = [0u8; SCRATCH_BUF_SIZE];
+    // The revision of the last mutation emitted.
+    let mut emitted = from;
     while let Some((rev, p, next)) = reg.tail.entry(at) {
         at = next;
         let n = p.len();
@@ -449,9 +533,19 @@ fn catch_up_from_tail(reg: &mut RegistryState, wid: u64, from: i64, to: i64) {
         let owed = reg.hub.get(wid).is_some_and(|rec| {
             rev > rec.start_revision && rec.owes(0, kind, &payload[key_at..key_at + key_len])
         });
-        if owed {
-            emit_event(reg, wid, &payload[..n]);
+        if !owed {
+            continue;
         }
+        if emit_event(reg, wid, &payload[..n]) {
+            emitted = rev;
+            continue;
+        }
+        if emitted < rev {
+            emit_replay_plan(reg, wid, rev - 1, to);
+        } else if !resync_watch(reg, wid, rev) {
+            end_resynced(reg, wid);
+        }
+        return;
     }
 }
 
@@ -460,31 +554,60 @@ fn catch_up_from_tail(reg: &mut RegistryState, wid: u64, from: i64, to: i64) {
 /// (`mutation_head`) falls between whole commits: the mutations one
 /// commit fans out (one revision, several keys) are written together,
 /// and none of them is left on the channel unmatched below the cut.
+/// Stops at a mutation whose fan-out `events_out` has no room for
+/// (`fan_pending`).
 fn catch_up_mutations(reg: &mut RegistryState) {
-    let sys = reg.syscalls;
-    if sys.is_null() || reg.mutations_in < 0 {
-        return;
-    }
     let mut budget = MUTATION_CATCH_UP;
-    while budget > 0 {
-        // SAFETY: the module's syscall table, set at init.
-        let Some((mt, len)) = (unsafe {
-            read_envelope(
-                &mut reg.mutations_inbox,
-                &*sys,
-                reg.mutations_in,
-                &mut reg.scratch,
-            )
-        }) else {
-            return;
-        };
-        if mt == MSG_WATCH_EVENT {
-            let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-            tmp[..len].copy_from_slice(&reg.scratch[..len]);
-            handle_mutation(reg, &tmp[..len]);
-        }
+    while budget > 0 && poll_mutation(reg) {
         budget -= 1;
     }
+}
+
+/// The revision of the mutation at the head of `mutations`, left there.
+fn head_mutation_rev(reg: &mut RegistryState) -> Option<i64> {
+    let sys = reg.syscalls;
+    if sys.is_null() || reg.mutations_in < 0 {
+        return None;
+    }
+    // SAFETY: the module's syscall table, set at init.
+    let sys = unsafe { &*sys };
+    let handle = reg.mutations_in;
+    let (mt, len) = reg
+        .mutations_inbox
+        .peek(&mut Chan { sys, handle }, &mut reg.scratch)?;
+    if mt != MSG_WATCH_EVENT {
+        return None;
+    }
+    let payload = reg.scratch.get(ENVELOPE_HDR..ENVELOPE_HDR + len)?;
+    parse_mutation(payload).map(|(rev, _, _, _)| rev)
+}
+
+/// Match the mutation at the head of `mutations`, taking it off the
+/// channel once its fan-out is whole: `true` when one was taken, `false`
+/// when none is waiting or its fan-out is pending.
+fn poll_mutation(reg: &mut RegistryState) -> bool {
+    let sys = reg.syscalls;
+    if sys.is_null() || reg.mutations_in < 0 {
+        return false;
+    }
+    // SAFETY: the module's syscall table, set at init.
+    let sys = unsafe { &*sys };
+    let handle = reg.mutations_in;
+    let Some((mt, len)) = reg
+        .mutations_inbox
+        .peek(&mut Chan { sys, handle }, &mut reg.scratch)
+    else {
+        return false;
+    };
+    if mt == MSG_WATCH_EVENT {
+        let mut tmp = [0u8; SCRATCH_BUF_SIZE];
+        tmp[..len].copy_from_slice(&reg.scratch[ENVELOPE_HDR..ENVELOPE_HDR + len]);
+        if !handle_mutation(reg, &tmp[..len]) {
+            return false;
+        }
+    }
+    reg.mutations_inbox
+        .take(&mut Chan { sys, handle }, len, &mut reg.scratch)
 }
 
 fn drop_record(reg: &mut RegistryState, sid: &SessionId) {
@@ -576,16 +699,42 @@ fn handle_define(reg: &mut RegistryState, idx: usize, sid: &SessionId, def: &[u8
             enter_service(reg, sid, false);
         }
         emit_retention_floor(reg);
+    } else {
+        // The anchor answered the client `created` as it forwarded the
+        // define; a watch the hub cannot hold (its table full, a span past
+        // `WATCH_KEY_MAX`, an id or session already held, an unknown
+        // filter bit) is refused on the path a refused replay takes — a
+        // COMPACTED frame for it, which the anchor answers by cancelling
+        // the watch — never left silent.
+        refuse_define(reg, idx, watch_id);
     }
+}
+
+/// Refuse a watch definition the hub would not take: a
+/// `WATCH_FRAME_OP_COMPACTED` frame for `watch_id` at the registry's head
+/// toward the fanout (forwarded to the anchor, which cancels the watch and
+/// ends its session) and the session forgotten here.
+fn refuse_define(reg: &mut RegistryState, idx: usize, watch_id: u64) {
+    let sys = reg.syscalls;
+    if !sys.is_null() {
+        let mut body = [0u8; 23];
+        body[0..8].copy_from_slice(&watch_id.to_le_bytes());
+        body[10..18].copy_from_slice(&reg.mutation_head.to_le_bytes());
+        body[18] = WATCH_FRAME_OP_COMPACTED;
+        // SAFETY: the module's syscall table, set at init.
+        let _ = unsafe { write_envelope(&*sys, reg.events_out, MSG_WATCH_EVENT, &body) };
+    }
+    reg.m_resyncs = reg.m_resyncs.wrapping_add(1);
+    reg.sw.forget(idx);
 }
 
 /// Emit a replay plan for `watch_id` over `(from, to]` (`to` 0: up to the
 /// store's present), counted open on its record until the fanout answers
 /// it finished; live matching for the watch is held off until then.
 ///
-/// A plan that cannot be written is not open: live matching resumes for
-/// mutations read from here on, and the window is not delivered — as
-/// for a plan the fanout drops.
+/// A plan that cannot be written is never opened: the watch is told to
+/// resync instead (`resync_watch`), as a plan the fanout refuses ends it.
+/// Left in service, it would go on live past a window it never received.
 ///
 /// The watch's key span is looked up here and shipped with the plan.
 /// The fanout holds no watch table by design, so if the span did not
@@ -630,6 +779,10 @@ fn emit_replay_plan(reg: &mut RegistryState, watch_id: u64, from: i64, to: i64) 
         if let Some(rec) = reg.hub.get_mut(watch_id) {
             rec.begin_replay(from, to);
         }
+    } else if !resync_watch(reg, watch_id, from) {
+        // Neither the plan nor the resync frame fits its channel: the
+        // watch cannot be served or told so; it ends here.
+        end_resynced(reg, watch_id);
     }
 }
 
@@ -655,25 +808,106 @@ fn emit_retention_floor(reg: &mut RegistryState) {
 
 // ── Mutation dispatcher ───────────────────────────────────────────────
 
-fn handle_mutation(reg: &mut RegistryState, payload: &[u8]) {
+/// Match mutation `payload` against every in-service watch and emit it to
+/// each that matches: `true` once its fan-out is whole, `false` when
+/// `events_out` ran out of room part way (`fan_pending`): the caller leaves
+/// it on `mutations` and hands it here again, and the fan-out goes on from
+/// the watch it stopped at. A malformed payload is `true` (nothing to do).
+fn handle_mutation(reg: &mut RegistryState, payload: &[u8]) -> bool {
     let Some((revision, event_kind, key_at, key_len)) = parse_mutation(payload) else {
-        return;
+        return true;
     };
-    reg.mutation_head = reg.mutation_head.max(revision);
-    reg.tail.push(revision, payload);
+    if !reg.fan_pending {
+        reg.mutation_head = reg.mutation_head.max(revision);
+        reg.tail.push(revision, payload);
+        reg.fan_from = 0;
+        reg.fan_batches = 0;
+    }
     let key = &payload[key_at..key_at + key_len];
 
-    const MAX_MATCHES_PER_EVENT: usize = 32;
-    let mut matched = 0usize;
-    let mut matched_ids = [0u64; MAX_MATCHES_PER_EVENT];
-    match_event(&reg.hub, 0, revision, event_kind, key, |m| {
-        if matched < MAX_MATCHES_PER_EVENT {
+    // Matches are gathered a batch at a time (the hub is borrowed while
+    // it matches, the emit needs it back) and every batch is emitted, so
+    // a key many watches cover reaches each of them. Past the batch
+    // budget — a pathological fan-in — the rest are not passed over: each
+    // is told to resync (a COMPACTED frame at this revision, which cancels
+    // that watch so the client relists) and ended, so no watch silently
+    // misses an event. A watch whose event (or resync) the channel has no
+    // room for stops the fan-out there, to go on from it next step.
+    loop {
+        let mut matched = 0usize;
+        let mut matched_ids = [0u64; MAX_MATCHES_PER_EVENT];
+        let next = match_event_from(&reg.hub, reg.fan_from, 0, revision, event_kind, key, |m| {
+            if matched == MAX_MATCHES_PER_EVENT {
+                return false;
+            }
             matched_ids[matched] = m.watch_id;
             matched += 1;
+            true
+        });
+        reg.fan_batches = reg.fan_batches.saturating_add(1);
+        let overflow = reg.fan_batches > MAX_MATCH_BATCHES;
+        for &wid in &matched_ids[..matched] {
+            let sent = if overflow {
+                resync_watch(reg, wid, revision)
+            } else {
+                emit_event(reg, wid, payload)
+            };
+            if !sent {
+                // Records never move while they live, so the watch is
+                // found again at this index; its batch is matched afresh.
+                if let Some(i) = reg.hub.records.iter().position(|r| r.watch_id == wid) {
+                    reg.fan_from = i;
+                    reg.fan_batches -= 1;
+                    reg.fan_pending = true;
+                    return false;
+                }
+            }
         }
-    });
-    for &wid in &matched_ids[..matched] {
-        emit_event(reg, wid, payload);
+        match next {
+            Some(n) => reg.fan_from = n,
+            None => break,
+        }
+    }
+    reg.fan_pending = false;
+    true
+}
+
+/// Tell watch `wid` to resync at `revision`: a `WATCH_FRAME_OP_COMPACTED`
+/// frame toward the fanout (forwarded verbatim to the anchor, which
+/// cancels that watch with `revision` as its compact revision; the client
+/// relists) and the record ended, exactly as a replay the fanout refused
+/// ends.
+/// Wire shape on `events_out`: `[watch_id:8][kpg:2][rev:8][op:1]
+/// [klen:2][vlen:2]`.
+///
+/// `false`, with nothing changed, when `events_out` has no room for the
+/// frame: the caller offers it again later.
+fn resync_watch(reg: &mut RegistryState, wid: u64, revision: i64) -> bool {
+    let sys = reg.syscalls;
+    if !sys.is_null() && reg.events_out >= 0 {
+        let mut body = [0u8; 23];
+        body[0..8].copy_from_slice(&wid.to_le_bytes());
+        body[10..18].copy_from_slice(&revision.to_le_bytes());
+        body[18] = WATCH_FRAME_OP_COMPACTED;
+        // SAFETY: the module's syscall table, set at init.
+        if !unsafe { write_envelope(&*sys, reg.events_out, MSG_WATCH_EVENT, &body) } {
+            return false;
+        }
+    }
+    end_resynced(reg, wid);
+    true
+}
+
+/// End watch `wid` after its resync frame: the session forgotten and the
+/// record dropped (the anchor ends the session from the frame).
+fn end_resynced(reg: &mut RegistryState, wid: u64) {
+    reg.m_resyncs = reg.m_resyncs.wrapping_add(1);
+    let sid = reg.hub.get(wid).map(|r| r.binding.session_id);
+    if let Some(sid) = sid {
+        if let Some(idx) = reg.sw.find(&sid) {
+            reg.sw.forget(idx);
+        }
+        drop_record(reg, &sid);
     }
 }
 
@@ -707,12 +941,17 @@ fn parse_mutation(payload: &[u8]) -> Option<(i64, u8, usize, usize)> {
 /// (consumed by watch_fanout and forwarded verbatim as MSG_WATCH_FRAME):
 ///
 ///   [watch_id:8][kpg:2][rev:8][op:1][klen:2][k][vlen:2][v]
-fn emit_event(reg: &mut RegistryState, wid: u64, payload: &[u8]) {
+///
+/// `false` when `events_out` has no room for it: nothing was written or
+/// counted, and the caller offers it again later.
+fn emit_event(reg: &mut RegistryState, wid: u64, payload: &[u8]) -> bool {
     let sys = reg.syscalls;
     let mut out_buf = [0u8; SCRATCH_BUF_SIZE];
     let body_len = payload.len();
-    if sys.is_null() || 8 + body_len > out_buf.len() {
-        return;
+    // No channel to write, or an event past the largest the store emits
+    // (`wire::WATCH_EVENT_MAX` behind its watch id): nothing to retry.
+    if sys.is_null() || reg.events_out < 0 || 8 + body_len > out_buf.len() {
+        return true;
     }
     out_buf[0..8].copy_from_slice(&wid.to_le_bytes());
     out_buf[8..8 + body_len].copy_from_slice(payload);
@@ -730,6 +969,7 @@ fn emit_event(reg: &mut RegistryState, wid: u64, payload: &[u8]) {
             rec.out_emitted = rec.out_emitted.wrapping_add(1);
         }
     }
+    ok
 }
 
 // ── Progress ack from fanout ──────────────────────────────────────────
@@ -755,10 +995,11 @@ fn handle_progress_ack(reg: &mut RegistryState, payload: &[u8]) {
             }
         }
         WATCH_PROGRESS_COMPACTED => {
-            // The replay window fell behind the compaction floor: the
-            // watch was refused explicitly on the wire by the fanout's
-            // frame; here it ends. The anchor drops its session from
-            // the same frame, so no DETACH exchange follows.
+            // The fanout refused the watch's replay (the window
+            // compacted, or not readable whole) explicitly on the wire
+            // with its own frame; here it ends. The anchor ends the
+            // session from that frame: its DETACH finds the session
+            // forgotten here and is answered DETACHED.
             let sid = reg
                 .hub
                 .get(watch_id)
@@ -853,7 +1094,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*sys_ptr;
 
         // Drain at most one envelope per input per tick; the
-        // scheduler ticks again to drain more.
+        // scheduler ticks again to drain more. A mutation whose fan-out
+        // `events_out` has no room for stays at the head of `mutations`
+        // and goes on next tick (`poll_mutation`).
         if let Some((mt, len)) =
             read_envelope(&mut reg.ctrl_inbox, sys, reg.ctrl_in, &mut reg.scratch)
         {
@@ -865,18 +1108,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 handle_ctrl(reg, &tmp[..len]);
             }
         }
-        if let Some((mt, len)) = read_envelope(
-            &mut reg.mutations_inbox,
-            sys,
-            reg.mutations_in,
-            &mut reg.scratch,
-        ) {
-            if mt == MSG_WATCH_EVENT {
-                let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-                tmp[..len].copy_from_slice(&reg.scratch[..len]);
-                handle_mutation(reg, &tmp[..len]);
-            }
-        }
+        let _ = poll_mutation(reg);
         if let Some((mt, len)) = read_envelope(
             &mut reg.progress_inbox,
             sys,
@@ -917,7 +1149,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             telemetry::emit_counters(
                 &*reg.syscalls,
                 reg.metrics_out,
-                &[reg.m_registered, reg.m_cancelled],
+                &[reg.m_registered, reg.m_cancelled, reg.m_resyncs],
             );
         }
     }

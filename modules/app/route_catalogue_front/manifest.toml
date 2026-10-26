@@ -1,0 +1,73 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+timer_class      = "wall_clock"
+
+# The route catalogue as an exchange provider: a publisher POSTs a route
+# generation — endpoint records and the route under a staging generation,
+# sealed with a manifest, activated by CAS against the expected
+# predecessor — a director GETs a revision-pinned snapshot page by page
+# with a verified manifest, and an operator POSTs a bounded
+# garbage-collection pass. A controller POSTs declarations (one record per
+# id, only advancing) and appends to an operation's gap-free status
+# stream; an operator reclaims a closed one. Records are opaque WHR1
+# envelopes checked structurally only. See
+# modules/common/route_catalogue.rs (the machines and the key layout) and
+# modules/common/route_catalogue_front.rs (the requests and statuses).
+#
+# Wiring: kv_out/kv_in -> a free client pair of kv_request_router, any of
+# the four (`proto` names it and must: 1 etcd_in/etcd_out, 2
+# redis_in/redis_out, 3 memcached_in/memcached_out, 4
+# memcached_udp_in/memcached_udp_out; any other value refuses
+# construction) — the router answers on the pair a request came in by;
+# request_in/response_out -> the publishers and directors.
+
+[[ports]]
+name         = "request_in"
+index        = 0
+direction    = "input"
+content_type = "ExchangeRequest"
+buffer_size  = 16384
+max_record   = 8192
+
+# MSG_KV_RESPONSE from the router pair's output.
+[[ports]]
+name         = "kv_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# One record per answer: a HEAD carrying a snapshot page or a result.
+[[ports]]
+name         = "response_out"
+index        = 0
+direction    = "output"
+content_type = "ExchangeResponse"
+buffer_size  = 32768
+max_record   = 8192
+
+# MSG_KV_REQUEST into the router pair's input.
+[[ports]]
+name         = "kv_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+[[ports]]
+name         = "metrics"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+
+# ── Observability ────────────────────────────────────────────────────
+# Module-scope counters emitted on `metrics` at a ~1 s wall-clock cadence.
+# Declaration order IS the id contract (id N = the Nth name). APPEND ONLY.
+#   0 activated  publications activated (the CAS won)
+#   1 refused    requests refused (any non-200 answer)
+#   2 pages      snapshot pages served
+#   3 gc_passes  garbage-collection passes run
+[observability]
+metrics = ["activated", "refused", "pages", "gc_passes"]

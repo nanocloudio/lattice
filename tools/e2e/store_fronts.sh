@@ -17,6 +17,21 @@
 #         (examples/store_fronts/group3.yaml): SQL and KV through the leader's
 #         fronts commit on the group, and every replica's subscription
 #         receives the INSERT's event at the same revision
+#   catalogue
+#         route_catalogue_front on the store (examples/store_fronts/
+#         catalogue.yaml): a generation of two routes published as one
+#         request of five records, each route sealed with its own manifest;
+#         a route declared with an endpoint short refused 422; the withdrawn
+#         form activated and read back sealed over nothing; a stale
+#         predecessor refused 409; the next generation after the withdrawn
+#         one; the changes after revision 0 holding all of it
+#   catalogue_pairs
+#         route_catalogue_front wired to the router directly
+#         (examples/store_fronts/catalogue_pairs.yaml) on each of its four
+#         client pairs in turn — etcd, redis, memcached, memcached_udp: a
+#         generation published, the same generation again refused 409, a
+#         snapshot page opening with the active pointer at it, the changes
+#         holding its seal
 #
 # Each case runs the graph in a sandbox under target/ (its store directory
 # with it), so nothing is written under the repository's own tree.
@@ -350,6 +365,166 @@ group() {
   fi
 }
 
-for t in ${*:-sql kv cdc group}; do "$t"; done
+# The catalogue case's stdin: each request one chunk, a second apart.
+catalogue_input() {
+  python3 -I -c '
+import hashlib, struct, sys, time
+def env(kind, gen, payload):
+    h = b"WHR1" + struct.pack("<HHIQ", kind, 0, len(payload), gen) + bytes([7]) * 16 + payload
+    return h + hashlib.sha256(h).digest()
+def item(kind, route, ident, rec):
+    body = bytes([kind, route]) + ident + rec
+    return struct.pack("<H", len(body)) + body
+def ep(i):
+    return bytes([i]) + bytes(14) + bytes([0xEE])
+def gen_items(g, routes):
+    out = b""
+    for r, n in enumerate(routes):
+        for i in range(n):
+            out += item(2, r, ep(r * 16 + i), env(2, g, bytes([r * 16 + i]) * 16))
+        out += item(1, r, bytes(16), env(1, g, bytes([0xBB]) * 24))
+    return out
+w = sys.stdout.buffer
+for chunk in [b"p1:" + gen_items(1, [1, 2]),
+              b"bad:" + gen_items(3, [1, 2]),
+              b"wd:",
+              b"st:" + gen_items(4, [1]),
+              b"p5:" + gen_items(5, [1]),
+              b"snap:"]:
+    time.sleep(2)
+    w.write(chunk)
+    w.flush()
+time.sleep(3)
+'
+}
+
+catalogue() {
+  local dir t r
+  dir="$SANDBOX/catalogue"
+  rm -rf -- "$dir"
+  mkdir -p "$dir/store_fronts.kv"
+  sed -e "s#stack: ../../packaging/stack/#stack: $ROOT/packaging/stack/#" \
+    examples/store_fronts/catalogue.yaml >"$dir/graph.yaml"
+  t="$dir/out.bin"
+  (cd "$dir" && catalogue_input | FLUXOR_PROJECT_ROOT=$ROOT timeout 40 "$FLX" run graph.yaml \
+    >"$t" 2>"$dir/graph.log") 2>/dev/null
+  reap TERM
+  r=$(python3 -I - "$t" <<'PY'
+import struct, sys
+out = open(sys.argv[1], "rb").read()
+svc = b"rc/" + b"\xa1" * 16 + b"/" + b"\xb2" * 16 + b"/"
+def value(key):
+    # The last write of the key: the changes come in revision order.
+    at = out.rfind(struct.pack("<H", len(key)) + key)
+    if at < 0:
+        return None
+    at += 2 + len(key)
+    n = struct.unpack_from("<I", out, at)[0]
+    return out[at + 4:at + 4 + n]
+def sealed(g):
+    v = value(svc + b"gen/" + struct.pack(">Q", g) + b"/sealed")
+    if not v or v[:4] != b"LCS1":
+        return None
+    return struct.unpack_from("<III", v, 4)
+def manifest(g, r):
+    v = value(svc + b"gen/" + struct.pack(">Q", g) + b"/r/" + bytes([r]) + b"/manifest")
+    return struct.unpack_from("<I", v, 4)[0] if v and v[:4] == b"LCM1" else None
+checks = {
+    "422": b"\n422 " in b"\n" + out,
+    "409": b"\n409 " in b"\n" + out,
+    "gen1": sealed(1) == (2, 3, 7) and manifest(1, 0) == 1 and manifest(1, 1) == 2,
+    "gen3": sealed(3) is None,
+    "withdrawn": sealed(2) == (0, 0, 0),
+    "gen5": sealed(5) == (1, 1, 3),
+    "active": (value(svc + b"active") or b"\0" * 8)[:8] == struct.pack("<Q", 5),
+}
+print(" ".join(k for k, v in checks.items() if not v) or "ok")
+PY
+)
+  if [ "$r" = ok ]; then
+    ok "catalogue (two routes, a short route refused, the withdrawn form, a stale predecessor, the changes holding it all)"
+  else
+    no catalogue "failed: $r (output kept in $dir)"
+  fi
+}
+
+# The catalogue_pairs case's stdin: each request one chunk, two seconds
+# apart (each answered well within that).
+catalogue_pairs_input() {
+  python3 -I -c '
+import hashlib, struct, sys, time
+def env(kind, gen, payload):
+    h = b"WHR1" + struct.pack("<HHIQ", kind, 0, len(payload), gen) + bytes([7]) * 16 + payload
+    return h + hashlib.sha256(h).digest()
+def item(kind, route, ident, rec):
+    body = bytes([kind, route]) + ident + rec
+    return struct.pack("<H", len(body)) + body
+def ep(i):
+    return bytes([i]) + bytes(14) + bytes([0xEE])
+def gen_items(g, routes):
+    out = b""
+    for r, n in enumerate(routes):
+        for i in range(n):
+            out += item(2, r, ep(r * 16 + i), env(2, g, bytes([r * 16 + i]) * 16))
+        out += item(1, r, bytes(16), env(1, g, bytes([0xBB]) * 24))
+    return out
+w = sys.stdout.buffer
+for chunk in [b"p1:" + gen_items(1, [1, 2]), b"dup:" + gen_items(1, [1, 2]), b"ss:", b"ch:"]:
+    time.sleep(2)
+    w.write(chunk)
+    w.flush()
+time.sleep(3)
+'
+}
+
+catalogue_pairs() {
+  local pair proto dir t r
+  for pp in etcd:1 redis:2 memcached:3 memcached_udp:4; do
+    pair=${pp%%:*}
+    proto=${pp##*:}
+    dir="$SANDBOX/catalogue_pairs_$pair"
+    rm -rf -- "$dir"
+    mkdir -p "$dir/catalogue.kv"
+    sed -e "s#to: router.memcached_in#to: router.${pair}_in#" \
+      -e "s#from: router.memcached_out#from: router.${pair}_out#" \
+      -e "s#^      proto: 3\$#      proto: $proto#" \
+      examples/store_fronts/catalogue_pairs.yaml >"$dir/graph.yaml"
+    t="$dir/out.bin"
+    (cd "$dir" && catalogue_pairs_input | FLUXOR_PROJECT_ROOT=$ROOT timeout 30 "$FLX" run graph.yaml \
+      >"$t" 2>"$dir/graph.log") 2>/dev/null
+    reap TERM
+    r=$(python3 -I - "$t" <<'PY'
+import struct, sys
+out = open(sys.argv[1], "rb").read()
+svc = b"rc/" + b"\xa1" * 16 + b"/" + b"\xb2" * 16 + b"/"
+active = svc + b"active"
+def value(key, at_line=False):
+    head = struct.pack("<H", len(key)) + key
+    at = out.rfind((b"\n" if at_line else b"") + head)
+    if at < 0:
+        return None
+    at += len(head) + (1 if at_line else 0)
+    n = struct.unpack_from("<I", out, at)[0]
+    return out[at + 4:at + 4 + n]
+seal = value(svc + b"gen/" + struct.pack(">Q", 1) + b"/sealed")
+checks = {
+    "409": b"\n409 " in out,
+    # The snapshot page opens with the active pointer (its first key).
+    "snapshot": (value(active, at_line=True) or b"\0" * 8)[:8] == struct.pack("<Q", 1),
+    "seal": bool(seal) and seal[:4] == b"LCS1" and struct.unpack_from("<III", seal, 4) == (2, 3, 7),
+    "active": (value(active) or b"\0" * 8)[:8] == struct.pack("<Q", 1),
+}
+print(" ".join(k for k, v in checks.items() if not v) or "ok")
+PY
+)
+    if [ "$r" = ok ]; then
+      ok "catalogue_pairs $pair (proto $proto: publish, a duplicate refused, a snapshot, the changes)"
+    else
+      no "catalogue_pairs $pair" "failed: $r (output kept in $dir)"
+    fi
+  done
+}
+
+for t in ${*:-sql kv cdc group catalogue catalogue_pairs}; do "$t"; done
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

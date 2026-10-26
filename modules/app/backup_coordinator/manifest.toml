@@ -12,6 +12,27 @@ hardware_targets = ["bcm2712", "linux"]
 # manifest. Artifacts live in the KV store under KS_BACKUP_ARTIFACT,
 # so they inherit the same durability and replication as the data.
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
+# others. The profile sets `db_ops::MAX_BACKUP_RANGES` (the map's bound,
+# `partition_map::MAX_RANGES`), the ranges one backup manifest this
+# module builds or decodes names: 64 on pi5, 16 on rp2350, 128 on
+# server. A graph builds every module in one profile; nothing checks
+# that, and a manifest naming more ranges than a reader's bound is
+# refused whole by it.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
 [[ports]]
 name = "kv_in"
 direction = "input"

@@ -92,7 +92,25 @@ pub struct Sub {
     /// The provider step in which it holds first claim on the history-walk
     /// budget (it was refused the step before); 0 for none.
     pub prio: u32,
+    /// A durable subscription (`store_provider`'s `SUB_DURABLE`): its
+    /// cursor is kept in the store under `owner_key` and `shard`
+    /// (`watch_cursor.rs`). `cursor_state` is one of the provider's
+    /// `CUR_*` codes; `cursor_rev` the last safe revision loaded or
+    /// written, `witness` the cursor record's `mod_revision` (0: none),
+    /// `generation` the subscription generation this holder writes.
+    pub durable: bool,
+    pub cursor_state: u8,
+    pub shard: u16,
+    pub generation: u32,
+    pub cursor_rev: u64,
+    pub witness: u64,
+    pub owner_len: u8,
+    pub owner_key: [u8; OWNER_KEY_MAX],
 }
+
+/// The longest owner name a durable subscription's cursor key carries
+/// (`watch_cursor::OWNER_MAX`).
+pub const OWNER_KEY_MAX: usize = 32;
 
 /// The fields a record kind shares with the slab that holds it.
 trait Slot: Copy {
@@ -137,6 +155,14 @@ impl Slot for Sub {
         owner: [0; 8],
         module: [0; 8],
         prio: 0,
+        durable: false,
+        cursor_state: 0,
+        shard: 0,
+        generation: 0,
+        cursor_rev: 0,
+        witness: 0,
+        owner_len: 0,
+        owner_key: [0; OWNER_KEY_MAX],
     };
     fn used(&self) -> bool {
         self.used

@@ -22,6 +22,25 @@ scope = "fleet"
 #              instance is (0 = the one new sessions attach to, 1 = a
 #              standby). A single-registry graph leaves it at 0.
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact; `rp2350` and `server`
+# select the RP2350 and server ceilings of `watch_hub::MAX_WATCHES`
+# (RP2350 / Pi 5 / server: 64 / 1,024 / 8,192 watches; ~25 KiB,
+# ~392 KiB, ~3.1 MiB of records). Every module of a graph is built in
+# one profile.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
 [[ports]]
 # `ctrl_in` (not `ctrl`) because bare `ctrl` is a fluxor-reserved
 # port name (it collides with the kernel-allocated control channel
@@ -90,4 +109,10 @@ content_type = "OctetStream"
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.
 [observability]
-metrics = ["registered", "cancelled"]
+# APPEND ONLY — ids are a wire contract.
+#   2 resyncs  watches ended with a COMPACTED frame the registry wrote
+#              itself (the client relists): one mutation matched more
+#              watches than the match-batch budget reaches, a replay plan
+#              or tail catch-up found no room on its channel, or a define
+#              the hub would not hold.
+metrics = ["registered", "cancelled", "resyncs"]

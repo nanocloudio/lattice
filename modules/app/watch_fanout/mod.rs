@@ -24,29 +24,43 @@
 //!   tombstones; suppressing them would leave a resumed client
 //!   believing a deleted key still exists.
 //!
-//! - **Refusal is reported, never approximated.** If the window has
-//!   been reclaimed the provider says `COMPACTED`, and the fanout
-//!   abandons the backfill and counts it rather than delivering the
-//!   surviving tail. A partial history is indistinguishable from a
-//!   whole one to the client, so offering it would convert a visible
-//!   failure into a silent one.
+//! - **Refusal is reported, never approximated.** A window the fanout
+//!   cannot deliver whole — reclaimed (the provider says `COMPACTED`),
+//!   past the window's bounds, or unreadable (an error answer, a
+//!   malformed page, a request the channel refused) — refuses the watch
+//!   explicitly and is counted, rather than delivering the surviving
+//!   tail: a `WATCH_FRAME_OP_COMPACTED` frame to the anchor, which cancels
+//!   the client's stream (the client relists), and a
+//!   `WATCH_PROGRESS_COMPACTED` ack to the registry, which ends the
+//!   record. A partial history is indistinguishable from a whole one to
+//!   the client, so offering it would convert a visible failure into a
+//!   silent one.
 //!
-//! Every plan read is answered with one `WATCH_PROGRESS_REPLAYED` ack
-//! once it is finished with — sent, refused or dropped — carrying the
-//! number of frames it put on the wire and the revision its window
-//! reached. It follows those frames' own acks, so the registry knows
-//! when a watch has nothing more coming from a replay, how many
-//! replayed frames its delivery cursor counts, and where to continue
-//! the watch from; a watch is handed off only once that is so. A plan
-//! up to "now" (`to` 0) is pinned to the ceiling the provider reports
-//! for its first page, so every later page reads the same window and
-//! the ack names it.
+//! Every plan taken on is answered with one `WATCH_PROGRESS_REPLAYED` ack
+//! once it is finished with, carrying the number of frames it put on the
+//! wire and the revision its window reached. It follows those frames' own
+//! acks, so the registry knows when a watch has nothing more coming from
+//! a replay, how many replayed frames its delivery cursor counts, and
+//! where to continue the watch from; a watch is handed off only once that
+//! is so. A plan up to "now" (`to` 0) is pinned to the ceiling the
+//! provider reports for its first page, so every later page reads the
+//! same window and the ack names it.
 //!
 //! Backfills are serialized: one in flight, the rest queued. That keeps
 //! the module's memory fixed and stops a reconnect storm from issuing
-//! an unbounded number of concurrent scans. When the queue is full a
-//! plan is dropped AND COUNTED — the metric is the point, because a
-//! silently dropped plan is a client that quietly misses events.
+//! an unbounded number of concurrent scans. A plan past the queue, or
+//! one with no history provider wired to read it from, is refused as
+//! COMPACTED at once and counted — never acked as replayed with no
+//! frames, which would let the registry take the window as delivered.
+//!
+//! ## Backpressure
+//!
+//! A frame is written whole or not at all, and one the channel toward
+//! the anchor has no room for is offered again on a later step, never
+//! dropped. A live event stays on `events_in` until its frame is taken
+//! (holding the registry's events behind it); a gathered window — far
+//! larger than one channel ring — goes out across steps as the anchor
+//! drains it, and its plan closes only once its last frame is out.
 
 #![no_std]
 #![allow(
@@ -77,15 +91,16 @@ mod watch_replay;
 
 #[path = "../../common/envelope.rs"]
 mod envelope;
-use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
+use envelope::{read_envelope, Chan, Inbox, ENVELOPE_HDR};
 
 use types::{
     KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS, KV_RESULT_COMPACTED, KV_RESULT_KVS, KV_RESULT_VERSIONS,
     PROTO_INTERNAL_WATCH, VERSIONS_FLAG_META,
 };
 use watch_replay::{
-    build_frame, parse_replay_plan, walk_versions_page_meta, ReplayPlan, ENTRY_FLAG_MANIFEST,
-    FRAME_OP_DELETE, FRAME_OP_PUT_MANIFEST, PLAN_KEY_MAX, SCAN_BODY_MAX,
+    build_frame, parse_replay_plan, plan_disposition, walk_versions_page_meta, PlanDisposition,
+    ReplayPlan, ENTRY_FLAG_MANIFEST, FRAME_OP_DELETE, FRAME_OP_PUT_MANIFEST, PLAN_KEY_MAX,
+    SCAN_BODY_MAX,
 };
 use wire::{
     MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_WATCH_EVENT, MSG_WATCH_FRAME, MSG_WATCH_PROGRESS,
@@ -98,12 +113,18 @@ use wire::{
 /// page reads (the router's 8320).
 const SCRATCH_BUF_SIZE: usize = 8832;
 
-/// Queued replay plans. One is in flight at a time; this bounds how
-/// many reconnects can be absorbed before plans start being dropped.
-/// Sized against the etcd anchor's stream count rather than its
+/// Queued replay plans, by capacity profile. One is in flight at a time;
+/// this bounds how many reconnects can be absorbed before plans are
+/// refused as COMPACTED (the client relists; never a silent drop). Sized
+/// against the watches reconnecting at once rather than the anchor's
 /// connection count — a reconnect storm re-registers watches, and each
 /// re-registration is one plan.
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
 const MAX_PENDING_PLANS: usize = 16;
+#[cfg(feature = "profile_rp2350")]
+const MAX_PENDING_PLANS: usize = 4;
+#[cfg(feature = "profile_server")]
+const MAX_PENDING_PLANS: usize = 256;
 
 /// Versions requested per backfill page. Bounded so one page fits the
 /// scratch buffer with room for the largest entry, and so a single
@@ -112,16 +133,36 @@ const REPLAY_PAGE_LIMIT: u16 = 32;
 
 /// Bytes of the versions a window's events replaced that lie below the
 /// window (read back one point read each: the window holds the rest).
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
 const PREV_BYTES: usize = 65536;
+#[cfg(feature = "profile_rp2350")]
+const PREV_BYTES: usize = 16384;
+#[cfg(feature = "profile_server")]
+const PREV_BYTES: usize = 1048576;
 
 /// Bytes of one backfill window held for ordering. The provider walks a
 /// span key by key (and a key's versions newest-first); a watch delivers
 /// in revision order, so the whole window is gathered, sorted, then sent.
 /// A window past this (or past `WINDOW_FRAMES`) is refused as compacted —
 /// the client relists — never sent out of order or cut.
+/// By capacity profile: one catalogue shard's records (Pi 5: 128 endpoint
+/// records of up to 512 B, 64 KiB; a server: 4,096 of 256 B, 1 MiB; the
+/// RP2350: 64 of 256 B, 16 KiB), so a shard's whole backfill is one
+/// window.
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
 const WINDOW_BYTES: usize = 65536;
-/// Frames one backfill window holds for ordering.
+#[cfg(feature = "profile_rp2350")]
+const WINDOW_BYTES: usize = 16384;
+#[cfg(feature = "profile_server")]
+const WINDOW_BYTES: usize = 1048576;
+/// Frames one backfill window holds for ordering: a shard's records and
+/// their manifests.
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
 const WINDOW_FRAMES: usize = 256;
+#[cfg(feature = "profile_rp2350")]
+const WINDOW_FRAMES: usize = 64;
+#[cfg(feature = "profile_server")]
+const WINDOW_FRAMES: usize = 4096;
 
 #[repr(C)]
 struct FanoutState {
@@ -181,13 +222,19 @@ struct FanoutState {
     /// from `fill_at` on.
     filling: bool,
     fill_at: usize,
+    /// Sending the gathered window (after its replaced versions are read
+    /// back), from frame `send_at` on: the frames the channel toward the
+    /// anchor had no room for yet.
+    sending: bool,
+    send_at: usize,
     /// Frames the in-flight backfill has put on the wire.
     replay_sent: u64,
 
     // Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
     // metrics` order (0=events, 1=delivered, 2=dropped, 3=replayed,
-    // 4=replays_unserviceable).
+    // 4=replays_unserviceable). `dropped` counts frames for a graph with
+    // no `frames_out` wired: a full channel drops nothing.
     m_events: u64,
     m_delivered: u64,
     m_dropped: u64,
@@ -223,6 +270,8 @@ impl FanoutState {
         self.prev_len = 0;
         self.filling = false;
         self.fill_at = 0;
+        self.sending = false;
+        self.send_at = 0;
         self.replay_sent = 0;
         self.m_events = 0;
         self.m_delivered = 0;
@@ -249,49 +298,72 @@ unsafe fn write_envelope(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &
     (sys.channel_write)(chan, buf.as_mut_ptr(), total) == total as i32
 }
 
-/// Frame one event toward the anchor and ack it to the registry; `true`
-/// when the frame was written.
-fn handle_event(fanout: &mut FanoutState, event_payload: &[u8]) -> bool {
-    // Frame the event for the anchor. The fanout doesn't know which
-    // anchor stream to target (the routing is per-watch, owned by
-    // watch_registry); for the single-watch-per-stream case the
-    // anchor decodes the event and looks up its own pending
-    // streams. The frame body is `MSG_WATCH_EVENT`'s payload
-    // verbatim — the anchor's protobuf encoder rebuilds the
-    // etcd-v3 WatchResponse from `[kpg, rev, op, key, value]`.
-    fanout.m_events += 1;
-    unsafe {
-        let sys = fanout.syscalls;
-        if sys.is_null() {
-            fanout.m_dropped += 1;
-            return false;
-        }
-        if write_envelope(&*sys, fanout.frames_out, MSG_WATCH_FRAME, event_payload) {
-            fanout.frames_emitted = fanout.frames_emitted.wrapping_add(1);
-            fanout.m_delivered += 1;
-            // One ack per framed event: it is the watch's acked
-            // revision and its delivery cursor at once, so the registry
-            // advances both in one step and they cannot disagree at a
-            // handoff. The event body
-            // is `[watch_id:8][kpg:2][rev:8]…`.
-            if event_payload.len() >= 18 {
-                let mut wid = [0u8; 8];
-                wid.copy_from_slice(&event_payload[0..8]);
-                let mut rev = [0u8; 8];
-                rev.copy_from_slice(&event_payload[10..18]);
-                emit_progress(
-                    fanout,
-                    u64::from_le_bytes(wid),
-                    u64::from_le_bytes(rev),
-                    WATCH_PROGRESS_DELIVERED,
-                );
-            }
-            true
-        } else {
-            fanout.m_dropped += 1;
-            false
-        }
+/// Write one frame toward the anchor and ack it to the registry: `true`
+/// when the channel took it. On `false` nothing was written, and the
+/// caller offers the frame again on a later step.
+///
+/// The frame body is `MSG_WATCH_EVENT`'s payload verbatim behind its
+/// watch id (`[watch_id:8][kpg:2][rev:8]…`): the anchor routes it by the
+/// watch id to its stream and rebuilds the etcd-v3 `WatchResponse` from
+/// `[kpg, rev, op, key, value]` and the metadata tail.
+fn frame_out(fanout: &mut FanoutState, payload: &[u8]) -> bool {
+    let sys = fanout.syscalls;
+    // SAFETY: the module's syscall table, set at init.
+    if sys.is_null()
+        || !unsafe { write_envelope(&*sys, fanout.frames_out, MSG_WATCH_FRAME, payload) }
+    {
+        return false;
     }
+    fanout.frames_emitted = fanout.frames_emitted.wrapping_add(1);
+    fanout.m_delivered += 1;
+    // One ack per framed event: it is the watch's acked revision and its
+    // delivery cursor at once, so the registry advances both in one step
+    // and they cannot disagree at a handoff.
+    if payload.len() >= 18 {
+        let mut wid = [0u8; 8];
+        wid.copy_from_slice(&payload[0..8]);
+        let mut rev = [0u8; 8];
+        rev.copy_from_slice(&payload[10..18]);
+        emit_progress(
+            fanout,
+            u64::from_le_bytes(wid),
+            u64::from_le_bytes(rev),
+            WATCH_PROGRESS_DELIVERED,
+        );
+    }
+    true
+}
+
+/// Frame the next live event on `events_in`. It is taken off the channel
+/// only once its frame is written: while the channel toward the anchor has
+/// no room it stays where it is — the registry's events queued behind it
+/// — and is offered again next step.
+///
+/// # Safety
+/// `sys` is the module's syscall table.
+unsafe fn poll_events(fanout: &mut FanoutState, sys: &SyscallTable) {
+    let handle = fanout.events_in;
+    let Some((mt, len)) = fanout
+        .events_inbox
+        .peek(&mut Chan { sys, handle }, &mut fanout.scratch)
+    else {
+        return;
+    };
+    if mt == MSG_WATCH_EVENT {
+        if fanout.frames_out < 0 {
+            fanout.m_dropped += 1;
+        } else {
+            let mut tmp = [0u8; SCRATCH_BUF_SIZE];
+            tmp[..len].copy_from_slice(&fanout.scratch[ENVELOPE_HDR..ENVELOPE_HDR + len]);
+            if !frame_out(fanout, &tmp[..len]) {
+                return;
+            }
+        }
+        fanout.m_events += 1;
+    }
+    let _ = fanout
+        .events_inbox
+        .take(&mut Chan { sys, handle }, len, &mut fanout.scratch);
 }
 
 /// Emit one `MSG_WATCH_PROGRESS` back to the registry.
@@ -345,9 +417,9 @@ fn replay_finished(fanout: &mut FanoutState, watch_id: u64, frames: u64, through
     }
 }
 
-/// Record a plan we could not service. Always paired with a reason in
-/// the caller, because the metric's job is to make a client that
-/// silently missed events visible.
+/// Record a plan we could not service. Always paired with an explicit
+/// refusal (`refuse_compacted`), so the client knows; the metric makes
+/// the rate visible.
 fn unserviceable(fanout: &mut FanoutState) {
     fanout.skipped_replays = fanout.skipped_replays.wrapping_add(1);
     fanout.m_replays_unserviceable = fanout.m_replays_unserviceable.wrapping_add(1);
@@ -358,40 +430,43 @@ fn handle_replay_plan(fanout: &mut FanoutState, payload: &[u8]) {
         unserviceable(fanout);
         return;
     };
-    // No KV path in this graph: the composition has no history provider
-    // to replay from. Honest refusal, not a silent no-op.
-    if fanout.kv_out < 0 {
-        unserviceable(fanout);
-        replay_finished(fanout, plan.watch_id, 0, plan.to);
-        return;
-    }
-    // Nothing asked for: a closed window (the client missed nothing) or
-    // an absent span (the watch vanished before the plan was built).
-    // Both are legitimate no-ops, not failures — see
-    // `ReplayPlan::is_empty`.
-    if plan.is_empty() {
-        replay_finished(fanout, plan.watch_id, 0, plan.to);
-        return;
-    }
-    if fanout.active {
-        if fanout.pending_len >= MAX_PENDING_PLANS {
+    match plan_disposition(
+        &plan,
+        fanout.kv_out >= 0,
+        fanout.active,
+        fanout.pending_len,
+        MAX_PENDING_PLANS,
+    ) {
+        // Nothing asked for: a closed window (the client missed nothing)
+        // or an absent span (the watch vanished before the plan was
+        // built). Both are legitimate no-ops, not failures — see
+        // `ReplayPlan::is_empty`.
+        PlanDisposition::Finished => replay_finished(fanout, plan.watch_id, 0, plan.to),
+        // No history provider in this graph, or the queue is full: the
+        // window cannot be served. Refused explicitly as COMPACTED — the
+        // client is cancelled at the plan's lower bound and relists —
+        // never acked as replayed with zero frames, which would let the
+        // registry take a window the client never received as delivered.
+        PlanDisposition::Refuse => {
             unserviceable(fanout);
-            replay_finished(fanout, plan.watch_id, 0, plan.to);
-            return;
+            refuse_compacted(fanout, plan.watch_id, plan.from);
         }
-        fanout.pending[fanout.pending_len] = plan;
-        fanout.pending_len += 1;
-        return;
+        PlanDisposition::Queue => {
+            fanout.pending[fanout.pending_len] = plan;
+            fanout.pending_len += 1;
+        }
+        PlanDisposition::Start => {
+            fanout.current = plan;
+            fanout.active = true;
+            issue_backfill_page(fanout);
+        }
     }
-    fanout.current = plan;
-    fanout.active = true;
-    issue_backfill_page(fanout);
 }
 
 /// Issue the next `KV_OP_SCAN_VERSIONS` page for the in-flight plan.
-/// A write failure abandons the backfill rather than retrying forever:
-/// a full outbound channel that stays full is a wedged graph, and
-/// spinning on it would convert that into a livelock.
+/// A write failure abandons the backfill (the watch refused) rather than
+/// retrying forever: a full outbound channel that stays full is a wedged
+/// graph, and spinning on it would convert that into a livelock.
 fn issue_backfill_page(fanout: &mut FanoutState) {
     fanout.corr_seq = fanout.corr_seq.wrapping_add(1);
     let corr = fanout.corr_seq;
@@ -399,7 +474,7 @@ fn issue_backfill_page(fanout: &mut FanoutState) {
 
     let mut body = [0u8; SCAN_BODY_MAX + 1];
     let Some(n) = plan.scan_body(REPLAY_PAGE_LIMIT, &mut body[..SCAN_BODY_MAX]) else {
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
         return;
     };
     // Each version with its own metadata, as a live event carries it; a
@@ -428,8 +503,18 @@ fn issue_backfill_page(fanout: &mut FanoutState) {
         !sys.is_null() && write_envelope(&*sys, fanout.kv_out, MSG_KV_REQUEST, &env[..18 + n])
     };
     if !ok {
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
     }
+}
+
+/// Give up on the in-flight backfill: its watch is refused as COMPACTED
+/// at the plan's lower bound (the client relists from there), then the
+/// plan is finished with. Never finished as if replayed: the registry
+/// would take the window as delivered and continue the watch past events
+/// the client never received.
+fn abandon_backfill(fanout: &mut FanoutState) {
+    refuse_compacted(fanout, fanout.current.watch_id, fanout.current.from);
+    finish_backfill(fanout, false);
 }
 
 /// End the in-flight backfill and start the next queued plan, if any.
@@ -451,6 +536,8 @@ fn finish_backfill(fanout: &mut FanoutState, serviced: bool) {
     fanout.prev_len = 0;
     fanout.filling = false;
     fanout.fill_at = 0;
+    fanout.sending = false;
+    fanout.send_at = 0;
     fanout.active = false;
     if fanout.pending_len > 0 {
         fanout.current = fanout.pending[0];
@@ -479,7 +566,8 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
     // A response from a backfill we already abandoned must not be
     // injected into the current one — the frames would carry the wrong
     // watch_id and the client would receive another watcher's history.
-    if !fanout.active || corr != fanout.corr_seq {
+    // Nothing is asked of the store while the window is being sent.
+    if !fanout.active || fanout.sending || corr != fanout.corr_seq {
         return;
     }
     let result = payload[9];
@@ -512,12 +600,12 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
         return;
     }
     if result != KV_RESULT_VERSIONS {
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
         return;
     }
     let blen = u16::from_le_bytes([payload[18], payload[19]]) as usize;
     if payload.len() < 20 + blen || blen < 10 {
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
         return;
     }
     let body = &payload[20..20 + blen];
@@ -572,7 +660,7 @@ fn handle_kv_response(fanout: &mut FanoutState, payload: &[u8]) {
         // the entries decoded so far — a truncated history is
         // indistinguishable from a complete one once it reaches the
         // client.
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
         return;
     };
     if overflow {
@@ -666,8 +754,9 @@ fn next_fill(fanout: &mut FanoutState) {
         fanout.fill_at += 1;
     }
     if fanout.fill_at == fanout.win_n {
-        send_window(fanout);
-        finish_backfill(fanout, true);
+        fanout.sending = true;
+        fanout.send_at = 0;
+        continue_send(fanout);
         return;
     }
     let (at, len, rev) = fanout.win_idx[fanout.fill_at];
@@ -680,7 +769,7 @@ fn next_fill(fanout: &mut FanoutState) {
                 k.len()
             }
             _ => {
-                finish_backfill(fanout, false);
+                abandon_backfill(fanout);
                 return;
             }
         }
@@ -712,7 +801,7 @@ fn next_fill(fanout: &mut FanoutState) {
         !sys.is_null() && write_envelope(&*sys, fanout.kv_out, MSG_KV_REQUEST, &env[..18 + n])
     };
     if !ok {
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
     }
 }
 
@@ -726,7 +815,7 @@ fn fill_answer(fanout: &mut FanoutState, result: u8, body: &[u8]) {
         return;
     }
     if result != KV_RESULT_KVS || body.len() < 11 {
-        finish_backfill(fanout, false);
+        abandon_backfill(fanout);
         return;
     }
     let n = u16::from_le_bytes([body[9], body[10]]);
@@ -739,7 +828,7 @@ fn fill_answer(fanout: &mut FanoutState, result: u8, body: &[u8]) {
             .get(vo..vo + 4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
         else {
-            finish_backfill(fanout, false);
+            abandon_backfill(fanout);
             return;
         };
         let (Some(value), Some(meta), Some(&flags)) = (
@@ -747,7 +836,7 @@ fn fill_answer(fanout: &mut FanoutState, result: u8, body: &[u8]) {
             body.get(vo + 4 + vl..vo + 4 + vl + 32),
             body.get(vo + 4 + vl + 32),
         ) else {
-            finish_backfill(fanout, false);
+            abandon_backfill(fanout);
             return;
         };
         let at = fanout.prev_len;
@@ -792,11 +881,22 @@ fn sort_window(fanout: &mut FanoutState) {
     }
 }
 
-/// Send the window, each frame with its metadata tail and the version
-/// it replaced — the shape a live event has.
-fn send_window(fanout: &mut FanoutState) {
+/// Send what is left of the gathered window; once its last frame is out,
+/// the plan is finished with.
+fn continue_send(fanout: &mut FanoutState) {
+    if send_window(fanout) {
+        finish_backfill(fanout, true);
+    }
+}
+
+/// Send the window from frame `send_at` on, each frame with its metadata
+/// tail and the version it replaced — the shape a live event has. `true`
+/// once every frame is out; `false` when the channel toward the anchor
+/// had no room for frame `send_at`, which is sent first next step.
+fn send_window(fanout: &mut FanoutState) -> bool {
     let mut frame = [0u8; 8 + wire::WATCH_EVENT_MAX];
-    for i in 0..fanout.win_n {
+    while fanout.send_at < fanout.win_n {
+        let i = fanout.send_at;
         let (at, len, _) = fanout.win_idx[i];
         let (at, len) = (at as usize, len as usize);
         let mut n = len;
@@ -857,11 +957,17 @@ fn send_window(fanout: &mut FanoutState) {
                 n += 8;
             }
         }
-        if handle_event(fanout, &frame[..n]) {
+        if fanout.frames_out < 0 {
+            fanout.m_dropped += 1;
+        } else if frame_out(fanout, &frame[..n]) {
             fanout.replay_sent = fanout.replay_sent.wrapping_add(1);
+        } else {
+            return false;
         }
         fanout.m_replayed = fanout.m_replayed.wrapping_add(1);
+        fanout.send_at += 1;
     }
+    true
 }
 
 #[no_mangle]
@@ -924,18 +1030,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*sys_ptr;
-        if let Some((mt, len)) = read_envelope(
-            &mut fanout.events_inbox,
-            sys,
-            fanout.events_in,
-            &mut fanout.scratch,
-        ) {
-            if mt == MSG_WATCH_EVENT {
-                let mut tmp = [0u8; SCRATCH_BUF_SIZE];
-                tmp[..len].copy_from_slice(&fanout.scratch[..len]);
-                let _ = handle_event(fanout, &tmp[..len]);
-            }
+        // The rest of a window the channel had no room for goes first.
+        if fanout.active && fanout.sending {
+            continue_send(fanout);
         }
+        poll_events(fanout, sys);
         if let Some((mt, len)) = read_envelope(
             &mut fanout.replay_plan_inbox,
             sys,

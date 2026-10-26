@@ -28,10 +28,14 @@
 //!   and return a typed error that maps onto
 //!   `db_context::RetryClass::StaleRoute`.
 //!
-//! Golden vectors: `tests/contract_partition_map.rs`. Changing them is
-//! a persistent-format break and requires a version bump plus an
-//! explicit migration — never an update to the vector.
+//! Golden vectors: `tests/harness/tests/contract_partition_map.rs`. They
+//! pin the persistent format: a vector moves only with a deliberate change
+//! to the format itself, never to make a test pass.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "capacity profiles: `profile_rp2350` / `profile_server` are features the [[variant]]s of the modules that build them declare; a module without variants builds the Pi 5 default and declares neither"
+)]
 #![allow(
     dead_code,
     reason = "shared via #[path] into multiple modules and host tests; each consumer uses a subset of the surface"
@@ -53,8 +57,21 @@ pub const MAX_KEY_BOUND_LEN: usize = 256;
 /// Maximum replicas per range: three voters default, five max;
 /// learners/observers fit within the same bound in transition states.
 pub const MAX_REPLICAS: usize = 5;
-/// Fixed capacity of one `OrderedRangeMap`.
+/// Fixed capacity of one `OrderedRangeMap`, by profile: 64 on a Pi 5, 16
+/// on an RP2350, 128 on a server (`docs/architecture/route_catalogue.md`
+/// "Profiles" has the arithmetic). A graph builds every module in one
+/// profile, so every holder of a map agrees on its bound; nothing checks
+/// it, and a holder refuses whole a frame naming more ranges than its own
+/// bound ([`OrderedRangeMap::apply_full_update`]). A scan cursor carries
+/// the range index in one byte ([`tag_scan_cursor`]), so no profile
+/// passes 256.
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
 pub const MAX_RANGES: usize = 64;
+#[cfg(feature = "profile_rp2350")]
+pub const MAX_RANGES: usize = 16;
+#[cfg(feature = "profile_server")]
+pub const MAX_RANGES: usize = 128;
+const _: () = assert!(MAX_RANGES <= u8::MAX as usize + 1);
 /// Fixed logical hash-slot count. `u16` slots sized to match the
 /// existing `types::KpgId` (`u16`) hash-routing scale: a comfortable
 /// multiple of the partition-group counts pi5-class clusters run,

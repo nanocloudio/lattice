@@ -4,14 +4,33 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 
 # Load-policy recommender.
-# Surveys key counts and REPORTS what policy permits saying about the
-# load. It has no port that can reach the lifecycle machinery, by
-# design: execution remains bounded by operator policy, and an
-# advisor wired to the supervisor would turn every policy bug into a
-# topology change. Write rate and hot-key concentration are not
-# attributable to ranges in this graph yet, so they are reported as
-# UNMEASURED rather than zero — which is why this slice can recommend
-# merges and structurally cannot recommend a split.
+# Surveys each range's key count and REPORTS what policy permits saying
+# about the load. Write rate is the router's per-range write count when
+# `signal_in` carries the router's telemetry, else the key count's growth
+# (an estimate); range 0's busiest-key share comes from the same
+# telemetry. Without it, rate and concentration are reported UNMEASURED,
+# never zero. By default it only reports: an advisor acting on its own
+# would turn every policy bug into a topology change. With
+# `auto_execute = 1` and `exec_out` wired, it emits one split command for
+# the operator-declared key the first time policy recommends a split.
+
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
+# others. This module reads no profiled ceiling: its three variants
+# build the same code, so a graph names one profile for every module it
+# builds.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
 
 [[ports]]
 name = "kv_in"

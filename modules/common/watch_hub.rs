@@ -1,42 +1,44 @@
 //! Pure-logic watch hub for Lattice.
 //!
 //! Mirrors `modules/common/kv_store.rs` / `etcd_codec.rs`: the same
-//! source compiles into the no_std PIC `watch_registry` /
-//! `watch_fanout` modules AND is `#[path]`-mounted into host-side
-//! tests under `tests/integration_watch.rs`. A regression in the
-//! state machine — replay-fence math, key-prefix matching,
+//! source compiles into the no_std PIC `watch_registry` module AND is
+//! `#[path]`-mounted into the host suites under `tests/harness/tests/`
+//! (`integration_watch.rs` runs the inline tests below). A regression in
+//! the state machine — replay-fence math, key-prefix matching,
 //! filter-evaluation — is caught by `cargo test` before any module
 //! ELF runs.
 //!
 //! ## Roles
 //!
-//! - **`watch_registry`** owns persisted state: which `WatchID` is
-//!   active, the per-watch key range / filter / start-revision /
-//!   `last_sent_revision`, and the session binding — Fluxor's
-//!   `session_id` / `anchor_id` / `session_epoch` triple
-//!   (`session_core::SessionBinding`) that names the anchor fronting
-//!   the watch and fences stale frames after a rebind.
-//! - **`watch_fanout`** consumes durable mutation events from
-//!   `kv_state_worker`, walks the watch table, picks matching
-//!   watches, batches per-anchor frames, and hands them off to
-//!   `etcd_edge_anchor` for the wire.
-//!
-//! Both modules use this facade. Registry calls are mutating;
-//! fanout calls are mostly read-only (it consults watch records to
-//! decide what to ship and reports back via `mark_delivered`).
+//! - **`watch_registry`** owns the table and is this facade's one PIC
+//!   consumer: which `WatchID` is active, the per-watch key range /
+//!   filter / start-revision / `last_sent_revision`, the session binding
+//!   — Fluxor's `session_id` / `anchor_id` / `session_epoch` triple
+//!   (`session_core::SessionBinding`) that names the anchor fronting the
+//!   watch and fences stale frames after a rebind — and the matching of
+//!   each mutation `kv_state_worker` commits against every watch
+//!   ([`match_event_from`]).
+//! - **`watch_fanout`** holds no watch table. It frames the events the
+//!   registry matched toward `etcd_edge_anchor`, acks each one back
+//!   (the registry's [`WatchHub::mark_delivered`]), and serves the
+//!   registry's replay plans from the store's history
+//!   (`watch_replay.rs`).
 //!
 //! ## What this facade does NOT own
 //!
 //! - HPACK / gRPC framing — that lives in `etcd_codec.rs`.
-//! - Event buffering — events flow through immediately; if a slow
-//!   consumer needs replay, the registry consults the
-//!   `kv_state_worker` snapshot via `replay_plan` (which today is a
-//!   `kv_state_worker` snapshot via `replay_plan`).
+//! - History beyond the [`MutationTail`] — a watch owed revisions the
+//!   tail no longer holds is replayed from the store by `watch_fanout`
+//!   (`MSG_WATCH_REPLAY_PLAN`, `watch_replay.rs`).
 //! - Lease attachment — that lives in `lease_manager` and only
 //!   surfaces here through the `LeaseId` carried on a `KeyValue`.
 //!
 //! Heap-free, `no_std`-compatible, dual-target.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "capacity profiles: `profile_rp2350` / `profile_server` are features the [[variant]]s of the modules that build them declare; a module without variants builds the Pi 5 default and declares neither"
+)]
 #![allow(
     dead_code,
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface so single-module rustc invocations see unused items"
@@ -55,16 +57,33 @@ use session_core::{AnchorId, PlacementEpoch, SessionBinding, SessionId};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
-/// Active watches across all anchors. Sized for the bare-metal Pi 5
-/// target: 256 × ~96 B = ~24 KiB of state. The registry imposes its
-/// own per-tenant cap on top of this.
-pub const MAX_WATCHES: usize = 256;
+/// Active watches across all anchors, by capacity profile. A
+/// route-catalogue director watches one stable catalogue shard at a time,
+/// not one endpoint: a shard is a service id's leading byte under one
+/// tenant (`rc/<tenant>/<byte>…`), so a tenant's catalogue is 256 shards,
+/// whatever its size — Pi 5's 4,096 routes and 32,768 endpoints are 16
+/// routes and 128 endpoints a shard, a server's 65,536 and 1,048,576 are
+/// 256 and 4,096. The watch count is then shards × tenants served: Pi 5
+/// admits four tenants' directors (1,024), a server thirty-two (8,192),
+/// the RP2350 one tenant's 64 shards (its 16 routes and 64 endpoints need
+/// no more). Each record is `size_of::<WatchRecord>()` (392 B with a
+/// 256-byte key): ~392 KiB, ~3.1 MiB and ~25 KiB of records, each watch
+/// also taking a slot of the registry's session worker. Every module of a
+/// graph is built in one profile.
+#[cfg(not(any(feature = "profile_rp2350", feature = "profile_server")))]
+pub const MAX_WATCHES: usize = 1024;
+#[cfg(feature = "profile_rp2350")]
+pub const MAX_WATCHES: usize = 64;
+#[cfg(feature = "profile_server")]
+pub const MAX_WATCHES: usize = 8192;
 
-/// Max key bytes in a watch's range. etcd's `range_end` lets a
-/// watch span a key range; Lattice's subset only supports
-/// single-key watches plus the simple `b"x"..b"y"` prefix form
-/// (where `range_end` is the next byte after the last byte of `key`).
-pub const WATCH_KEY_MAX: usize = 96;
+/// Bytes a watch's `key` and `range_end` take together
+/// (`WatchRecord::key_buf`). etcd's `range_end` lets a watch span a key
+/// range: a single key, a `[key, range_end)` range (a prefix watch is the
+/// range whose end is the prefix with its last byte incremented), or
+/// `range_end` `\0` for every key from `key` on. Lattice's key ceiling:
+/// a 256-byte single-key watch is held whole.
+pub const WATCH_KEY_MAX: usize = 256;
 
 // ── Event kinds (mirrors etcd v3 mvccpb.Event.EventType) ──────────────
 
@@ -463,14 +482,14 @@ pub enum WatchError {
 }
 
 /// Fixed-capacity table of `WatchRecord` indexed by `watch_id`
-/// (linear scan). Capacity `MAX_WATCHES` is enough for hundreds of
-/// concurrent etcd Watch streams; finer-grained tenancy is enforced
-/// at the registry's admission layer (`max_watches_per_tenant`).
+/// (linear scan), `MAX_WATCHES` slots. A cancelled watch's slot is freed
+/// in place: no record moves, so a record's index is stable for as long
+/// as it lives ([`match_event_from`] resumes by index).
 #[repr(C)]
 pub struct WatchHub {
     pub records: [WatchRecord; MAX_WATCHES],
-    /// Monotonic per-hub revision the registry stamps on every
-    /// successful state mutation. Used to detect rebind churn.
+    /// Monotonic per-hub counter, bumped on every successful state
+    /// mutation (register, adopt, cancel, rebind, unbind, delivery ack).
     pub registry_revision: u64,
     /// Next `watch_id` to issue when the caller asks for an
     /// auto-assigned id. Starts at 1; never returns 0 (the free
@@ -662,9 +681,8 @@ impl WatchHub {
         Ok(id)
     }
 
-    /// Cancel a watch. Returns the record's `last_sent_revision` so
-    /// the registry can include it in the cancel-ack envelope. The
-    /// slot is freed.
+    /// Cancel a watch. Returns the record's `last_sent_revision`. The
+    /// slot is freed in place.
     pub fn cancel(&mut self, watch_id: u64) -> Result<i64, WatchError> {
         let idx = self.index_of(watch_id).ok_or(WatchError::NotFound)?;
         let last = self.records[idx].last_sent_revision;
@@ -813,6 +831,44 @@ pub fn match_event<F: FnMut(MatchedWatch)>(
             session_epoch: rec.binding.session_epoch,
         });
     }
+}
+
+/// [`match_event`] in bounded batches: from record index `from`, hand
+/// each matching watch to `sink` until it answers `false` (its batch is
+/// full). `None` when every record was visited; `Some(next)` the index
+/// the next batch starts at, with the record that was refused included
+/// (it is handed over again). A registry that must bound the matches it
+/// holds at once drives this until `None`, so no matching watch is
+/// passed over.
+pub fn match_event_from<F: FnMut(MatchedWatch) -> bool>(
+    hub: &WatchHub,
+    from: usize,
+    tenant_id: u32,
+    event_revision: i64,
+    event_kind: u8,
+    event_key: &[u8],
+    mut sink: F,
+) -> Option<usize> {
+    for (i, rec) in hub.records.iter().enumerate().skip(from) {
+        if event_revision <= rec.start_revision
+            || event_revision <= rec.live_from
+            || rec.replays_open > 0
+        {
+            continue;
+        }
+        if !rec.wants(tenant_id, event_kind, event_key) {
+            continue;
+        }
+        let keep = sink(MatchedWatch {
+            watch_id: rec.watch_id,
+            session_id: rec.binding.session_id,
+            session_epoch: rec.binding.session_epoch,
+        });
+        if !keep {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ── Catch-up after a replay ───────────────────────────────────────────
@@ -996,9 +1052,11 @@ impl Default for MutationTail {
 
 // ── Replay planning ───────────────────────────────────────────────────
 
-/// Plan returned to `watch_fanout` after a `resume` — describes the
-/// revision interval the fanout needs to replay from the KV worker's
-/// snapshot before resuming live tail.
+/// The revision interval `(from_revision, to_revision]` a watch would
+/// need replayed to reach `to_revision` from what its client has
+/// ([`replay_plan`]). The registry plans its replays through
+/// [`WatchRecord::enter_service`] and [`catch_up_step`] instead, bounded
+/// at its own mutation head; this is the record-only form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplayPlan {
     pub watch_id: u64,
@@ -1007,11 +1065,10 @@ pub struct ReplayPlan {
     pub session_epoch: u32,
 }
 
-/// Build a replay plan after a `resume`. `current_revision` is the
-/// worker's latest committed revision. If the watch is already
-/// up-to-date (`last_sent_revision == current_revision`) the plan
-/// is `Ordering::Equal`-edge — the caller can skip the replay step
-/// and tail live.
+/// The replay that takes `watch_id` from its `last_sent_revision` to
+/// `current_revision`, the latest committed revision. A watch already
+/// there (or past it) gets the empty interval `(current, current]` — the
+/// caller skips the replay and tails live. `None` for an unknown watch.
 pub fn replay_plan(hub: &WatchHub, watch_id: u64, current_revision: i64) -> Option<ReplayPlan> {
     let rec = hub.get(watch_id)?;
     let from = rec.last_sent_revision;
@@ -1403,13 +1460,13 @@ mod tests {
                     self.issue(from, 0);
                 }
             } else if from_tail && self.tail.covers(from) {
-                self.from_tail(from, head);
+                self.deliver_tail(from, head);
             } else {
                 self.issue(from, head);
             }
         }
 
-        fn from_tail(&mut self, from: i64, to: i64) {
+        fn deliver_tail(&mut self, from: i64, to: i64) {
             let mut owed = Vec::new();
             let rec = *self.hub.get(self.wid).unwrap();
             self.tail.for_each_above(from, |rev, p| {
@@ -1457,7 +1514,7 @@ mod tests {
                 CatchUp::Live(f) => self.rec().live_from = f,
                 CatchUp::Settled => {}
                 CatchUp::Tail { from, to } => {
-                    self.from_tail(from, to);
+                    self.deliver_tail(from, to);
                     if self.rec().phase == WATCH_PHASE_ACTIVE {
                         self.rec().live_from = to;
                     }
@@ -1501,7 +1558,7 @@ mod tests {
         }
         assert!(sim.wire.is_empty(), "nothing live ahead of the replay");
         // The replay closes behind a gap the tail no longer holds: a
-        // follow-on replay from where it ended.
+        // further replay from where it ended.
         assert_eq!(sim.run_replay(), CatchUp::Replay { from: 60, to: 100 });
         sim.commit(b"k");
         sim.commit(b"x");

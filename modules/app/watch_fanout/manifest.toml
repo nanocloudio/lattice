@@ -3,13 +3,33 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 
-# High-rate event fanout and batching engine for active watches.
-# Consumes mutation and progress events from the KV path, applies
-# per-watch filtering, batches updates, tracks per-stream
-# backpressure, and hands framed watch responses back to
-# `etcd_edge_anchor`.
+# Event framing and replay for active watches. Frames each event
+# `watch_registry` matched as a `MSG_WATCH_FRAME` for `etcd_edge_anchor`
+# and acks it back to the registry; serves the registry's replay plans
+# from the store's history (`KV_OP_SCAN_VERSIONS` through the router),
+# re-framing each version as the event it was. Holds no watch table.
 
-# Filtered events from watch_registry.
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact; `rp2350` and `server`
+# select the RP2350 and server ceilings of the replay queue and window
+# (RP2350 / Pi 5 / server: `MAX_PENDING_PLANS` 4 / 16 / 256,
+# `WINDOW_BYTES` and `PREV_BYTES` 16 KiB / 64 KiB / 1 MiB each,
+# `WINDOW_FRAMES` 64 / 256 / 4,096). Every module of a graph is built in
+# one profile.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
+# Matched events from watch_registry, one `MSG_WATCH_EVENT` per watch.
 [[ports]]
 name = "events_in"
 direction = "input"
@@ -38,8 +58,8 @@ content_type = "OctetStream"
 # KV_OP_SCAN_VERSIONS over the plan's key span and revision window, and
 # turns each returned version into the same MSG_WATCH_FRAME a live
 # event would have produced. Unwired in graphs without a durable
-# history provider: the fanout then counts the plan as unserviceable
-# rather than pretending it replayed.
+# history provider: the fanout then refuses each plan as COMPACTED (the
+# client relists) rather than pretending it replayed.
 [[ports]]
 name = "kv_out"
 direction = "output"

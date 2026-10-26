@@ -360,7 +360,9 @@ pub const MSG_WATCH_REPLAY_PLAN: u8 = 0xCC;
 /// DELIVERED acks of every frame it sent and carries their number in
 /// place of a revision — the registry's count of replayed frames it
 /// owes the cursor, and its sign that no frame of that plan is still to
-/// come. Every plan the fanout reads gets exactly one, serviced or not.
+/// come. Every plan the fanout serves gets exactly one; a plan it refuses
+/// (history compacted past it, or no room to serve it) refuses its watch
+/// with a COMPACTED frame instead.
 /// It also carries the plan's upper bound as scanned — for a plan up to
 /// "now", the ceiling the provider pinned on the first page; 0 when no
 /// page was read — which the registry continues the watch's catch-up

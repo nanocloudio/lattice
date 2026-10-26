@@ -6,10 +6,10 @@ graph: through exchange edges (fluxor's exchange contract,
 application's own graph or is a foreign server across a network is a
 placement choice, not a different integration:
 
-| Placement | SQL | KV | Change feed |
-|---|---|---|---|
-| A foreign server (real PostgreSQL, real Redis) | `pg_client` | `redis_client` | — |
-| lattice's store in the same graph | `sql_front` | `kv_front` | `cdc_front` (PULL), `cdc_pump` (PUSH) |
+| Placement | SQL | KV | Change feed | Route catalogue |
+|---|---|---|---|---|
+| A foreign server (real PostgreSQL, real Redis) | `pg_client` | `redis_client` | — | — |
+| lattice's store in the same graph | `sql_front` | `kv_front` | `cdc_front` (PULL), `cdc_pump` (PUSH) | `route_catalogue_front` |
 
 Each front takes its protocol client's requests and gives its answers —
 byte-identical to what the client reads from lattice's own listener for the
@@ -188,6 +188,72 @@ its position (`after`), several subscribers share one module, and credit,
 not acknowledgement, paces delivery. They share the envelope
 (`cdc_wire.rs`) and the router surface, not a state machine, so each is its
 own module.
+
+## Route catalogue (`route_catalogue_front`)
+
+Wormhole's route and endpoint catalogues as exchanges
+([route_catalogue.md](../architecture/route_catalogue.md)): a publisher
+POSTs a route generation (up to 16 routes, each with its endpoints, and its policies, among its records — or none, withdrawing the service), a director
+GETs a revision-pinned snapshot page by page, an operator POSTs a
+garbage-collection pass; a controller POSTs a declaration and appends to
+an operation's status stream, and an operator reclaims a closed stream.
+Records are opaque WHR1 envelopes checked structurally only. Targets name the service as
+`/rc/<tenant hex32>/<service hex32>/<verb>`; integer headers are decimal.
+
+| Request | Headers | Body | Answer |
+|---|---|---|---|
+| `POST …/publish` | `generation` (non-zero), `predecessor` (0: none), `endpoints` (a comma list, one count per route the generation carries, route 0 first, at most 16; empty: the withdrawn form, no route at all) | one item per record — the HEAD's inline body (held, at most 4,114 bytes, and staged once the generation's staging marker stands), then each BODY — `[kind u8][route u8][id 16][WHR1 envelope]`: kind 1 a route (id ignored), 2 an endpoint of that route, 3 a policy of the generation (route and id ignored: it is keyed by its content address); the record without MORE ends the publication, which is then sealed and activated. A withdrawn generation carries no item | `200` with `generation` and `revision` (the activation's) |
+| `GET …/changes` | `after` (the revision the requester holds: its snapshot's, or the last page's `through`) | none | `200` with `revision` (the store's), `through` (every revision in `(after, through]` is on the page, whole), `more` (0/1: `through` is below `revision`) and `changes` (how many); the body is `[revision u64][index u16][count u16][kind u8][klen u16][key][vlen u32][value]` per change, little-endian, kind 0 a write and 1 a delete, in revision then key order, each numbered `index` of its revision's `count`, at most the page and the requester's response credit |
+| `GET …/snapshot` | `at` (0 or absent: the store's revision, which the first page pins), `continue` (the last page's token, hex) | none | `200` with `revision`, `more` (0/1), `continue` (hex, when more), `count` and `digest` (hex, on the last page); the body is the page, `[klen u16][key][vlen u32][value]` per record, little-endian, at most 7,635 bytes and the requester's response credit; a page that fills stops after its last whole record and `continue` goes on from there |
+| `POST …/gc` | `predecessor`, `keep`, `retention-ms`, `now-ms` (0: the module's clock), all required | none | `200` with `reclaimed`, `deleted` |
+| `POST …/declare` | `id` (32 hex digits) | the HEAD's inline body: one placed envelope (any kind but 0–3) | `200` with `generation` (the record's), `revision`, `unchanged` (1: the same bytes were already declared) |
+| `POST …/status` | `operation` (32 hex digits), `last` (0/1: the stream's last status) | the HEAD's inline body: one placed envelope | `200` with `seq` (the number it was published under) and `revision` (the head's) |
+| `POST …/reclaim` | `operation` (32 hex digits: a closed stream) | none | `200` with `deleted` |
+
+| Status | When |
+|---|---|
+| 400 | another target or method, a missing or malformed header, a zero generation, a malformed item, an envelope refused structurally, a record of the wrong kind, an `at` past the store's revision, a continuation that is malformed or not of this snapshot's revision and service |
+| 409 | the generation's staging marker already exists (the generation is begun or was published), the active pointer is not at the predecessor named, or a racing publisher won the CAS; a declaration at or behind the generation held, or another record at it, or a racing one; a status for a closed stream, a status another occupies the next number with, or a racing append; a reclaim of an open stream |
+| 410 | a snapshot revision the store has compacted; changes after a revision it has compacted |
+| 413 | a record over 4,096 bytes or over what one routed put carries (an endpoint record over 4,034 bytes, a route record over 4,048), an inline HEAD item over 4,114 bytes, a target over 79 bytes, headers over 512, a response credit too small for one record |
+| 422 | a referential gap: a route's endpoints or the policies read back are not those staged, a route declared but not staged (or staged but not declared), or a withdrawn generation with records staged |
+| 502 | the store refused an operation or answered what cannot be read (a garbage-collection pass that fails, an active pointer that does not decode) |
+| 503 | a request is already held (one at a time), or draining |
+
+Every exchange is answered exactly once. One request is held at a time;
+a HEAD arriving while one is held is answered `503` from a slot of its
+own, leaving the held request undisturbed. A publication's items are
+taken one at a time, each written before the next is read: the front
+grants request-body credit for one item (4,114 bytes) each time it is
+ready for the next, so a slow store holds the publication at the
+requester rather than in memory. A requester's ABORT ends its request
+unanswered; a publication's generation stays staged, invisible, for a
+garbage-collection pass to reclaim. The front
+is an ordinary KV client on a free client pair of `kv_request_router`, as
+`cdc_front` is, with one KV request in flight at a time; a snapshot at a
+past revision needs a store that keeps history (the disk store,
+`state_store: 1`). Any of the four client pairs carries it — the router
+answers a request on the pair it came in by — and its `proto` param names
+the pair, which it must (any other value refuses construction):
+
+| Pair | `kv_out` to | `kv_in` from | `proto` |
+|---|---|---|---|
+| etcd (the default) | `router.etcd_in` | `router.etcd_out` | 1 |
+| redis | `router.redis_in` | `router.redis_out` | 2 |
+| memcached | `router.memcached_in` | `router.memcached_out` | 3 |
+| memcached_udp | `router.memcached_udp_in` | `router.memcached_udp_out` | 4 |
+
+A pair is free when no protocol anchor or other client holds it; the
+router's `internal_*` pairs belong to their own callers and are not client
+pairs. `examples/store_fronts/catalogue_pairs.yaml` wires the front to the
+router directly, and the harness suite `live_catalogue_pairs.rs` and
+`tools/e2e/store_fronts.sh catalogue_pairs` run it on each of the four
+pairs: publish, a refused duplicate, a snapshot and the changes answered on
+every one. It emits `activated`,
+`refused`, `pages` and `gc_passes` on `metrics` once a second. The
+stacks below do not include it; a graph that includes `lattice_store`
+can wire its `kv_out`/`kv_in` to the `pump_kv_in`/`pump_kv_out` exports
+with `proto: 3` when no `cdc_pump` holds that pair.
 
 ## The store stack
 

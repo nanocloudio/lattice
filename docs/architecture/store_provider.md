@@ -39,7 +39,8 @@ keeps. Any other configuration registers no contract and logs
 | Param | Id | Default | Meaning |
 |---|---|---|---|
 | `store_change_log` | 25 | 0 (`CHANGE_LOG_DEFAULT`, 256 KiB) | bytes of the change log; a larger figure needs `heap.arena_bytes` raised to match |
-| `store_sub_quota` | 26 | 0 (`DEFAULT_SUB_QUOTA`, 256) | subscriptions one workload owner may hold; the system owner (the node's own controllers) is not held to it |
+| `store_sub_quota` | 26 | 0 (`DEFAULT_SUB_QUOTA`: 256 in the `store` build, 32 in `store_rp2350`, 4,096 in `store_server`) | subscriptions one workload owner may hold; the system owner (the node's own controllers) is not held to it |
+| `history_revisions` | 12 | 0 (all the store holds) | the history a change read may reach back, in revisions: a window from before `revision - history_revisions` is LOST however much the store has yet to compact |
 | `scope`, `scoped` | 17, 18 | empty | a node's private records: the graph keeps the plain names of the comma-separated `scoped` prefixes, the store keeps them under `/~node/<scope>`, so every replica holds each node's apart. A LIST, CHANGES or subscription on a scoped prefix answers in the graph's names; one on a broader prefix sees the store's. A scope that cannot be kept registers no contract |
 | `import_log` | 10 | empty | a fluxor host store's `store.log` imported once, before the store serves; recorded as done in the provider's own keyspace, so a restart does not import again |
 | `replica_id` | 13 | 0 | the origin a replica's proposals carry; two replicas of a group must not share it |
@@ -55,7 +56,7 @@ keeps. Any other configuration registers no contract and logs
 | `DELETE` | `0x1424` | `[key_len u16][key][precondition][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
 | `CLOSE` | `0x1425` | on a read slot | 0 |
 | `LIST` | `0x1302` | `[prefix_len u16][prefix][cursor_len u16][cursor][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | a page of `[len u8][kind 0][key]` entries, then `[FF][FF][cursor_len u8][cursor]`: the key the next page starts at, none at the end |
-| `SUBSCRIBE` | `0x1305` | `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now) | a subscription's handle |
+| `SUBSCRIBE` | `0x1305` | `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now; bit 1: durable, then `[shard u16][owner_len u8][owner]`) | a subscription's handle |
 | `CLOSE` | `0x1306` | on a subscription | 0 |
 | `CHANGES` | `0x1307` | `[prefix_len u16][prefix][sub i32][token_len u16][token][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | one page (below) |
 | `TAKE_RUNG` | `0x1309` | `[event i32][out_ptr u64][out_cap u32]` | `[more u8][count u16][handle i32]…` |
@@ -73,15 +74,15 @@ caller it is as if it were not open, as the host stores answer.
 
 | Answer | Meaning |
 |---|---|
-| `EINVAL` | a malformed or short argument, a key past `KEY_MAX`, a subscription event that is not the calling module's |
+| `EINVAL` | a malformed or short argument, a key past `KEY_MAX`, a subscription event that is not the calling module's, a durable subscription's owner name outside 1..=32 printable bytes or holding `/` |
 | `ENXIO` | `GET` or `HEAD` of a key that is not there |
 | `EEXIST` | a create-if-absent `PUT` lost to an existing key |
-| `EAGAIN` on a read | the store cannot answer now — its device is busy, it is still recovering, a walk is still paused, or this step's history budget is spent. Nothing moved (no handle opened or closed, no page or fence written); ask again with the same request on a later step, never within the same one |
+| `EAGAIN` on a read | the store cannot answer now — its device is busy, it is still recovering, a walk is still paused, or this step's history budget is spent; a durable `SUBSCRIBE` whose cursor read the store refuses waits the same way. Nothing moved (no handle opened or closed, no page or fence written); ask again with the same request on a later step, never within the same one |
 | `EAGAIN` on a write | the etag precondition failed: the key moved |
 | `EINPROGRESS` | the write is not decided yet, or not taken yet; ask again with the same request |
 | `ENOMEM` | no heap for another read slot, subscription or answer; a subscription past the owner's quota; an output buffer too small for one entry |
 | `EOVERFLOW` | a value or page larger than the call's lengths can carry |
-| `ENOSYS` | an unknown op, or a handle this caller did not open |
+| `ENOSYS` | an unknown op, a handle this caller did not open, or a durable `SUBSCRIBE` on a replica |
 | `ERROR` | the store failed or is quarantined |
 
 ## Writes
@@ -125,9 +126,10 @@ bit and a signal — until the subscriber takes it with `TAKE_RUNG` and reads
 what changed with `CHANGES`. Nothing is pushed, copied per subscriber, or
 lost to a full channel. A subscription whose module is gone, or whose event
 slot another module now holds, is dropped instead of signalled.
-`SUBSCRIBE` is idempotent on (owner, module, event, prefix), and is served
-while the store is still recovering, so a consumer that subscribes at start
-is registered rather than refused.
+`SUBSCRIBE` is idempotent on (owner, module, event, prefix, and a durable
+subscription's shard and owner name), and a plain one is served while the
+store is still recovering, so a consumer that subscribes at start is
+registered rather than refused.
 
 The change log is a key-only ring of `[rev u64][hint u8][kl u8][key]`
 entries in apply order, bounded below by a base: it answers for every
@@ -137,7 +139,7 @@ overflowed (`KEYLOG_BYTES`) or cleared the keyspace, an install, a restart
 — raises the base and is a gap: every subscriber is rung to read again.
 
 `CHANGES` answers one bounded page: a head `[status u8][more u8][safe_rev
-u64][count u32]`, records `[rev u64][kind u8][key_len u16][val_len
+u64][count u32]` (status 0 a page, 1 LOST, 2 RESYNC_REQUIRED), records `[rev u64][kind u8][key_len u16][val_len
 u32][key][value]` (kind 0 added, 1 modified, 2 deleted), and a trailer
 `[token_len u16][token]` to pass on the next call. The token says where to
 read from:
@@ -147,6 +149,7 @@ read from:
 | empty | a relist: every entry under the prefix now, by key |
 | eight bytes | a bare revision: the changes after it |
 | one the provider issued | where the last page stopped — in the change log, in a relist, or in a history walk |
+| `[4]` (`T_CURSOR`) | a durable subscription's cursor (below) |
 
 A window the change log answers is served from it, each record read at the
 store's current state, so applying a page's records by key is idempotent
@@ -158,6 +161,99 @@ LOST. Each call is bounded (`LOG_SCAN_MAX` log entries,
 callers per step); a page cut short ends with a token, and a read refused
 for the step's budget answers `EAGAIN` and rings its subscription again
 next step.
+
+### Durable subscriptions
+
+A subscription's registry record, its rung bit and the change log are heap
+state: a restart of the provider loses them and raises the log's base, a
+gap every subscriber must read across. A subscriber that must resume
+exactly — a route-catalogue director, which may not serve from a table
+with a hole in it — subscribes **durable**: `SUBSCRIBE` flag bit 1
+(`SUB_DURABLE`), followed by `[shard u16][owner_len u8][owner]`, an owner
+name of 1..=32 bytes of printable ASCII without `/` that the subscriber
+keeps across its own restarts, and the catalogue shard the subscription
+covers. The provider then keeps the subscription's cursor in the store
+itself (`modules/common/watch_cursor.rs`), one record per (owner, shard):
+
+```text
+key    \x00lattice/watch-cursor/<owner>/<shard hex4>
+record "LWC1" | version u8 = 1 | shard u16 | last_safe_rev u64
+       | subscription_generation u32 | digest u32 (FNV-1a over the rest)
+```
+
+under the reserved system prefix `\x00`, which lattice's protocol surfaces
+never produce (a `storage.object` caller can still name it), written by
+`KV_OP_CAS` on the record's `mod_revision` witness exactly as the CDC pump
+writes its checkpoint pointer, so two holders of one owner key cannot both
+advance it unseen. Asking `CHANGES` on from a token, on the durable
+subscription's handle and under its prefix, is the subscriber's word that
+it holds everything before that token, and that is when the cursor moves: to the bare revision
+asked, to the revision before a log token's (every revision before it was
+delivered whole), to a history token's `since`; a relist in progress moves
+nothing until its end revision is asked. A revision past the store's own
+moves nothing: no subscriber holds what the store has not reached. The
+cursor is monotonic and the write is best effort — a store busy now is
+tried at the next ask — so a cursor can lag (a restart then re-delivers a
+page, idempotent by key) but never lead. Each subscription made under an
+owner key writes the `subscription_generation` it read plus one, so the
+record names the subscription that last advanced it. On a replica, where
+the provider's own writes are not the group's, a durable `SUBSCRIBE` is
+`ENOSYS`.
+
+The token `[T_CURSOR]` (one byte, 4) asks to go on from the cursor. The
+provider decides as [`watch_cursor::resume`] does — the change log answers
+(`cursor >= base`), or the store's history reaches the cursor
+(`cursor >= revision - history`): the page is the one a bare-revision token
+at the cursor would give, from the log or across the restart's gap from
+history. Otherwise, and whenever the history walk itself finds the window
+gone, the page is status 2, **`RESYNC_REQUIRED`**: `[2][reason u8][cursor
+u64][count 0][token_len 0]`, the reason one of
+
+| Reason | Code | Meaning |
+|---|---|---|
+| `NO_CURSOR` | 1 | nothing is held under the owner key: a first subscription — relist, then go on from the relist's revision |
+| `HISTORY_COMPACTED` | 2 | the history no longer reaches the cursor (the memory store keeps none) |
+| `AHEAD_OF_STORE` | 3 | the cursor is past the store's revision: the record names a revision the store never reached |
+| `CORRUPT` | 4 | the record under the key is not a cursor this provider reads |
+| `CONFLICT` | 5 | another holder advanced the cursor since this one read it |
+| `NOT_DURABLE` | 6 | the subscription the read names is not durable |
+
+A resync is the subscriber's cue to take a fresh snapshot (a relist) and go
+on from its revision. It is never a page with a hole in it, and it is not
+LOST: LOST stays the answer for a window the subscriber named itself that
+compaction took. Going on from the relist's revision is the ack that
+writes the cursor again: a first cursor, one over a record the decoder
+refused, and one below a record past the store, so the subscription is
+durable again from there. A `CONFLICT` is final for the holder that met
+it: another holder owns the record, and this one's acks write nothing.
+`contract_store_provider` proves a durable subscription resumes exactly
+after its cursor across a provider restart on the disk store, with no
+duplicate and no gap, answers each reason above, and is durable again
+after each resync but a conflict.
+
+## Which inputs gate readiness
+
+Fluxor's composer refuses a graph in which a module claiming
+`storage.object` or `storage.namespace` feeds the store that answers it
+through an input the store waits on before it answers (`gates_readiness`
+on the port, default `true`): the fat32-over-its-own-block-device deadlock.
+Whether this provider serves is `provider_ready` — the store recovered from
+its own files (disk recovery, the command log's replay, a configured
+`import_log`) and no snapshot install mid-stream — so its manifest declares
+`gates_readiness = false` on every input — `commands`, `read_permit`,
+`lease_revoke`, `expire`, `in_epoch_events`, `durability` and
+`snapshot_import`: a request pipeline that ends at the router
+and the store (an HTTP chain staging bodies here, in nanocloud's planes)
+feeds it without deadlocking it. A single-node worker answers a write in
+the call; a replica's write is answered `EINPROGRESS` until its own
+proposal returns applied and its quorum fence arrives on `durability`,
+which the store's own proposal produces, not the feeding pipeline. An
+install that begins on `snapshot_import` pauses serving until its stream
+completes, and that stream is durability's, read from its own snapshot: a
+pause, not a precondition. (Nanocloud's control plane reaches the store
+from its HTTP chain through consensus and durability into
+`snapshot_import`.) `contract_store_readiness_ports`
+pins every input to its declaration.
 
 ## Slow stores
 

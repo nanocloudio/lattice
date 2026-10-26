@@ -71,15 +71,33 @@ provides         = ["storage.object", "storage.namespace"]
 # store's table: the composer adds `bytes_each` per unit of `store_subs`'s
 # full planned ceiling (the graph's declared subscriptions plus reserve) to
 # this instance's heap cap, and leaves that demand off the host pool. A
-# subscription costs its registry record, a share of its watch (a distinct
-# prefix, up to 255 bytes) and its index entry, in whole pages.
+# subscription costs its registry record (104 bytes, a durable
+# subscription's cursor state and owner key inline), a share of its watch
+# (272 bytes: a distinct prefix of up to 255) and its index entry (4), in
+# whole pages.
 [capacities]
-heap_per_demand = { pool = "store_subs", bytes_each = 320, base = 8238500 }
+heap_per_demand = { pool = "store_subs", bytes_each = 384, base = 8238516 }
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `store` is the Pi 5 profile and the default (unsuffixed) artefact,
+# `store_rp2350` and `store_server` the others. The profile sets
+# `store_provider::DEFAULT_SUB_QUOTA`, the subscriptions a workload owner
+# may hold when `store_sub_quota` names none: 256 on the Pi 5, 32 on the
+# RP2350, 4,096 on a server. The arena (`base` above) is the same in
+# each: the quota is a figure, not a table. A graph builds every module
+# in one profile; nothing checks that.
 [[variant]]
 name     = "store"
 features = ["store_provider"]
 default  = true
+
+[[variant]]
+name     = "store_rp2350"
+features = ["store_provider", "profile_rp2350"]
+
+[[variant]]
+name     = "store_server"
+features = ["store_provider", "profile_server"]
 
 
 # Deterministic KPG KV state machine. Owns `revision`,
@@ -149,12 +167,24 @@ access = "write"
 name = "commands"
 direction = "input"
 content_type = "OctetStream"
+# The provider answers its contracts whatever has or has not arrived on
+# this input (`gates_readiness = false`): whether it serves is
+# `provider_ready` — the store recovered from its own files (disk recovery,
+# the command log's replay, a configured `import_log`), and no snapshot
+# install mid-stream — and nothing routed here is waited on before a call
+# is answered. A single-node worker answers a write in the call; a
+# replica's write is answered EINPROGRESS until its own proposal
+# (`prov_out`) returns applied, which comes back from consensus, not from
+# whoever feeds the pipeline. So a module upstream of the router (an HTTP
+# chain that stages bodies in this store) is not deadlocked by feeding it.
+gates_readiness = false
 
 # Lin-bound read permit from substrate read_gate.
 [[ports]]
 name = "read_permit"
 direction = "input"
 content_type = "OctetStream"
+gates_readiness = false  # see `commands`
 
 # Quorum durability proof from substrate durability, and the COMMITTED
 # MVCC GC floor (`MSG_GC_FLOOR_COMMITTED`)
@@ -166,12 +196,18 @@ content_type = "OctetStream"
 name = "durability"
 direction = "input"
 content_type = "OctetStream"
+# Not readiness: a replica's write is answered EINPROGRESS until the quorum
+# fence for its own proposal arrives here, which the store's proposal
+# produces, not whoever feeds the pipeline; reads and the single-node
+# store never wait on it.
+gates_readiness = false
 
 # Lease-driven revoke from lease_manager.
 [[ports]]
 name = "lease_revoke"
 direction = "input"
 content_type = "OctetStream"
+gates_readiness = false  # see `commands`
 
 # Reclamation events from ttl_scheduler. Each one releases slots the
 # committed clock has already put past their deadline: no revision, no
@@ -181,6 +217,7 @@ content_type = "OctetStream"
 name = "expire"
 direction = "input"
 content_type = "OctetStream"
+gates_readiness = false  # see `commands`
 
 # Cluster-wide placement epoch events from substrate
 # `control_plane.epoch_events`. MSG_PLACEMENT_EPOCH_EVENT updates
@@ -193,6 +230,7 @@ content_type = "OctetStream"
 name = "in_epoch_events"
 direction = "input"
 content_type = "OctetStream"
+gates_readiness = false  # see `commands`
 
 # Applied responses to the router.
 [[ports]]
@@ -219,6 +257,11 @@ content_type = "OctetStream"
 name = "snapshot_import"
 direction = "input"
 content_type = "OctetStream"
+# Not readiness: the store serves before anything arrives here. An install
+# that begins here pauses serving until its stream completes, and that
+# stream is durability's, read from its own snapshot, not produced by
+# whoever feeds the pipeline: a pause, not a precondition.
+gates_readiness = false
 
 [[ports]]
 name = "snapshot_export"

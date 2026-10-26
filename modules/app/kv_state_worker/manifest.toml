@@ -60,6 +60,24 @@ hardware_targets = ["bcm2712", "linux"]
 requires_contract = "fs"
 access = "write"
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
+# others. This module reads no profiled ceiling: its three variants
+# build the same code, so a graph names one profile for every module it
+# builds.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
 # Routed commands from kv_request_router (already epoch-validated), and
 # the committed clock: MSG_LEASE_TICK arrives on this same channel so
 # the time a command applies under is fixed by its position in the

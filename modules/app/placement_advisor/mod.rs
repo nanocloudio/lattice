@@ -19,11 +19,12 @@
 //! ## What it can and cannot measure, stated rather than implied
 //!
 //! Key count is observable here: it is a scan. Write rate and hot-key
-//! concentration are NOT — nothing in this graph attributes writes to
-//! ranges yet — so the advisor reports them as UNMEASURED (`0`) rather
-//! than as zero-load. A range with no attributed writes is not a quiet
-//! range, it is an unmeasured one, and the contract honours that: an
-//! unmeasured concentration cannot satisfy the hot-key clause.
+//! concentration come from the router's telemetry on `signal_in` (below);
+//! with that port unwired, or before the router has been heard from,
+//! they are UNMEASURED (`0`) rather than zero-load. A range with no
+//! attributed writes is not a quiet range, it is an unmeasured one, and
+//! the contract honours that: an unmeasured concentration cannot satisfy
+//! the hot-key clause.
 //!
 //! What it CAN still recommend is the point. Size and key count are
 //! valid inputs on their own, so an oversized range
@@ -31,7 +32,7 @@
 //! oversized range is still oversized. Gating splits on load as well
 //! as size would not have been conservative, it would have been
 //! SILENT: the split half would never fire anywhere the write rate is
-//! unmeasured, which is everywhere in this graph.
+//! unmeasured.
 //!
 //! ## The load signal
 //!
@@ -49,9 +50,9 @@
 //! growth above the counted rate means batched writes, growth below means
 //! overwrites.
 //!
-//! Per-KEY concentration is unavailable from either: the router counts
-//! writes per RANGE, so the hot-key clause needs a signal neither of
-//! these provides.
+//! Per-KEY concentration is neither rate: it is the router's sampled
+//! busiest-key share for range 0 (`TM_ID_RANGE0_HOTKEY`), which
+//! under-reports multi-op transactions; other ranges have none.
 
 #![no_std]
 #![allow(
@@ -700,6 +701,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         while a.signal_in >= 0 {
             let poll = (sys.channel_poll)(a.signal_in, POLL_IN);
             if poll <= 0 || (poll as u32) & POLL_IN == 0 {
+                break;
+            }
+            // A frame is read only once it is whole on the channel: a read
+            // of part of one would take its bytes and leave every later
+            // frame misaligned.
+            let have = (sys.channel_peek)(a.signal_in, frame.as_mut_ptr(), TM_SCALAR_SIZE);
+            if have < TM_SCALAR_SIZE as i32 {
                 break;
             }
             let n = (sys.channel_read)(a.signal_in, frame.as_mut_ptr(), TM_SCALAR_SIZE);

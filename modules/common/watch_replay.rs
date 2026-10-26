@@ -34,10 +34,10 @@
 // (the PIC `mod.rs` and the host test crate), not here, for the same
 // reason: a `#[path]`-mounted module cannot carry crate attributes.
 
-/// Cap on a watch's key and range_end, each. Mirrors
-/// `watch_hub::WATCH_KEY_MAX`, since a plan's span is copied out of a
-/// `WatchRecord`.
-pub const PLAN_KEY_MAX: usize = 96;
+/// Cap on a plan's key and on its range_end, each: `watch_hub::WATCH_KEY_MAX`,
+/// the most either can be, since a plan's span is copied out of a
+/// `WatchRecord` (which caps the two together at that).
+pub const PLAN_KEY_MAX: usize = 256;
 
 /// Fixed head of a `MSG_WATCH_REPLAY_PLAN`:
 /// `[watch_id:8][from:8][to:8]`, then the two length-prefixed bounds.
@@ -50,8 +50,8 @@ pub const SCAN_BODY_MAX: usize = 2 + PLAN_KEY_MAX + 2 + (PLAN_KEY_MAX + 1) + 8 +
 
 /// A frame's op on the wire, as the live path writes it: the frame is
 /// `MSG_WATCH_EVENT`'s payload, whose op is `types::KV_OP_PUT` /
-/// `types::KV_OP_DELETE` (mirrored here; `tests/integration_watch_replay.rs`
-/// holds them equal). The watch hub's own event kinds are a different
+/// `types::KV_OP_DELETE` (mirrored here;
+/// `tests/harness/tests/integration_watch_replay.rs` holds them equal). The watch hub's own event kinds are a different
 /// numbering and never reach a frame.
 pub const FRAME_OP_PUT: u8 = 0x02;
 pub const FRAME_OP_DELETE: u8 = 0x03;
@@ -70,7 +70,8 @@ pub const VERSION_KIND_DELETE: u8 = 0x01;
 #[derive(Clone, Copy)]
 pub struct ReplayPlan {
     pub watch_id: u64,
-    /// Exclusive lower bound — the watch's `last_sent_revision`.
+    /// Exclusive lower bound — the revision the client has every owed
+    /// event through.
     pub from: u64,
     /// Inclusive upper bound; `0` means "up to now".
     pub to: u64,
@@ -165,6 +166,50 @@ impl ReplayPlan {
         n += 2;
         Some(n)
     }
+}
+
+/// What a fanout does with a replay plan it is handed
+/// ([`plan_disposition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanDisposition {
+    /// Nothing is owed (an empty span, a closed window): acked as replayed
+    /// with no frames.
+    Finished,
+    /// The window cannot be served — no history provider is wired, or the
+    /// queue is full — so the watch is refused as COMPACTED: the client is
+    /// cancelled with the plan's lower bound and relists. Never acked as
+    /// replayed with zero frames: the registry would take the window as
+    /// delivered and go on past events the client never received.
+    Refuse,
+    /// A backfill is in flight: queue it.
+    Queue,
+    /// Start it now.
+    Start,
+}
+
+/// Decide a plan's fate: `kv_wired` whether a history provider answers,
+/// `active` whether a backfill is in flight, `pending` the queued plans
+/// and `max_pending` the queue's ceiling.
+pub fn plan_disposition(
+    plan: &ReplayPlan,
+    kv_wired: bool,
+    active: bool,
+    pending: usize,
+    max_pending: usize,
+) -> PlanDisposition {
+    if plan.is_empty() {
+        return PlanDisposition::Finished;
+    }
+    if !kv_wired {
+        return PlanDisposition::Refuse;
+    }
+    if !active {
+        return PlanDisposition::Start;
+    }
+    if pending >= max_pending {
+        return PlanDisposition::Refuse;
+    }
+    PlanDisposition::Queue
 }
 
 /// Decode a `MSG_WATCH_REPLAY_PLAN` payload:
@@ -364,7 +409,7 @@ pub fn walk_versions_page_meta(
 /// A watch frame with its metadata tail, as live events carry it
 /// (`MSG_WATCH_EVENT`): the base frame ([`build_frame`]), then
 /// `[create:8][version:8][lease:8][prev:1]` and, when `prev` is given,
-/// `[pvlen:2][pvalue][pcreate:8][pmod:8][pversion:8][plesase:8]`. `meta`
+/// `[pvlen:2][pvalue][pcreate:8][pmod:8][pversion:8][please:8]`. `meta`
 /// is the entry's `[create, version, lease]` (zeros for a delete).
 pub fn build_frame_full(
     watch_id: u64,

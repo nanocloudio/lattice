@@ -79,9 +79,11 @@ pub const WORKERS: usize = 2;
 pub const NO_WORKER_IDX: u8 = 0xFF;
 
 /// Per-session ingress hold: data-plane envelopes that arrived while
-/// the session was not in service (attaching, or mid-handoff). Sized
-/// for a burst of keepalives or a couple of watch control envelopes.
-pub const HOLD_BYTES: usize = 192;
+/// the session was not in service (attaching, or mid-handoff). Sized for
+/// the largest envelope a session's first command can be — an etcd watch
+/// define carrying a 256-byte key and range end (3-byte envelope header,
+/// 47-byte define head, 256-byte span: 306) — or a burst of keepalives.
+pub const HOLD_BYTES: usize = 320;
 
 /// Ticks a handoff phase may wait before the anchor refuses it.
 pub const HANDOFF_DEADLINE_TICKS: u32 = 2000;

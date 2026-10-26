@@ -10,6 +10,29 @@ hardware_targets = ["bcm2712", "linux"]
 # whether adapter semantics allow using those plans. Dirty-epoch
 # rejection becomes graph-visible here rather than library-local.
 
+# Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
+# `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
+# others. The profile sets `partition_map::MAX_RANGES`, the ranges the
+# ordered map this module holds can carry: 64 on pi5, 16 on rp2350, 128
+# on server. A map travels as one `RANGE_MAP_UPDATE` frame, and the
+# `range_map` param and the supervisor's publication carry one in
+# `RANGE_MAP_PARAM_MAX` (2,048) bytes: on pi5 and server that binds
+# first, at about thirty single-replica ranges. A graph builds every
+# module in one profile; nothing checks that, and a holder refuses whole
+# a map larger than its own bound.
+[[variant]]
+name     = "pi5"
+features = []
+default  = true
+
+[[variant]]
+name     = "rp2350"
+features = ["profile_rp2350"]
+
+[[variant]]
+name     = "server"
+features = ["profile_server"]
+
 # Per-protocol ingress from each edge anchor.
 [[ports]]
 name = "etcd_in"

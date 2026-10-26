@@ -14,6 +14,7 @@
 //! | 4   | hold        | u32  | 0        | 1: send one request at start, with no body, and read a held answer |
 //! | 5   | abort_after | u32  | 0        | With `hold`: ABORT the exchange after this many BODY records (0: never) |
 //! | 6   | select      | str  | (empty)  | Take only stdin chunks that begin with these bytes (up to 8), the prefix dropped from the body — so one stdin can feed several requesters |
+//! | 7   | framed      | u32  | 0        | 1: a chunk is items, `[len u16 LE][item]` each, sent as one request of several records — the first inline in the HEAD, each other a BODY as the provider's request-body CREDIT admits it |
 //!
 //! A `target`, `headers` or `select` past its bound refuses construction. A
 //! body that does not fit one request record is written to `text_out` as
@@ -90,6 +91,13 @@ struct CliState {
     bodies: u32,
     /// Response-body bytes printed and owed back to the provider as CREDIT.
     regrant: u32,
+    /// `framed` param, and a framed request's items still to send as BODY
+    /// records (`input[items_at..items_end]`) with the request-body credit
+    /// the provider has granted for them.
+    framed: u8,
+    items_at: u16,
+    items_end: u16,
+    req_credit: u32,
 
     /// The request record in flight (kept whole for a re-issue).
     req: [u8; ex::RECORD_MAX],
@@ -150,6 +158,9 @@ define_params! {
     5, abort_after, u32, 0
         => |s, d, len| { s.abort_after = p_u32(d, len, 0, 0); };
 
+    7, framed, u32, 0
+        => |s, d, len| { s.framed = p_u32(d, len, 0, 0) as u8; };
+
     6, select, str, 0 => |s, d, len| {
         if len > SELECT_MAX {
             s.bad_param = 1;
@@ -209,6 +220,10 @@ pub extern "C" fn module_new(
         s.abort_after = 0;
         s.bodies = 0;
         s.regrant = 0;
+        s.framed = 0;
+        s.items_at = 0;
+        s.items_end = 0;
+        s.req_credit = 0;
         s.req_len = 0;
         s.phase = 0;
         s.down = 0;
@@ -286,6 +301,20 @@ fn selected(head: &[u8], select: &[u8]) -> bool {
     true
 }
 
+/// The item at `at` of a framed chunk (`[len u16 LE][item]`): where its
+/// bytes are and where the next begins; `None` past `end` or cut short.
+fn framed_item(input: &[u8], at: usize, end: usize) -> Option<(usize, usize, usize)> {
+    if at + 2 > end {
+        return None;
+    }
+    let len = usize::from(u16::from_le_bytes([input[at], input[at + 1]]));
+    let start = at + 2;
+    if start + len > end {
+        return None;
+    }
+    Some((start, len, start + len))
+}
+
 /// `status` as three digits at the start of `out`.
 fn put_status(out: &mut [u8], status: u16) -> usize {
     let mut v = status;
@@ -355,15 +384,34 @@ fn stage_body_hex(s: &mut CliState, at: usize, len: usize) {
 fn stage_request(s: &mut CliState, body_len: usize) {
     s.id = ex::ExchangeId::from_u64(s.next_id);
     s.next_id = s.next_id.wrapping_add(1);
+    // Framed: the first item inline, the rest BODY records after it.
+    let (body_at, inline, flags) = if s.framed == 1 && body_len > 0 {
+        let Some((at, len, next)) = framed_item(&s.input, 0, body_len) else {
+            s.answer_len = 0;
+            let msg = b"malformed framed body";
+            s.answer[..msg.len()].copy_from_slice(msg);
+            stage_line(s, ex::status::BAD_REQUEST, msg.len());
+            return;
+        };
+        s.items_at = next as u16;
+        s.items_end = body_len as u16;
+        let more = if next < body_len { ex::flag::MORE } else { 0 };
+        (at, len, more)
+    } else {
+        s.items_at = 0;
+        s.items_end = 0;
+        (0, body_len, 0)
+    };
+    s.req_credit = 0;
     let head = ex::RequestHead {
         id: s.id,
-        flags: 0,
+        flags,
         method: s.method,
         target: &s.target[..s.target_len as usize],
         headers: &s.headers[..s.headers_len as usize],
         peer: &[],
         resp_credit: ANSWER_MAX as u32,
-        body: &s.input[..body_len],
+        body: &s.input[body_at..body_at + inline],
     };
     match ex::write_request_head(&head, &mut s.req) {
         Some(len) => {
@@ -488,6 +536,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     (flags & ex::flag::MORE != 0, at, data.len())
                 }
+                Some(ex::Record::Credit { id, bytes }) if id == s.id && s.phase == 2 => {
+                    s.req_credit = s.req_credit.saturating_add(bytes);
+                    continue;
+                }
                 Some(ex::Record::Abort { id, reason }) if id == s.id && s.phase == 2 => {
                     if s.hold == 1 {
                         s.phase = 0;
@@ -534,6 +586,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             && (sys.channel_write)(s.request_out, s.req.as_ptr(), s.req_len as usize) > 0
         {
             s.phase = 2;
+        }
+        // A framed request's next item, as the provider's credit admits it.
+        while s.phase == 2 && s.items_at < s.items_end && s.down == 0 {
+            let (at, end) = (s.items_at as usize, s.items_end as usize);
+            let Some((start, len, next)) = framed_item(&s.input, at, end) else {
+                s.items_at = s.items_end;
+                break;
+            };
+            if (len as u32) > s.req_credit {
+                break;
+            }
+            let more = if next < end { ex::flag::MORE } else { 0 };
+            // The response buffer is free here: every answer was read above.
+            let Some(n) = ex::write_body(&s.id, more, &s.input[start..start + len], &mut s.rec)
+            else {
+                s.items_at = s.items_end;
+                break;
+            };
+            if (sys.channel_write)(s.request_out, s.rec.as_ptr(), n) <= 0 {
+                break;
+            }
+            s.req_credit -= len as u32;
+            s.items_at = next as u16;
         }
     }
     0

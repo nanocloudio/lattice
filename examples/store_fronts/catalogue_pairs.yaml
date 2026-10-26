@@ -1,0 +1,121 @@
+# route_catalogue_front on any free client pair of kv_request_router: the
+# KV state worker on its disk store, the router, and the front wired to the
+# router's memcached pair (`proto: 3`) as written. Each client pair is the
+# same KV surface — the router answers a request on the pair it came in by —
+# so the front is wired to any of the four by rewriting the two router port
+# names and `proto` together:
+#
+#   etcd           router.etcd_in / router.etcd_out                    proto 1
+#   redis          router.redis_in / router.redis_out                  proto 2
+#   memcached      router.memcached_in / router.memcached_out          proto 3
+#   memcached_udp  router.memcached_udp_in / router.memcached_udp_out  proto 4
+#
+# tools/e2e/store_fronts.sh `catalogue_pairs` and the harness suite
+# tests/harness/tests/live_catalogue_pairs.rs run it on each. Each requester
+# takes the stdin chunks that begin with its `select` prefix:
+#
+#   p1:   POST publish: generation 1, two routes (one endpoint, then two)
+#   dup:  the same generation again: 409 (already begun)
+#   ss:   GET snapshot at the store's revision (its first record the active
+#         pointer, at generation 1)
+#   ch:   GET the changes after revision 0 (the publication whole)
+#
+# The service is tenant a1…a1, service b2…b2. The store directory
+# (`catalogue.kv`) is created beforehand.
+target: linux
+tick_us: 1000
+scheduler:
+  accept_cycles: true
+platform:
+  cli: {}
+
+modules:
+  - name: worker
+    type: kv_state_worker
+    params:
+      state_store: 1
+      command_log: 1
+      store_dir: catalogue.kv
+  - name: router
+    type: kv_request_router
+  - name: rc
+    type: route_catalogue_front
+    params:
+      proto: 3
+  - name: p1
+    type: exchange_cli
+    params:
+      select: "p1:"
+      framed: 1
+      target: "/rc/a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1/b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2/publish"
+      headers: "generation: 1\r\npredecessor: 0\r\nendpoints: 1,2\r\n"
+  - name: dup
+    type: exchange_cli
+    params:
+      select: "dup:"
+      framed: 1
+      target: "/rc/a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1/b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2/publish"
+      headers: "generation: 1\r\npredecessor: 0\r\nendpoints: 1,2\r\n"
+  - name: ss
+    type: exchange_cli
+    params:
+      select: "ss:"
+      method: 1
+      target: "/rc/a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1/b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2/snapshot"
+      headers: "at: 0\r\n"
+  - name: ch
+    type: exchange_cli
+    params:
+      select: "ch:"
+      method: 1
+      target: "/rc/a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1/b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2/changes"
+      headers: "after: 0\r\n"
+  - name: cli_in
+  - name: cli_out
+
+wiring:
+  # The store.
+  - from: router.kv_out
+    to: worker.commands
+  - from: worker.responses
+    to: router.kv_in
+
+  # The front on one client pair of the router.
+  - from: rc.kv_out
+    to: router.memcached_in
+  - from: router.memcached_out
+    to: rc.kv_in
+
+  # The requesters, each on its own stdin chunks.
+  - from: cli_in.stdin_out
+    to: p1.body_in
+  - from: cli_in.stdin_out
+    to: dup.body_in
+  - from: cli_in.stdin_out
+    to: ss.body_in
+  - from: cli_in.stdin_out
+    to: ch.body_in
+  - from: p1.request_out
+    to: rc.request_in
+  - from: dup.request_out
+    to: rc.request_in
+  - from: ss.request_out
+    to: rc.request_in
+  - from: ch.request_out
+    to: rc.request_in
+  - from: rc.response_out
+    to: p1.response_in
+  - from: rc.response_out
+    to: dup.response_in
+  - from: rc.response_out
+    to: ss.response_in
+  - from: rc.response_out
+    to: ch.response_in
+  - from: p1.text_out
+    to: cli_out.bytes_in
+  - from: dup.text_out
+    to: cli_out.bytes_in
+  - from: ss.text_out
+    to: cli_out.bytes_in
+  - from: ch.text_out
+    to: cli_out.bytes_in
