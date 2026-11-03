@@ -505,6 +505,23 @@ pub enum MapViolation {
     Overlap { index: usize },
 }
 
+/// Where an etcd Txn's key set lives ([`OrderedRangeMap::etcd_txn_owner`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxnOwner {
+    /// Every key is in one partition; the index of the first descriptor
+    /// the key set touches.
+    One(usize),
+    /// The Txn names no key at all (no compares, empty branches, or only
+    /// empty spans): any one range answers it.
+    KeyFree,
+    /// The key set spans partitions: no single store can apply it.
+    Spans,
+    /// A key no descriptor holds (a map mid-update): a stale route.
+    Unrouted,
+    /// The body does not parse as a Txn, or nests past the bound.
+    Malformed,
+}
+
 /// Typed routing-check failure. Every variant maps onto
 /// `db_context::RetryClass::StaleRoute`: the caller's descriptor cache
 /// is stale (or the map itself is mid-update) and must be refreshed
@@ -711,6 +728,146 @@ impl OrderedRangeMap {
             after - 1
         };
         Some((first, last))
+    }
+
+    /// Where an etcd Txn (a `KV_OP_ETCD_TXN` body, `types.rs`) executes
+    /// on this map: the one partition every key it can touch lives in.
+    ///
+    /// The key set is everything either branch could reach — each
+    /// compare's key or range, each Range / Put / DeleteRange / manifest
+    /// Put of BOTH branches, and every nested Txn's own compares and
+    /// branches, to `max_depth` levels below the outermost — with etcd's
+    /// span rules (`end` empty: the one key; `end` = `\0`: every key from
+    /// `start` on; else `[start, end)`; an empty span touches nothing).
+    /// Both branches count because which one runs is decided only by the
+    /// store, after routing.
+    ///
+    /// Ranges sharing one `(cluster, partition)` binding are one store, so
+    /// a key set over several of them still has one owner;
+    /// [`TxnOwner::One`] names the first descriptor the set touches.
+    pub fn etcd_txn_owner(&self, body: &[u8], max_depth: usize) -> TxnOwner {
+        let mut owner: Option<usize> = None;
+        match self.etcd_txn_walk(body, 0, max_depth, &mut owner) {
+            Err(e) => e,
+            Ok(()) => match owner {
+                Some(i) => TxnOwner::One(i),
+                None => TxnOwner::KeyFree,
+            },
+        }
+    }
+
+    /// One Txn level of [`etcd_txn_owner`](Self::etcd_txn_owner).
+    fn etcd_txn_walk(
+        &self,
+        body: &[u8],
+        depth: usize,
+        max_depth: usize,
+        owner: &mut Option<usize>,
+    ) -> Result<(), TxnOwner> {
+        const BAD: TxnOwner = TxnOwner::Malformed;
+        if depth > max_depth {
+            return Err(BAD);
+        }
+        let u16_at = |at: usize| -> Option<usize> {
+            Some(u16::from_le_bytes([*body.get(at)?, *body.get(at + 1)?]) as usize)
+        };
+        let u32_at = |at: usize| -> Option<usize> {
+            let b = body.get(at..at + 4)?;
+            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
+        // `[len:u16][bytes]` at `at` → (bytes, next offset).
+        let take = |at: usize| -> Option<(&[u8], usize)> {
+            let n = u16_at(at)?;
+            Some((body.get(at + 2..at + 2 + n)?, at + 2 + n))
+        };
+        let mut at = 0usize;
+        let ncmp = *body.first().ok_or(BAD)?;
+        at += 1;
+        for _ in 0..ncmp {
+            // [target][result][key][end][operand:u64][value_len:u32][value]
+            let (key, next) = take(at + 2).ok_or(BAD)?;
+            let (end, next) = take(next).ok_or(BAD)?;
+            let vlen = u32_at(next + 8).ok_or(BAD)?;
+            at = next + 12 + vlen;
+            if at > body.len() {
+                return Err(BAD);
+            }
+            self.etcd_span_owner(key, end, owner)?;
+        }
+        for _branch in 0..2 {
+            let n = *body.get(at).ok_or(BAD)?;
+            at += 1;
+            for _ in 0..n {
+                let kind = *body.get(at).ok_or(BAD)?;
+                let len = u32_at(at + 1).ok_or(BAD)?;
+                let op = body.get(at + 5..at + 5 + len).ok_or(BAD)?;
+                at += 5 + len;
+                let span = |op: &[u8]| -> Option<(usize, usize)> {
+                    let s = u16::from_le_bytes([*op.first()?, *op.get(1)?]) as usize;
+                    let e = u16::from_le_bytes([*op.get(2 + s)?, *op.get(3 + s)?]) as usize;
+                    op.get(4 + s..4 + s + e)?;
+                    Some((s, e))
+                };
+                match kind {
+                    // Range / DeleteRange: a span head.
+                    1 | 3 => {
+                        let (s, e) = span(op).ok_or(BAD)?;
+                        self.etcd_span_owner(&op[2..2 + s], &op[4 + s..4 + s + e], owner)?;
+                    }
+                    // Put / manifest Put: key-first.
+                    2 | 5 => {
+                        let k =
+                            u16::from_le_bytes([*op.first().ok_or(BAD)?, *op.get(1).ok_or(BAD)?])
+                                as usize;
+                        let key = op.get(2..2 + k).ok_or(BAD)?;
+                        self.etcd_span_owner(key, &[], owner)?;
+                    }
+                    4 => self.etcd_txn_walk(op, depth + 1, max_depth, owner)?,
+                    _ => return Err(BAD),
+                }
+            }
+        }
+        if at != body.len() {
+            return Err(BAD);
+        }
+        Ok(())
+    }
+
+    /// Fold one etcd span into the Txn's owner: every descriptor it
+    /// touches must share the owner's binding.
+    fn etcd_span_owner(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        owner: &mut Option<usize>,
+    ) -> Result<(), TxnOwner> {
+        let (first, last) = if end.is_empty() {
+            match self.ranges().iter().position(|d| d.contains(start)) {
+                Some(i) => (i, i),
+                None => return Err(TxnOwner::Unrouted),
+            }
+        } else {
+            let end: &[u8] = if end == [0] { &[] } else { end };
+            match self.covering(start, end) {
+                Some(run) => run,
+                // An empty span touches no key.
+                None if !end.is_empty() && start >= end => return Ok(()),
+                None => return Err(TxnOwner::Unrouted),
+            }
+        };
+        for i in first..=last {
+            let b = &self.ranges()[i].binding;
+            match *owner {
+                None => *owner = Some(i),
+                Some(o) => {
+                    let ob = &self.ranges()[o].binding;
+                    if (ob.cluster_id, ob.partition_id) != (b.cluster_id, b.partition_id) {
+                        return Err(TxnOwner::Spans);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Replace this map with the contents of one `RANGE_MAP_UPDATE_V1`

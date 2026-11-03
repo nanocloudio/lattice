@@ -1,6 +1,6 @@
 # Route and endpoint catalogues
 
-Lattice stores and distributes Wormhole's route and endpoint records: a
+Lattice stores and distributes a traffic fabric's route and endpoint records: a
 publisher stages a route generation — up to 16 routes, each with its
 endpoints, or none at all to withdraw the service — seals it with manifests and
 activates it by compare-and-swap; a director takes a complete snapshot at
@@ -24,7 +24,7 @@ the catalogue across key/partition groups.
 
 ## Records
 
-A route or endpoint record is Wormhole's WHR1 envelope:
+A route or endpoint record is the publisher's WHR1 envelope:
 
 ```text
 magic "WHR1" | kind u16 LE | flags u16 LE | record_len u32 LE
@@ -44,7 +44,7 @@ A **placed record** — a generation's policy, a declaration, a status — is
 the same envelope under the same checks (`validate_record`), of any kind
 but the reserved zero and the three a generation's fixed places hold
 (route, endpoint, endpoint manifest). The kinds are the publisher's:
-Wormhole's traffic dial (`0x84`) and relay policy (`0x83`), its
+a traffic fabric's traffic dial (`0x84`) and relay policy (`0x83`), its
 attachment, chain and egress policies, its prefix authority (`0x7E`),
 its failure-domain family (`0xA0`–`0xA6`, the evacuation status `0xA4`
 and outcome `0xA5` among them) and its region family (`0xB0`–`0xB7`,
@@ -100,7 +100,7 @@ records and its endpoint-set manifest. Generations are big-endian so they
 list in order; within one, records sort `pol/…`, then each route's
 directory in index order — `ep/…`, `manifest`, `route` — then `sealed`. A
 policy's id is its **content address**, the first 16 bytes of the SHA-256
-of its payload — the id a Wormhole route names the policy by — so a
+of its payload — the id a route names the policy by — so a
 generation's policies are immutable, resolving one is finding the record
 stored under the address named, and one policy serves every route of the
 generation that names it.
@@ -257,7 +257,7 @@ tail through the front rather than through a durable subscription:
 `GET …/changes` with `after: R` answers every change under the service in
 `(R, through]`, and each change carries its revision, its `index` among
 that revision's changes and their `count`. A consumer applies a revision
-only once it holds all `count` of its changes (Wormhole's adapter does
+only once it holds all `count` of its changes (the traffic fabric's adapter does
 exactly that with its `index`/`count` change records), and every page
 ends on a revision boundary, so no revision is ever split across pages.
 The next page asks from the last page's `through`; `more` says whether

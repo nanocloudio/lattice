@@ -35,7 +35,7 @@ contract while lattice holds it.
   `storage.namespace` contracts, write answers, subscriptions and the
   change log, the replicated store, and how slow stores are waited on
 - [architecture/route_catalogue.md](architecture/route_catalogue.md) —
-  Wormhole's route and endpoint catalogues: the key layout, the
+  a traffic fabric's route and endpoint catalogues: the key layout, the
   envelope check, staged publication and CAS activation, a
   generation's policies, declarations, gap-free status streams,
   snapshot-then-watch, explicit readiness, the catalogue across

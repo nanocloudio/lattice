@@ -47,8 +47,10 @@ params:
     min: 0
     max: 4294967295
     description: >-
-      History kept, in revisions: a subscription or change read from before
-      it answers 410. 0 keeps everything.
+      History kept, in revisions: the store compacts to its revision less
+      this, so a KV_OP_SCAN_VERSIONS window, subscription or change read
+      from before it answers compacted (410). 0 keeps everything until a
+      client's Compact (KV_OP_COMPACT).
   sweep_grace_ms:
     type: integer
     default: 300000

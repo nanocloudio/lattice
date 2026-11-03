@@ -65,6 +65,17 @@ params:
     description: >-
       The disk store's directory (absolute, or relative to the working
       directory), created by the operator; up to 128 bytes.
+  history_revisions:
+    type: integer
+    default: 65536
+    min: 0
+    max: 4294967295
+    description: >-
+      History kept, in revisions: the group compacts to its revision less
+      this (proposed through the group's log, applied by every replica), so
+      a KV_OP_SCAN_VERSIONS window, subscription or change read from before
+      it answers compacted (410). 0 keeps everything until a client's
+      Compact (KV_OP_COMPACT).
   lin_reads:
     type: integer
     default: 0
@@ -112,6 +123,7 @@ modules:
       state_store: 1
       sweep_wrap: 1
       store_dir: ${param:store_dir}
+      history_revisions: ${param:history_revisions}
       sweep_grace_ms: ${param:sweep_grace_ms}
   - name: router
     type: kv_request_router

@@ -55,7 +55,7 @@ use types::{
 };
 use types::{
     KV_OP_COMPACT, KV_OP_ETCD_TXN, KV_OP_HASH_KV, KV_OP_LEASE_KEYS, KV_OP_LEASE_REVOKE,
-    KV_RESULT_DUPLICATE, KV_RESULT_ETCD_TXN,
+    KV_OP_RESTORE, KV_RESULT_DUPLICATE, KV_RESULT_ETCD_TXN, KV_RESULT_EXISTS,
 };
 
 // ── Capacities ────────────────────────────────────────────────────────
@@ -1535,6 +1535,16 @@ pub trait Materializer {
     fn put_meta(&mut self, key: &[u8], value: &[u8]) -> bool;
     /// Remove a bookkeeping record the same way.
     fn remove_meta(&mut self, key: &[u8]) -> bool;
+    /// Write an ABSENT `key` exactly as a restore states it
+    /// ([`KV_OP_RESTORE`]): `value` with `meta`'s create and mod revision,
+    /// version, lease and flags, as the version at `meta.mod_revision` —
+    /// claiming no revision and leaving the engine revision where it is
+    /// ([`raise_revision`](Self::raise_revision) moves it). `false` =
+    /// capacity/fault.
+    fn import_exact(&mut self, key: &[u8], value: &[u8], meta: &RecMeta) -> bool;
+    /// Raise the engine revision to at least `rev`, writing nothing (a
+    /// restore's: every later write takes a revision above it).
+    fn raise_revision(&mut self, rev: u64);
     /// Is a write batch open ([`begin_batch`](Self::begin_batch))?
     fn batch_open(&self) -> bool;
     /// The revision the op in progress writes at: the batch's, once taken,
@@ -1843,6 +1853,7 @@ pub fn apply_mat_ctx<M: Materializer>(
         KV_OP_DELETE_META => batched(store, |s| apply_delete_meta(s, body, out_body, now_ms)),
         KV_OP_LEASE_REVOKE => batched(store, |s| apply_lease_keys(s, body, out_body, now_ms, true)),
         KV_OP_COMPACT => apply_compact(store, body),
+        KV_OP_RESTORE => batched(store, |s| apply_restore(s, body, out_body, now_ms)),
         KV_OP_HASH_KV => apply_hash_kv(store, body, out_body, now_ms),
         KV_OP_LEASE_KEYS => apply_lease_keys(store, body, out_body, now_ms, false),
         KV_OP_ETCD_TXN => {
@@ -2100,6 +2111,37 @@ impl Materializer for KvStore {
             }
             None => true,
         }
+    }
+
+    fn import_exact(&mut self, key: &[u8], value: &[u8], meta: &RecMeta) -> bool {
+        let user = key;
+        let mut kbuf = [0u8; MAX_KEY_LEN];
+        let Some(key) = self.compose_key(key, &mut kbuf) else {
+            return false;
+        };
+        let Err(idx) = self.lookup(key) else {
+            return false; // the caller found it absent: a logic fault
+        };
+        // `insert_fresh` claims a revision; the import claims none.
+        let (revision, batch) = (self.revision, self.batch);
+        if !self.insert_fresh(idx, key, value) {
+            return false;
+        }
+        self.revision = revision;
+        self.batch = batch;
+        let r = &mut self.records[idx];
+        r.create_revision = meta.create_revision;
+        r.mod_revision = meta.mod_revision;
+        r.version = meta.version;
+        r.lease_id = meta.lease_id;
+        r.flags = meta.flags;
+        r.commit_ts = meta.commit_ts;
+        self.note_key(meta.mod_revision, KEY_CREATED, user);
+        true
+    }
+
+    fn raise_revision(&mut self, rev: u64) {
+        self.revision = self.revision.max(rev);
     }
 
     fn batch_open(&self) -> bool {
@@ -3263,6 +3305,29 @@ impl<S: RunStorage> Materializer for DiskMaterializer<'_, S> {
                 true
             }
         }
+    }
+
+    fn import_exact(&mut self, key: &[u8], value: &[u8], meta: &RecMeta) -> bool {
+        if key.len() > MAX_KEY_LEN || value.len() > MAX_VALUE_LEN {
+            return false;
+        }
+        let mut payload = [0u8; disk_store::MAX_VALUE_LEN];
+        encode_disk_meta(&mut payload, meta);
+        payload[DISK_META_LEN..DISK_META_LEN + value.len()].copy_from_slice(value);
+        if !self.put_version(
+            key,
+            meta.mod_revision,
+            ValueKind::Value,
+            &payload[..DISK_META_LEN + value.len()],
+        ) {
+            return false;
+        }
+        self.note_key(meta.mod_revision, KEY_CREATED, key);
+        true
+    }
+
+    fn raise_revision(&mut self, rev: u64) {
+        self.revision = self.revision.max(rev);
     }
 
     fn batch_open(&self) -> bool {
@@ -5227,6 +5292,11 @@ pub fn write_bound(op: u8, body: &[u8]) -> Option<usize> {
             Some(3 + 2 * children)
         }
         KV_OP_TXN => txn_write_bound(body),
+        // Every record, and the fence record.
+        KV_OP_RESTORE => {
+            let n = body.get(16..18).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+            Some(1 + usize::from(n))
+        }
         _ => None,
     }
 }
@@ -6204,6 +6274,192 @@ fn apply_lease_keys<M: Materializer>(
     out[8] = u8::from(more);
     out[9..11].copy_from_slice(&(n as u16).to_le_bytes());
     (KV_RESULT_KVS, at)
+}
+
+/// The restore fence record's keyspace and key ([`KV_OP_RESTORE`]): the
+/// store's own, never a user key, so a fresh store's emptiness, its keys'
+/// digest ([`KV_OP_HASH_KV`]) and every walk of the bound identity are
+/// untouched by it. Value `[fence:u64 LE][snapshot_revision:u64 LE]`.
+pub const KS_RESTORE_FENCE: u32 = 0x800D_0001;
+const RESTORE_FENCE_KEY: &[u8] = b"fence";
+
+/// One record of a [`KV_OP_RESTORE`] page.
+struct RestoreRecord<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+    meta: RecMeta,
+}
+
+fn parse_restore_record<'a>(body: &'a [u8], off: &mut usize) -> Option<RestoreRecord<'a>> {
+    let key = read_key(body, off)?;
+    let vlen = u32::from_le_bytes(body.get(*off..*off + 4)?.try_into().ok()?) as usize;
+    *off += 4;
+    let value = body.get(*off..*off + vlen)?;
+    *off += vlen;
+    let create_revision = read_u64(body, off)?;
+    let mod_revision = read_u64(body, off)?;
+    let version = read_u64(body, off)?;
+    let lease_id = read_u64(body, off)?;
+    let flags = read_u8(body, off)?;
+    Some(RestoreRecord {
+        key,
+        value,
+        meta: RecMeta {
+            create_revision,
+            mod_revision,
+            version,
+            lease_id,
+            expiry_ms: 0,
+            commit_ts: 0,
+            flags,
+        },
+    })
+}
+
+/// [`KV_OP_RESTORE`]: one page of an exact restore (the rules are the op's
+/// docs). Checked whole before anything is written: the fence, every
+/// record's shape and bounds, every key's absence (or exact presence),
+/// the room; then the new records, the revision and — on a store not yet
+/// fenced — the fence record.
+fn apply_restore<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    const BAD: (u8, usize) = (KV_RESULT_INTERNAL, 0);
+    let mut off = 0usize;
+    let (Some(fence), Some(snapshot), Some(count)) = (
+        read_u64(body, &mut off),
+        read_u64(body, &mut off),
+        read_u16(body, &mut off),
+    ) else {
+        return BAD;
+    };
+    if fence == 0 || out.len() < 4 {
+        return BAD;
+    }
+    let mut fb = [0u8; 16];
+    let held = in_chunk_space(store, KS_RESTORE_FENCE, |s| {
+        match s.get_live(RESTORE_FENCE_KEY, now_ms, &mut fb) {
+            GetOutcome::Absent => Some(None),
+            GetOutcome::Found { value_len: 16, .. } => Some(Some((
+                u64::from_le_bytes(fb[0..8].try_into().unwrap_or([0; 8])),
+                u64::from_le_bytes(fb[8..16].try_into().unwrap_or([0; 8])),
+            ))),
+            _ => None,
+        }
+    });
+    let fenced = match held {
+        None => return BAD,
+        Some(Some(f)) if f == (fence, snapshot) => true,
+        Some(Some(_)) => return (KV_RESULT_EXISTS, 0),
+        // Fresh is a store that has never written: revision 0. (Not
+        // merely one with no live key — a store that wrote and deleted
+        // has revisions a restored version could sit below, and a replay
+        // of this page over its own result must see what the first run
+        // saw: nothing, as of revision 0.)
+        Some(None) if store.revision() == 0 => false,
+        Some(None) => return (KV_RESULT_EXISTS, 0),
+    };
+    // Pass one: every record checked, nothing written.
+    let records_at = off;
+    let mut fresh = 0usize;
+    let mut held_n = 0u16;
+    let mut probe = [0u8; MAX_VALUE_LEN];
+    for _ in 0..count {
+        let Some(r) = parse_restore_record(body, &mut off) else {
+            return BAD;
+        };
+        let m = &r.meta;
+        if m.version == 0
+            || m.create_revision == 0
+            || m.create_revision > m.mod_revision
+            || m.mod_revision > snapshot
+            || m.flags != 0
+            || r.key.is_empty()
+            || r.key.len() > MAX_KEY_LEN
+            || r.value.len() > MAX_VALUE_LEN
+        {
+            return BAD;
+        }
+        match store.get_live(r.key, now_ms, &mut probe) {
+            GetOutcome::Absent => fresh += 1,
+            GetOutcome::Found { value_len, meta }
+                if probe.get(..value_len) == Some(r.value)
+                    && (
+                        meta.create_revision,
+                        meta.mod_revision,
+                        meta.version,
+                        meta.lease_id,
+                    ) == (m.create_revision, m.mod_revision, m.version, m.lease_id) =>
+            {
+                held_n += 1;
+            }
+            GetOutcome::Found { .. } | GetOutcome::TooBig => return (KV_RESULT_EXISTS, 0),
+            GetOutcome::Fault => return BAD,
+        }
+    }
+    if off != body.len() {
+        return BAD;
+    }
+    // A key twice in one page is no snapshot's.
+    let mut a = records_at;
+    for i in 0..count {
+        let Some(ra) = parse_restore_record(body, &mut a) else {
+            return BAD;
+        };
+        let mut b = a;
+        for _ in i + 1..count {
+            let Some(rb) = parse_restore_record(body, &mut b) else {
+                return BAD;
+            };
+            if rb.key == ra.key {
+                return BAD;
+            }
+        }
+    }
+    if store.free_slots() < fresh + usize::from(!fenced) {
+        return (KV_RESULT_QUOTA, 0);
+    }
+    // Pass two: the records as they were.
+    let mut off = records_at;
+    let mut written = 0u16;
+    for _ in 0..count {
+        let Some(r) = parse_restore_record(body, &mut off) else {
+            return BAD;
+        };
+        if let GetOutcome::Absent = store.get_live(r.key, now_ms, &mut probe) {
+            if !store.import_exact(r.key, r.value, &r.meta) {
+                return BAD;
+            }
+            written += 1;
+        }
+    }
+    store.raise_revision(snapshot);
+    // History below the snapshot is not here (each key holds only its
+    // version as of `snapshot`), so a change feed or watch resuming from
+    // under it must be told it was compacted, never handed a partial
+    // history as though it were whole.
+    if store.compact_revision() < snapshot {
+        store.set_compact_revision(snapshot);
+    }
+    if !fenced {
+        let mut v = [0u8; 16];
+        v[0..8].copy_from_slice(&fence.to_le_bytes());
+        v[8..16].copy_from_slice(&snapshot.to_le_bytes());
+        if !in_chunk_space(store, KS_RESTORE_FENCE, |s| {
+            s.put_meta(RESTORE_FENCE_KEY, &v)
+        }) {
+            return BAD;
+        }
+    }
+    // Watchers and change feeds of this identity cannot have seen these
+    // versions arrive in revision order: the keyspace changed whole.
+    store.note_whole();
+    out[0..2].copy_from_slice(&written.to_le_bytes());
+    out[2..4].copy_from_slice(&held_n.to_le_bytes());
+    (KV_RESULT_OK, 4)
 }
 
 /// [`KV_OP_COMPACT`]: etcd's Compact, refused as etcd refuses it — a

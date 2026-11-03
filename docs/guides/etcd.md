@@ -98,8 +98,27 @@ and Watch, which are. Anything unserved answers status 12
   reserved keyspace) before the grant is answered, and deleted after
   its keys; at start the anchor re-grants every recorded lease with its
   full TTL, as etcd extends its leases when it restarts. The anchor's
-  records are read linearizably, so a restarted graph reads them after
-  its log has replayed; requests wait until they are loaded.
+  records are read through the ReadIndex fence where the replica grants
+  it, so a restarted leader reads them after its log has replayed;
+  requests wait until they are loaded. A replica that cannot take the
+  fence (a follower, a group between leaders) refuses it, and the anchor
+  then reads its records as that replica holds them — its applied state,
+  which is what an etcd member's own auth store is — asking for the fence
+  again after ten seconds.
+- **Auth follows the group.** Once loaded, the anchor checks the auth
+  keyspace every second (its record count and newest mod revision, one
+  read) and reads the records again, over the cache that keeps serving,
+  when the keyspace has moved: a user, role or `AuthEnable` committed
+  through another replica's listener reaches this one within a second
+  plus its replica's apply lag (`tests/harness/tests/cluster.rs`,
+  `a_followers_etcd_listener_serves_under_the_groups_auth`).
+- **On a follower** of a replicated group the listener serves what the
+  replica can answer correctly: serializable Ranges from its applied
+  state, signing in, and the auth checks. A linearizable Range, and
+  every write, needs the leader: the follower refuses them UNAVAILABLE
+  ("request timed out"), which etcd clients retry on another endpoint.
+  Serving them on the follower needs a ReadIndex the follower asks of
+  the leader, which the consensus module does not offer yet.
 - **Snapshot** streams the live keys at one revision in lattice's own
   entry format, zero-padded to 512-byte pages and ending with its
   SHA-256 (what etcd's clients verify). `etcdctl snapshot save` works;
@@ -148,7 +167,7 @@ clients print and match it as they would against etcd.
 | NOSPACE alarm raised | 8 (RESOURCE_EXHAUSTED) | etcdserver: mvcc: database space exceeded |
 | No user / bad token / not permitted | 3 / 16 / 7 | etcd's auth messages |
 | Store unavailable at start (auth records unread) | 14 (UNAVAILABLE) | etcdserver: the store is not answering (auth records unread) |
-| No authority answered in time (a follower, an unresolved read fence) | 14 | etcdserver: request timed out |
+| No authority answered in time (a linearizable read or a write on a follower, an unresolved read fence) | 14 | etcdserver: request timed out |
 | Routing epoch moved under the request | 14 | etcdserver: leader changed |
 | Throttled or backpressured | 8 | etcdserver: too many requests |
 | Operation spans ranges the graph keeps apart | 9 (FAILED_PRECONDITION) | lattice: the operation spans ranges this graph keeps apart |

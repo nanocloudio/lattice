@@ -552,6 +552,8 @@ fn op_is_write(op: u8) -> bool {
         // reclaims chunks never passes here: the state worker proposes
         // it, and dispatch refuses it from any ingress.)
         | 0x23 /*PUT_CHUNK*/ | 0x26 /*PUT_MANIFEST*/
+        // An exact restore's page.
+        | 0x2C /*RESTORE*/
     )
 }
 
@@ -957,10 +959,29 @@ fn route_ordered(
     // span crossing ranges would otherwise be answered by the range that
     // owns its start, missing the rest. etcd's ends: none = the one key,
     // `\0` = unbounded.
-    // etcd's Txn touches keys anywhere in its compares and ops, and a
-    // lease's keys can be anywhere: on a map of one range it is that
-    // range's; across ranges it is refused rather than applied by one range
-    // to keys another owns.
+    // etcd's Txn routes by its key set: every key either branch can
+    // reach — compares, Range / Put / DeleteRange spans, nested Txns —
+    // in one partition executes there at one revision; a key set across
+    // partitions is refused rather than applied by one range to keys
+    // another owns (no cross-range coordinator speaks etcd's Txn).
+    if op == KV_OP_ETCD_TXN && map.ranges().len() > 1 {
+        return match map.etcd_txn_owner(body, types::ETCD_TXN_DEPTH_MAX) {
+            partition_map::TxnOwner::One(i) => route_single(router, &map.ranges()[i]),
+            partition_map::TxnOwner::KeyFree => route_single(router, &map.ranges()[0]),
+            partition_map::TxnOwner::Spans => RouteOrdered::Reject {
+                result: KV_RESULT_CROSS_RANGE,
+                stale: false,
+            },
+            partition_map::TxnOwner::Unrouted => RouteOrdered::Reject {
+                result: KV_RESULT_DIRTY_EPOCH,
+                stale: true,
+            },
+            partition_map::TxnOwner::Malformed => reject_internal,
+        };
+    }
+    // A lease's keys can be anywhere, and Compact / HashKV are whole-store:
+    // on a map of one range they are that range's; across ranges they are
+    // refused.
     if op == KV_OP_ETCD_TXN
         || op == KV_OP_LEASE_REVOKE
         || op == KV_OP_LEASE_KEYS

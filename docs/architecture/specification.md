@@ -287,11 +287,13 @@ commits through the KV path. Historical reads below the floor return
 the compacted result.
 
 `backup_coordinator` (`modules/app/backup_coordinator/mod.rs`)
-produces a consistent backup by scanning every record at one
-protected revision; a compacted answer aborts the backup rather than
-exporting a partial. Restore verifies manifest completeness and
-replays pages as puts (a merge; it does not delete keys absent from
-the backup).
+produces a consistent backup by reading every live key with its
+metadata at one revision R; a compacted answer aborts the backup rather
+than exporting a partial. Restore verifies manifest completeness and
+writes the pages exactly (`KV_OP_RESTORE`: each key's create and mod
+revision, version and lease preserved, the store's revision past R)
+into a fresh store fenced under the backup's epoch, then checks the
+restored digest against R's.
 
 ## TTL, leases, and watches
 

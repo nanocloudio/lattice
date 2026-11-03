@@ -1,4 +1,4 @@
-//! route_catalogue — Wormhole's route and endpoint catalogues in Lattice:
+//! route_catalogue — a traffic fabric's route and endpoint catalogues in Lattice:
 //! staged publication, sealed manifests, compare-and-swap activation,
 //! bounded garbage collection and revision-pinned paged snapshots; and
 //! beside the generations, declarations and gap-free status streams.
@@ -58,7 +58,7 @@
 //! A policy, a declaration and a status are WHR1 envelopes too, checked by
 //! [`validate_record`]: the same structure, and any kind but the reserved
 //! zero and the three a generation's fixed places hold. Their kinds are
-//! the publisher's (Wormhole's dial, attachment, chain, egress, address,
+//! the publisher's (a traffic fabric's dial, attachment, chain, egress, address,
 //! failure-domain and region families among them); a key names its
 //! record's kind and a reader checks the two agree. Lattice reads the
 //! envelope's kind and generation, and never a payload.
@@ -172,7 +172,7 @@ use types::{
     KV_RESULT_KVS, KV_RESULT_OK, KV_RESULT_VERSIONS,
 };
 
-// ── The envelope (Wormhole's, checked here, never interpreted) ────────
+// ── The envelope (the publisher's, checked here, never interpreted) ───
 
 pub const ENVELOPE_MAGIC: [u8; 4] = *b"WHR1";
 /// `magic | kind u16 | flags u16 | record_len u32 | record_generation u64

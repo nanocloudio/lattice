@@ -191,7 +191,7 @@ own module.
 
 ## Route catalogue (`route_catalogue_front`)
 
-Wormhole's route and endpoint catalogues as exchanges
+A traffic fabric's route and endpoint catalogues as exchanges
 ([route_catalogue.md](../architecture/route_catalogue.md)): a publisher
 POSTs a route generation (up to 16 routes, each with its endpoints, and its policies, among its records — or none, withdrawing the service), a director
 GETs a revision-pinned snapshot page by page, an operator POSTs a
@@ -254,6 +254,55 @@ every one. It emits `activated`,
 stacks below do not include it; a graph that includes `lattice_store`
 can wire its `kv_out`/`kv_in` to the `pump_kv_in`/`pump_kv_out` exports
 with `proto: 3` when no `cdc_pump` holds that pair.
+
+## The raw KV pair (`pump_kv`)
+
+The stacks export one of the router's client pairs raw: `pump_kv_in` /
+`pump_kv_out` are `router.memcached_in` / `router.memcached_out`, the
+memcached pair (`proto: 3`). It is the general in-graph KV client pair, not
+a cdc_pump-only one: any module that speaks the router's KV envelopes — a
+`cdc_pump`, a `cdc_front` or `route_catalogue_front` given `proto: 3`, or an
+application's own store client (a management plane's store, say) — wires
+its `kv_out` to `pump_kv_in` and its `kv_in` from `pump_kv_out`, one client
+per pair. Nothing on it is memcached-specific: no memcached anchor holds it
+in a stack, and the router serves every op on every client pair alike.
+
+**Request** (`MSG_KV_REQUEST`, `0xC0`, `modules/common/wire.rs`): payload
+`[corr_id u64][protocol u8 = 3][tenant u32][conn_id u8][consistency u8]
+[op u8][body_len u16][body]`, little-endian, a body of at most 4,096 bytes
+(`KV_REQUEST_PAYLOAD_MAX`). `corr_id` is the client's own and comes back
+verbatim; `conn_id` names a lane: ops on one lane that may touch the same
+key apply in the order sent (a multi-key op orders against everything on
+its lane), different lanes are independent. `consistency` is a `REQ_*`
+byte (`types.rs`; `REQ_LINEARIZABLE` fences a read through the leader on a
+replicated stack with `lin_reads: 1`).
+
+**Answer** (`MSG_KV_RESPONSE`, `0xC1`): `[corr_id u64][conn_id u8]
+[result u8][revision u64][body_len u16][body][fence tail]` — `revision` the
+store's revision the answer was produced at, and the fence tail
+(`FenceTail`, 37 bytes) carries the applied Raft index and term on a
+replicated stack. Op codes, bodies and results are `types.rs`'s
+`KV_OP_*` / `KV_RESULT_*`; the ones a store client is built on:
+
+| Op | Code | Use |
+|---|---|---|
+| `KV_OP_ETCD_TXN` | `0x1E` | compares (version, create, mod revision, value, lease) over keys or ranges, then one branch of Range / Put / DeleteRange / nested Txn, all at ONE revision: every conditional write. On a multi-range map it executes in the one partition its whole key set lives in (both branches, nested Txns); a key set across partitions answers `KV_RESULT_CROSS_RANGE` |
+| `KV_OP_RANGE_META` | `0x1C` | live keys of a span with their create/mod revision, version and lease, at a revision |
+| `KV_OP_SCAN_VERSIONS` | `0x14` | every version in a span whose revision is in `(from, to]`, deletes included (`VERSIONS_FLAG_META` adds create revision, version and lease): the watch read. `KV_RESULT_COMPACTED` once `from` is below the history kept — the stacks' `history_revisions` (65,536 by default) — which is a watcher's 410: relist |
+| `KV_OP_COMPACT` | `0x21` | retire history below a revision (the stacks also compact on their own, `history_revisions`) |
+| `KV_OP_HASH_KV` | `0x22` | the store's revision and a digest of its live keys |
+| `KV_OP_LEASE_KEYS` / `KV_OP_LEASE_REVOKE` | `0x20` / `0x1F` | a lease's keys; delete them with it |
+
+A lease here is a key's `lease` field (a Put's `lease` and a Txn's lease
+compare); granting and keeping one alive is the client's own record, written
+with the same Txns. On `lattice_store_group3` every write — an ETCD_TXN
+among them — commits on a quorum before it is answered, from the leader
+only: a follower's gateway refuses the proposal, its router answers the
+write `KV_RESULT_LIN_BOUND` (`0x08`, no authority here), and the client
+writes through the leader's pair. A write that committed across a leader
+change is answered once, by the replica it was sent to, or refused; it is
+never applied twice (`tests/harness/tests/cluster.rs`,
+`an_etcd_txn_compare_and_put_is_linearizable_across_a_leader_change`).
 
 ## The store stack
 

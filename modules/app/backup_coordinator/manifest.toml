@@ -3,14 +3,23 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 
-# Consistent database backup and restore. Drives the numbered backup
-# machine over the db_ops
-# contracts: every exported record is read at ONE protected revision
-# (a backup assembled from several revisions is a set of records that
-# never existed together), a COMPACTED answer ABORTS rather than
-# shipping a partial export, and a restore refuses an incomplete
-# manifest. Artifacts live in the KV store under KS_BACKUP_ARTIFACT,
-# so they inherit the same durability and replication as the data.
+# Consistent database backup and EXACT restore. A backup reads the store
+# at ONE revision R (KV_OP_HASH_KV names R and digests the live keys there;
+# every page is a KV_OP_RANGE_META at R, each key with its create and mod
+# revision, version and lease); a COMPACTED answer ABORTS rather than
+# shipping a partial export. The manifest carries R, the consensus index
+# the state was applied through (0: none), the epoch it is fenced under
+# (`epoch`) and R's digest. Artifacts live in the KV store under
+# KS_BACKUP_ARTIFACT, so they inherit the same durability and replication
+# as the data. A restore refuses an incomplete manifest and writes every
+# page as one KV_OP_RESTORE to the TARGET store (the `target` pair;
+# unwired, the kv pair's): every key with the metadata it had, the
+# store's revision past R, into a store that is fresh or fenced by this
+# restore — then checks the target's digest is R's, its revision past R
+# and its compaction floor at R.
+#
+# Params: `mode` (0 inert, 1 backup, 2 restore), `backup_id`,
+# `start_delay_ms`, `epoch` (the fence a backup records; non-zero).
 
 # Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
 # `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the
@@ -38,6 +47,13 @@ name = "kv_in"
 direction = "input"
 content_type = "OctetStream"
 
+# The restore's target store: KV_OP_RESTORE pages and the digest read go
+# out here, their answers come back (both or neither wired).
+[[ports]]
+name = "target_in"
+direction = "input"
+content_type = "OctetStream"
+
 [[ports]]
 name = "kv_out"
 direction = "output"
@@ -45,6 +61,11 @@ content_type = "OctetStream"
 
 [[ports]]
 name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "target_out"
 direction = "output"
 content_type = "OctetStream"
 

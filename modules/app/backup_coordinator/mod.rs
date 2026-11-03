@@ -1,4 +1,4 @@
-//! backup_coordinator — consistent database backup and restore.
+//! backup_coordinator — consistent database backup and EXACT restore.
 //!
 //! Drives the backup procedure's numbered machine over the contracts
 //! in `db_ops.rs`, which own every transition rule; this module is
@@ -8,34 +8,55 @@
 //!
 //! ## What makes the backup CONSISTENT
 //!
-//! Every exported record is read with `KV_OP_SCAN_AT` at ONE protected
-//! revision (backup step 1's protected timestamp, taken as the
-//! store's
-//! current revision when the backup begins). A backup assembled from
-//! reads at different revisions would be a set of records that never
-//! existed together — the definition of an inconsistent backup — so
-//! the revision is chosen once and every page carries it. If the
-//! provider has already reclaimed that history it answers `COMPACTED`
-//! and the backup ABORTS: a partial export is indistinguishable from a
-//! whole one once it is on disk, so refusing loudly is the only safe
-//! answer.
+//! The backup reads the store at ONE revision R: `KV_OP_HASH_KV` names
+//! the store's revision and digests its live keys there, and every page
+//! is a `KV_OP_RANGE_META` at R — every live key with its value, create
+//! and mod revision, version and lease. A backup assembled from reads at
+//! different revisions would be a set of records that never existed
+//! together. If the store has already reclaimed R's history it answers
+//! `COMPACTED` and the backup ABORTS: a partial export is
+//! indistinguishable from a whole one once it is on disk.
+//!
+//! The manifest carries the snapshot's metadata: R
+//! (`protected_timestamp`), the consensus index the state was applied
+//! through when a log orders the store (`raft_index`, from the answer's
+//! fence tail; 0 when none), the epoch it is fenced under (`fence`, the
+//! `epoch` param) and the digest and key count R had (`state_hash`,
+//! `state_keys`).
 //!
 //! ## Where artifacts live
 //!
 //! In the KV store itself, under `KS_BACKUP_ARTIFACT`, keyed by
-//! `[backup_id][sequence]`, deliberately: the artifacts inherit the same
-//! durability, replication, and crash semantics as everything else, and
-//! a restore is a scan rather than a file-format reader. Backups held in
-//! an external object store are not provided.
+//! `[backup_id][sequence]`: the artifacts inherit the same durability,
+//! replication, and crash semantics as everything else. A page is a run
+//! of `KV_OP_RESTORE` records (`types.rs`) — key, value, and the
+//! metadata the key had at R. Backups held in an external object store
+//! are not provided.
 //!
-//! ## Restore
+//! ## Restore: exact, into a fresh store
 //!
-//! Reads the manifest, verifies it is complete (`is_complete`), then
-//! replays every artifact page as PUTs. Restore is idempotent: the
-//! same page written twice lands the same bytes. It does NOT delete
-//! keys absent from the backup — a restore into a live database is a
-//! merge, and silently deleting what the operator did not ask to
-//! remove would be the more dangerous default.
+//! Reads the manifest (from the store the artifacts are in, the `kv`
+//! pair), verifies it is complete, then sends every artifact page as one
+//! `KV_OP_RESTORE` to the TARGET store (the `target` pair; unwired, the
+//! `kv` pair's own store, which having been written refuses it). Every
+//! key lands with the revision, version and lease it had, and the
+//! target's revision passes R, so a revision a client held before the
+//! backup — a resource version, the mod revision it compares — means the
+//! same after the restore or a migration. The target must be fresh
+//! (never written) or fenced by this same restore (a resumed one): the
+//! first page writes the manifest's fence into it, and a store fenced
+//! under another epoch, or written, refuses the restore whole. Last, the
+//! target's digest (`KV_OP_HASH_KV`) must be the manifest's, its revision
+//! at least R and its compaction floor at least R (history below R is not
+//! there): a restore that reads back anything else faults. A completed
+//! restore logs what it measured: `[bkp] restore complete r=<records>
+//! h=<held> rev=<R> at=<target revision> floor=<target floor> verified`,
+//! `held` counting the records the target already had exactly (a resumed
+//! or repeated restore's pages).
+//!
+//! Not carried: a large value (a manifest record faults the backup), a
+//! key's TTL deadline, and history before R (the target answers windows
+//! from R on).
 
 #![no_std]
 #![allow(
@@ -75,10 +96,13 @@ mod telemetry;
 mod envelope;
 use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
-use db_ops::{BackupManifest, BackupPhase, EncryptionKeyIdentity, DIGEST_LEN};
+use db_ops::{
+    BackupManifest, BackupPhase, EncryptionKeyIdentity, BACKUP_ARTIFACT_FORMAT_VERSION, DIGEST_LEN,
+};
 use types::{
-    KV_OP_GET, KV_OP_GET_AT, KV_OP_PUT, KV_OP_RANGE_SCAN, KV_OP_SCAN_AT, KV_RESULT_COMPACTED,
-    KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, KV_RESULT_SCAN_CURSOR, PROTO_ETCD,
+    KV_OP_GET, KV_OP_HASH_KV, KV_OP_PUT, KV_OP_RANGE_META, KV_OP_RESTORE, KV_RESULT_COMPACTED,
+    KV_RESULT_EXISTS, KV_RESULT_KVS, KV_RESULT_MANIFEST, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
+    PROTO_ETCD, RESTORE_HEAD_LEN, RESTORE_META_LEN,
 };
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -92,22 +116,25 @@ const KS_BACKUP_ARTIFACT: u32 = 0x8008_0002;
 const ENV_BUF: usize = 8192;
 const PAGE_BUF: usize = 3584;
 const KEY_MAX: usize = 128;
-/// Records per exported page.
+/// Records per exported read.
 const PAGE_LIMIT: u16 = 24;
+/// A backed-up key, and its successor (the next read's start).
+const USER_KEY: usize = 512;
 
 // ── Driver states ────────────────────────────────────────────────────
 
 const S_IDLE: u8 = 0;
 const S_WAIT: u8 = 1; // waiting out the start delay
-const S_EXPORT_SCAN: u8 = 2; // SCAN_AT page in flight
-const S_EXPORT_GET: u8 = 10; // per-key GET_AT in flight
-const S_EXPORT_PUT: u8 = 3; // artifact page write in flight
-const S_MANIFEST_PUT: u8 = 4;
-const S_RESTORE_GET: u8 = 5; // manifest read in flight
-const S_RESTORE_SCAN: u8 = 6; // artifact page read in flight
-const S_RESTORE_PUT: u8 = 7; // one restored record in flight
-const S_DONE: u8 = 8;
-const S_FAULT: u8 = 9;
+const S_EXPORT_HASH: u8 = 2; // the snapshot's revision and digest
+const S_EXPORT_RANGE: u8 = 3; // a RANGE_META page at R in flight
+const S_EXPORT_PUT: u8 = 4; // an artifact page write in flight
+const S_MANIFEST_PUT: u8 = 5;
+const S_RESTORE_GET: u8 = 6; // manifest read in flight
+const S_RESTORE_ARTIFACT: u8 = 7; // an artifact page read in flight
+const S_RESTORE_PAGE: u8 = 8; // a KV_OP_RESTORE page in flight
+const S_RESTORE_VERIFY: u8 = 9; // the target's digest
+const S_DONE: u8 = 10;
+const S_FAULT: u8 = 11;
 
 define_params! {
     CoordState;
@@ -129,6 +156,14 @@ define_params! {
     // boot.
     3, start_delay_ms, u32, 3000
         => |s, d, len| { s.start_delay_ms = p_u32(d, len, 0, 3000); };
+
+    // The epoch a backup is fenced under (its manifest's `fence`): the
+    // restore writes it into the target store's fence, and a store fenced
+    // under another epoch refuses the restore. A management plane names
+    // the epoch its own writes compare, and moves past it after a
+    // restore. Non-zero.
+    4, epoch, u32, 1
+        => |s, d, len| { s.epoch = p_u32(d, len, 0, 1); };
 }
 
 #[repr(C)]
@@ -138,35 +173,49 @@ struct CoordState {
     /// The kv input's envelope reading (`common/envelope.rs`).
     kv_inbox: Inbox,
     kv_out: i32,
+    /// The restore's target store (unwired: the kv pair's).
+    target_in: i32,
+    target_inbox: Inbox,
+    target_out: i32,
     metrics_out: i32,
 
     mode: u8,
     backup_id_low: u32,
     start_delay_ms: u32,
+    epoch: u32,
 
     state: u8,
     boot_ms: u64,
     corr: u64,
 
     manifest: BackupManifest,
-    /// The revision every export page reads at.
+    /// The revision every export page reads at (R).
     protected_revision: u64,
-    /// Export/restore progress.
-    cursor: u64,
+    /// Artifact pages written (backup) or read (restore).
     sequence: u32,
-    /// Staged page (artifact bytes being built, or read back).
+    /// Every page's bytes, chained (the manifest entry's digest), and
+    /// their count.
+    page_hash: u64,
+    page_bytes: u64,
+    /// Staged artifact page (built, or read back).
     page: [u8; PAGE_BUF],
     page_len: u16,
-    page_at: u16,
     page_records: u16,
-    /// Export: the SCAN_AT page's keys, `[len:u16][key]` records, and
-    /// the one currently being read.
-    keys: [u8; PAGE_BUF],
-    keys_len: u16,
-    keys_at: u16,
-    keys_left: u16,
-    cur_key: [u8; 512],
-    cur_key_len: u16,
+    /// Export: the RANGE_META answer being consumed — its body, the next
+    /// entry's offset, the entries left, and whether more lie past it.
+    ans: [u8; ENV_BUF],
+    ans_len: u16,
+    ans_at: u16,
+    ans_left: u16,
+    ans_more: u8,
+    /// The last key exported; the next read starts at its successor.
+    last_key: [u8; USER_KEY + 1],
+    last_key_len: u16,
+    /// Restore: pages the target took.
+    restored_pages: u32,
+    /// Restore: records the target already held exactly (a resumed or
+    /// repeated restore's pages).
+    m_held: u64,
 
     env: [u8; ENV_BUF],
 
@@ -184,27 +233,34 @@ impl CoordState {
         self.kv_in = -1;
         self.kv_inbox = Inbox::new();
         self.kv_out = -1;
+        self.target_in = -1;
+        self.target_inbox = Inbox::new();
+        self.target_out = -1;
         self.metrics_out = -1;
         self.mode = 0;
         self.backup_id_low = 1;
         self.start_delay_ms = 3000;
+        self.epoch = 1;
         self.state = S_IDLE;
         self.boot_ms = 0;
         self.corr = 0;
         self.manifest = BackupManifest::EMPTY;
         self.protected_revision = 0;
-        self.cursor = 0;
         self.sequence = 0;
+        self.page_hash = FNV_OFFSET;
+        self.page_bytes = 0;
         self.page = [0; PAGE_BUF];
         self.page_len = 0;
-        self.page_at = 0;
         self.page_records = 0;
-        self.keys = [0; PAGE_BUF];
-        self.keys_len = 0;
-        self.keys_at = 0;
-        self.keys_left = 0;
-        self.cur_key = [0; 512];
-        self.cur_key_len = 0;
+        self.ans = [0; ENV_BUF];
+        self.ans_len = 0;
+        self.ans_at = 0;
+        self.ans_left = 0;
+        self.ans_more = 0;
+        self.last_key = [0; USER_KEY + 1];
+        self.last_key_len = 0;
+        self.restored_pages = 0;
+        self.m_held = 0;
         self.env = [0; ENV_BUF];
         self.m_records = 0;
         self.m_pages = 0;
@@ -226,11 +282,21 @@ impl CoordState {
 
 // ── KV plumbing ──────────────────────────────────────────────────────
 
-const BODY_AT: usize = wire::ENVELOPE_HDR + 18;
+const REQ_HEAD: usize = 18;
+const BODY_AT: usize = wire::ENVELOPE_HDR + REQ_HEAD;
 
-fn kv_send(c: &mut CoordState, op: u8, body_len: usize, next: u8) -> bool {
+/// The pair a request goes on: the store the artifacts are in, or the
+/// restore's target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pair {
+    Source,
+    Target,
+}
+
+/// Send the staged body (`body_len` bytes at `BODY_AT`) as `op` on
+/// `pair`, and move to `next`.
+fn kv_send(c: &mut CoordState, pair: Pair, op: u8, body_len: usize, next: u8) -> bool {
     c.corr = c.corr.wrapping_add(1).max(1);
-    const REQ_HEAD: usize = 18;
     let at = wire::ENVELOPE_HDR;
     if at + REQ_HEAD + body_len > c.env.len() {
         return false;
@@ -245,16 +311,14 @@ fn kv_send(c: &mut CoordState, op: u8, body_len: usize, next: u8) -> bool {
     c.env[at + 14] = 0;
     c.env[at + 15] = op;
     c.env[at + 16..at + 18].copy_from_slice(&(body_len as u16).to_le_bytes());
+    let chan = match pair {
+        Pair::Target if c.target_out >= 0 => c.target_out,
+        _ => c.kv_out,
+    };
     let sent = unsafe {
         let sys = c.syscalls;
         !sys.is_null()
-            && write_envelope(
-                &*sys,
-                c.kv_out,
-                MSG_KV_REQUEST,
-                REQ_HEAD + body_len,
-                &mut c.env,
-            )
+            && write_envelope(&*sys, chan, MSG_KV_REQUEST, REQ_HEAD + body_len, &mut c.env)
     };
     if sent {
         c.state = next;
@@ -262,97 +326,29 @@ fn kv_send(c: &mut CoordState, op: u8, body_len: usize, next: u8) -> bool {
     sent
 }
 
-fn stage_get(c: &mut CoordState, key: &[u8]) -> Option<usize> {
-    let need = 2 + key.len();
-    if BODY_AT + need > c.env.len() {
-        return None;
+/// Stage `parts` back to back as the request body: its length.
+fn stage(c: &mut CoordState, parts: &[&[u8]]) -> Option<usize> {
+    let mut n = 0usize;
+    for p in parts {
+        copy(c.env.get_mut(BODY_AT + n..BODY_AT + n + p.len())?, p);
+        n += p.len();
     }
-    c.env[BODY_AT..BODY_AT + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    c.env[BODY_AT + 2..BODY_AT + need].copy_from_slice(key);
-    Some(need)
+    Some(n)
 }
 
-fn stage_put(c: &mut CoordState, key: &[u8], value: &[u8]) -> Option<usize> {
-    let need = 2 + key.len() + 4 + value.len() + 1 + 8;
-    if BODY_AT + need > c.env.len() {
-        return None;
+fn send(c: &mut CoordState, pair: Pair, op: u8, parts: &[&[u8]], next: u8, what: &[u8]) {
+    match stage(c, parts) {
+        Some(n) if kv_send(c, pair, op, n, next) => {}
+        _ => fault(c, what),
     }
-    let mut p = BODY_AT;
-    c.env[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    for (i, b) in key.iter().enumerate() {
-        c.env[p + i] = *b;
-    }
-    p += key.len();
-    c.env[p..p + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
-    p += 4;
-    for (i, b) in value.iter().enumerate() {
-        c.env[p + i] = *b;
-    }
-    p += value.len();
-    c.env[p] = 0;
-    p += 1;
-    c.env[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
-    Some(need)
 }
 
-/// `KV_OP_SCAN_AT` body: `[revision:u64][cursor:u64][limit:u16]`.
-/// Returns KEYS as of the revision (`KV_RESULT_SCAN_CURSOR`); the
-/// values come from per-key `KV_OP_GET_AT` at the SAME revision, which
-/// is what keeps the export a single consistent snapshot.
-fn stage_scan_at(c: &mut CoordState, cursor: u64, revision: u64) -> Option<usize> {
-    let need = 8 + 8 + 2;
-    if BODY_AT + need > c.env.len() {
-        return None;
+/// `src` into the head of `dst`, byte by byte (a length the build cannot
+/// prove equal would pull in a panic path a module cannot link).
+fn copy(dst: &mut [u8], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = *s;
     }
-    let mut p = BODY_AT;
-    c.env[p..p + 8].copy_from_slice(&revision.to_le_bytes());
-    p += 8;
-    c.env[p..p + 8].copy_from_slice(&cursor.to_le_bytes());
-    p += 8;
-    c.env[p..p + 2].copy_from_slice(&PAGE_LIMIT.to_le_bytes());
-    Some(need)
-}
-
-/// `KV_OP_GET_AT` body: `[revision:u64][key_len:u16][key…]`.
-fn stage_get_at(c: &mut CoordState, revision: u64, key: &[u8]) -> Option<usize> {
-    let need = 8 + 2 + key.len();
-    if BODY_AT + need > c.env.len() {
-        return None;
-    }
-    let mut p = BODY_AT;
-    c.env[p..p + 8].copy_from_slice(&revision.to_le_bytes());
-    p += 8;
-    c.env[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    for (i, b) in key.iter().enumerate() {
-        c.env[p + i] = *b;
-    }
-    Some(need)
-}
-
-fn stage_range_scan(c: &mut CoordState, start: &[u8], end: &[u8], cursor: u64) -> Option<usize> {
-    let need = 2 + start.len() + 2 + end.len() + 10;
-    if BODY_AT + need > c.env.len() {
-        return None;
-    }
-    let mut p = BODY_AT;
-    c.env[p..p + 2].copy_from_slice(&(start.len() as u16).to_le_bytes());
-    p += 2;
-    for (i, b) in start.iter().enumerate() {
-        c.env[p + i] = *b;
-    }
-    p += start.len();
-    c.env[p..p + 2].copy_from_slice(&(end.len() as u16).to_le_bytes());
-    p += 2;
-    for (i, b) in end.iter().enumerate() {
-        c.env[p + i] = *b;
-    }
-    p += end.len();
-    c.env[p..p + 8].copy_from_slice(&cursor.to_le_bytes());
-    p += 8;
-    c.env[p..p + 2].copy_from_slice(&8u16.to_le_bytes());
-    Some(need)
 }
 
 // ── Keys ─────────────────────────────────────────────────────────────
@@ -378,38 +374,35 @@ fn artifact_key(c: &CoordState, sequence: u32, out: &mut [u8]) -> Option<usize> 
     user_key(out, KS_BACKUP_ARTIFACT, &body)
 }
 
-fn artifact_bounds(c: &CoordState, start: &mut [u8], end: &mut [u8]) -> Option<(usize, usize)> {
-    let sn = user_key(start, KS_BACKUP_ARTIFACT, &c.backup_id())?;
-    let mut n = sn;
-    end[..n].copy_from_slice(&start[..n]);
-    while n > 0 {
-        if end[n - 1] != 0xFF {
-            end[n - 1] += 1;
-            return Some((sn, n));
-        }
-        n -= 1;
-    }
-    None
-}
+// ── Digests ──────────────────────────────────────────────────────────
 
-/// FNV-1a 64 over a page, widened into the contract's 32-byte digest
-/// slot. Not a cryptographic digest, and the module docs say so: it
-/// detects corruption, not tampering. Authenticated digests
-/// arrive with the external-object-store slice.
-fn page_digest(page: &[u8]) -> [u8; DIGEST_LEN] {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in page {
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
+/// FNV-1a 64 continued over `bytes`.
+fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
+    h
+}
+
+/// Every page's chained FNV-1a 64 and their byte count, widened into the
+/// contract's 32-byte digest slot. Not a cryptographic digest: it detects
+/// corruption, not tampering (authenticated digests arrive with the
+/// external-object-store slice).
+fn pages_digest(h: u64, bytes: u64) -> [u8; DIGEST_LEN] {
     let mut out = [0u8; DIGEST_LEN];
     out[0..8].copy_from_slice(&h.to_be_bytes());
-    out[8..16].copy_from_slice(&(page.len() as u64).to_be_bytes());
+    out[8..16].copy_from_slice(&bytes.to_be_bytes());
     // Non-zero by construction: DIGEST_ABSENT is a reserved value the
-    // contract refuses, and an empty page must still record a digest.
+    // contract refuses, and an empty backup must still record a digest.
     out[DIGEST_LEN - 1] = 1;
     out
 }
+
+/// The one logical range this composition backs up.
+const RANGE_ID: [u8; 16] = [1u8; 16];
 
 // ── The pump ─────────────────────────────────────────────────────────
 
@@ -434,94 +427,154 @@ fn log_info(c: &CoordState, msg: &[u8]) {
     }
 }
 
-/// Start the backup: the manifest opens at the protected revision.
+/// `v` as `width` decimal digits into `out` at `at`.
+fn digits(out: &mut [u8], at: usize, width: usize, mut v: u64) {
+    for i in (0..width).rev() {
+        if let Some(b) = out.get_mut(at + i) {
+            *b = b'0' + (v % 10) as u8;
+        }
+        v /= 10;
+    }
+}
+
+/// Backup step 1: the snapshot's revision and digest, in one read.
 fn begin_backup(c: &mut CoordState) {
-    let id = c.backup_id();
-    // Revision 0 means "current" to the provider's as-of read, which
-    // is the protected point for this slice: the backup reads a single
-    // consistent revision chosen by the store, and every page repeats
-    // it. An allocator-leased protected timestamp is the named
-    // upgrade path.
+    c.sequence = 0;
+    c.page_hash = FNV_OFFSET;
+    c.page_bytes = 0;
+    c.page_len = 0;
+    c.last_key_len = 0;
+    log_info(c, b"[bkp] export begins");
+    send(
+        c,
+        Pair::Source,
+        KV_OP_HASH_KV,
+        &[&0u64.to_le_bytes()],
+        S_EXPORT_HASH,
+        b"[bkp] hash send",
+    );
+}
+
+/// The manifest opens at R, with the snapshot's metadata.
+fn open_manifest(c: &mut CoordState, rev: u64, hash: u32, keys: u64, raft_index: u64) {
     let key = EncryptionKeyIdentity {
         key_id: [1; 16],
         key_version: 1,
         rotation_epoch: 1,
     };
-    let Some(m) = BackupManifest::begin(id, 0, 1, key) else {
+    let Some(m) = BackupManifest::begin(c.backup_id(), 0, rev, key) else {
         fault(c, b"[bkp] manifest refused");
         return;
     };
     c.manifest = m;
+    c.manifest.metadata_revision = rev;
+    c.manifest.raft_index = raft_index;
+    c.manifest.fence = u64::from(c.epoch);
+    c.manifest.state_hash = hash;
+    c.manifest.state_keys = keys;
     // One logical range in this composition; discovery is that range.
-    if c.manifest.discover_range([1u8; 16], 1).is_err() {
-        fault(c, b"[bkp] discovery refused");
-        return;
-    }
-    if c.manifest
-        .transition(BackupPhase::DescriptorSetDiscovered)
-        .is_err()
+    if c.manifest.discover_range(RANGE_ID, 1).is_err()
+        || c.manifest
+            .transition(BackupPhase::DescriptorSetDiscovered)
+            .is_err()
         || c.manifest.transition(BackupPhase::RangesExporting).is_err()
     {
         fault(c, b"[bkp] transition refused");
         return;
     }
-    c.cursor = 0;
-    c.sequence = 0;
-    c.protected_revision = 0;
-    log_info(c, b"[bkp] export begins");
-    send_export_scan(c);
+    c.protected_revision = rev;
+    send_export_range(c);
 }
 
-fn send_export_scan(c: &mut CoordState) {
-    let cursor = c.cursor;
-    let rev = c.protected_revision;
-    let Some(bn) = stage_scan_at(c, cursor, rev) else {
-        fault(c, b"[bkp] scan stage");
-        return;
-    };
-    if !kv_send(c, KV_OP_SCAN_AT, bn, S_EXPORT_SCAN) {
-        fault(c, b"[bkp] scan send");
+/// The next page of live keys at R: from the start, or from the key past
+/// the last exported (`\0` end: every key on).
+fn send_export_range(c: &mut CoordState) {
+    let mut start = [0u8; USER_KEY + 1];
+    let mut sl = c.last_key_len as usize;
+    copy(&mut start[..sl], &c.last_key[..sl]);
+    if sl > 0 {
+        // The successor: the key itself, then the least byte.
+        start[sl] = 0;
+        sl += 1;
     }
+    let rev = c.protected_revision;
+    send(
+        c,
+        Pair::Source,
+        KV_OP_RANGE_META,
+        &[
+            &(sl as u16).to_le_bytes(),
+            &start[..sl],
+            &1u16.to_le_bytes(),
+            &[0],
+            &rev.to_le_bytes(),
+            &u32::from(PAGE_LIMIT).to_le_bytes(),
+            // flags (none: a manifest is refused, not exported), sort
+            // target and order (key ascending), and no revision bounds.
+            &[0, 0, 0],
+            &[0u8; 32],
+        ],
+        S_EXPORT_RANGE,
+        b"[bkp] range send",
+    );
 }
 
-/// Read the next key of the scan page at the protected revision, or
-/// close the artifact page out.
-fn send_next_export_get(c: &mut CoordState) {
-    if c.keys_left == 0 {
-        if c.page_len > 0 {
-            send_artifact_put(c);
-        } else if c.cursor != 0 {
-            send_export_scan(c);
-        } else {
-            finish_backup(c);
+/// Take the held answer's entries into the page; write the page when the
+/// next does not fit; read on when the answer is spent; finish when the
+/// store is.
+fn drain_export(c: &mut CoordState) {
+    while c.ans_left > 0 {
+        let at = c.ans_at as usize;
+        let len = c.ans_len as usize;
+        let a = &c.ans[..len];
+        let Some(kl) = a
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        else {
+            fault(c, b"[bkp] range page corrupt");
+            return;
+        };
+        let voff = at + 2 + kl;
+        let Some(vl) = a
+            .get(voff..voff + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        else {
+            fault(c, b"[bkp] range page corrupt");
+            return;
+        };
+        let moff = voff + 4 + vl;
+        let end = moff + 32;
+        if end > len || kl > USER_KEY {
+            fault(c, b"[bkp] range page corrupt");
+            return;
         }
-        return;
+        // The record: key, value, metadata, flags — `KV_OP_RESTORE`'s.
+        let need = 2 + kl + 4 + vl + RESTORE_META_LEN;
+        let w = c.page_len as usize;
+        if w + need > PAGE_BUF {
+            if w == 0 {
+                fault(c, b"[bkp] record larger than a page");
+            } else {
+                send_artifact_put(c);
+            }
+            return;
+        }
+        copy(&mut c.page[w..w + need - 1], &c.ans[at..end]);
+        c.page[w + need - 1] = 0;
+        c.page_len = (w + need) as u16;
+        c.page_records += 1;
+        copy(&mut c.last_key[..kl], &c.ans[at + 2..at + 2 + kl]);
+        c.last_key_len = kl as u16;
+        c.ans_at = end as u16;
+        c.ans_left -= 1;
+        c.m_records = c.m_records.wrapping_add(1);
     }
-    let at = c.keys_at as usize;
-    if at + 2 > c.keys_len as usize {
-        fault(c, b"[bkp] key page corrupt");
-        return;
-    }
-    let klen = u16::from_le_bytes([c.keys[at], c.keys[at + 1]]) as usize;
-    if at + 2 + klen > c.keys_len as usize || klen > c.cur_key.len() {
-        fault(c, b"[bkp] key page corrupt");
-        return;
-    }
-    for i in 0..klen {
-        c.cur_key[i] = c.keys[at + 2 + i];
-    }
-    c.cur_key_len = klen as u16;
-    c.keys_at = (at + 2 + klen) as u16;
-    c.keys_left -= 1;
-    let rev = c.protected_revision;
-    let mut key = [0u8; 512];
-    key[..klen].copy_from_slice(&c.cur_key[..klen]);
-    let Some(bn) = stage_get_at(c, rev, &key[..klen]) else {
-        fault(c, b"[bkp] get stage");
-        return;
-    };
-    if !kv_send(c, types::KV_OP_GET_AT, bn, S_EXPORT_GET) {
-        fault(c, b"[bkp] get send");
+    if c.ans_more != 0 {
+        send_export_range(c);
+    } else if c.page_len > 0 {
+        send_artifact_put(c);
+    } else {
+        finish_backup(c);
     }
 }
 
@@ -536,22 +589,32 @@ fn send_artifact_put(c: &mut CoordState) {
     let len = c.page_len as usize;
     let mut page = [0u8; PAGE_BUF];
     page[..len].copy_from_slice(&c.page[..len]);
-    let mut k = [0u8; KEY_MAX];
-    k[..kn].copy_from_slice(&key[..kn]);
-    let Some(bn) = stage_put(c, &k[..kn], &page[..len]) else {
-        fault(c, b"[bkp] artifact stage");
-        return;
-    };
-    if !kv_send(c, KV_OP_PUT, bn, S_EXPORT_PUT) {
-        fault(c, b"[bkp] artifact send");
-    }
+    c.page_hash = fnv(c.page_hash, &page[..len]);
+    c.page_bytes += len as u64;
+    send(
+        c,
+        Pair::Source,
+        KV_OP_PUT,
+        &[
+            &(kn as u16).to_le_bytes(),
+            &key[..kn],
+            &(len as u32).to_le_bytes(),
+            &page[..len],
+            &[0],
+            &0u64.to_le_bytes(),
+        ],
+        S_EXPORT_PUT,
+        b"[bkp] artifact send",
+    );
 }
 
 /// All pages written: record the export, complete, persist.
 fn finish_backup(c: &mut CoordState) {
-    let digest = page_digest(&c.page[..c.page_len as usize]);
-    let bytes = u64::from(c.sequence) * u64::from(PAGE_LIMIT);
-    if c.manifest.record_export(&[1u8; 16], digest, bytes).is_err() {
+    let digest = pages_digest(c.page_hash, c.page_bytes);
+    if c.manifest
+        .record_export(&RANGE_ID, digest, c.page_bytes)
+        .is_err()
+    {
         fault(c, b"[bkp] export record refused");
         return;
     }
@@ -573,15 +636,21 @@ fn finish_backup(c: &mut CoordState) {
         fault(c, b"[bkp] manifest key");
         return;
     };
-    let mut k = [0u8; KEY_MAX];
-    k[..kn].copy_from_slice(&key[..kn]);
-    let Some(bn) = stage_put(c, &k[..kn], &rec[..rn]) else {
-        fault(c, b"[bkp] manifest stage");
-        return;
-    };
-    if !kv_send(c, KV_OP_PUT, bn, S_MANIFEST_PUT) {
-        fault(c, b"[bkp] manifest send");
-    }
+    send(
+        c,
+        Pair::Source,
+        KV_OP_PUT,
+        &[
+            &(kn as u16).to_le_bytes(),
+            &key[..kn],
+            &(rn as u32).to_le_bytes(),
+            &rec[..rn],
+            &[0],
+            &0u64.to_le_bytes(),
+        ],
+        S_MANIFEST_PUT,
+        b"[bkp] manifest send",
+    );
 }
 
 /// Restore: read the manifest first — a restore from an INCOMPLETE
@@ -593,95 +662,125 @@ fn begin_restore(c: &mut CoordState) {
         fault(c, b"[bkp] manifest key");
         return;
     };
-    let mut k = [0u8; KEY_MAX];
-    k[..kn].copy_from_slice(&key[..kn]);
-    let Some(bn) = stage_get(c, &k[..kn]) else {
-        fault(c, b"[bkp] manifest stage");
-        return;
-    };
-    if !kv_send(c, KV_OP_GET, bn, S_RESTORE_GET) {
-        fault(c, b"[bkp] manifest send");
-    }
+    send(
+        c,
+        Pair::Source,
+        KV_OP_GET,
+        &[&(kn as u16).to_le_bytes(), &key[..kn]],
+        S_RESTORE_GET,
+        b"[bkp] manifest send",
+    );
 }
 
-fn send_restore_scan(c: &mut CoordState) {
-    let mut start = [0u8; KEY_MAX];
-    let mut end = [0u8; KEY_MAX];
-    let Some((sn, en)) = artifact_bounds(c, &mut start, &mut end) else {
-        fault(c, b"[bkp] artifact bounds");
+/// The next artifact page, by sequence — until the manifest's bytes are
+/// read; then (an empty backup: once, with no records) the target's
+/// fence and revision, then its digest.
+fn next_restore_step(c: &mut CoordState) {
+    let total = c.manifest.entries().first().map_or(0, |e| e.byte_size);
+    if c.page_bytes < total {
+        let mut key = [0u8; KEY_MAX];
+        let Some(kn) = artifact_key(c, c.sequence, &mut key) else {
+            fault(c, b"[bkp] artifact key");
+            return;
+        };
+        send(
+            c,
+            Pair::Source,
+            KV_OP_GET,
+            &[&(kn as u16).to_le_bytes(), &key[..kn]],
+            S_RESTORE_ARTIFACT,
+            b"[bkp] artifact read send",
+        );
         return;
-    };
-    let cursor = c.cursor;
-    let mut s = [0u8; KEY_MAX];
-    let mut e = [0u8; KEY_MAX];
-    s[..sn].copy_from_slice(&start[..sn]);
-    e[..en].copy_from_slice(&end[..en]);
-    let Some(bn) = stage_range_scan(c, &s[..sn], &e[..en], cursor) else {
-        fault(c, b"[bkp] restore stage");
-        return;
-    };
-    if !kv_send(c, KV_OP_RANGE_SCAN, bn, S_RESTORE_SCAN) {
-        fault(c, b"[bkp] restore send");
     }
+    if c.page_bytes != total {
+        fault(c, b"[bkp] artifact bytes disagree with the manifest");
+        return;
+    }
+    let digest = c.manifest.entries().first().map(|e| e.digest);
+    if digest != Some(pages_digest(c.page_hash, c.page_bytes)) {
+        fault(c, b"[bkp] artifact digest disagrees with the manifest");
+        return;
+    }
+    if c.restored_pages == 0 {
+        // Nothing was backed up: the target is still fenced and carried
+        // past R.
+        c.page_len = 0;
+        c.page_records = 0;
+        send_restore_page(c);
+        return;
+    }
+    send(
+        c,
+        Pair::Target,
+        KV_OP_HASH_KV,
+        &[&0u64.to_le_bytes()],
+        S_RESTORE_VERIFY,
+        b"[bkp] verify send",
+    );
 }
 
-/// Replay the next record from the staged artifact page.
-fn send_next_restore_put(c: &mut CoordState) {
-    if c.page_records == 0 {
-        if c.cursor != 0 {
-            send_restore_scan(c);
-        } else {
-            log_info(c, b"[bkp] restore complete");
-            c.state = S_DONE;
-        }
-        return;
-    }
-    let at = c.page_at as usize;
+/// The staged page as one `KV_OP_RESTORE` to the target.
+fn send_restore_page(c: &mut CoordState) {
     let len = c.page_len as usize;
-    if at + 6 > len {
-        fault(c, b"[bkp] artifact page corrupt");
-        return;
-    }
-    let klen = u16::from_le_bytes([c.page[at], c.page[at + 1]]) as usize;
-    let koff = at + 2;
-    let voff = koff + klen;
-    if voff + 4 > len {
-        fault(c, b"[bkp] artifact page corrupt");
-        return;
-    }
-    let vlen = u32::from_le_bytes([
-        c.page[voff],
-        c.page[voff + 1],
-        c.page[voff + 2],
-        c.page[voff + 3],
-    ]) as usize;
-    let vend = voff + 4 + vlen;
-    if vend > len {
-        fault(c, b"[bkp] artifact page corrupt");
-        return;
-    }
-    let mut key = [0u8; 512];
-    let mut val = [0u8; PAGE_BUF];
-    if klen > key.len() || vlen > val.len() {
-        fault(c, b"[bkp] record too large");
-        return;
-    }
-    key[..klen].copy_from_slice(&c.page[koff..koff + klen]);
-    val[..vlen].copy_from_slice(&c.page[voff + 4..voff + 4 + vlen]);
-    c.page_at = vend as u16;
-    c.page_records -= 1;
-    let Some(bn) = stage_put(c, &key[..klen], &val[..vlen]) else {
-        fault(c, b"[bkp] restore put stage");
-        return;
-    };
-    if !kv_send(c, KV_OP_PUT, bn, S_RESTORE_PUT) {
-        fault(c, b"[bkp] restore put send");
-    }
+    let mut page = [0u8; PAGE_BUF];
+    page[..len].copy_from_slice(&c.page[..len]);
+    let fence = c.manifest.fence;
+    let rev = c.manifest.protected_timestamp;
+    let n = c.page_records;
+    send(
+        c,
+        Pair::Target,
+        KV_OP_RESTORE,
+        &[
+            &fence.to_le_bytes(),
+            &rev.to_le_bytes(),
+            &n.to_le_bytes(),
+            &page[..len],
+        ],
+        S_RESTORE_PAGE,
+        b"[bkp] restore page send",
+    );
 }
 
-fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
+/// The records in an artifact page (each a `KV_OP_RESTORE` record), or
+/// `None` when the page does not walk whole.
+fn count_records(page: &[u8]) -> Option<u16> {
+    let mut at = 0usize;
+    let mut n = 0u16;
+    while at < page.len() {
+        let kl = u16::from_le_bytes([*page.get(at)?, *page.get(at + 1)?]) as usize;
+        let vo = at + 2 + kl;
+        let vl = u32::from_le_bytes(page.get(vo..vo + 4)?.try_into().ok()?) as usize;
+        at = vo + 4 + vl + RESTORE_META_LEN;
+        if at > page.len() {
+            return None;
+        }
+        n = n.checked_add(1)?;
+    }
+    Some(n)
+}
+
+/// A KV answer's result code as three digits at `at`.
+fn with_rc(msg: &mut [u8], at: usize, rc: u8) {
+    digits(msg, at, 3, u64::from(rc));
+}
+
+fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8], applied_index: u64) {
     match c.state {
-        S_EXPORT_SCAN => {
+        S_EXPORT_HASH => {
+            if result != KV_RESULT_OK || body.len() < 36 {
+                let mut msg = *b"[bkp] snapshot digest failed rc=000";
+                with_rc(&mut msg, 32, result);
+                fault(c, &msg);
+                return;
+            }
+            let hash = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let rev = u64::from_le_bytes(body[12..20].try_into().unwrap_or([0; 8]));
+            let keys = u64::from_le_bytes(body[28..36].try_into().unwrap_or([0; 8]));
+            open_manifest(c, rev, hash, keys, applied_index);
+        }
+        S_EXPORT_RANGE => {
             if result == KV_RESULT_COMPACTED {
                 // The protected history is gone: ABORT rather than
                 // ship a partial export (the whole reason the
@@ -690,100 +789,30 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
                 fault(c, b"[bkp] aborted: protected history compacted");
                 return;
             }
-            if result != KV_RESULT_SCAN_CURSOR || body.len() < 10 {
-                let mut msg = *b"[bkp] export scan failed rc=000 len=0000";
-                msg[28] = b'0' + ((result / 100) % 10);
-                msg[29] = b'0' + ((result / 10) % 10);
-                msg[30] = b'0' + (result % 10);
-                let bl = body.len().min(9999) as u32;
-                msg[36] = b'0' + ((bl / 1000) % 10) as u8;
-                msg[37] = b'0' + ((bl / 100) % 10) as u8;
-                msg[38] = b'0' + ((bl / 10) % 10) as u8;
-                msg[39] = b'0' + (bl % 10) as u8;
+            if result == KV_RESULT_MANIFEST {
+                let _ = c.manifest.transition(BackupPhase::Aborted);
+                fault(c, b"[bkp] aborted: a large value is not carried");
+                return;
+            }
+            if result != KV_RESULT_KVS || body.len() < 11 || body.len() > ENV_BUF {
+                let mut msg = *b"[bkp] export read failed rc=000";
+                with_rc(&mut msg, 28, result);
                 fault(c, &msg);
                 return;
             }
-            {
-                // Measure the first page rather than infer from the
-                // outcome: rc, count, and next cursor in one line.
-                let cnt = u16::from_le_bytes([body[8], body[9]]);
-                let mut msg = *b"[bkp] scan page n=0000 cur=0";
-                msg[18] = b'0' + ((cnt / 1000) % 10) as u8;
-                msg[19] = b'0' + ((cnt / 100) % 10) as u8;
-                msg[20] = b'0' + ((cnt / 10) % 10) as u8;
-                msg[21] = b'0' + (cnt % 10) as u8;
-                let cur = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
-                msg[27] = if cur == 0 { b'0' } else { b'1' };
-                log_info(c, &msg);
-            }
-            c.cursor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
-            let count = u16::from_le_bytes([body[8], body[9]]);
-            // Restage the page's keys as `[len:u16][key]` records.
-            c.keys_len = 0;
-            c.keys_at = 0;
-            c.keys_left = count;
-            let mut at = 10usize;
-            for _ in 0..count {
-                if at + 4 > body.len() {
-                    fault(c, b"[bkp] scan page corrupt");
-                    return;
-                }
-                let klen =
-                    u32::from_le_bytes(body[at..at + 4].try_into().unwrap_or([0; 4])) as usize;
-                at += 4;
-                if at + klen > body.len() || klen > 512 {
-                    fault(c, b"[bkp] scan page corrupt");
-                    return;
-                }
-                let w = c.keys_len as usize;
-                if w + 2 + klen > c.keys.len() {
-                    fault(c, b"[bkp] key page overflow");
-                    return;
-                }
-                c.keys[w..w + 2].copy_from_slice(&(klen as u16).to_le_bytes());
-                for i in 0..klen {
-                    c.keys[w + 2 + i] = body[at + i];
-                }
-                c.keys_len = (w + 2 + klen) as u16;
-                at += klen;
-            }
-            // Start (or continue) building this artifact page.
-            c.page_len = 0;
-            send_next_export_get(c);
-        }
-        S_EXPORT_GET => {
-            if result == KV_RESULT_COMPACTED {
-                let _ = c.manifest.transition(BackupPhase::Aborted);
-                fault(c, b"[bkp] aborted: protected history compacted");
+            let count = u16::from_le_bytes([body[9], body[10]]);
+            if count == 0 && body[8] != 0 {
+                // More to read and nothing that fit: one record is
+                // larger than an answer.
+                fault(c, b"[bkp] record larger than an answer");
                 return;
             }
-            if result == KV_RESULT_OK {
-                // Append `[klen:u16][key][vlen:u32][value]` — the same
-                // record shape a RANGE_SCAN page uses, so a restore
-                // walks artifacts with the identical parser.
-                let klen = c.cur_key_len as usize;
-                let need = 2 + klen + 4 + body.len();
-                let w = c.page_len as usize;
-                if w + need > PAGE_BUF {
-                    fault(c, b"[bkp] artifact page overflow");
-                    return;
-                }
-                c.page[w..w + 2].copy_from_slice(&(klen as u16).to_le_bytes());
-                for i in 0..klen {
-                    c.page[w + 2 + i] = c.cur_key[i];
-                }
-                let vo = w + 2 + klen;
-                c.page[vo..vo + 4].copy_from_slice(&(body.len() as u32).to_le_bytes());
-                for (i, b) in body.iter().enumerate() {
-                    c.page[vo + 4 + i] = *b;
-                }
-                c.page_len = (w + need) as u16;
-                c.m_records = c.m_records.wrapping_add(1);
-            } else if result != KV_RESULT_NOT_FOUND {
-                fault(c, b"[bkp] historical read failed");
-                return;
-            }
-            send_next_export_get(c);
+            c.ans[..body.len()].copy_from_slice(body);
+            c.ans_len = body.len() as u16;
+            c.ans_at = 11;
+            c.ans_left = count;
+            c.ans_more = body[8];
+            drain_export(c);
         }
         S_EXPORT_PUT => {
             if result != KV_RESULT_OK {
@@ -793,11 +822,8 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
             c.m_pages = c.m_pages.wrapping_add(1);
             c.sequence += 1;
             c.page_len = 0;
-            if c.cursor != 0 {
-                send_export_scan(c);
-            } else {
-                finish_backup(c);
-            }
+            c.page_records = 0;
+            drain_export(c);
         }
         S_MANIFEST_PUT => {
             if result != KV_RESULT_OK {
@@ -805,18 +831,11 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
                 return;
             }
             let _ = c.manifest.transition(BackupPhase::ProtectionReleased);
-            // Measure, don't infer: records and pages in the line.
-            let mut msg = *b"[bkp] backup complete r=0000 p=0000";
-            let r = c.m_records.min(9999) as u32;
-            let pg = c.m_pages.min(9999) as u32;
-            msg[24] = b'0' + ((r / 1000) % 10) as u8;
-            msg[25] = b'0' + ((r / 100) % 10) as u8;
-            msg[26] = b'0' + ((r / 10) % 10) as u8;
-            msg[27] = b'0' + (r % 10) as u8;
-            msg[31] = b'0' + ((pg / 1000) % 10) as u8;
-            msg[32] = b'0' + ((pg / 100) % 10) as u8;
-            msg[33] = b'0' + ((pg / 10) % 10) as u8;
-            msg[34] = b'0' + (pg % 10) as u8;
+            // Measure, don't infer: records, pages and the revision.
+            let mut msg = *b"[bkp] backup complete r=0000 p=0000 rev=0000000000";
+            digits(&mut msg, 24, 4, c.m_records.min(9999));
+            digits(&mut msg, 31, 4, c.m_pages.min(9999));
+            digits(&mut msg, 40, 10, c.protected_revision);
             log_info(c, &msg);
             c.state = S_DONE;
         }
@@ -827,9 +846,7 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
             }
             if result != KV_RESULT_OK {
                 let mut msg = *b"[bkp] manifest read failed rc=000";
-                msg[30] = b'0' + ((result / 100) % 10);
-                msg[31] = b'0' + ((result / 10) % 10);
-                msg[32] = b'0' + (result % 10);
+                with_rc(&mut msg, 30, result);
                 fault(c, &msg);
                 return;
             }
@@ -842,82 +859,99 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8]) {
                 fault(c, b"[bkp] refusing restore of an incomplete backup");
                 return;
             }
+            if m.artifact_format_version != BACKUP_ARTIFACT_FORMAT_VERSION || m.fence == 0 {
+                fault(c, b"[bkp] refusing restore: artifact format or fence");
+                return;
+            }
             c.manifest = m;
-            c.cursor = 0;
-            c.page_records = 0;
+            c.sequence = 0;
+            c.page_hash = FNV_OFFSET;
+            c.page_bytes = 0;
+            c.restored_pages = 0;
+            c.m_held = 0;
             log_info(c, b"[bkp] restore begins");
-            send_restore_scan(c);
+            next_restore_step(c);
         }
-        S_RESTORE_SCAN => {
-            if result != KV_RESULT_RANGE || body.len() < 10 {
-                fault(c, b"[bkp] artifact scan failed");
+        S_RESTORE_ARTIFACT => {
+            if result == KV_RESULT_NOT_FOUND {
+                fault(c, b"[bkp] artifact missing");
                 return;
             }
-            c.cursor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
-            let count = u16::from_le_bytes([body[8], body[9]]);
-            if count == 0 {
-                if c.cursor != 0 {
-                    send_restore_scan(c);
-                } else {
-                    log_info(c, b"[bkp] restore complete");
-                    c.state = S_DONE;
-                }
+            if result != KV_RESULT_OK || body.len() > PAGE_BUF {
+                fault(c, b"[bkp] artifact read failed");
                 return;
             }
-            // One artifact per page-scan step: take the FIRST record's
-            // value as the staged page, and remember the rest by
-            // leaving the cursor where it is (each artifact is one
-            // scan record, so a single-record read keeps this simple
-            // and bounded).
-            let klen = u16::from_le_bytes([body[10], body[11]]) as usize;
-            let voff = 12 + klen;
-            if voff + 4 > body.len() {
-                fault(c, b"[bkp] artifact record corrupt");
+            let Some(n) = count_records(body) else {
+                fault(c, b"[bkp] artifact page corrupt");
                 return;
-            }
-            let vlen =
-                u32::from_le_bytes(body[voff..voff + 4].try_into().unwrap_or([0; 4])) as usize;
-            let vend = voff + 4 + vlen;
-            if vend > body.len() || vlen > PAGE_BUF {
-                fault(c, b"[bkp] artifact too large");
-                return;
-            }
-            c.page[..vlen].copy_from_slice(&body[voff + 4..vend]);
-            c.page_len = vlen as u16;
-            c.page_at = 0;
-            // Records inside the artifact page: count them by walking.
-            let mut n = 0u16;
-            let mut at = 0usize;
-            while at + 6 <= vlen {
-                let kl = u16::from_le_bytes([c.page[at], c.page[at + 1]]) as usize;
-                let vo = at + 2 + kl;
-                if vo + 4 > vlen {
-                    break;
-                }
-                let vl = u32::from_le_bytes([
-                    c.page[vo],
-                    c.page[vo + 1],
-                    c.page[vo + 2],
-                    c.page[vo + 3],
-                ]) as usize;
-                let ve = vo + 4 + vl;
-                if ve > vlen {
-                    break;
-                }
-                n += 1;
-                at = ve;
-            }
+            };
+            c.page[..body.len()].copy_from_slice(body);
+            c.page_len = body.len() as u16;
             c.page_records = n;
-            // Re-scan from the NEXT artifact after this page drains.
-            send_next_restore_put(c);
+            c.page_hash = fnv(c.page_hash, body);
+            c.page_bytes += body.len() as u64;
+            send_restore_page(c);
         }
-        S_RESTORE_PUT => {
-            if result != KV_RESULT_OK {
-                fault(c, b"[bkp] restore write failed");
+        S_RESTORE_PAGE => {
+            if result == KV_RESULT_EXISTS {
+                fault(
+                    c,
+                    b"[bkp] restore refused: the target is not fresh, or fenced by another restore",
+                );
                 return;
             }
-            c.m_restored = c.m_restored.wrapping_add(1);
-            send_next_restore_put(c);
+            if result != KV_RESULT_OK {
+                let mut msg = *b"[bkp] restore page failed rc=000";
+                with_rc(&mut msg, 29, result);
+                fault(c, &msg);
+                return;
+            }
+            // `[written:u16][held:u16]`: a record the target already held
+            // with exactly this value and metadata is a page applied before
+            // (a resumed restore, or one repeated over its own result).
+            let held = match body {
+                [_, _, h0, h1, ..] => u16::from_le_bytes([*h0, *h1]),
+                _ => 0,
+            };
+            c.m_restored = c.m_restored.wrapping_add(u64::from(c.page_records));
+            c.m_held = c.m_held.wrapping_add(u64::from(held));
+            c.restored_pages += 1;
+            c.sequence += 1;
+            next_restore_step(c);
+        }
+        S_RESTORE_VERIFY => {
+            if result != KV_RESULT_OK || body.len() < 36 {
+                fault(c, b"[bkp] restore verify failed");
+                return;
+            }
+            let hash = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let floor = u64::from_le_bytes(body[4..12].try_into().unwrap_or([0; 8]));
+            let rev = u64::from_le_bytes(body[12..20].try_into().unwrap_or([0; 8]));
+            let keys = u64::from_le_bytes(body[28..36].try_into().unwrap_or([0; 8]));
+            if hash != c.manifest.state_hash
+                || keys != c.manifest.state_keys
+                || rev < c.manifest.protected_timestamp
+            {
+                fault(c, b"[bkp] restore digest disagrees with the snapshot's");
+                return;
+            }
+            // History below R is not in the target (each key holds only its
+            // version as of R): a read from under R must answer compacted,
+            // never a partial history.
+            if floor < c.manifest.protected_timestamp {
+                fault(c, b"[bkp] restore left history below the snapshot readable");
+                return;
+            }
+            // Measured on the target: records (and of them, held already),
+            // R, the target's revision and its compaction floor.
+            let mut msg = *b"[bkp] restore complete r=0000 h=0000 rev=0000000000 at=0000000000 floor=0000000000 verified";
+            digits(&mut msg, 25, 4, c.m_restored.min(9999));
+            digits(&mut msg, 32, 4, c.m_held.min(9999));
+            digits(&mut msg, 41, 10, c.manifest.protected_timestamp);
+            digits(&mut msg, 55, 10, rev);
+            digits(&mut msg, 72, 10, floor);
+            log_info(c, &msg);
+            c.state = S_DONE;
         }
         _ => {}
     }
@@ -964,12 +998,51 @@ pub extern "C" fn module_new(
     unsafe {
         let sys = &*sys_ptr;
         c.metrics_out = dev_channel_port(sys, 1, 1);
+        c.target_in = dev_channel_port(sys, 0, 1);
+        c.target_out = dev_channel_port(sys, 1, 2);
     }
-    if c.mode > 2 {
+    if c.mode > 2 || c.epoch == 0 {
         return -1; // an unknown mode must not run as "inert"
+    }
+    // A target named by half its pair would send pages nowhere it reads.
+    if (c.target_in < 0) != (c.target_out < 0) {
+        return -1;
     }
     c.state = if c.mode == 0 { S_IDLE } else { S_WAIT };
     0
+}
+
+/// Read one KV answer from `chan` and apply it when it is the one in
+/// flight.
+unsafe fn take_answer(c: &mut CoordState, target: bool) {
+    let sys = &*c.syscalls;
+    let mut env = [0u8; ENVELOPE_HDR + ENV_BUF];
+    let got = if target {
+        read_envelope(&mut c.target_inbox, sys, c.target_in, &mut env)
+    } else {
+        read_envelope(&mut c.kv_inbox, sys, c.kv_in, &mut env)
+    };
+    let Some((msg, len)) = got else {
+        return;
+    };
+    let payload = &env[..len];
+    if msg != MSG_KV_RESPONSE || payload.len() < 20 {
+        return;
+    }
+    let corr = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
+    let result = payload[9];
+    let blen = u16::from_le_bytes([payload[18], payload[19]]) as usize;
+    if corr != c.corr || payload.len() < 20 + blen {
+        return;
+    }
+    // The fence tail's applied index: the consensus position the answer
+    // was produced at (0 where no log orders the store).
+    let applied_index = payload
+        .get(20 + blen..20 + blen + 8)
+        .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+    let mut body = [0u8; ENV_BUF];
+    body[..blen].copy_from_slice(&payload[20..20 + blen]);
+    on_kv_response(c, result, &body[..blen], applied_index);
 }
 
 #[no_mangle]
@@ -989,20 +1062,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     unsafe {
-        let sys = &*sys_ptr;
-        let mut env = [0u8; ENVELOPE_HDR + ENV_BUF];
-        if let Some((msg, len)) = read_envelope(&mut c.kv_inbox, sys, c.kv_in, &mut env) {
-            let payload = &env[..len];
-            if msg == MSG_KV_RESPONSE && payload.len() >= 20 {
-                let corr = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
-                let result = payload[9];
-                let blen = u16::from_le_bytes([payload[18], payload[19]]) as usize;
-                if corr == c.corr && payload.len() >= 20 + blen {
-                    let mut body = [0u8; ENV_BUF];
-                    body[..blen].copy_from_slice(&payload[20..20 + blen]);
-                    on_kv_response(c, result, &body[..blen]);
-                }
-            }
+        take_answer(c, false);
+        if c.target_in >= 0 {
+            take_answer(c, true);
         }
     }
 

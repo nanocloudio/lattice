@@ -125,6 +125,63 @@ pub fn directive<'a>(schema: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     })
 }
 
+/// A collection's id paths from a dialect's `id_paths` param,
+/// `<paths>[;<collection>,…=<paths>]…[;?=<paths>]`: the paths of the entry
+/// that names the collection; else, with a `?=` entry, the LAST `depth` of
+/// its paths — `depth` being how many id components the request's key
+/// states (its id prefix and id), so one entry serves the kinds a dialect
+/// meets unnamed whether their key is `/<plural>/<name>` (one component,
+/// the name path) or `/<plural>/<ns>/<name>` (two, namespace and name);
+/// `depth` 0 or past the entry's paths takes all of them; else the first
+/// entry's paths (an entry with no `=`). Without a `?=` entry `depth` is
+/// never read.
+pub fn id_paths_for<'p>(param: &'p [u8], collection: &[u8], depth: usize) -> &'p [u8] {
+    let mut default: &[u8] = &[];
+    let mut by_depth: Option<&[u8]> = None;
+    for (i, ent) in param.split(|&c| c == b';').enumerate() {
+        match ent.iter().position(|&c| c == b'=') {
+            Some(eq) => {
+                let names = ent.get(..eq).unwrap_or(&[]);
+                let paths = ent.get(eq + 1..).unwrap_or(&[]);
+                if trim(names) == b"?" {
+                    by_depth = by_depth.or(Some(paths));
+                } else if names.split(|&c| c == b',').any(|n| trim(n) == collection) {
+                    return paths;
+                }
+            }
+            None if i == 0 => default = ent,
+            None => {}
+        }
+    }
+    match by_depth {
+        Some(paths) => last_id_paths(paths, depth),
+        None => default,
+    }
+}
+
+/// The last `k` paths of a `,`-list of id paths (all of them when `k` is
+/// 0 or at least their number): the paths a `k`-component id fills.
+pub fn last_id_paths(paths: &[u8], k: usize) -> &[u8] {
+    let n = entries(paths).count();
+    if k == 0 || k >= n {
+        return paths;
+    }
+    let mut skip = n - k;
+    let mut at = 0usize;
+    for (i, &c) in paths.iter().enumerate() {
+        if c == b',' && !trim(paths.get(at..i).unwrap_or(&[])).is_empty() {
+            skip -= 1;
+            if skip == 0 {
+                return paths.get(i + 1..).unwrap_or(&[]);
+            }
+        }
+        if c == b',' {
+            at = i + 1;
+        }
+    }
+    paths
+}
+
 /// The non-empty entries of a `,`-list.
 fn entries(list: &[u8]) -> impl Iterator<Item = &[u8]> {
     list.split(|&b| b == b',')

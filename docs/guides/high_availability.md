@@ -95,12 +95,25 @@ cannot take the majority.
 ## Backup and restore
 
 Independent of replication, `backup_coordinator` produces a
-consistent backup by scanning every record at one protected
-revision — a scan that races compaction is aborted rather than
-exported partially — and restore replays the backup's pages as puts
-(a merge: keys absent from the backup are not deleted). Backup
-artefacts are ordinary KV records, so they replicate with the
-cluster. Source: `modules/app/backup_coordinator/mod.rs`.
+consistent backup by reading every live key, with its create and mod
+revision, version and lease, at one revision R — a read that races
+compaction is aborted rather than exported partially. The manifest
+carries R, the consensus index the state was applied through, the
+epoch the backup is fenced under and R's digest. A restore is EXACT and
+goes into a fresh store (its `target` pair): every key lands with the
+metadata it had (`KV_OP_RESTORE`), the store's revision passes R, its
+compaction floor is R (history below R is not there, so a read or change
+feed from under it answers compacted), and the restored digest must be
+R's — so a revision a client holds survives a restore or a migration. The
+coordinator reads the digest, revision and floor back and logs them
+(`[bkp] restore complete r=… h=… rev=R at=… floor=… verified`; `h` counts
+records the target already held, as a repeated or resumed restore finds
+them). A store already written, or fenced by another restore, refuses it.
+The target may be any store a client reaches on a raw KV pair — the
+`lattice_store` stack's `pump_kv` included (`configs/store-stack-restore.yaml`,
+`tests/harness/tests/live_store_restore.rs`: a fresh disk store, kept
+across a restart). Backup artefacts are ordinary KV records, so they
+replicate with the cluster. Source: `modules/app/backup_coordinator/mod.rs`.
 
 ## Monitoring
 

@@ -242,15 +242,28 @@ impl Role {
 }
 
 /// The auth state the anchor checks requests against: the store's
-/// records, read once at start and kept current by the changes the
-/// anchor commits.
+/// records, read at start, kept current by the changes the anchor
+/// commits, and read again whenever the keyspace moves under it (a
+/// change another replica's anchor committed) — the member's own view
+/// of the replicated auth state, as an etcd member's auth store is.
 pub struct AuthCache {
     pub loaded: bool,
     pub enabled: bool,
     pub revision: u64,
     pub users: [User; USERS_MAX],
     pub roles: [Role; ROLES_MAX],
+    /// A refresh pass is reading the records again over the cache in
+    /// place: what it reads is marked, and what it never read is
+    /// dropped when it ends ([`AuthCache::end_refresh`]).
+    pub refreshing: bool,
+    pub seen_users: u64,
+    pub seen_roles: u64,
+    pub seen_enabled: bool,
+    pub seen_rev: bool,
 }
+
+// One bit per slot in the refresh marks.
+const _: () = assert!(USERS_MAX <= 64 && ROLES_MAX <= 64);
 
 impl AuthCache {
     pub fn init(&mut self) {
@@ -265,6 +278,53 @@ impl AuthCache {
         for r in self.roles.iter_mut() {
             *r = Role::EMPTY;
         }
+        self.refreshing = false;
+        self.seen_users = 0;
+        self.seen_roles = 0;
+        self.seen_enabled = false;
+        self.seen_rev = false;
+    }
+
+    /// Start reading every record again over the cache, which keeps
+    /// answering meanwhile: each record read is applied as it comes.
+    pub fn begin_refresh(&mut self) {
+        self.refreshing = true;
+        self.seen_users = 0;
+        self.seen_roles = 0;
+        self.seen_enabled = false;
+        self.seen_rev = false;
+    }
+
+    /// Every record has been read again: what the pass never read is no
+    /// longer stored, so it goes — a user or role deleted elsewhere,
+    /// auth turned off by the record's removal. Returns whether anything
+    /// was dropped.
+    pub fn end_refresh(&mut self) -> bool {
+        if !self.refreshing {
+            return false;
+        }
+        self.refreshing = false;
+        let mut dropped = false;
+        for (i, u) in self.users.iter_mut().enumerate() {
+            if u.used && self.seen_users & (1u64 << i) == 0 {
+                *u = User::EMPTY;
+                dropped = true;
+            }
+        }
+        for (i, r) in self.roles.iter_mut().enumerate() {
+            if r.used && self.seen_roles & (1u64 << i) == 0 {
+                *r = Role::EMPTY;
+                dropped = true;
+            }
+        }
+        if !self.seen_enabled && self.enabled {
+            self.enabled = false;
+            dropped = true;
+        }
+        if !self.seen_rev {
+            self.revision = 1;
+        }
+        dropped
     }
 
     pub fn user(&self, name: &[u8]) -> Option<usize> {
@@ -291,19 +351,25 @@ impl AuthCache {
     /// Apply one stored record (a load, or a change just committed). A
     /// `None` value is the record's deletion.
     pub fn apply(&mut self, key: &[u8], value: Option<&[u8]>) {
+        let present = value.is_some();
         if key == KEY_ENABLED {
             self.enabled = value.is_some_and(|v| v.first() == Some(&1));
+            self.seen_enabled |= present;
         } else if key == KEY_REV {
             if let Some(v) = value.and_then(|v| v.get(..8)) {
                 let mut b = [0u8; 8];
                 b.copy_from_slice(v);
                 self.revision = u64::from_le_bytes(b);
             }
+            self.seen_rev |= present;
         } else if let Some(name) = key.strip_prefix(b"u/") {
             let at = self.user(name).or_else(|| self.free_user());
             if let Some(i) = at {
                 match value.and_then(|v| decode_user(name, v)) {
-                    Some(u) => self.users[i] = u,
+                    Some(u) => {
+                        self.users[i] = u;
+                        self.seen_users |= 1u64 << i;
+                    }
                     None => self.users[i] = User::EMPTY,
                 }
             }
@@ -311,7 +377,10 @@ impl AuthCache {
             let at = self.role(name).or_else(|| self.free_role());
             if let Some(i) = at {
                 match value.and_then(|v| decode_role(name, v)) {
-                    Some(r) => self.roles[i] = r,
+                    Some(r) => {
+                        self.roles[i] = r;
+                        self.seen_roles |= 1u64 << i;
+                    }
                     None => self.roles[i] = Role::EMPTY,
                 }
             }

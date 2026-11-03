@@ -529,30 +529,37 @@ fn directives(schema: &[u8], out: &mut [u8; 256]) -> Option<usize> {
 }
 
 /// The collection's descriptor from the schema, into `st.desc`.
-/// A collection's id paths from the `id_paths` param,
-/// `<paths>[;<collection>,…=<paths>]…`: the paths of the entry that names
-/// the collection, else the first entry's (a cluster-scoped kind's id is
-/// its name alone, a namespaced kind's its namespace and name).
-fn id_paths_for<'p>(param: &'p [u8], collection: &[u8]) -> &'p [u8] {
-    let mut default: &[u8] = &[];
-    for (i, ent) in param.split(|&c| c == b';').enumerate() {
-        match ent.iter().position(|&c| c == b'=') {
-            Some(eq) => {
-                let names = ent.get(..eq).unwrap_or(&[]);
-                if names.split(|&c| c == b',').any(|n| trim(n) == collection) {
-                    return ent.get(eq + 1..).unwrap_or(&[]);
-                }
-            }
-            None if i == 0 => default = ent,
-            None => {}
+/// How many id components a request's key states: its id prefix's (a
+/// namespace) and its id's — an array's elements, else one; a write with
+/// no id still names one (the name the object states or is generated).
+/// Read only by an `id_paths` param with a `?=` entry
+/// ([`doc_schema::id_paths_for`]).
+fn id_depth(tree: &mut [u8], r: &JsonRequest<'_>) -> usize {
+    let mut count = |json: &[u8]| -> usize {
+        let Ok(n) = json_tree::parse(json, tree) else {
+            return 0;
+        };
+        match Value::parse(tree.get(..n).unwrap_or(&[])) {
+            Ok(v) if v.ty() == doc_tree::T_ARRAY => v.elements().count(),
+            Ok(_) => 1,
+            Err(_) => 0,
         }
-    }
-    default
+    };
+    let prefix = r.field(J_ID_PREFIX).map_or(0, &mut count);
+    let id = match r.field(J_ID) {
+        Some(j) => count(j),
+        None => usize::from(is_write(r.op)),
+    };
+    prefix + id
 }
 
-fn describe(st: &mut DialectState, name: &[u8]) -> Result<usize, Refusal> {
+fn describe(st: &mut DialectState, name: &[u8], depth: usize) -> Result<usize, Refusal> {
     let bad = || refused(OUT_INVALID, why_schema());
-    let ids_text = id_paths_for(st.id_paths.get(..st.id_paths_len).unwrap_or(&[]), name);
+    let ids_text = doc_schema::id_paths_for(
+        st.id_paths.get(..st.id_paths_len).unwrap_or(&[]),
+        name,
+        depth,
+    );
     let mut ids: [&[u8]; MAX_ID_PATHS] = [&[]; MAX_ID_PATHS];
     let mut n = 0usize;
     for p in ids_text.split(|&c| c == b',') {
@@ -609,7 +616,8 @@ fn translate(st: &mut DialectState) -> Result<usize, Refusal> {
     let schema_len = st.schema_len;
     let name = r.field(J_COLLECTION).unwrap_or(&[]);
     let dn = if is_write(r.op) {
-        describe(st, name)?
+        let depth = id_depth(&mut st.tree, &r);
+        describe(st, name, depth)?
     } else {
         0
     };
@@ -850,9 +858,12 @@ fn render(st: &mut DialectState, req: &[u8], corr: u64, conn: u8, op: u8) -> usi
     let schema = schema.get(..schema_len).unwrap_or(&[]);
     let table = table.get(..table_len).unwrap_or(&[]);
     let reading = Reading {
-        id_paths: id_paths_for(
+        // Every path the collection's entry names: a deleted document's
+        // id fills the last of them its components reach (`gone`).
+        id_paths: doc_schema::id_paths_for(
             id_paths.get(..id_paths_len).unwrap_or(&[]),
             req.and_then(|r| r.field(J_COLLECTION)).unwrap_or(&[]),
+            0,
         ),
         ..reading
     };
@@ -1126,7 +1137,15 @@ fn gone(
             *in_own = !*in_own;
             Ok(())
         };
-    let mut paths = id_paths
+    // A compound id fills the last paths, one component each (a
+    // collection's entry names as many as its ids hold, or — a `?=`
+    // entry — the most any key states).
+    let k = if id.ty() == doc_tree::T_ARRAY {
+        id.elements().count()
+    } else {
+        1
+    };
+    let mut paths = doc_schema::last_id_paths(id_paths, k)
         .split(|&c| c == b',')
         .map(trim)
         .filter(|p| !p.is_empty());

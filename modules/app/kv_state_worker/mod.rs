@@ -429,13 +429,15 @@ define_params! {
             }
         };
 
-    // History kept, in revisions, by a worker with its own command log
-    // (nothing orders it, so nothing else compacts it): once the store
-    // passes the last compaction by this much and an eighth more, it
-    // compacts to its revision less this — etcd's revision auto-compaction,
-    // and fluxor's host store's change window (65536). A watch or change
-    // read from before it answers compacted (Kubernetes' 410). 0: keep
-    // everything.
+    // History kept, in revisions, by a disk worker: once the store passes
+    // the last compaction by this much and an eighth more, it compacts to
+    // its revision less this — etcd's revision auto-compaction, and
+    // fluxor's host store's change window (65536). A worker with its own
+    // command log applies the Compact through it; one consensus orders
+    // (`sweep_wrap: 1`) proposes it on `sweep_out`, and every replica
+    // applies it at the committed revision. A watch, SCAN_VERSIONS window
+    // or change read from before it answers compacted (Kubernetes' 410).
+    // 0: keep everything (until a client's Compact).
     12, history_revisions, u32, 0
         => |s, d, len| { s.history_revisions = p_u32(d, len, 0, 0); };
 
@@ -1037,6 +1039,10 @@ struct WorkerState {
     /// `history_revisions` param, and the revision last compacted to.
     history_revisions: u32,
     compacted_to: u64,
+    /// The step a history Compact was last proposed at (a store
+    /// consensus orders, `sweep_wrap` 1), and whether one was.
+    compact_step: u64,
+    compact_proposed: bool,
     /// A bulk load is running (the store.log import): its ops are logged
     /// without a sync each, and synced once, before its end is recorded.
     clog_defer: bool,
@@ -1161,6 +1167,8 @@ impl WorkerState {
         self.sweep_flags = 0;
         self.sweep_inflight = false;
         self.sweep_step = 0;
+        self.compact_step = 0;
+        self.compact_proposed = false;
         self.sweep_floor = 0;
         self.sweeps_proposed = 0;
         self.sweeps_applied = 0;
@@ -1839,12 +1847,71 @@ unsafe fn propose_chunk_sweep(worker: &mut WorkerState) {
     // As many queue entries as the store lets one sweep take.
     let budget = u16::try_from(kv_store::SWEEP_BUDGET_MAX).unwrap_or(u16::MAX);
     body[16..].copy_from_slice(&budget.to_le_bytes());
+    if propose(worker, types::KV_OP_CHUNK_SWEEP, &body) {
+        worker.sweep_inflight = true;
+        worker.sweep_step = worker.step_ctr;
+        worker.sweep_floor = floor;
+        worker.sweep_armed = false;
+        worker.sweep_flags = 0;
+        worker.sweeps_proposed = worker.sweeps_proposed.wrapping_add(1);
+    }
+}
+
+/// Keep `history_revisions` of history on a store consensus orders
+/// (`sweep_wrap` 1): the Compact is proposed on `sweep_out`, as a chunk
+/// sweep is, and applies on every replica at the revision the command
+/// names (a follower's gateway refuses its own proposal, so the leader's
+/// is the one that commits). Proposed once the store passes the last
+/// Compact by the window and an eighth more, and again after
+/// `SWEEP_RETRY_STEPS` if none has applied. A store with its own command
+/// log compacts through it instead ([`retain_history`]).
+unsafe fn propose_history_compact(worker: &mut WorkerState) {
+    let keep = u64::from(worker.history_revisions);
+    if keep == 0
+        || worker.sweep_wrap == 0
+        || worker.state_store != STATE_STORE_DISK
+        || worker.sweep_out < 0
+        || worker.syscalls.is_null()
+    {
+        return;
+    }
+    let rev = worker.disk_revision;
+    if rev
+        <= worker
+            .disk_state
+            .compact_revision
+            .saturating_add(keep + keep / 8)
+    {
+        worker.compact_proposed = false;
+        return;
+    }
+    if worker.compact_proposed
+        && worker.step_ctr.wrapping_sub(worker.compact_step) < SWEEP_RETRY_STEPS
+    {
+        return;
+    }
+    let target = rev - keep;
+    if propose(worker, types::KV_OP_COMPACT, &target.to_le_bytes()) {
+        worker.compact_proposed = true;
+        worker.compact_step = worker.step_ctr;
+    }
+}
+
+/// Write one of this worker's own ordered commands (`op`, `body`) on
+/// `sweep_out`: a bare `MSG_KV_COMMAND` (`sweep_wrap` 0) or a
+/// `MSG_CLIENT_PROPOSAL` for consensus (`sweep_wrap` 1). `false` when the
+/// channel did not take it whole.
+unsafe fn propose(worker: &mut WorkerState, op: u8, body: &[u8]) -> bool {
+    // The longest body this worker proposes is a sweep's.
+    if body.len() > kv_store::SWEEP_BODY_LEN || worker.sweep_out < 0 || worker.syscalls.is_null() {
+        return false;
+    }
     let head = wire::KvCommandHead {
         corr_id: 0,
         kpg_id: worker.gc_claim_kpg,
         conn_id: 0,
         consistency: 0,
-        op: types::KV_OP_CHUNK_SWEEP,
+        op,
         tenant: 0,
         database: 0,
         keyspace: 0,
@@ -1853,8 +1920,8 @@ unsafe fn propose_chunk_sweep(worker: &mut WorkerState) {
     };
     // [type][len:u16] + (proposal: [conn:u16=0][LATTICE_ENTRY_TAG]) +
     // head + body.
-    const CMD_LEN: usize = wire::KvCommandHead::LEN + kv_store::SWEEP_BODY_LEN;
-    let mut frame = [0u8; 3 + 3 + CMD_LEN];
+    let cmd_len = wire::KvCommandHead::LEN + body.len();
+    let mut frame = [0u8; 3 + 3 + wire::KvCommandHead::LEN + kv_store::SWEEP_BODY_LEN];
     let pre = if worker.sweep_wrap == 0 {
         frame[0] = MSG_KV_COMMAND;
         3
@@ -1863,22 +1930,15 @@ unsafe fn propose_chunk_sweep(worker: &mut WorkerState) {
         frame[5] = wire::LATTICE_ENTRY_TAG;
         6
     };
-    let payload_len = pre - 3 + CMD_LEN;
+    let payload_len = pre - 3 + cmd_len;
     frame[1..3].copy_from_slice(&(payload_len as u16).to_le_bytes());
     if !head.encode(&mut frame[pre..]) {
-        return;
+        return false;
     }
-    frame[pre + wire::KvCommandHead::LEN..pre + CMD_LEN].copy_from_slice(&body);
-    let total = pre + CMD_LEN;
+    frame[pre + wire::KvCommandHead::LEN..pre + cmd_len].copy_from_slice(body);
+    let total = pre + cmd_len;
     let sys = &*worker.syscalls;
-    if (sys.channel_write)(worker.sweep_out, frame.as_mut_ptr(), total) == total as i32 {
-        worker.sweep_inflight = true;
-        worker.sweep_step = worker.step_ctr;
-        worker.sweep_floor = floor;
-        worker.sweep_armed = false;
-        worker.sweep_flags = 0;
-        worker.sweeps_proposed = worker.sweeps_proposed.wrapping_add(1);
-    }
+    (sys.channel_write)(worker.sweep_out, frame.as_mut_ptr(), total) == total as i32
 }
 
 /// What applying one `MSG_KV_COMMAND` frame came to.
@@ -5352,6 +5412,7 @@ fn step(state: *mut u8) -> i32 {
         publish_retention_claim(worker);
         maybe_request_ts_lease(worker);
         propose_chunk_sweep(worker);
+        propose_history_compact(worker);
     }
     let drain_t0 = unsafe { now_us(worker) };
     let scans0 = worker.disk_state.scans_opened.get();

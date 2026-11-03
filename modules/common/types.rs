@@ -503,6 +503,44 @@ pub const KV_OP_ORIGIN_CHUNK: u8 = 0x2A;
 /// import's marker in the same entry. Proposed and answered as
 /// `KV_OP_ORIGIN_REGISTER`.
 pub const KV_OP_ORIGIN_IMPORT: u8 = 0x2B;
+/// One page of an EXACT restore: records written with the metadata they
+/// had where they were backed up, into a store that is fresh or already
+/// fenced for this restore — so a revision a client holds (a resource
+/// version, a compare's mod revision) means the same thing after.
+///
+/// Body: `[fence:u64 LE][snapshot_revision:u64 LE][count:u16 LE]` then per
+/// record `[key_len:u16 LE][key…][value_len:u32 LE][value…]`
+/// `[create_revision:u64 LE][mod_revision:u64 LE][version:u64 LE]`
+/// `[lease:u64 LE][flags:u8]` (flags 0: a large value's manifest is not
+/// carried).
+///
+/// - The fence: the store's restore fence record (its own keyspace, never
+///   a user key) must hold this `(fence, snapshot_revision)`; with none,
+///   the store must be fresh — never written, revision 0 — and the page
+///   records it. A store fenced for another restore, or written and not
+///   fenced, refuses the page `KV_RESULT_EXISTS` and writes nothing.
+///   `fence` 0 is refused.
+/// - Each record is written AS IT WAS: its value, create and mod revision,
+///   version and lease, at its mod revision — no fresh revision. It must
+///   satisfy `1 <= create <= mod <= snapshot_revision` and `version >= 1`
+///   (else `KV_RESULT_INTERNAL`); a key already live with exactly this
+///   value and metadata is a replayed page and is left as it is; one live
+///   otherwise refuses the page `KV_RESULT_EXISTS`.
+/// - The store's revision becomes at least `snapshot_revision` (the fence
+///   record is written just above it), so every later write's revision is
+///   above every restored one.
+/// - A page applies whole or not at all, and answers `KV_RESULT_OK` with
+///   `[written:u16 LE][held:u16 LE]` (records written, records already
+///   there).
+///
+/// The fence does not hold other writers off: the restorer is the store's
+/// only writer until it is done (a client fences its own, e.g. by the
+/// epoch it compares on every write).
+pub const KV_OP_RESTORE: u8 = 0x2C;
+/// The fixed head of a [`KV_OP_RESTORE`] body, and a record's metadata
+/// after its value.
+pub const RESTORE_HEAD_LEN: usize = 8 + 8 + 2;
+pub const RESTORE_META_LEN: usize = 8 + 8 + 8 + 8 + 1;
 
 // ── KV op-specific body shapes ─────────────────────────────────────────
 //

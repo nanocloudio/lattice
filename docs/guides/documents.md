@@ -141,10 +141,19 @@ say when; what is answered is always read from the store's history at the
 watch's cursor, so a lost notification costs latency (every followed watch
 is read again each second), never a change.
 
-The JSON dialect's `id_paths` param is `<paths>[;<collection>,…=<paths>]…`:
-the first entry's paths for every collection no later entry names
-(Kubernetes: `metadata.namespace,metadata.name`, and `metadata.name` alone
-for the cluster-scoped kinds). A schema's `named=<collection>|<path>:<gen>`
+The JSON dialect's `id_paths` param is
+`<paths>[;<collection>,…=<paths>]…[;?=<paths>]`: the first entry's paths for
+every collection no later entry names (Kubernetes:
+`metadata.namespace,metadata.name`, and `metadata.name` alone for the
+cluster-scoped kinds). A `?=` entry (opt-in) serves the collections no entry
+names by the request's key instead: the LAST k of its paths, k the id
+components the request states (its `J_ID_PREFIX` and `J_ID` — an array's
+elements, else one; a write with no `J_ID` one for the name). With
+`?=metadata.namespace,metadata.name`, a kind met only at run time (a custom
+resource) is keyed by its name alone when its key is `/<plural>/<name>` and by
+namespace and name when it is `/<plural>/<ns>/<name>`; the collection's first
+write fixes which. A deleted document's id fills the last paths its
+components reach. A schema's `named=<collection>|<path>:<gen>`
 stamps and keeps the path in that collection only (Kubernetes' namespace
 name label).
 

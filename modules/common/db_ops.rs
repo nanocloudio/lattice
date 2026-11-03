@@ -1536,13 +1536,13 @@ fn successor(cursor: &FeedCursor, descriptor: RangeDescriptor) -> SuccessorCurso
 
 /// Version of the [`BackupManifest`] wire encoding. Bump on ANY layout
 /// change; decoders fail closed on an unknown version.
-pub const BACKUP_MANIFEST_VERSION: u16 = 1;
+pub const BACKUP_MANIFEST_VERSION: u16 = 2;
 
 /// Version of the exported range-artifact format the manifest
 /// describes. Distinct from the manifest version: a restore target
 /// that cannot read the artifact format refuses even when it can read
 /// the manifest.
-pub const BACKUP_ARTIFACT_FORMAT_VERSION: u16 = 1;
+pub const BACKUP_ARTIFACT_FORMAT_VERSION: u16 = 2;
 
 /// Maximum ranges named by one backup manifest.
 ///
@@ -1840,7 +1840,7 @@ pub enum BackupRecovery {
 /// The durable record of one database backup, shaped after
 /// the per-range snapshot manifest.
 ///
-/// Wire layout ([`BACKUP_MANIFEST_VERSION`] 1, all integers LE):
+/// Wire layout ([`BACKUP_MANIFEST_VERSION`] 2, all integers LE):
 ///
 /// ```text
 /// [version:u16][payload_len:u16]
@@ -1848,6 +1848,7 @@ pub enum BackupRecovery {
 /// [database_id:u32]
 /// [protected_timestamp:u64]
 /// [metadata_revision:u64]
+/// [raft_index:u64][fence:u64][state_hash:u32][state_keys:u64]
 /// [artifact_format_version:u16]
 /// [key_id:16][key_version:u32][rotation_epoch:u32]
 /// [phase:u8][complete:u8]
@@ -1877,6 +1878,18 @@ pub struct BackupManifest {
     /// descriptor set was discovered. A restore that cannot reproduce
     /// this revision is restoring a different descriptor set.
     pub metadata_revision: u64,
+    /// The consensus log index the snapshot's state was applied through,
+    /// when a log orders the store (0: none, or not known).
+    pub raft_index: u64,
+    /// The epoch the snapshot is fenced under: a restore writes it into
+    /// the target's restore fence (`KV_OP_RESTORE`), and a store fenced
+    /// under another refuses it. Non-zero once a backup records it.
+    pub fence: u64,
+    /// The snapshot's live keys as the store digests them at
+    /// `protected_timestamp` (`KV_OP_HASH_KV`'s hash and key count): a
+    /// restore that reads back another digest restored something else.
+    pub state_hash: u32,
+    pub state_keys: u64,
     /// Format of the exported artifacts (not of this manifest).
     pub artifact_format_version: u16,
     /// Which key wrapped the artifacts.
@@ -1890,7 +1903,7 @@ pub struct BackupManifest {
 /// Fixed wire overhead of a manifest: header plus every field except
 /// the range entries.
 pub const BACKUP_MANIFEST_FIXED_WIRE_LEN: usize =
-    4 + 16 + 4 + 8 + 8 + 2 + EncryptionKeyIdentity::WIRE_LEN + 1 + 1 + 1;
+    4 + 16 + 4 + 8 + 8 + 8 + 8 + 4 + 8 + 2 + EncryptionKeyIdentity::WIRE_LEN + 1 + 1 + 1;
 /// Worst-case encoded manifest length.
 pub const BACKUP_MANIFEST_MAX_WIRE_LEN: usize =
     BACKUP_MANIFEST_FIXED_WIRE_LEN + MAX_BACKUP_RANGES * RANGE_ENTRY_WIRE_LEN;
@@ -1901,6 +1914,10 @@ impl BackupManifest {
         database_id: 0,
         protected_timestamp: 0,
         metadata_revision: 0,
+        raft_index: 0,
+        fence: 0,
+        state_hash: 0,
+        state_keys: 0,
         artifact_format_version: BACKUP_ARTIFACT_FORMAT_VERSION,
         key: EncryptionKeyIdentity::EMPTY,
         phase: BackupPhase::INITIAL,
@@ -2180,6 +2197,14 @@ impl BackupManifest {
         n += 8;
         out[n..n + 8].copy_from_slice(&self.metadata_revision.to_le_bytes());
         n += 8;
+        out[n..n + 8].copy_from_slice(&self.raft_index.to_le_bytes());
+        n += 8;
+        out[n..n + 8].copy_from_slice(&self.fence.to_le_bytes());
+        n += 8;
+        out[n..n + 4].copy_from_slice(&self.state_hash.to_le_bytes());
+        n += 4;
+        out[n..n + 8].copy_from_slice(&self.state_keys.to_le_bytes());
+        n += 8;
         out[n..n + 2].copy_from_slice(&self.artifact_format_version.to_le_bytes());
         n += 2;
         out[n..n + 16].copy_from_slice(&self.key.key_id);
@@ -2242,6 +2267,14 @@ impl BackupManifest {
         n += 8;
         let metadata_revision = u64::from_le_bytes(p.get(n..n + 8)?.try_into().ok()?);
         n += 8;
+        let raft_index = u64::from_le_bytes(p.get(n..n + 8)?.try_into().ok()?);
+        n += 8;
+        let fence = u64::from_le_bytes(p.get(n..n + 8)?.try_into().ok()?);
+        n += 8;
+        let state_hash = u32::from_le_bytes(p.get(n..n + 4)?.try_into().ok()?);
+        n += 4;
+        let state_keys = u64::from_le_bytes(p.get(n..n + 8)?.try_into().ok()?);
+        n += 8;
         let artifact_format_version = u16::from_le_bytes(p.get(n..n + 2)?.try_into().ok()?);
         n += 2;
         let key_id: [u8; 16] = p.get(n..n + 16)?.try_into().ok()?;
@@ -2284,6 +2317,10 @@ impl BackupManifest {
             database_id,
             protected_timestamp,
             metadata_revision,
+            raft_index,
+            fence,
+            state_hash,
+            state_keys,
             artifact_format_version,
             key: EncryptionKeyIdentity {
                 key_id,

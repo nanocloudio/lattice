@@ -164,8 +164,9 @@ impl Token {
     };
 }
 
-/// Reading a keyspace of the anchor's own records at start (the auth
-/// records, the lease records), page by page in key order.
+/// Reading a keyspace of the anchor's own records (the auth records,
+/// the lease records), page by page in key order: at start, and for the
+/// auth records again whenever the keyspace has moved under the cache.
 #[repr(C)]
 struct RecordLoad {
     /// 0 to start, 1 a page in flight, 2 loaded.
@@ -178,7 +179,42 @@ struct RecordLoad {
     /// A read of the records has been refused: until one succeeds the
     /// store, not the load, is why requests wait.
     failed: bool,
+    /// This pass reads the records again over a cache that keeps
+    /// serving (the auth records only), rather than loading them first.
+    refresh: bool,
+    /// The records this pass has read, and the highest mod revision
+    /// among them: the keyspace's print ([`AuthPrint`]) as the pass saw
+    /// it.
+    count: u64,
+    max_mod: u64,
+    /// The local auth changes applied when this pass began; one applied
+    /// during the pass starts it again.
+    gen: u32,
 }
+
+/// What identifies a state of a record keyspace: how many records it
+/// holds and the highest mod revision among them. Every write moves the
+/// highest mod revision (the store's revisions only rise) and every
+/// delete the count, so two reads agree on both only when nothing
+/// changed between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct AuthPrint {
+    count: u64,
+    max_mod: u64,
+}
+
+/// How often an anchor whose auth records have loaded checks them
+/// against the store's keyspace ([`AuthPrint`]), reading them again
+/// when it has moved: a change committed through another replica's
+/// anchor reaches this one within this, plus its replica's apply lag.
+const AUTH_PROBE_MS: u64 = 1000;
+
+/// After its replica refuses a fenced read of the anchor's records (a
+/// follower, or a group without a leader, cannot take the ReadIndex
+/// fence), the records are read as the replica holds them for this
+/// long before the fence is asked for again.
+const FENCE_RETRY_MS: u64 = 10_000;
 
 /// The one auth change in flight: its stream, and the records its Txn
 /// writes, applied to the cache once it commits
@@ -996,12 +1032,25 @@ struct AnchorState {
     alarm_n: usize,
     snap: SnapState,
     /// etcd's users, roles and whether auth is on: the auth keyspace's
-    /// records, read at start and kept current by the changes committed.
+    /// records, read at start, kept current by the changes this anchor
+    /// commits, and read again when the auth probe finds the keyspace
+    /// moved (a change committed through another replica's anchor).
     auth: AuthCache,
     auth_load: RecordLoad,
     /// The lease records, read at start and re-granted.
     lease_load: RecordLoad,
     auth_job: AuthJob,
+    /// The auth keyspace as the cache last read it whole.
+    auth_print: AuthPrint,
+    /// The probe of the auth keyspace's print in flight (0: none), and
+    /// when the next goes.
+    auth_probe_corr: u64,
+    auth_probe_ms: u64,
+    /// Local auth changes applied to the cache, counted.
+    auth_gen: u32,
+    /// Until when the anchor's record reads go unfenced, after the
+    /// replica refused the fence (0: they ask for it).
+    fence_retry_ms: u64,
     tokens: [Token; TOKENS_MAX],
     token_seq: u32,
 
@@ -1103,10 +1152,20 @@ impl AnchorState {
         self.auth_load.corr = 0;
         self.auth_load.retry_ms = 0;
         self.auth_load.failed = false;
+        self.auth_load.refresh = false;
         self.lease_load.state = 0;
         self.lease_load.corr = 0;
         self.lease_load.retry_ms = 0;
         self.lease_load.failed = false;
+        self.lease_load.refresh = false;
+        self.auth_print = AuthPrint {
+            count: 0,
+            max_mod: 0,
+        };
+        self.auth_probe_corr = 0;
+        self.auth_probe_ms = 0;
+        self.auth_gen = 0;
+        self.fence_retry_ms = 0;
         self.lease_end_phase = 0;
         self.auth_job.active = false;
         self.auth_job.corr = 0;
@@ -3451,25 +3510,41 @@ fn send_kv_op(anchor: &mut AnchorState, corr: u64, slot_byte: u8, op: u8, body: 
     send_kv_op_in(anchor, corr, slot_byte, op, body, 0)
 }
 
-/// [`send_kv_op_in`] as a linearizable read: answered once the store has
-/// applied everything committed. The anchor's record loads take it, so
-/// a restarted graph's records are read after its log has replayed.
-fn send_kv_read_lin(
+/// [`send_kv_op_in`] for a read of the anchor's own records. It asks for
+/// the ReadIndex fence (answered once the store has applied everything
+/// committed, so a restarted graph's records are read after its log has
+/// replayed) while the replica grants it. A replica that cannot — a
+/// follower, or a group between leaders — refuses it
+/// (`KV_RESULT_LIN_BOUND`), and the records are then read as the
+/// replica holds them ([`FENCE_RETRY_MS`]): what an etcd member's own
+/// auth store is, its applied state, kept current by the auth probe.
+fn send_record_read(
     anchor: &mut AnchorState,
     corr: u64,
     op: u8,
     body: &[u8],
     keyspace: u32,
 ) -> bool {
-    send_kv_op_with(
-        anchor,
-        corr,
-        0xFF,
-        op,
-        body,
-        keyspace,
-        types::REQ_LINEARIZABLE,
-    )
+    let consistency = if record_reads_fenced(anchor) {
+        types::REQ_LINEARIZABLE
+    } else {
+        types::REQ_SERIALIZABLE
+    };
+    send_kv_op_with(anchor, corr, 0xFF, op, body, keyspace, consistency)
+}
+
+/// Whether the anchor's record reads ask for the fence now.
+fn record_reads_fenced(anchor: &AnchorState) -> bool {
+    anchor.fence_retry_ms == 0
+        || anchor.syscalls.is_null()
+        || unsafe { dev_millis(&*anchor.syscalls) } >= anchor.fence_retry_ms
+}
+
+/// The replica refused a record read's fence: read unfenced for a while.
+fn record_fence_refused(anchor: &mut AnchorState) {
+    if !anchor.syscalls.is_null() {
+        anchor.fence_retry_ms = unsafe { dev_millis(&*anchor.syscalls) } + FENCE_RETRY_MS;
+    }
 }
 
 /// [`send_kv_op`] in `keyspace` (database 0), for the anchor's own
@@ -3807,6 +3882,11 @@ unsafe fn poll_routed_in(anchor: &mut AnchorState) -> bool {
     if corr != 0 && corr == anchor.auth_load.corr {
         anchor.auth_load.corr = 0;
         record_load_page(anchor, LOAD_AUTH, result, body_off, body_len);
+        return true;
+    }
+    if corr != 0 && corr == anchor.auth_probe_corr {
+        anchor.auth_probe_corr = 0;
+        auth_probe_reply(anchor, result, body_off, body_len);
         return true;
     }
     if corr != 0 && corr == anchor.lease_load.corr {
@@ -4630,13 +4710,27 @@ fn serve_record_load(anchor: &mut AnchorState, sel: u8) {
     if now < record_load(anchor, sel).retry_ms {
         return;
     }
+    record_pass_begin(anchor, sel);
+    request_record_page(anchor, sel);
+}
+
+/// Start a pass over the records from the first key. A load starts the
+/// cache empty; a refresh reads over it, which keeps serving.
+fn record_pass_begin(anchor: &mut AnchorState, sel: u8) {
     if sel == LOAD_AUTH {
-        anchor.auth.init();
+        if anchor.auth_load.refresh {
+            anchor.auth.begin_refresh();
+        } else {
+            anchor.auth.init();
+        }
     }
+    let gen = anchor.auth_gen;
     let rl = record_load(anchor, sel);
     rl.next[0] = 0;
     rl.next_len = 1;
-    request_record_page(anchor, sel);
+    rl.count = 0;
+    rl.max_mod = 0;
+    rl.gen = gen;
 }
 
 /// Ask for the next page of records, in key order.
@@ -4660,7 +4754,7 @@ fn request_record_page(anchor: &mut AnchorState, sel: u8) {
     };
     let corr = anchor.next_corr();
     let sent =
-        n.is_some_and(|n| send_kv_read_lin(anchor, corr, KV_OP_RANGE_META, &body[..n], keyspace));
+        n.is_some_and(|n| send_record_read(anchor, corr, KV_OP_RANGE_META, &body[..n], keyspace));
     if sent {
         let rl = record_load(anchor, sel);
         rl.corr = corr;
@@ -4690,8 +4784,21 @@ fn record_load_page(
     body_off: usize,
     body_len: usize,
 ) {
+    if result == types::KV_RESULT_LIN_BOUND {
+        // The replica cannot take the fence: the same page, unfenced.
+        record_fence_refused(anchor);
+        request_record_page(anchor, sel);
+        return;
+    }
     if result != KV_RESULT_KVS || body_len < 11 {
         record_load_failed(anchor, sel);
+        return;
+    }
+    if sel == LOAD_AUTH && anchor.auth_load.refresh && anchor.auth_load.gen != anchor.auth_gen {
+        // A change this anchor committed landed mid-pass: what the pass
+        // has read may predate it, so it reads everything again.
+        record_pass_begin(anchor, sel);
+        request_record_page(anchor, sel);
         return;
     }
     let (n, more) = {
@@ -4732,6 +4839,10 @@ fn record_load_page(
         } else {
             restore_lease(anchor, &key[..kl], &val[..vl]);
         }
+        let mod_rev = rd_le64(&anchor.reply[..end], v0 + vl + 8);
+        let rl = record_load(anchor, sel);
+        rl.count += 1;
+        rl.max_mod = rl.max_mod.max(mod_rev);
         last = (k0, kl);
         p = v0 + vl + 32;
     }
@@ -4745,10 +4856,107 @@ fn record_load_page(
         rl.next_len = kl + 1;
         request_record_page(anchor, sel);
     } else {
-        record_load(anchor, sel).state = 2;
+        let rl = record_load(anchor, sel);
+        rl.state = 2;
+        rl.failed = false;
+        rl.refresh = false;
+        let print = AuthPrint {
+            count: rl.count,
+            max_mod: rl.max_mod,
+        };
         if sel == LOAD_AUTH {
+            anchor.auth.end_refresh();
             anchor.auth.loaded = true;
+            anchor.auth_print = print;
+            drop_orphan_tokens(anchor);
         }
+    }
+}
+
+/// Tokens of users the cache no longer holds (deleted through another
+/// replica) go with them.
+fn drop_orphan_tokens(anchor: &mut AnchorState) {
+    let AnchorState { auth, tokens, .. } = anchor;
+    for t in tokens.iter_mut() {
+        if t.len != 0 && auth.user(t.user.as_bytes()).is_none() {
+            *t = Token::FREE;
+        }
+    }
+}
+
+/// Once the auth records have loaded, ask the store every
+/// [`AUTH_PROBE_MS`] for the keyspace's print — one read of its record
+/// count and newest record — and read the records again when it is not
+/// the one the cache was read at.
+fn serve_auth_probe(anchor: &mut AnchorState) {
+    if !anchor.auth.loaded
+        || anchor.auth_load.state != 2
+        || anchor.auth_probe_corr != 0
+        || anchor.auth_job.active
+        || anchor.kv_out < 0
+        || anchor.syscalls.is_null()
+    {
+        return;
+    }
+    let now = unsafe { dev_millis(&*anchor.syscalls) };
+    if now < anchor.auth_probe_ms {
+        return;
+    }
+    anchor.auth_probe_ms = now + AUTH_PROBE_MS;
+    // Every record, newest mod revision first, only that one returned:
+    // the answer's `total` is the count.
+    let req = RangeRequest {
+        key: b"\0",
+        range_end: b"\0",
+        limit: 1,
+        keys_only: true,
+        sort_target: 3,
+        sort_order: 2,
+        ..Default::default()
+    };
+    let mut body = [0u8; 128];
+    let Some(n) = etcd_codec::encode_range_meta_body(&req, &mut body) else {
+        return;
+    };
+    let corr = anchor.next_corr();
+    if send_record_read(anchor, corr, KV_OP_RANGE_META, &body[..n], AUTH_KEYSPACE) {
+        anchor.auth_probe_corr = corr;
+    }
+}
+
+/// The keyspace's print: the same as the cache's, or a refresh pass.
+fn auth_probe_reply(anchor: &mut AnchorState, result: u8, body_off: usize, body_len: usize) {
+    if result == types::KV_RESULT_LIN_BOUND {
+        // Unfenced, at once.
+        record_fence_refused(anchor);
+        anchor.auth_probe_ms = 0;
+        return;
+    }
+    if result != KV_RESULT_KVS || body_len < 11 {
+        return;
+    }
+    let b = &anchor.reply[body_off..body_off + body_len];
+    let count = rd_le64(b, 0);
+    let n = u16::from_le_bytes([b[9], b[10]]);
+    let max_mod = if n == 0 {
+        0
+    } else {
+        // `[key_len:u16][key][value_len:u32][value]` then create, mod.
+        let kl = b
+            .get(11..13)
+            .map_or(0, |x| u16::from_le_bytes([x[0], x[1]]) as usize);
+        let vl_at = 13 + kl;
+        let vl = b
+            .get(vl_at..vl_at + 4)
+            .map_or(0, |x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]) as usize);
+        rd_le64(b, vl_at + 4 + vl + 8)
+    };
+    let print = AuthPrint { count, max_mod };
+    if print != anchor.auth_print && !anchor.auth_job.active && anchor.auth_load.state == 2 {
+        let rl = &mut anchor.auth_load;
+        rl.state = 0;
+        rl.refresh = true;
+        rl.retry_ms = 0;
     }
 }
 
@@ -5289,11 +5497,21 @@ fn auth_job_done(anchor: &mut AnchorState, result: u8, revision: i64) {
         && anchor.slots[slot_idx].streams[strm].stream_id == stream_id;
     if result != KV_RESULT_ETCD_TXN {
         if live {
-            send_grpc_error(anchor, slot_idx, stream_id, 13);
+            // Not committed: a replica that cannot (a follower, a group
+            // between leaders) is UNAVAILABLE, retryably, as for any
+            // write; anything else is the store's fault.
+            if result == types::KV_RESULT_LIN_BOUND || result == types::KV_RESULT_DIRTY_EPOCH {
+                let mut m = [0u8; 96];
+                let n = msg_timed_out(&mut m);
+                send_grpc_error_msg(anchor, slot_idx, stream_id, 14, &m[..n]);
+            } else {
+                send_grpc_error(anchor, slot_idx, stream_id, 13);
+            }
             anchor.slots[slot_idx].free_stream(strm);
         }
         return;
     }
+    anchor.auth_gen = anchor.auth_gen.wrapping_add(1);
     let mut p = 0usize;
     while p < anchor.auth_job.len {
         let mut key = [0u8; 256];
@@ -7184,6 +7402,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         serve_snapshot(anchor);
         serve_record_load(anchor, LOAD_AUTH);
         serve_record_load(anchor, LOAD_LEASES);
+        serve_auth_probe(anchor);
         flush_slots(anchor);
 
         // Emit module-scope counters on `metrics_out` at a
