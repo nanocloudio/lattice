@@ -22,7 +22,8 @@ cleanup() {
 trap cleanup EXIT
 
 FLUXOR_LINUX_BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/fluxor-linux" \
-  setsid fluxor run configs/single-minimal-etcd-tls.yaml >"$D/run.log" 2>&1 &
+  setsid fluxor run configs/single-minimal-etcd-tls.yaml \
+    --param cert=certs/dev/server.der --param key=certs/dev/server.key.der >"$D/run.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 100); do (echo >/dev/tcp/127.0.0.1/2379) 2>/dev/null && break; sleep 0.1; done
 

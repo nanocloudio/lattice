@@ -546,11 +546,17 @@ pub const TS_LEASE_GRANT_WIRE_LEN: usize = 48;
 // inlined like `MSG_CLIENT_PROPOSAL` above to avoid build-time coupling
 // to a sibling crate's source path.
 //
-// The gateway checks leadership BEFORE assigning a correlation id
-// (`gateway/codec.rs`: the NOT_LEADER return precedes `next_corr_id`),
-// so a rejected proposal is refused pre-assignment and the reject can
-// only name the CONN, never a corr_id. The router therefore correlates
-// rejects by conn, not by op — see `drain_gateway_rejects` for how.
+// A reject names only the CONN the proposal was sent with, never a
+// corr_id: the gateway echoes the `[conn_id:u16]` of the proposal it
+// refuses. The router therefore sends each replicated write with a conn
+// id of its own — a TICKET unique among its writes in flight — and a
+// reject names exactly one op; see `drain_gateway_rejects`.
+//
+// A write on a follower is forwarded to the leader of its term (clustor
+// follower forwarding) and answered like a leader's: applied, or refused
+// with one of the statuses below. Every refusal but OUTCOME_UNKNOWN
+// means "not appended anywhere"; OUTCOME_UNKNOWN means the forward
+// reached a leader that may have appended it before failing.
 //
 // Frame on `gateway.responses` (per `gateway/surface.rs::send_response`
 // — NOT the standard 3-byte envelope):
@@ -561,10 +567,22 @@ pub const TS_LEASE_GRANT_WIRE_LEN: usize = 48;
 // carries the believed LEADER ID when status is NOT_LEADER — the hint
 // a failover-capable client needs.
 pub const MSG_CLIENT_REJECT: u8 = 0x15;
+/// Leader backpressure (uncommitted window, WAL deferral): not appended.
+pub const CLIENT_REJECT_THROTTLED: u8 = 0x01;
+/// Not appended: no leader known past the hold, the asked node no longer
+/// led the term, or the assigned position applied another term's entry.
 pub const CLIENT_REJECT_NOT_LEADER: u8 = 0x02;
+/// The gateway saw a newer placement epoch than the request: not appended.
+pub const CLIENT_REJECT_STALE_EPOCH: u8 = 0x03;
+/// The leader is frozen in strict fallback: not appended.
+pub const CLIENT_REJECT_FALLBACK: u8 = 0x04;
 /// The proposal is larger than one log entry carries (clustor's
 /// `CLIENT_REJECT_TOO_LARGE`): no retry can succeed.
 pub const CLIENT_REJECT_TOO_LARGE: u8 = 0x06;
+/// A forwarded write whose leader went silent before saying whether it
+/// appended it: it may yet commit, or never (clustor never re-proposes
+/// it). The one refusal that is not "not appended".
+pub const CLIENT_REJECT_OUTCOME_UNKNOWN: u8 = 0x07;
 pub const CLIENT_REJECT_BODY_LEN: usize = 10;
 
 /// The largest proposal body the replicated path carries: one clustor

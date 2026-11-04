@@ -492,6 +492,15 @@ struct InflightMeta {
     /// The partition the op was routed to: whose worker's notices renew
     /// it.
     kpg: u16,
+    /// A replicated write's ticket: the conn id its proposal carried to
+    /// the gateway, unique among the writes in flight, so the gateway's
+    /// reject (which names only that conn id) answers exactly this op.
+    /// 0 for an op on any other path.
+    ticket: u16,
+    /// A replicated write's caller corr (the anchor's), when the table
+    /// keys it by its PROPOSAL corr ([`take_proposal_corr`]); 0 when the
+    /// key is the caller's corr.
+    orig_corr: u64,
 }
 
 /// True for protocols whose anchor keeps a per-conn response reorder
@@ -552,8 +561,8 @@ fn op_is_write(op: u8) -> bool {
         // reclaims chunks never passes here: the state worker proposes
         // it, and dispatch refuses it from any ingress.)
         | 0x23 /*PUT_CHUNK*/ | 0x26 /*PUT_MANIFEST*/
-        // An exact restore's page.
-        | 0x2C /*RESTORE*/
+        // An exact restore's page, and a retention hold.
+        | 0x2C /*RESTORE*/ | 0x2D /*RETAIN*/
     )
 }
 
@@ -987,6 +996,7 @@ fn route_ordered(
         || op == KV_OP_LEASE_KEYS
         || op == KV_OP_COMPACT
         || op == KV_OP_HASH_KV
+        || op == types::KV_OP_RETAIN
     {
         return if map.ranges().len() == 1 {
             route_single(router, &map.ranges()[0])
@@ -1485,6 +1495,10 @@ struct RouterState {
     partition_fanout: u8,
     /// Ordered-mode refusals of cross-range key sets (metric 6).
     m_cross_range_rejects: u64,
+    /// Requests whose op code this build does not define, answered
+    /// `KV_RESULT_UNSUPPORTED` (metric `unsupported_ops`): a peer newer than
+    /// this router.
+    m_unsupported: u64,
     /// Requests refused because their key's home range lives in another
     /// Clustor cluster domain — answered with a
     /// KV_RESULT_CROSS_DOMAIN redirect, counted so a misconfigured
@@ -1577,6 +1591,16 @@ struct RouterState {
     /// says whether refusals are arriving typed (here) or by timeout
     /// (there) — the second means the reject wire is down.
     m_not_leader_rejects: u64,
+    /// Replicated writes the gateway answered OUTCOME_UNKNOWN (a
+    /// forward whose leader failed before saying), plus those past
+    /// their own deadline unanswered.
+    m_outcome_unknown: u64,
+    /// The last ticket handed to a replicated write (`InflightMeta::ticket`).
+    next_ticket: u16,
+    /// This router's proposal-corr salt (set once, at construction) and
+    /// the sequence under it ([`take_proposal_corr`]).
+    corr_salt: u64,
+    proposal_seq: u32,
     /// Requests rejected by the mode-1 generation/epoch fence.
     m_stale_rejects: u64,
     /// MAP_UPDATE_V1 frames dropped fail-closed (unknown version,
@@ -1693,6 +1717,7 @@ impl RouterState {
         self.proposal_outs = [-1; MAX_PARTITION_PORTS];
         self.partition_fanout = 0;
         self.m_cross_range_rejects = 0;
+        self.m_unsupported = 0;
         self.m_cross_domain_rejects = 0;
         self.m_proposal_drops = 0;
         self.pending_lin = [PendingLinRead::empty(); LIN_READ_SLOTS];
@@ -1716,6 +1741,10 @@ impl RouterState {
         self.m_fence_timeouts = 0;
         self.m_inflight_timeouts = 0;
         self.m_not_leader_rejects = 0;
+        self.m_outcome_unknown = 0;
+        self.next_ticket = 0;
+        self.corr_salt = 0;
+        self.proposal_seq = 0;
         self.m_stale_rejects = 0;
         self.m_map_update_drops = 0;
         self.step_ctr = 0;
@@ -1941,6 +1970,22 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         body_len -= 3;
     }
 
+    // An op code this build does not define came from a newer peer:
+    // classified here it would take a path by guesswork (an unknown write
+    // routed as a read skips consensus). Answered typed, before any side
+    // effect, so the skew reads as skew.
+    if !types::kv_op_known(op) {
+        router.m_unsupported = router.m_unsupported.wrapping_add(1);
+        emit_reject(
+            router,
+            protocol,
+            corr_id,
+            conn_id,
+            types::KV_RESULT_UNSUPPORTED,
+        );
+        return DISPATCH_DROPPED;
+    }
+
     // A chunk sweep reclaims at the floor it names, which must be one
     // that committed: only the state worker proposes it. From a client
     // it would name any floor it liked. An origin entry is a store
@@ -1972,8 +2017,15 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     // bypass consensus and mutate only the local worker, and on a
     // fence-wired config it would take the ReadIndex fence and return
     // CLUSTERDOWN. Classify by op so every mutation goes through
-    // consensus when it is wired.
-    let is_write = op_is_write(op);
+    // consensus when it is wired. An etcd Txn that only reads (no Put
+    // or DeleteRange in either branch, nested Txns included) is the one
+    // op whose class its body decides: it changes nothing and takes no
+    // revision, so it is a read with the consistency it asks — fenced
+    // by ReadIndex when linearizable, served on a follower — and never
+    // proposed.
+    let is_write = op_is_write(op)
+        && !(op == KV_OP_ETCD_TXN
+            && types::etcd_txn_read_only(&req[body_off..body_off + body_len]));
     // Hash of the op's key, for hot-KEY tracking. Ops with no
     // single key (scans, txns spanning many) contribute nothing rather
     // than contributing a wrong key — a txn attributed to one of its
@@ -2214,10 +2266,30 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         id_tenant,
         id_database,
         id_keyspace,
-        deadline_ms: unsafe { dev_millis(&*router.syscalls) }.wrapping_add(INFLIGHT_TIMEOUT_MS),
+        deadline_ms: unsafe { dev_millis(&*router.syscalls) }.wrapping_add(if use_consensus {
+            CONSENSUS_TIMEOUT_MS
+        } else {
+            INFLIGHT_TIMEOUT_MS
+        }),
         kpg: kpg_id,
+        ticket: if use_consensus {
+            take_ticket(router)
+        } else {
+            0
+        },
+        orig_corr: if use_consensus { corr_id } else { 0 },
     };
-    if router.inflight.insert(corr_id, meta).is_err() {
+    // A replicated write is keyed — and goes into the log — under a
+    // proposal corr of this router's own: every replica applies every
+    // committed command and answers its corr, so a corr another node's
+    // caller chose (anchors on every node count alike) must never meet
+    // an op in flight here.
+    let key = if use_consensus {
+        take_proposal_corr(router)
+    } else {
+        corr_id
+    };
+    if router.inflight.insert(key, meta).is_err() {
         // Every slot holds an op in flight: refused retryably, never
         // dropped — a caller with no answer waits on nothing.
         emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
@@ -2231,7 +2303,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     if cmd_payload_len > u16::MAX as usize || cmd_total > SCRATCH_BUF_SIZE {
         // A command the worker's frame cannot carry: the inflight slot
         // reserved above is rolled back, and the caller told.
-        let _ = router.inflight.remove(corr_id);
+        let _ = router.inflight.remove(key);
         emit_reject(
             router,
             protocol,
@@ -2249,7 +2321,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
     // Mode 0: KPG_ID_DEFAULT. Mode 1: the fenced lookup's binding
     // (identical bytes under the single-partition default map).
     wire::KvCommandHead {
-        corr_id,
+        corr_id: key,
         kpg_id,
         conn_id,
         consistency,
@@ -2294,7 +2366,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         // One consensus entry carries `[LATTICE_ENTRY_TAG][command]`; a
         // larger command cannot be committed, however often it is retried.
         if 1 + cmd_payload_len > wire::CONSENSUS_PROPOSAL_BODY_MAX {
-            let _ = router.inflight.remove(corr_id);
+            let _ = router.inflight.remove(key);
             router.m_proposal_drops = router.m_proposal_drops.wrapping_add(1);
             emit_reject(
                 router,
@@ -2311,7 +2383,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
             // any caller without its own timeout — every other refusal
             // in this router emits a typed result, and there is no
             // reason for these two to be the exception.
-            let _ = router.inflight.remove(corr_id);
+            let _ = router.inflight.remove(key);
             router.m_proposal_drops = router.m_proposal_drops.wrapping_add(1);
             emit_reject(router, protocol, corr_id, conn_id, KV_RESULT_INTERNAL);
             return DISPATCH_DROPPED;
@@ -2324,7 +2396,9 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         cp_buf[0] = MSG_CLIENT_PROPOSAL;
         cp_buf[1] = (cp_payload_len & 0xFF) as u8;
         cp_buf[2] = ((cp_payload_len >> 8) & 0xFF) as u8;
-        cp_buf[3..5].copy_from_slice(&u16::from(conn_id).to_le_bytes());
+        // The conn id the gateway echoes in a reject: this write's ticket.
+        let ticket = router.inflight.get(key).map_or(0, |m| m.ticket);
+        cp_buf[3..5].copy_from_slice(&ticket.to_le_bytes());
         cp_buf[5] = LATTICE_ENTRY_TAG;
         // Copy MSG_KV_COMMAND payload (everything after the 3-byte
         // outer header) into the proposal body.
@@ -2341,7 +2415,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
             // Same reasoning as above: backpressure on the proposal
             // port is a retryable condition the caller can act on, and
             // silence is not.
-            let _ = router.inflight.remove(corr_id);
+            let _ = router.inflight.remove(key);
             router.m_proposal_drops = router.m_proposal_drops.wrapping_add(1);
             emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
             return DISPATCH_DROPPED;
@@ -2423,7 +2497,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         // Fence unavailable → this op is now a DIRECT-path snapshot
         // read; fix the accounting before falling through.
         meta.path = PATH_DIRECT;
-        let _ = router.inflight.remove(corr_id);
+        let _ = router.inflight.remove(key);
         if router.inflight.insert(corr_id, meta).is_err() {
             emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
             return DISPATCH_DROPPED;
@@ -2444,7 +2518,7 @@ unsafe fn dispatch_parsed(router: &mut RouterState, protocol: u8, req: &[u8]) ->
         );
     if !written && !stash_command(router, kv_port, cmd_total, kv_tag) {
         // Even the waiting room is full: refused, retryably.
-        let _ = router.inflight.remove(corr_id);
+        let _ = router.inflight.remove(key);
         emit_reject(router, protocol, corr_id, conn_id, types::KV_RESULT_QUOTA);
         return DISPATCH_DROPPED;
     }
@@ -2945,6 +3019,44 @@ unsafe fn send_help_command(
 /// 20 s to decide a 1 MiB write under load answers it, it is not refused.
 const INFLIGHT_TIMEOUT_MS: u64 = 5_000;
 
+/// How long a replicated write may wait for the gateway's answer before
+/// the router answers it [`types::KV_RESULT_OUTCOME_UNKNOWN`] itself. The
+/// gateway answers every write — applied, or refused — and its slowest
+/// refusal is a follower's no-leader hold (clustor `NO_LEADER_HOLD_MS`,
+/// 8 s, or two election timeouts when longer: Lattice's 4 s election
+/// gives the same 8 s); a forward's own deadline is 4 s. Past both, so
+/// the caller hears clustor's answer — "not appended" when it is — and
+/// this fires only for an answer that is never coming.
+const CONSENSUS_TIMEOUT_MS: u64 = 12_000;
+
+/// Proposal corrs: their own band of the u64 space, apart from the
+/// anchors' (protocol in the top byte, counting up from 1) and the
+/// router's help corrs ([`HELP_CORR_BASE`]).
+const PROPOSAL_CORR_BASE: u64 = 0x4000_0000_0000_0000;
+
+/// A replicated write's proposal corr: `[band][salt:38][seq:24]`. The
+/// salt is this router's (its clock at construction, so replicas started
+/// apart never share one), the sequence its own; a late apply of a write
+/// answered long ago can meet a new write only after 16 Mi more.
+fn take_proposal_corr(router: &mut RouterState) -> u64 {
+    router.proposal_seq = router.proposal_seq.wrapping_add(1) & 0x00FF_FFFF;
+    PROPOSAL_CORR_BASE
+        | ((router.corr_salt & 0x3F_FFFF_FFFF) << 24)
+        | u64::from(router.proposal_seq)
+}
+
+/// A ticket for a replicated write: nonzero, and held by no write in
+/// flight (the table holds at most `MAX_INFLIGHT` of 65,535).
+fn take_ticket(router: &mut RouterState) -> u16 {
+    loop {
+        router.next_ticket = router.next_ticket.wrapping_add(1);
+        let t = router.next_ticket;
+        if t != 0 && !router.inflight.iter().any(|m| m.ticket == t) {
+            return t;
+        }
+    }
+}
+
 /// A worker says the command at its channel head is still being worked on
 /// (`MSG_KV_WORKING`). It takes its commands in channel order and answers
 /// each one it takes, so every direct op routed to that partition — held
@@ -3043,47 +3155,64 @@ unsafe fn sweep_inflight_deadlines(router: &mut RouterState) {
     // Collect first: `emit_reject` mutates the table, so it cannot run
     // while an iterator borrows it. Bounded by one sweep's worth.
     const MAX_PER_SWEEP: usize = 32;
-    let mut expired: [(u64, u8, u8); MAX_PER_SWEEP] = [(0, 0, 0); MAX_PER_SWEEP];
+    let mut expired: [(u64, u8, u8, bool); MAX_PER_SWEEP] = [(0, 0, 0, false); MAX_PER_SWEEP];
     let mut n = 0;
     for (corr_id, meta) in router.inflight.iter_entries() {
         if n == MAX_PER_SWEEP {
             break;
         }
         if now >= meta.deadline_ms {
-            expired[n] = (corr_id, meta.proto, meta.conn);
+            expired[n] = (corr_id, meta.proto, meta.conn, meta.path == PATH_CONSENSUS);
             n += 1;
         }
     }
-    for &(corr_id, proto, conn) in &expired[..n] {
+    for &(corr_id, proto, conn, proposed) in &expired[..n] {
         // Fail closed. `emit_reject` removes the entry, so an op is
         // answered exactly once even if the real reply arrives later —
         // that late reply finds no entry and is dropped, which is the
-        // same path a reply for a closed connection already takes.
-        let _ = emit_reject(router, proto, corr_id, conn, KV_RESULT_LIN_BOUND);
+        // same path a reply for a closed connection already takes. A
+        // replicated write with no answer was proposed and may yet
+        // commit: its outcome is unknown, and said so.
+        let result = if proposed {
+            router.m_outcome_unknown = router.m_outcome_unknown.wrapping_add(1);
+            types::KV_RESULT_OUTCOME_UNKNOWN
+        } else {
+            KV_RESULT_LIN_BOUND
+        };
+        let _ = emit_reject(router, proto, corr_id, conn, result);
         router.m_inflight_timeouts = router.m_inflight_timeouts.wrapping_add(1);
     }
 }
 
 /// Drain the gateway's reject feedback and answer the ops it refused.
 ///
-/// The gateway checks leadership BEFORE assigning a correlation id, so
-/// its reject can only name the CONN — there is no corr_id to match.
-/// Correlating by conn is still exact for the case that matters:
+/// A reject names only the conn id its proposal carried — never a
+/// corr_id — so every replicated write goes with a conn id of its own,
+/// its TICKET (`InflightMeta::ticket`), unique among the writes in
+/// flight: a reject answers exactly the op it refuses, whatever else is
+/// in flight on the same client connection. (Correlating by client conn
+/// instead was exact only while a refusal meant "this node does not
+/// lead": with writes forwarded from a follower, one write is refused
+/// while the next commits, and a superseded position is refused at apply
+/// time, long after later writes were sent.)
 ///
-/// - NOT_LEADER is a property of the NODE, not of one proposal. Every
-///   consensus-path op this conn has in flight was proposed to the same
-///   non-leader and none will ever complete, so all of them are
-///   answered at once. Sibling rejects for ops failed here find their
-///   entries already gone, which is the same late-arrival path a reply
-///   for a closed connection takes.
-/// - Any other reject status is per-proposal (throttle, oversize).
-///   Rejects leave the gateway in the order proposals arrived — both
-///   directions are FIFO channels — so the OLDEST consensus-path op
-///   for that conn is the one refused, and only it is answered.
+/// Statuses (clustor gateway, `wire::CLIENT_REJECT_*`) and what the
+/// caller hears:
+/// - NOT_LEADER, FALLBACK — not appended anywhere: no leader past the
+///   hold, the asked node no longer led the term, the position applied
+///   another term's entry, or strict fallback. `KV_RESULT_NO_LEADER`;
+///   safe to retry as it is.
+/// - THROTTLED — not appended (leader backpressure): `KV_RESULT_QUOTA`.
+/// - TOO_LARGE — not appended, never can be: `KV_RESULT_TOO_LARGE`.
+/// - STALE_EPOCH — not appended: `KV_RESULT_DIRTY_EPOCH` (re-resolve).
+/// - OUTCOME_UNKNOWN — the forward reached a leader that may have
+///   appended it before failing: `KV_RESULT_OUTCOME_UNKNOWN`. Read back
+///   before retrying a write that is not idempotent.
+/// - anything else — not appended as far as this build can tell:
+///   `KV_RESULT_QUOTA`, retryable.
 ///
 /// Without this the rejection is dropped and the caller waits out the
-/// 5s inflight sweep. tests/cluster.rs pins the difference: a write to
-/// a follower fails in milliseconds, not at the timeout.
+/// consensus deadline. tests/cluster.rs pins the difference.
 unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
     if router.gateway_reject_in < 0 || router.syscalls.is_null() {
         return false;
@@ -3097,7 +3226,6 @@ unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
         // response, `[msg_type:u8][len:u16 LE]`, around the conn-tagged
         // wire frame
         //   [conn_id:u16 LE][msg_type:u8][len:u16 LE][payload…]
-        // Lattice conn ids are u8-ranged, so the u16 narrows losslessly.
         // The buffer holds the gateway's largest response frame whole.
         let mut body = [0u8; GATEWAY_RESPONSE_FRAME];
         let Some((_, take)) = read_envelope(
@@ -3112,72 +3240,50 @@ unsafe fn drain_gateway_rejects(router: &mut RouterState) -> bool {
         if take < 5 {
             continue;
         }
-        let conn_id = (u16::from_le_bytes([body[0], body[1]]) & 0xFF) as u8;
+        let ticket = u16::from_le_bytes([body[0], body[1]]);
         let msg_type = body[2];
         let plen = (u16::from_le_bytes([body[3], body[4]]) as usize).min(take - 5);
-        let mut payload = [0u8; 64];
-        for (d, s) in payload.iter_mut().zip(body.get(5..5 + plen).unwrap_or(&[])) {
-            *d = *s;
-        }
-        let take = plen;
         // This port also carries the gateway's other client responses
-        // (admin, read grants for graphs that route them here). Only
-        // rejects are ours to act on; the rest is drained so the ring
-        // never fills — a full ring would make the gateway drop the
-        // NEXT reject, and this port exists so rejects are not dropped.
-        if msg_type != MSG_CLIENT_REJECT || take < 2 {
+        // (applied answers, admin, read grants for graphs that route them
+        // here). Only rejects are ours to act on; the rest is drained so
+        // the ring never fills — a full ring would make the gateway drop
+        // the NEXT reject, and this port exists so rejects are not dropped.
+        if msg_type != MSG_CLIENT_REJECT || plen < 2 || ticket == 0 {
             continue;
         }
-        let status = payload[0];
-        // payload[1] is the believed leader id when status is
-        // NOT_LEADER — the re-dial hint a failover-capable client
-        // needs. Not yet surfaced downstream: MSG_KV_RESPONSE has no
-        // field that could carry it honestly, and inventing one is
-        // lattice_data_client failover work, not this fix.
-
-        if status == CLIENT_REJECT_NOT_LEADER {
-            // Fail every consensus-path op this conn has in flight.
-            const MAX_PER_REJECT: usize = 32;
-            let mut victims: [(u64, u8); MAX_PER_REJECT] = [(0, 0); MAX_PER_REJECT];
-            let mut n = 0;
-            for (corr, meta) in router.inflight.iter_entries() {
-                if n == MAX_PER_REJECT {
-                    break;
-                }
-                if meta.conn == conn_id && meta.path == PATH_CONSENSUS {
-                    victims[n] = (corr, meta.proto);
-                    n += 1;
-                }
+        let status = body[5];
+        // body[6] is the believed leader id when status is NOT_LEADER.
+        // Not surfaced downstream: MSG_KV_RESPONSE has no field that
+        // could carry it honestly, and with writes forwarded from a
+        // follower no caller needs to re-dial for one.
+        let mut refused: Option<(u64, u8, u8)> = None;
+        for (corr, meta) in router.inflight.iter_entries() {
+            if meta.path == PATH_CONSENSUS && meta.ticket == ticket {
+                refused = Some((corr, meta.proto, meta.conn));
+                break;
             }
-            for &(corr, proto) in &victims[..n] {
-                if emit_reject(router, proto, corr, conn_id, KV_RESULT_LIN_BOUND) {
-                    op_settled(router, proto, conn_id);
-                }
+        }
+        // None: the op was answered already (its deadline passed, or a
+        // late duplicate) — the same late-arrival path a reply for a
+        // closed connection takes.
+        let Some((corr, proto, conn)) = refused else {
+            continue;
+        };
+        let result = match status {
+            CLIENT_REJECT_NOT_LEADER | wire::CLIENT_REJECT_FALLBACK => {
                 router.m_not_leader_rejects = router.m_not_leader_rejects.wrapping_add(1);
+                types::KV_RESULT_NO_LEADER
             }
-        } else {
-            // Per-proposal refusal: answer the oldest consensus-path
-            // op for this conn, retryably.
-            let mut oldest: Option<(u64, u8, u64)> = None;
-            for (corr, meta) in router.inflight.iter_entries() {
-                if meta.conn == conn_id && meta.path == PATH_CONSENSUS {
-                    match oldest {
-                        Some((_, _, d)) if d <= meta.deadline_ms => {}
-                        _ => oldest = Some((corr, meta.proto, meta.deadline_ms)),
-                    }
-                }
+            wire::CLIENT_REJECT_OUTCOME_UNKNOWN => {
+                router.m_outcome_unknown = router.m_outcome_unknown.wrapping_add(1);
+                types::KV_RESULT_OUTCOME_UNKNOWN
             }
-            // TOO_LARGE is final; anything else is retryable.
-            let result = if status == wire::CLIENT_REJECT_TOO_LARGE {
-                types::KV_RESULT_TOO_LARGE
-            } else {
-                types::KV_RESULT_QUOTA
-            };
-            if let Some((corr, proto, _)) = oldest {
-                if emit_reject(router, proto, corr, conn_id, result) {
-                    op_settled(router, proto, conn_id);
-                }
-            }
+            wire::CLIENT_REJECT_TOO_LARGE => types::KV_RESULT_TOO_LARGE,
+            wire::CLIENT_REJECT_STALE_EPOCH => KV_RESULT_DIRTY_EPOCH,
+            _ => types::KV_RESULT_QUOTA,
+        };
+        if emit_reject(router, proto, corr, conn, result) {
+            op_settled(router, proto, conn);
         }
     }
     progressed
@@ -3352,9 +3458,15 @@ unsafe fn emit_reject_with_body(
     env[0] = MSG_KV_RESPONSE;
     env[1] = resp_len as u8;
     env[2] = (resp_len >> 8) as u8;
+    // A replicated write in flight is keyed by its proposal corr; its
+    // caller is answered under its own.
+    let reply_corr = match router.inflight.get(corr_id) {
+        Some(m) if m.orig_corr != 0 => m.orig_corr,
+        _ => corr_id,
+    };
     // revision 0; body_len is the redirect payload length (if any).
     wire::KvResponseHead {
-        corr_id,
+        corr_id: reply_corr,
         conn_id,
         result,
         revision: 0,
@@ -3873,7 +3985,12 @@ unsafe fn drain_kv_in(router: &mut RouterState) -> bool {
     out[1] = (resp_payload_len & 0xFF) as u8;
     out[2] = ((resp_payload_len >> 8) & 0xFF) as u8;
     wire::KvResponseHead {
-        corr_id,
+        // A replicated write's caller is answered under its own corr.
+        corr_id: if meta.orig_corr != 0 {
+            meta.orig_corr
+        } else {
+            corr_id
+        },
         conn_id,
         result,
         revision,
@@ -3984,6 +4101,8 @@ pub extern "C" fn module_new(
     let sys_ptr = syscalls.cast::<SyscallTable>();
     let router = unsafe { &mut *state.cast::<RouterState>() };
     router.init(sys_ptr);
+    // The proposal-corr salt: this replica's clock at construction.
+    router.corr_salt = unsafe { dev_micros(&*sys_ptr) };
     if !params.is_null() && params_len >= 4 {
         unsafe { parse_tlv(router, params, params_len) };
     }
@@ -4258,6 +4377,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     router.m_helps_started,
                     router.m_helps_resolved,
                     router.m_resp_drops,
+                    // Ops this build does not define (skew).
+                    router.m_unsupported,
+                    // Replicated writes whose outcome is not known.
+                    router.m_outcome_unknown,
                 ],
             );
         }

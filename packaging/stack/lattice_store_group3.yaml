@@ -4,10 +4,14 @@
 #
 # A write through the leader's fronts leaves the router as a proposal, commits
 # on a quorum's WAL (`wal/` in the working directory) and applies on every
-# replica through its apply bridge; a follower's gateway refuses a proposal,
-# so its fronts answer writes with the connectors' no-authority refusal.
+# replica through its apply bridge. A write through a follower's fronts is
+# the same: its gateway hands the proposal to consensus, which forwards it to
+# the leader of its term, and it applies here like any other; one the group
+# does not take is refused typed (no leader / outcome unknown when the leader
+# failed mid-forward — the connectors' own errors, see docs/guides/fronts.md).
 # Reads and subscriptions are each replica's own (`lin_reads: 1` fences reads
-# through the leader). Each node of the group includes this stack once, with its
+# through the leader's ReadIndex, on a follower too; a read-only etcd Txn is a
+# read). Each node of the group includes this stack once, with its
 # own `self_id` and the same three peer addresses, and wires its peer link:
 #
 #   include:
@@ -180,6 +184,9 @@ modules:
       heartbeat_interval_ms: 150
       election_timeout_ms: 4000
       proposal_batch_timeout_ms: 1
+      # The untagged relay (the worker's own proposals, e.g. history
+      # compaction). The fronts' tagged writes are forwarded from a
+      # follower to the leader whatever this says.
       forward_proposals: 1
   - name: durability
     type: durability

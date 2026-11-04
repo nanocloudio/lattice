@@ -452,15 +452,15 @@ const fn kv_result_for(class: DataRetryClass) -> u8 {
         DataRetryClass::UnavailableAuthority | DataRetryClass::DeadlineExpired => {
             KV_RESULT_LIN_BOUND
         }
-        // Nothing compute can do differently. `AmbiguousDelivery` lands
-        // here too, which UNDERSTATES it — the mutation may have
-        // applied — but the surface response carries the truth and the
-        // KV envelope has no code for "maybe". Discovering the real
-        // outcome is what the idempotency identity is for.
-        DataRetryClass::Malformed
-        | DataRetryClass::UnsupportedCapability
-        | DataRetryClass::Cancelled
-        | DataRetryClass::AmbiguousDelivery => KV_RESULT_INTERNAL,
+        // The mutation may have applied: the KV envelope's "maybe".
+        // Discovering the real outcome is what the idempotency identity
+        // is for.
+        DataRetryClass::AmbiguousDelivery => types::KV_RESULT_OUTCOME_UNKNOWN,
+        // The remote store lacks the op: the same typed answer a local
+        // store gives.
+        DataRetryClass::UnsupportedCapability => types::KV_RESULT_UNSUPPORTED,
+        // Nothing compute can do differently.
+        DataRetryClass::Malformed | DataRetryClass::Cancelled => KV_RESULT_INTERNAL,
     }
 }
 

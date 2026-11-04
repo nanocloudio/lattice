@@ -42,8 +42,20 @@ connections of the one listener its anchor binds:
   - name: tls
     mode: 1
     verify_peer: 0
-    cert_file: "certs/dev/server.der"
-    key_file: "certs/dev/server.key.der"
+    cert_file: ${param:cert}
+    key_file: ${param:key}
+```
+
+`tls` reads the certificate and key at runtime from absolute paths, PEM
+or DER, and re-reads them when they change, so a rotated certificate
+takes effect without a restart; until both read and parse, the server
+refuses handshakes. The TLS-fronted configs take the paths as `file`
+params, which render absolute (a relative value resolves from the
+working directory):
+
+```sh
+fluxor run configs/single-minimal-etcd-tls.yaml \
+  --param cert=certs/dev/server.der --param key=certs/dev/server.key.der
 ```
 
 `tools/dev-certs.sh` mints a development CA and server certificate into
@@ -112,13 +124,18 @@ and Watch, which are. Anything unserved answers status 12
   through another replica's listener reaches this one within a second
   plus its replica's apply lag (`tests/harness/tests/cluster.rs`,
   `a_followers_etcd_listener_serves_under_the_groups_auth`).
-- **On a follower** of a replicated group the listener serves what the
-  replica can answer correctly: serializable Ranges from its applied
-  state, signing in, and the auth checks. A linearizable Range, and
-  every write, needs the leader: the follower refuses them UNAVAILABLE
-  ("request timed out"), which etcd clients retry on another endpoint.
-  Serving them on the follower needs a ReadIndex the follower asks of
-  the leader, which the consensus module does not offer yet.
+- **On a follower** of a replicated group the listener serves everything
+  the leader's does: serializable Ranges from its applied state,
+  linearizable Ranges and read-only Txns fenced through the leader's
+  ReadIndex, and writes, which its consensus forwards to the leader of
+  its term. A write the group does not take is UNAVAILABLE: "etcdserver:
+  no leader" (not applied; retry it as it is) or "etcdserver: request timed
+  out, possibly due to previous leader failure" (forwarded to a leader that
+  failed before saying: it may have committed — read back before re-sending
+  a Txn that is not idempotent).
+- **Values** up to `kv_large::VALUE_MAX` (8 KiB) are written and read back
+  whole in every shape (Range, Txn, prev_kv, watch events); a Put of a
+  larger value is refused 3 "request is too large".
 - **Snapshot** streams the live keys at one revision in lattice's own
   entry format, zero-padded to 512-byte pages and ending with its
   SHA-256 (what etcd's clients verify). `etcdctl snapshot save` works;
@@ -167,7 +184,9 @@ clients print and match it as they would against etcd.
 | NOSPACE alarm raised | 8 (RESOURCE_EXHAUSTED) | etcdserver: mvcc: database space exceeded |
 | No user / bad token / not permitted | 3 / 16 / 7 | etcd's auth messages |
 | Store unavailable at start (auth records unread) | 14 (UNAVAILABLE) | etcdserver: the store is not answering (auth records unread) |
-| No authority answered in time (a linearizable read or a write on a follower, an unresolved read fence) | 14 | etcdserver: request timed out |
+| No authority answered in time (an unresolved read fence) | 14 | etcdserver: request timed out |
+| A write the group did not take (no leader, a superseded position, strict fallback) | 14 | etcdserver: no leader |
+| A forwarded write whose leader failed before saying (may have committed) | 14 | etcdserver: request timed out, possibly due to previous leader failure |
 | Routing epoch moved under the request | 14 | etcdserver: leader changed |
 | Throttled or backpressured | 8 | etcdserver: too many requests |
 | Operation spans ranges the graph keeps apart | 9 (FAILED_PRECONDITION) | lattice: the operation spans ranges this graph keeps apart |

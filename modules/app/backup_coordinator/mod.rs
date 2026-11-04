@@ -13,8 +13,15 @@
 //! is a `KV_OP_RANGE_META` at R — every live key with its value, create
 //! and mod revision, version and lease. A backup assembled from reads at
 //! different revisions would be a set of records that never existed
-//! together. If the store has already reclaimed R's history it answers
-//! `COMPACTED` and the backup ABORTS: a partial export is
+//! together. R is protected for the whole export: before it reads R the
+//! coordinator takes a retention hold (`KV_OP_RETAIN`, named `bkp/<backup
+//! id>`) at the store's current revision, so no Compact — a client's, or
+//! the store's own history compaction — passes it while the hold lives;
+//! the hold lives `HOLD_TTL_MS` (60 s) on the store's clock and is renewed
+//! between pages, then released once the manifest is durable (a
+//! coordinator that dies stops holding within the TTL). If the store had
+//! already reclaimed the history (the hold is refused, or a page is) it
+//! answers `COMPACTED` and the backup ABORTS: a partial export is
 //! indistinguishable from a whole one once it is on disk.
 //!
 //! The manifest carries the snapshot's metadata: R
@@ -100,9 +107,10 @@ use db_ops::{
     BackupManifest, BackupPhase, EncryptionKeyIdentity, BACKUP_ARTIFACT_FORMAT_VERSION, DIGEST_LEN,
 };
 use types::{
-    KV_OP_GET, KV_OP_HASH_KV, KV_OP_PUT, KV_OP_RANGE_META, KV_OP_RESTORE, KV_RESULT_COMPACTED,
-    KV_RESULT_EXISTS, KV_RESULT_KVS, KV_RESULT_MANIFEST, KV_RESULT_NOT_FOUND, KV_RESULT_OK,
-    PROTO_ETCD, RESTORE_HEAD_LEN, RESTORE_META_LEN,
+    KV_OP_GET, KV_OP_HASH_KV, KV_OP_PUT, KV_OP_RANGE_META, KV_OP_RESTORE, KV_OP_RETAIN,
+    KV_RESULT_COMPACTED, KV_RESULT_EXISTS, KV_RESULT_KVS, KV_RESULT_MANIFEST, KV_RESULT_NOT_FOUND,
+    KV_RESULT_OK, PROTO_ETCD, RESTORE_HEAD_LEN, RESTORE_META_LEN, RETAIN_ANSWER_LEN,
+    RETAIN_AT_CURRENT,
 };
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -135,6 +143,17 @@ const S_RESTORE_PAGE: u8 = 8; // a KV_OP_RESTORE page in flight
 const S_RESTORE_VERIFY: u8 = 9; // the target's digest
 const S_DONE: u8 = 10;
 const S_FAULT: u8 = 11;
+const S_HOLD_TAKE: u8 = 12; // the retention hold, taken at the current revision
+const S_HOLD_RENEW: u8 = 13; // the hold renewed between pages
+const S_HOLD_RELEASE: u8 = 14; // the hold released, the backup durable
+
+/// How long the backup's retention hold lives past the store's clock
+/// unless renewed: a coordinator that dies mid-export stops holding the
+/// store's history within it.
+const HOLD_TTL_MS: u64 = 60_000;
+/// The hold is renewed between pages once this old (a third of its
+/// life: two renewals may be lost before it lapses).
+const HOLD_RENEW_MS: u64 = HOLD_TTL_MS / 3;
 
 define_params! {
     CoordState;
@@ -191,6 +210,10 @@ struct CoordState {
     manifest: BackupManifest,
     /// The revision every export page reads at (R).
     protected_revision: u64,
+    /// The retention hold's floor (at most R) and when it was last taken
+    /// or renewed.
+    hold_floor: u64,
+    hold_ms: u64,
     /// Artifact pages written (backup) or read (restore).
     sequence: u32,
     /// Every page's bytes, chained (the manifest entry's digest), and
@@ -246,6 +269,8 @@ impl CoordState {
         self.corr = 0;
         self.manifest = BackupManifest::EMPTY;
         self.protected_revision = 0;
+        self.hold_floor = 0;
+        self.hold_ms = 0;
         self.sequence = 0;
         self.page_hash = FNV_OFFSET;
         self.page_bytes = 0;
@@ -367,6 +392,41 @@ fn manifest_key(c: &CoordState, out: &mut [u8]) -> Option<usize> {
     user_key(out, KS_BACKUP_MANIFEST, &c.backup_id())
 }
 
+/// The retention hold's name: `bkp/` and the backup id.
+fn hold_name(c: &CoordState) -> [u8; 20] {
+    let mut n = [0u8; 20];
+    n[0..4].copy_from_slice(b"bkp/");
+    n[4..20].copy_from_slice(&c.backup_id());
+    n
+}
+
+/// `KV_OP_RETAIN` of this backup's hold at `floor` (0 releases it).
+fn send_hold(c: &mut CoordState, floor: u64, next: u8) {
+    let name = hold_name(c);
+    let ttl = if floor == 0 { 0 } else { HOLD_TTL_MS };
+    send(
+        c,
+        Pair::Source,
+        KV_OP_RETAIN,
+        &[
+            &floor.to_le_bytes(),
+            &ttl.to_le_bytes(),
+            &(name.len() as u16).to_le_bytes(),
+            &name,
+        ],
+        next,
+        b"[bkp] hold send",
+    );
+}
+
+fn now_ms(c: &CoordState) -> u64 {
+    if c.syscalls.is_null() {
+        return 0;
+    }
+    // SAFETY: the module's syscall table.
+    unsafe { dev_millis(&*c.syscalls) }
+}
+
 fn artifact_key(c: &CoordState, sequence: u32, out: &mut [u8]) -> Option<usize> {
     let mut body = [0u8; 20];
     body[0..16].copy_from_slice(&c.backup_id());
@@ -445,6 +505,16 @@ fn begin_backup(c: &mut CoordState) {
     c.page_len = 0;
     c.last_key_len = 0;
     log_info(c, b"[bkp] export begins");
+    // Hold the store's history first, at its current revision, THEN read
+    // the revision the export reads at (at least the hold's): nothing the
+    // export reads can be compacted under it — by a client's Compact or
+    // the store's own history compaction — while the hold lives, and it
+    // is renewed for as long as the export runs.
+    send_hold(c, RETAIN_AT_CURRENT, S_HOLD_TAKE);
+}
+
+/// The hold is taken: the snapshot's revision and digest.
+fn send_snapshot_hash(c: &mut CoordState) {
     send(
         c,
         Pair::Source,
@@ -489,6 +559,12 @@ fn open_manifest(c: &mut CoordState, rev: u64, hash: u32, keys: u64, raft_index:
 /// The next page of live keys at R: from the start, or from the key past
 /// the last exported (`\0` end: every key on).
 fn send_export_range(c: &mut CoordState) {
+    if now_ms(c).saturating_sub(c.hold_ms) >= HOLD_RENEW_MS {
+        // Renewed first; the page is read once it is.
+        let floor = c.hold_floor;
+        send_hold(c, floor, S_HOLD_RENEW);
+        return;
+    }
     let mut start = [0u8; USER_KEY + 1];
     let mut sl = c.last_key_len as usize;
     copy(&mut start[..sl], &c.last_key[..sl]);
@@ -768,6 +844,40 @@ fn with_rc(msg: &mut [u8], at: usize, rc: u8) {
 
 fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8], applied_index: u64) {
     match c.state {
+        S_HOLD_TAKE | S_HOLD_RENEW => {
+            if result == KV_RESULT_COMPACTED {
+                let _ = c.manifest.transition(BackupPhase::Aborted);
+                fault(c, b"[bkp] aborted: protected history compacted");
+                return;
+            }
+            if result != KV_RESULT_OK || body.len() < RETAIN_ANSWER_LEN {
+                let mut msg = *b"[bkp] retention hold refused rc=000";
+                with_rc(&mut msg, 32, result);
+                fault(c, &msg);
+                return;
+            }
+            c.hold_floor = u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8]));
+            c.hold_ms = now_ms(c);
+            if c.state == S_HOLD_TAKE {
+                send_snapshot_hash(c);
+            } else {
+                send_export_range(c);
+            }
+        }
+        S_HOLD_RELEASE => {
+            if result != KV_RESULT_OK {
+                // The backup is durable; the hold lapses on its own.
+                log_info(c, b"[bkp] hold release refused: it lapses");
+            }
+            c.hold_floor = 0;
+            // Measure, don't infer: records, pages and the revision.
+            let mut msg = *b"[bkp] backup complete r=0000 p=0000 rev=0000000000";
+            digits(&mut msg, 24, 4, c.m_records.min(9999));
+            digits(&mut msg, 31, 4, c.m_pages.min(9999));
+            digits(&mut msg, 40, 10, c.protected_revision);
+            log_info(c, &msg);
+            c.state = S_DONE;
+        }
         S_EXPORT_HASH => {
             if result != KV_RESULT_OK || body.len() < 36 {
                 let mut msg = *b"[bkp] snapshot digest failed rc=000";
@@ -831,13 +941,8 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8], applied_index: u6
                 return;
             }
             let _ = c.manifest.transition(BackupPhase::ProtectionReleased);
-            // Measure, don't infer: records, pages and the revision.
-            let mut msg = *b"[bkp] backup complete r=0000 p=0000 rev=0000000000";
-            digits(&mut msg, 24, 4, c.m_records.min(9999));
-            digits(&mut msg, 31, 4, c.m_pages.min(9999));
-            digits(&mut msg, 40, 10, c.protected_revision);
-            log_info(c, &msg);
-            c.state = S_DONE;
+            // The protection is released in the store too.
+            send_hold(c, 0, S_HOLD_RELEASE);
         }
         S_RESTORE_GET => {
             if result == KV_RESULT_NOT_FOUND {

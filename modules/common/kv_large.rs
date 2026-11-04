@@ -50,6 +50,16 @@ use kv_chunks::{
 /// Large values one request may carry (a TXN's `PUT`s).
 pub const MAX_LARGE_PER_REQUEST: usize = 64;
 
+/// The point protocols' object policy: the largest value the redis,
+/// memcached and etcd edges (and the KV front) write and read back whole.
+/// The store keeps any value as chunks under a manifest (a value past one
+/// data chunk); what bounds a value is the buffers of the edge that
+/// carries it, and every point edge sizes its own to this, so a value one
+/// of them writes is one each of them reads. A larger write is refused
+/// too large before any chunk is sent; a larger stored value (written
+/// another way) is answered too large, never cut.
+pub const VALUE_MAX: usize = 8192;
+
 /// A `KV_OP_PUT_CHUNK` body: hash, length, chunk.
 pub const CHUNK_REQUEST_MAX: usize = HASH_LEN + 2 + CHUNK_MAX;
 
@@ -638,6 +648,13 @@ pub fn carries_large(op: u8, body: &[u8], room: usize) -> bool {
 }
 
 pub use kv_chunks::ENTRY_BODY_MAX;
+
+/// Does every value an outgoing write puts fit `max` bytes (an edge's
+/// [`VALUE_MAX`])? An op that puts none, or a body this layer cannot walk
+/// (the store refuses it), passes.
+pub fn values_within(op: u8, body: &[u8], max: usize) -> bool {
+    each_value(op, body, &mut |_, len| len <= max) != Err(LargeError::Overflow)
+}
 
 /// Each value an outgoing write puts (a `PUT`'s, a Txn's or an etcd Txn's
 /// `PUT`s, an MSET's): `f(offset, length)` in `body`. `f` answering

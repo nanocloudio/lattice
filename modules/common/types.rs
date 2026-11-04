@@ -441,7 +441,9 @@ pub const KV_OP_LEASE_KEYS: u8 = 0x20;
 /// `KV_RESULT_COMPACTED` when the revision is at or below one already
 /// compacted, or `KV_RESULT_FUTURE_REV` when it is ahead of the store.
 /// Reads below it are refused from then on; the physical reclamation
-/// follows as the provider's maintenance.
+/// follows as the provider's maintenance. A live retention hold
+/// ([`KV_OP_RETAIN`]) below `revision` stops it at the hold's floor (still
+/// `KV_RESULT_OK`).
 pub const KV_OP_COMPACT: u8 = 0x21;
 /// etcd's HashKV (and the sizes its Status reports): a digest of the live
 /// keys as of a revision. Body `[revision:u64 LE]` (0 = the current one).
@@ -541,6 +543,124 @@ pub const KV_OP_RESTORE: u8 = 0x2C;
 /// after its value.
 pub const RESTORE_HEAD_LEN: usize = 8 + 8 + 2;
 pub const RESTORE_META_LEN: usize = 8 + 8 + 8 + 8 + 1;
+
+/// A retention hold: history from `floor` on is kept from compaction
+/// while the hold lives — what a backup reading the store at one revision
+/// takes for as long as it reads.
+///
+/// Body: `[floor:u64 LE][ttl_ms:u64 LE][name_len:u16 LE][name…]` — the
+/// hold's holder-chosen name (1..=[`RETAIN_NAME_MAX`] bytes; every holder
+/// names its own, e.g. `bkp/<backup id>`).
+///
+/// - `floor` 0 releases the hold `name` (no hold of that name is not an
+///   error).
+/// - `floor` [`RETAIN_AT_CURRENT`] takes it at the store's current
+///   revision: a holder that has not yet chosen its revision holds first,
+///   then reads the revision it will read at (`KV_OP_HASH_KV`) — nothing
+///   it can choose is compacted in between.
+/// - any other `floor` takes (or moves, or renews) it there. Below the
+///   store's compaction floor it is refused `KV_RESULT_COMPACTED` (that
+///   history is gone; the holder starts again), past the store's revision
+///   `KV_RESULT_FUTURE_REV`.
+///
+/// A hold lives `ttl_ms` past the store's clock when it was taken (0:
+/// until released), so a holder that dies stops holding; a holder renews
+/// by taking it again. While any hold lives, a `KV_OP_COMPACT` — a
+/// client's, or the store's own history compaction — compacts no further
+/// than the lowest hold's floor, and the store's GC retention claim
+/// (`compaction_floor::CLAIM_SOURCE_BACKUP`) asks for no less.
+///
+/// Holds are the store's own records (their own keyspace, never a user
+/// key: no digest, walk or watch sees them) and replicate like any write.
+/// Answered `KV_RESULT_OK` with `[floor:u64 LE][compact_revision:u64 LE]
+/// [hold_floor:u64 LE]`: the floor the hold is at (0 once released), the
+/// store's compaction floor, and the lowest live hold's floor
+/// (`u64::MAX`: none). An empty `name` changes nothing and answers the
+/// same (a query: a read).
+pub const KV_OP_RETAIN: u8 = 0x2D;
+/// [`KV_OP_RETAIN`]'s `floor` for "the store's current revision".
+pub const RETAIN_AT_CURRENT: u64 = u64::MAX;
+/// The longest [`KV_OP_RETAIN`] hold name.
+pub const RETAIN_NAME_MAX: usize = 64;
+/// [`KV_OP_RETAIN`]'s answer length.
+pub const RETAIN_ANSWER_LEN: usize = 24;
+
+/// Is a [`KV_OP_RETAIN`] body a query (an empty name: it changes
+/// nothing)?
+pub fn retain_is_query(body: &[u8]) -> bool {
+    body.get(16..18) == Some(&[0, 0][..])
+}
+
+/// The highest op code this build defines. Every op lies in
+/// `KV_OP_GET..=KV_OP_LAST`; a new op extends this bound.
+pub const KV_OP_LAST: u8 = KV_OP_RETAIN;
+
+/// Whether `op` is an op code this build defines at all (some layer of it
+/// implements the op — not necessarily the store: `KV_OP_TARGETED` is the
+/// router's, `KV_OP_TXN_STAGED` never leaves its writer). An op outside it
+/// was sent by a newer peer than the layer reading it, and is answered
+/// [`KV_RESULT_UNSUPPORTED`] by the first layer that dispatches it.
+pub const fn kv_op_known(op: u8) -> bool {
+    op >= KV_OP_GET && op <= KV_OP_LAST
+}
+
+/// Whether a [`KV_OP_ETCD_TXN`] body only reads: every op of both
+/// branches (which one runs is decided by the store, after routing) is a
+/// Range or a nested Txn that itself only reads, to
+/// [`ETCD_TXN_DEPTH_MAX`]. Such a Txn changes nothing and takes no
+/// revision, so it is a read: routed with the consistency it asks (a
+/// linearizable one fenced by ReadIndex, on a follower too), never
+/// proposed. A malformed body, or a branch op kind this build does not
+/// define, answers `false` — routed as the write it may be, and refused
+/// where it applies.
+pub fn etcd_txn_read_only(body: &[u8]) -> bool {
+    etcd_txn_read_only_at(body, 0).unwrap_or(false)
+}
+
+fn etcd_txn_read_only_at(body: &[u8], depth: usize) -> Option<bool> {
+    if depth > ETCD_TXN_DEPTH_MAX {
+        return None;
+    }
+    let u16_at = |at: usize| -> Option<usize> {
+        Some(u16::from_le_bytes([*body.get(at)?, *body.get(at + 1)?]) as usize)
+    };
+    let u32_at = |at: usize| -> Option<usize> {
+        let b = body.get(at..at + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let ncmp = *body.first()?;
+    let mut at = 1usize;
+    for _ in 0..ncmp {
+        // [target][result][key_len:u16][key][end_len:u16][end][operand:u64][value_len:u32][value]
+        at += 2;
+        at += 2 + u16_at(at)?;
+        at += 2 + u16_at(at)?;
+        at += 8;
+        at += 4 + u32_at(at)?;
+        body.get(..at)?;
+    }
+    let mut reads_only = true;
+    for _branch in 0..2 {
+        let n = *body.get(at)?;
+        at += 1;
+        for _ in 0..n {
+            let kind = *body.get(at)?;
+            let len = u32_at(at + 1)?;
+            let op = body.get(at + 5..at + 5 + len)?;
+            at += 5 + len;
+            match kind {
+                ETCD_OP_RANGE => {}
+                ETCD_OP_TXN => reads_only &= etcd_txn_read_only_at(op, depth + 1)?,
+                ETCD_OP_PUT | ETCD_OP_DELETE | ETCD_OP_PUT_MANIFEST => reads_only = false,
+                _ => return None,
+            }
+        }
+    }
+    if at != body.len() {
+        return None;
+    }
+    Some(reads_only)
+}
 
 // ── KV op-specific body shapes ─────────────────────────────────────────
 //
@@ -703,6 +823,9 @@ pub const PUT_FLAG2_MANIFESTS: u8 = 0x01;
 //   KV_RESULT_ARRAY         body = [count:u16 LE][element-len:u32 LE
 //                                   element-bytes...]* — element-len
 //                           = 0xFFFFFFFF marks null bulk in the array
+//   KV_RESULT_UNSUPPORTED   body empty → ERR unsupported operation
+//   KV_RESULT_NO_LEADER     body empty → CLUSTERDOWN no leader (not applied)
+//   KV_RESULT_OUTCOME_UNKNOWN body empty → ERR outcome unknown (may have applied)
 //   KV_RESULT_INTERNAL      body empty → ERR internal error
 
 pub const KV_RESULT_OK: u8 = 0x00;
@@ -889,6 +1012,31 @@ pub const KV_RESULT_MISSING_CHUNK: u8 = 0x1B;
 /// The request names one of the store's own keyspaces (its chunk
 /// records), which only the store writes.
 pub const KV_RESULT_RESERVED: u8 = 0x1C;
+/// The op is one the answering layer does not implement: an op code it
+/// does not know (a peer built against a newer contract — version skew),
+/// or one that layer never applies (`KV_OP_TXN_STAGED` at a store).
+/// Nothing is applied and nothing is logged; retrying the same op at the
+/// same layer cannot succeed. Every protocol front renders it as its own
+/// "unimplemented" error, so skew reads as skew, never as a fault.
+pub const KV_RESULT_UNSUPPORTED: u8 = 0x1D;
+/// A replicated write that was NOT applied: no leader was known for
+/// the group's hold, the node the write was forwarded to no longer led
+/// its term, the position it was assigned committed another term's entry
+/// (superseded), or the leader is frozen in strict fallback. Nothing was
+/// appended, so the same write may be retried as it is. etcd answers it
+/// UNAVAILABLE "etcdserver: no leader"; redis CLUSTERDOWN; memcached
+/// SERVER_ERROR.
+pub const KV_RESULT_NO_LEADER: u8 = 0x1E;
+/// A replicated write whose outcome is not known: it was forwarded to a
+/// leader that may have appended it, and no node that led that term
+/// could say before the deadline (the leader failed). It may yet commit,
+/// or never; it is never proposed again on its own. Not blindly
+/// retryable for a write that is not idempotent: read back first. An op
+/// in flight past the router's own deadline is answered
+/// [`KV_RESULT_LIN_BOUND`] (no authority answered), which for a write
+/// is just as undecided. etcd answers it UNAVAILABLE "etcdserver:
+/// request timed out, possibly due to previous leader failure".
+pub const KV_RESULT_OUTCOME_UNKNOWN: u8 = 0x1F;
 pub const KV_RESULT_PAUSED: u8 = 0xFE;
 
 pub const KV_RESULT_INTERNAL: u8 = 0xFF;

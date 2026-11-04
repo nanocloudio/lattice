@@ -1,33 +1,51 @@
 //! memcached_datagram_anchor — Memcached UDP anchor.
 //!
 //! Continuity class: `reroutable`. Each UDP request datagram carries
-//! a 2-byte request id; the server echoes the same id on the reply.
-//! There's no per-client connection state, so reroute / replica
-//! migration is transparent to the wire.
+//! a 2-byte request id; the server echoes the same id on every reply
+//! datagram. There's no per-client connection state, so reroute /
+//! replica migration is transparent to the wire.
 //!
 //! ## Memcached UDP framing
 //!
-//! Per memcached.org/protocol — UDP, each datagram (request *and*
-//! response) carries an 8-byte frame header followed by the same
-//! ASCII protocol the TCP path uses:
+//! Per memcached's UDP protocol, each datagram (request *and* response)
+//! carries an 8-byte frame header followed by the same ASCII protocol
+//! the TCP path uses (`memcached_codec`'s UDP framing):
 //!
 //!   `[req_id:u16 BE][seq:u16 BE][total:u16 BE][reserved:u16 = 0]`
 //!
-//! `req_id` is opaque to the server (echoed verbatim). `seq` and
-//! `total` would allow split requests across multiple datagrams; this
-//! anchor only handles `seq = 0 && total = 1` (the overwhelming common
-//! case) and drops anything else — clients that need to send a body
-//! larger than ~1400 bytes must use the TCP anchor instead.
+//! `req_id` is opaque to the server (echoed verbatim). A request is one
+//! datagram (`seq = 0`, `total = 1`); anything else is answered
+//! `ERROR` (as memcached: a request larger than a datagram is TCP's).
+//!
+//! A reply is cut into as many datagrams as it needs, each at most
+//! `UDP_DATAGRAM_MAX` (1400) bytes with its header, numbered
+//! `seq = 0..total` under the request's id, so a `get` answers any value
+//! up to the point protocols' bound (`kv_large::VALUE_MAX`) — a value
+//! stored as chunks under a manifest is fetched whole through a
+//! `kv_large` session first. The client reassembles by sequence number,
+//! in any arrival order. Loss is memcached's: nothing is retransmitted;
+//! a client missing a datagram times out and sends the request again.
+//!
+//! A reply whose datagrams the provider channel cannot take at once is
+//! parked in one of `TX_SLOTS` reply slots and sent on, in order, over
+//! the next steps; with every slot parked, the rest of a reply is
+//! dropped (counted `reply_dropped`) and the client's retry is the
+//! recovery. The state a reply holds is bounded by those slots.
 //!
 //! ## Supported commands
 //!
-//! `get k\r\n` → `VALUE k flags bytes\r\n<data>\r\nEND\r\n`
+//! `get k\r\n` → `VALUE k flags bytes\r\n<data>\r\nEND\r\n` / `END\r\n`
 //! `set k flags exp bytes\r\n<data>\r\n` → `STORED\r\n` / `NOT_STORED\r\n`
 //! `delete k\r\n` → `DELETED\r\n` / `NOT_FOUND\r\n`
+//! `version\r\n` → `VERSION 0.2.0\r\n`
 //!
-//! All other commands are answered with `ERROR\r\n` (memcached's
-//! generic unknown-command reply). Multi-key `get`, `incr` / `decr`,
-//! `add` / `replace` / `append` / `prepend`, and `cas` land later.
+//! A `set` carries its value in its one request datagram, inline: a
+//! value past one data chunk (`kv_chunks::DATA_MAX`) is answered
+//! `SERVER_ERROR object too large for cache` (write it over TCP; every
+//! value the store holds reads back here). All other commands are
+//! answered with `ERROR\r\n` (memcached's generic unknown-command
+//! reply). Multi-key `get`, `incr` / `decr`, `add` / `replace` /
+//! `append` / `prepend`, and `cas` are TCP-only.
 
 #![no_std]
 #![allow(
@@ -48,9 +66,13 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/types.rs"]
 mod types;
+
+#[path = "../../common/kv_large.rs"]
+mod kv_large;
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -70,10 +92,13 @@ use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use collections::InflightTable;
 use memcached_codec::{
-    encode_reply, eq_ascii_ci, find_crlf, parse_line, parse_u32_dec, token_bytes, Line, MemOp,
+    append, encode_get_answer, encode_reply, eq_ascii_ci, parse_line, parse_u32_dec, token_bytes,
+    udp_datagrams, udp_frame, udp_header, Line, MemOp, GET_ANSWER_OVERHEAD, UDP_DATAGRAM_MAX,
+    UDP_FRAME_HEADER,
 };
 use types::{
-    KV_OP_DELETE, KV_OP_GET, KV_OP_PUT, KV_RESULT_OK, PROTO_MEMCACHED_UDP, REQ_LINEARIZABLE,
+    KV_OP_DELETE, KV_OP_GET, KV_OP_PUT, KV_RESULT_INTERNAL, KV_RESULT_MANIFEST, KV_RESULT_OK,
+    KV_RESULT_TOO_LARGE, PROTO_MEMCACHED_UDP, REQ_LINEARIZABLE, REQ_SERIALIZABLE,
 };
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -83,13 +108,57 @@ use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
+/// One request datagram as the provider frames it (`[ep][af][addr][port]`
+/// then the memcached frame): a request is one datagram, so a `set`'s
+/// value is bounded by it.
 const RECV_BUF: usize = 2048;
-const SEND_BUF: usize = 2048;
-const SCRATCH: usize = 4096;
+/// A `KV_OP_PUT` body built from one request datagram.
+const PUT_BODY_MAX: usize = RECV_BUF + 16;
+/// A `MSG_KV_REQUEST` envelope: frame header, request head, body.
+const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
+const ENV_BUF: usize = 3 + REQ_HEAD + PUT_BODY_MAX;
+/// Every envelope the router writes is read whole.
+const ROUTED_BUF: usize = ENVELOPE_HDR + wire::FRAME_PAYLOAD_MAX;
 const MAX_INFLIGHT: usize = 512;
+/// The longest key a request or a session keeps.
+const KEY_MAX: usize = 256;
 
-const MEMCACHED_UDP_HEADER: usize = 8;
+/// A large GET's value, fetched whole: the point protocols' bound and
+/// the TCP anchor's slack (`memcached_stream_anchor::LG_OUT`).
+const LG_OUT: usize = kv_large::VALUE_MAX + 256;
+/// Large-value reads at once (a GET answered by a manifest, expanded).
+/// A GET that finds every one busy is answered `SERVER_ERROR`.
+const LG_SESSIONS: usize = 4;
+/// A session's next exchange: a chunk's hash.
+const LG_SEND: usize = 64;
+/// The conn byte of chunk exchanges (requests stamp 0).
+const LG_CHUNK_CONN: u8 = u8::MAX;
+/// A session's exchange waiting for room on `kv_out`.
+const LG_UNSENT: u64 = 1;
+/// A session that has not finished in this long is abandoned unanswered:
+/// its client has long since timed out and asked again.
+const LG_STALL_MS: u64 = 5_000;
+
+/// One whole reply: a `VALUE` block at `LG_OUT` with its key and `END`.
+const REPLY_MAX: usize = LG_OUT + KEY_MAX + GET_ANSWER_OVERHEAD;
+/// Replies parked for room on `dgram_out`.
+const TX_SLOTS: usize = 4;
+/// One `CMD_DG_SEND_TO` frame: header, IPv4 prefix, one datagram.
+const DG_FRAME: usize = 3 + DG_V4_PREFIX + UDP_DATAGRAM_MAX;
+
+const _: () = assert!(REPLY_MAX.div_ceil(UDP_DATAGRAM_MAX - UDP_FRAME_HEADER) <= u16::MAX as usize);
+const _: () = assert!(REQ_HEAD + PUT_BODY_MAX <= wire::KV_REQUEST_PAYLOAD_MAX);
+
 const DEFAULT_PORT: u16 = 11211;
+
+define_params! {
+    AnchorState;
+
+    // UDP port the anchor binds for memcached clients (memcached's own
+    // 11211 by default; a harness or a second graph moves it).
+    1, listen_port, u16, DEFAULT_PORT
+        => |s, d, len| { s.listen_port = p_u16(d, len, 0, DEFAULT_PORT); };
+}
 
 // ── Inflight table value ─────────────────────────────────────────────
 
@@ -97,13 +166,13 @@ const DEFAULT_PORT: u16 = 11211;
 #[repr(C)]
 struct InflightVal {
     op: u8,
-    /// Echo of the inbound `req_id` so the response datagram carries
+    /// Echo of the inbound `req_id` so the response datagrams carry
     /// the matching memcached UDP frame id.
     req_id: u16,
     src_addr: [u8; 4],
     src_port: u16,
     key_len: u16,
-    key: [u8; 256],
+    key: [u8; KEY_MAX],
 }
 
 impl InflightVal {
@@ -114,9 +183,39 @@ impl InflightVal {
             src_addr: [0; 4],
             src_port: 0,
             key_len: 0,
-            key: [0; 256],
+            key: [0; KEY_MAX],
         }
     }
+}
+
+/// A reply waiting for room on `dgram_out`: its datagrams from `next`.
+struct TxSlot {
+    live: bool,
+    req_id: u16,
+    addr: [u8; 4],
+    port: u16,
+    next: u16,
+    total: u16,
+    len: usize,
+    buf: [u8; REPLY_MAX],
+}
+
+/// One large GET: the manifest's value fetched chunk by chunk, then
+/// answered to whom it names.
+struct LgSlot {
+    session: kv_large::Session,
+    /// The exchange in flight; [`LG_UNSENT`] waiting for room; 0 = free.
+    corr: u64,
+    unsent_op: u8,
+    unsent_len: usize,
+    req_id: u16,
+    addr: [u8; 4],
+    port: u16,
+    key_len: u16,
+    key: [u8; KEY_MAX],
+    since_ms: u64,
+    send: [u8; LG_SEND],
+    out: [u8; LG_OUT],
 }
 
 // ── Anchor state ──────────────────────────────────────────────────────
@@ -146,29 +245,35 @@ struct AnchorState {
 
     bind_phase: BindPhase,
     ep_id: u8,
+    listen_port: u16,
     local_port: u16,
 
     corr_seq: u64,
 
     // Telemetry. Monotonic counters emitted on `metrics_out` at
     // a coarse step cadence; ids follow the manifest `[observability]
-    // metrics` order (0=requests, 1=forwarded, 2=errors).
+    // metrics` order (0=requests, 1=forwarded, 2=errors,
+    // 3=reply_datagrams, 4=reply_dropped).
     m_requests: u64,
     m_forwarded: u64,
     m_errors: u64,
+    m_datagrams: u64,
+    m_dropped: u64,
     step_ctr: u64,
 
     inflight: InflightTable<InflightVal, MAX_INFLIGHT>,
 
-    /// Re-entry buffer for partial CMD_DG_SEND_TO writes (backpressure).
-    /// Currently unused — channel_write is best-effort; a failed write
-    /// drops the response and the client will retransmit on its own
-    /// (memcached UDP timeout is client-side, ~50 ms).
-    _pending: u32,
+    tx: [TxSlot; TX_SLOTS],
+    lg: [LgSlot; LG_SESSIONS],
 
-    recv: [u8; RECV_BUF],
-    send: [u8; SEND_BUF],
-    scratch: [u8; SCRATCH],
+    /// The reply being rendered.
+    reply: [u8; REPLY_MAX],
+    /// The routed envelope being read.
+    routed: [u8; ROUTED_BUF],
+    /// The KV envelope being written.
+    env: [u8; ENV_BUF],
+    /// The datagram frame being written.
+    dg: [u8; DG_FRAME],
 }
 
 impl AnchorState {
@@ -183,14 +288,24 @@ impl AnchorState {
         self.routed_inbox = Inbox::new();
         self.bind_phase = BindPhase::Init;
         self.ep_id = 0xFF;
+        self.listen_port = DEFAULT_PORT;
         self.local_port = 0;
         self.corr_seq = 0;
         self.m_requests = 0;
         self.m_forwarded = 0;
         self.m_errors = 0;
+        self.m_datagrams = 0;
+        self.m_dropped = 0;
         self.step_ctr = 0;
         self.inflight = InflightTable::new();
-        self._pending = 0;
+        for t in self.tx.iter_mut() {
+            t.live = false;
+        }
+        for l in self.lg.iter_mut() {
+            l.session = kv_large::Session::new();
+            l.corr = 0;
+            l.unsent_op = 0;
+        }
     }
 
     fn next_corr(&mut self) -> u64 {
@@ -202,6 +317,14 @@ impl AnchorState {
             self.corr_seq = 1;
         }
         (u64::from(PROTO_MEMCACHED_UDP) << 56) | (self.corr_seq & 0x00FF_FFFF_FFFF_FFFF)
+    }
+
+    fn now_ms(&self) -> u64 {
+        if self.syscalls.is_null() {
+            0
+        } else {
+            unsafe { dev_millis(&*self.syscalls) }
+        }
     }
 }
 
@@ -239,7 +362,7 @@ unsafe fn try_bind(anchor: &mut AnchorState) {
         return;
     }
     let mut body = [0u8; 3];
-    body[0..2].copy_from_slice(&DEFAULT_PORT.to_le_bytes());
+    body[0..2].copy_from_slice(&anchor.listen_port.to_le_bytes());
     body[2] = 0; // flags
     let mut scratch = [0u8; 16];
     if channel_write_frame(&*sys, anchor.dgram_out, DG_CMD_BIND, &body, &mut scratch) {
@@ -262,8 +385,6 @@ unsafe fn drain_dgram_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    // Read into recv buffer (separate from scratch so request parsing
-    // and outbound envelope build don't alias).
     let mut local = [0u8; ENVELOPE_HDR + RECV_BUF];
     let (msg_type, plen) =
         match read_envelope(&mut anchor.dgram_inbox, sys, anchor.dgram_in, &mut local) {
@@ -272,18 +393,33 @@ unsafe fn drain_dgram_in(anchor: &mut AnchorState) -> bool {
         };
     match msg_type {
         DG_MSG_BOUND => {
-            // Payload: [ep_id:1][local_port:u16 LE]
-            if plen >= 3 {
-                anchor.ep_id = local[0];
-                anchor.local_port = u16::from_le_bytes([local[1], local[2]]);
-                anchor.bind_phase = BindPhase::Bound;
+            // Payload: [ep_id:1][local_port:u16 LE]. A provider output
+            // fanned to several consumers shows each of them every
+            // BOUND: claim only the one for the port asked for.
+            if plen >= 3 && anchor.bind_phase == BindPhase::Pending {
+                let (ep, port) = (local[0], u16::from_le_bytes([local[1], local[2]]));
+                if anchor.listen_port == 0 || port == anchor.listen_port {
+                    anchor.ep_id = ep;
+                    anchor.local_port = port;
+                    anchor.bind_phase = BindPhase::Bound;
+                }
             }
         }
         DG_MSG_RX_FROM => {
             handle_rx_from(anchor, &local[..plen]);
         }
         DG_MSG_CLOSED | DG_MSG_ERROR => {
-            anchor.bind_phase = BindPhase::Error;
+            // [ep_id:1]…: only this anchor's endpoint (or, while its bind
+            // is pending, a refused bind's 0xFF) ends it — another
+            // consumer's on a shared provider does not.
+            if plen >= 1 {
+                let ep = local[0];
+                let ours = (anchor.bind_phase == BindPhase::Bound && ep == anchor.ep_id)
+                    || (anchor.bind_phase == BindPhase::Pending && ep == 0xFF);
+                if ours {
+                    anchor.bind_phase = BindPhase::Error;
+                }
+            }
         }
         _ => {}
     }
@@ -292,7 +428,7 @@ unsafe fn drain_dgram_in(anchor: &mut AnchorState) -> bool {
 
 unsafe fn handle_rx_from(anchor: &mut AnchorState, payload: &[u8]) {
     // [ep_id:1][af:1][src_addr:4 BE][src_port:2 LE][memcached_udp_frame…]
-    if payload.len() < DG_V4_PREFIX + MEMCACHED_UDP_HEADER + 2 {
+    if payload.len() < DG_V4_PREFIX + UDP_FRAME_HEADER + 2 {
         return;
     }
     let ep_id = payload[0];
@@ -303,18 +439,15 @@ unsafe fn handle_rx_from(anchor: &mut AnchorState, payload: &[u8]) {
     let src_addr = [payload[2], payload[3], payload[4], payload[5]];
     let src_port = u16::from_le_bytes([payload[6], payload[7]]);
     let dgram = &payload[DG_V4_PREFIX..];
-
-    // Memcached UDP frame header: [req_id:u16 BE][seq:u16 BE][total:u16 BE][reserved:u16].
-    let req_id = u16::from_be_bytes([dgram[0], dgram[1]]);
-    let seq = u16::from_be_bytes([dgram[2], dgram[3]]);
-    let total = u16::from_be_bytes([dgram[4], dgram[5]]);
+    let Some((req_id, seq, total)) = udp_header(dgram) else {
+        return;
+    };
     if seq != 0 || total != 1 {
-        // Multi-datagram requests not supported. Echo an ERROR.
+        // A request is one datagram.
         send_error_reply(anchor, req_id, src_addr, src_port);
         return;
     }
-    let ascii = &dgram[MEMCACHED_UDP_HEADER..];
-    let _ = find_crlf(ascii); // CRLF must be present
+    let ascii = &dgram[UDP_FRAME_HEADER..];
     let Some(line) = parse_line(ascii) else {
         send_error_reply(anchor, req_id, src_addr, src_port);
         return;
@@ -340,18 +473,24 @@ unsafe fn dispatch_command(
     let cmd = token_bytes(request, line.tokens[0]);
     if eq_ascii_ci(cmd, b"get") {
         // get <key>
-        if line.count < 2 {
+        if line.count != 2 {
             send_error_reply(anchor, req_id, src_addr, src_port);
             return;
         }
         let key = token_bytes(request, line.tokens[1]);
-        let mut body = [0u8; 258];
-        let mut p = 0;
-        body[p] = (key.len() & 0xFF) as u8;
-        body[p + 1] = ((key.len() >> 8) & 0xFF) as u8;
-        p += 2;
-        body[p..p + key.len()].copy_from_slice(key);
-        p += key.len();
+        if key.len() > KEY_MAX {
+            send_text(
+                anchor,
+                req_id,
+                src_addr,
+                src_port,
+                b"CLIENT_ERROR bad command line format\r\n",
+            );
+            return;
+        }
+        let mut body = [0u8; 2 + KEY_MAX];
+        body[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        body[2..2 + key.len()].copy_from_slice(key);
         send_envelope(
             anchor,
             KV_OP_GET,
@@ -360,7 +499,8 @@ unsafe fn dispatch_command(
             req_id,
             src_addr,
             src_port,
-            &body[..p],
+            2 + key.len(),
+            &body,
         );
     } else if eq_ascii_ci(cmd, b"set") {
         // set <key> <flags> <exp> <bytes>\r\n<data>\r\n
@@ -374,28 +514,52 @@ unsafe fn dispatch_command(
             send_error_reply(anchor, req_id, src_addr, src_port);
             return;
         };
+        let value_len = value_len as usize;
         let data_start = line.line_end;
-        if data_start + value_len as usize + 2 > request.len() {
-            send_error_reply(anchor, req_id, src_addr, src_port);
+        if key.len() > KEY_MAX || data_start + value_len + 2 > request.len() {
+            send_text(
+                anchor,
+                req_id,
+                src_addr,
+                src_port,
+                b"CLIENT_ERROR bad data chunk\r\n",
+            );
             return;
         }
-        let value = &request[data_start..data_start + value_len as usize];
+        // The value rides inline in this one datagram's PUT: one past a
+        // data chunk would need the chunk upload a request datagram has
+        // no room to drive.
+        if value_len > kv_large::kv_chunks::DATA_MAX {
+            send_text(
+                anchor,
+                req_id,
+                src_addr,
+                src_port,
+                b"SERVER_ERROR object too large for cache\r\n",
+            );
+            return;
+        }
+        let value = &request[data_start..data_start + value_len];
         // KV_OP_PUT body: [key_len:u16][key…][value_len:u32][value…]
         //                  [put_flags:u8][expiry_ms:u64]
         let need = 2 + key.len() + 4 + value.len() + 1 + 8;
-        if need > anchor.send.len() {
-            send_error_reply(anchor, req_id, src_addr, src_port);
+        let mut buf = [0u8; PUT_BODY_MAX];
+        if need > buf.len() {
+            send_text(
+                anchor,
+                req_id,
+                src_addr,
+                src_port,
+                b"CLIENT_ERROR bad data chunk\r\n",
+            );
             return;
         }
-        let mut buf = [0u8; 1600];
         let mut p = 0;
-        buf[p] = (key.len() & 0xFF) as u8;
-        buf[p + 1] = ((key.len() >> 8) & 0xFF) as u8;
+        buf[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
         p += 2;
         buf[p..p + key.len()].copy_from_slice(key);
         p += key.len();
-        let vlen = (value.len() as u32).to_le_bytes();
-        buf[p..p + 4].copy_from_slice(&vlen);
+        buf[p..p + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
         p += 4;
         buf[p..p + value.len()].copy_from_slice(value);
         p += value.len();
@@ -411,7 +575,8 @@ unsafe fn dispatch_command(
             req_id,
             src_addr,
             src_port,
-            &buf[..p],
+            p,
+            &buf,
         );
     } else if eq_ascii_ci(cmd, b"delete") {
         if line.count < 2 {
@@ -419,17 +584,21 @@ unsafe fn dispatch_command(
             return;
         }
         let key = token_bytes(request, line.tokens[1]);
+        if key.len() > KEY_MAX {
+            send_text(
+                anchor,
+                req_id,
+                src_addr,
+                src_port,
+                b"CLIENT_ERROR bad command line format\r\n",
+            );
+            return;
+        }
         // KV_OP_DELETE body: [n_keys:u16 = 1][key_len:u16][key…]
-        let mut buf = [0u8; 260];
-        let mut p = 0;
-        buf[p] = 1;
-        buf[p + 1] = 0;
-        p += 2;
-        buf[p] = (key.len() & 0xFF) as u8;
-        buf[p + 1] = ((key.len() >> 8) & 0xFF) as u8;
-        p += 2;
-        buf[p..p + key.len()].copy_from_slice(key);
-        p += key.len();
+        let mut buf = [0u8; 4 + KEY_MAX];
+        buf[0..2].copy_from_slice(&1u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        buf[4..4 + key.len()].copy_from_slice(key);
         send_envelope(
             anchor,
             KV_OP_DELETE,
@@ -438,14 +607,49 @@ unsafe fn dispatch_command(
             req_id,
             src_addr,
             src_port,
-            &buf[..p],
+            4 + key.len(),
+            &buf,
         );
+    } else if eq_ascii_ci(cmd, b"version") {
+        send_text(anchor, req_id, src_addr, src_port, b"VERSION 0.2.0\r\n");
     } else {
         send_error_reply(anchor, req_id, src_addr, src_port);
     }
 }
 
 // ── MSG_KV_REQUEST emitter ───────────────────────────────────────────
+
+/// Write `MSG_KV_REQUEST` (`op`, `body[..len]`) under `corr` into
+/// `env`: the envelope's length.
+fn build_request(
+    env: &mut [u8],
+    corr: u64,
+    conn: u8,
+    consistency: u8,
+    op: u8,
+    body: &[u8],
+) -> Option<usize> {
+    let payload_len = REQ_HEAD + body.len();
+    if payload_len > wire::KV_REQUEST_PAYLOAD_MAX {
+        return None;
+    }
+    let total = 3 + payload_len;
+    let out = env.get_mut(..total)?;
+    out[0] = MSG_KV_REQUEST;
+    out[1..3].copy_from_slice(&(payload_len as u16).to_le_bytes());
+    out[3..11].copy_from_slice(&corr.to_le_bytes());
+    out[11] = PROTO_MEMCACHED_UDP;
+    // Tenant 0 — UDP memcached has no auth path.
+    out[12..16].copy_from_slice(&0u32.to_le_bytes());
+    // conn byte: no slot table here (the reply's peer is in the inflight
+    // entry); chunk fetches stamp their own.
+    out[16] = conn;
+    out[17] = consistency;
+    out[18] = op;
+    out[19..21].copy_from_slice(&(body.len() as u16).to_le_bytes());
+    out[21..total].copy_from_slice(body);
+    Some(total)
+}
 
 unsafe fn send_envelope(
     anchor: &mut AnchorState,
@@ -455,6 +659,7 @@ unsafe fn send_envelope(
     req_id: u16,
     src_addr: [u8; 4],
     src_port: u16,
+    body_len: usize,
     body: &[u8],
 ) -> bool {
     let sys = anchor.syscalls;
@@ -463,42 +668,16 @@ unsafe fn send_envelope(
     }
     let sys = &*sys;
     let corr = anchor.next_corr();
-
-    // Envelope head: [corr:8][proto:1][tenant:4][conn:1][cons:1][op:1][body_len:2] = 18
-    const HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
-    let payload_len = HEAD + body.len();
-    if payload_len > u16::MAX as usize {
+    let Some(total) = build_request(
+        &mut anchor.env,
+        corr,
+        0,
+        REQ_LINEARIZABLE,
+        op,
+        &body[..body_len],
+    ) else {
         return false;
-    }
-    let total = 3 + payload_len;
-    if total > anchor.scratch.len() {
-        return false;
-    }
-    let out = &mut anchor.scratch[..total];
-    out[0] = MSG_KV_REQUEST;
-    out[1] = (payload_len & 0xFF) as u8;
-    out[2] = ((payload_len >> 8) & 0xFF) as u8;
-    let mut p = 3;
-    out[p..p + 8].copy_from_slice(&corr.to_le_bytes());
-    p += 8;
-    out[p] = PROTO_MEMCACHED_UDP;
-    p += 1;
-    // Tenant 0 — UDP memcached has no auth path; multi-tenancy lands
-    // when the TCP anchor's tenant resolution is shared.
-    out[p..p + 4].copy_from_slice(&0u32.to_le_bytes());
-    p += 4;
-    // conn_id is unused for datagram — we look up the response peer
-    // from inflight metadata, not from a slot table. Stamp 0.
-    out[p] = 0;
-    p += 1;
-    out[p] = REQ_LINEARIZABLE;
-    p += 1;
-    out[p] = op;
-    p += 1;
-    out[p] = (body.len() & 0xFF) as u8;
-    out[p + 1] = ((body.len() >> 8) & 0xFF) as u8;
-    p += 2;
-    out[p..p + body.len()].copy_from_slice(body);
+    };
 
     let mut inflight = InflightVal::new();
     inflight.op = mem_op as u8;
@@ -511,7 +690,7 @@ unsafe fn send_envelope(
     if anchor.inflight.insert(corr, inflight).is_err() {
         return false;
     }
-    if (sys.channel_write)(anchor.kv_out, anchor.scratch.as_mut_ptr(), total) != total as i32 {
+    if (sys.channel_write)(anchor.kv_out, anchor.env.as_mut_ptr(), total) != total as i32 {
         let _ = anchor.inflight.remove(corr);
         return false;
     }
@@ -534,35 +713,49 @@ unsafe fn drain_routed_in(anchor: &mut AnchorState) -> bool {
     if poll <= 0 || (poll as u32) & POLL_IN == 0 {
         return false;
     }
-    // An envelope read whole: header room, then the payload.
-    let mut buf = [0u8; ENVELOPE_HDR + SCRATCH];
-    let Some((msg_type, payload_len)) =
-        read_envelope(&mut anchor.routed_inbox, sys, anchor.routed_in, &mut buf)
-    else {
+    let Some((msg_type, payload_len)) = read_envelope(
+        &mut anchor.routed_inbox,
+        sys,
+        anchor.routed_in,
+        &mut anchor.routed,
+    ) else {
         return false;
     };
     if msg_type != MSG_KV_RESPONSE {
-        return false;
+        return true;
     }
     // MSG_KV_RESPONSE head: [corr:8][conn:1][result:1][rev:8][body_len:2] = 20
     const HEAD: usize = 8 + 1 + 1 + 8 + 2;
     if payload_len < HEAD {
-        return false;
+        return true;
     }
-    let resp = &buf[..payload_len];
+    let resp = &anchor.routed[..payload_len];
     let corr = u64::from_le_bytes([
         resp[0], resp[1], resp[2], resp[3], resp[4], resp[5], resp[6], resp[7],
     ]);
-    let _conn_id = resp[8];
     let result = resp[9];
     let revision = u64::from_le_bytes([
         resp[10], resp[11], resp[12], resp[13], resp[14], resp[15], resp[16], resp[17],
     ]);
     let body_len = u16::from_le_bytes([resp[18], resp[19]]) as usize;
-    if 20 + body_len > payload_len {
-        return false;
+    if HEAD + body_len > payload_len {
+        return true;
     }
-    let body = &resp[20..20 + body_len];
+    // The body, out of `routed` (the handlers below write the state).
+    let mut body = [0u8; wire::KV_RESPONSE_BODY_MAX];
+    let blen = body_len.min(body.len());
+    body[..blen].copy_from_slice(&anchor.routed[HEAD..HEAD + blen]);
+    let body = &body[..blen];
+
+    // An exchange of a large-value session.
+    if let Some(i) = anchor
+        .lg
+        .iter()
+        .position(|l| l.corr == corr && l.corr > LG_UNSENT)
+    {
+        lg_reply(anchor, i, result, body);
+        return true;
+    }
 
     let Some(meta) = anchor.inflight.remove(corr) else {
         return true; // unmatched (timed out / dropped earlier)
@@ -570,28 +763,36 @@ unsafe fn drain_routed_in(anchor: &mut AnchorState) -> bool {
     let Some(mem_op) = MemOp::from_u8(meta.op) else {
         return true;
     };
+    let key = &meta.key[..meta.key_len as usize];
 
-    // Encode the memcached ASCII reply.
-    let mut reply = [0u8; 1500];
-    let mut reply_len = 0usize;
-    encode_reply(
-        &mut reply,
-        &mut reply_len,
-        mem_op,
-        &meta.key[..meta.key_len as usize],
-        result,
-        revision,
-        body,
-    );
-    let _ = result;
+    if mem_op == MemOp::Get && result == KV_RESULT_MANIFEST && !body.is_empty() {
+        lg_expand(anchor, &meta, result, body);
+        return true;
+    }
 
-    send_reply_datagram(
-        anchor,
-        meta.req_id,
-        meta.src_addr,
-        meta.src_port,
-        &reply[..reply_len],
-    );
+    let mut n = 0usize;
+    if mem_op == MemOp::Get {
+        encode_get_answer(
+            &mut anchor.reply,
+            &mut n,
+            false,
+            key,
+            result,
+            revision,
+            body,
+        );
+    } else {
+        encode_reply(
+            &mut anchor.reply,
+            &mut n,
+            mem_op,
+            key,
+            result,
+            revision,
+            body,
+        );
+    }
+    send_reply(anchor, meta.req_id, meta.src_addr, meta.src_port, n);
     true
 }
 
@@ -602,42 +803,300 @@ unsafe fn send_error_reply(
     src_port: u16,
 ) {
     anchor.m_errors += 1;
-    send_reply_datagram(anchor, req_id, src_addr, src_port, b"ERROR\r\n");
+    send_text(anchor, req_id, src_addr, src_port, b"ERROR\r\n");
 }
 
-unsafe fn send_reply_datagram(
+/// A reply the anchor writes itself.
+unsafe fn send_text(
     anchor: &mut AnchorState,
     req_id: u16,
     src_addr: [u8; 4],
     src_port: u16,
-    payload: &[u8],
+    text: &[u8],
 ) {
+    let n = text.len().min(REPLY_MAX);
+    anchor.reply[..n].copy_from_slice(&text[..n]);
+    send_reply(anchor, req_id, src_addr, src_port, n);
+}
+
+// ── Reply datagrams ───────────────────────────────────────────────────
+
+/// Datagram `seq` of `reply` to `(addr, port)` on `dgram_out`: `false`
+/// when the channel had no room for it.
+unsafe fn emit_datagram(
+    sys: &SyscallTable,
+    chan: i32,
+    ep_id: u8,
+    addr: [u8; 4],
+    port: u16,
+    req_id: u16,
+    seq: u16,
+    reply: &[u8],
+    dg: &mut [u8; DG_FRAME],
+) -> bool {
+    // CMD_DG_SEND_TO IPv4 body:
+    //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][memcached_udp_frame…]
+    const AT: usize = 3 + DG_V4_PREFIX;
+    let Some(n) = udp_frame(req_id, seq, reply, &mut dg[AT..]) else {
+        return true; // nothing to send: never a stall
+    };
+    let body = DG_V4_PREFIX + n;
+    dg[0] = DG_CMD_SEND_TO;
+    dg[1..3].copy_from_slice(&(body as u16).to_le_bytes());
+    dg[3] = ep_id;
+    dg[4] = DG_AF_INET;
+    dg[5..9].copy_from_slice(&addr);
+    dg[9..11].copy_from_slice(&port.to_le_bytes());
+    let total = 3 + body;
+    (sys.channel_write)(chan, dg.as_mut_ptr(), total) == total as i32
+}
+
+/// Send `reply[..len]` as its datagrams: at once while the channel takes
+/// them, the rest parked in a reply slot. Behind a parked reply a new one
+/// is parked whole (no reply overtakes another's room); with no slot free
+/// what is left is dropped — the client's retry recovers it.
+unsafe fn send_reply(anchor: &mut AnchorState, req_id: u16, addr: [u8; 4], port: u16, len: usize) {
     let sys = anchor.syscalls;
     if sys.is_null() || anchor.dgram_out < 0 || anchor.bind_phase != BindPhase::Bound {
         return;
     }
     let sys = &*sys;
-    // CMD_DG_SEND_TO IPv4 body:
-    //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][memcached_udp_frame…]
-    // memcached_udp_frame: [req_id:u16 BE][seq:u16 BE=0][total:u16 BE=1][reserved:u16=0][ascii…]
-    let total = DG_V4_PREFIX + MEMCACHED_UDP_HEADER + payload.len();
-    if total > anchor.send.len() {
+    let Some(total) = udp_datagrams(len) else {
+        return;
+    };
+    let mut seq = 0u16;
+    if !anchor.tx.iter().any(|t| t.live) {
+        let AnchorState {
+            reply,
+            dg,
+            dgram_out,
+            ep_id,
+            ..
+        } = &mut *anchor;
+        while seq < total {
+            if !emit_datagram(
+                sys,
+                *dgram_out,
+                *ep_id,
+                addr,
+                port,
+                req_id,
+                seq,
+                &reply[..len],
+                dg,
+            ) {
+                break;
+            }
+            seq += 1;
+        }
+        anchor.m_datagrams += u64::from(seq);
+        if seq == total {
+            return;
+        }
+    }
+    let Some(t) = anchor.tx.iter().position(|t| !t.live) else {
+        anchor.m_dropped += u64::from(total - seq);
+        return;
+    };
+    let AnchorState { reply, tx, .. } = &mut *anchor;
+    let slot = &mut tx[t];
+    slot.live = true;
+    slot.req_id = req_id;
+    slot.addr = addr;
+    slot.port = port;
+    slot.next = seq;
+    slot.total = total;
+    slot.len = len;
+    slot.buf[..len].copy_from_slice(&reply[..len]);
+}
+
+/// Send on the parked replies, oldest slot first, while the channel
+/// takes their datagrams.
+unsafe fn flush_tx(anchor: &mut AnchorState) {
+    let sys = anchor.syscalls;
+    if sys.is_null() || anchor.dgram_out < 0 || anchor.bind_phase != BindPhase::Bound {
         return;
     }
-    let out = &mut anchor.send[..total];
-    out[0] = anchor.ep_id;
-    out[1] = DG_AF_INET;
-    out[2..6].copy_from_slice(&src_addr);
-    out[6..8].copy_from_slice(&src_port.to_le_bytes());
-    // memcached UDP frame header — big-endian per memcached protocol.
-    out[8..10].copy_from_slice(&req_id.to_be_bytes());
-    out[10..12].copy_from_slice(&0u16.to_be_bytes()); // seq
-    out[12..14].copy_from_slice(&1u16.to_be_bytes()); // total
-    out[14..16].copy_from_slice(&0u16.to_be_bytes()); // reserved
-    out[16..16 + payload.len()].copy_from_slice(payload);
+    let sys = &*sys;
+    let AnchorState {
+        tx,
+        dg,
+        dgram_out,
+        ep_id,
+        m_datagrams,
+        ..
+    } = &mut *anchor;
+    for t in tx.iter_mut() {
+        if !t.live {
+            continue;
+        }
+        while t.next < t.total {
+            if !emit_datagram(
+                sys,
+                *dgram_out,
+                *ep_id,
+                t.addr,
+                t.port,
+                t.req_id,
+                t.next,
+                &t.buf[..t.len],
+                dg,
+            ) {
+                return;
+            }
+            t.next += 1;
+            *m_datagrams += 1;
+        }
+        t.live = false;
+    }
+}
 
-    let mut scratch = [0u8; SCRATCH];
-    let _ = channel_write_frame(sys, anchor.dgram_out, DG_CMD_SEND_TO, out, &mut scratch);
+// ── Large GETs ────────────────────────────────────────────────────────
+
+/// Expand a GET's manifest answer through a free session; with none free
+/// the GET is answered `SERVER_ERROR` (the client may ask again).
+unsafe fn lg_expand(anchor: &mut AnchorState, meta: &InflightVal, result: u8, body: &[u8]) {
+    let Some(i) = anchor.lg.iter().position(|l| l.corr == 0) else {
+        anchor.m_errors += 1;
+        send_text(
+            anchor,
+            meta.req_id,
+            meta.src_addr,
+            meta.src_port,
+            b"SERVER_ERROR too many large reads in flight\r\n",
+        );
+        return;
+    };
+    let now = anchor.now_ms();
+    let act = {
+        let l = &mut anchor.lg[i];
+        l.corr = LG_UNSENT;
+        l.unsent_op = 0;
+        l.unsent_len = 0;
+        l.req_id = meta.req_id;
+        l.addr = meta.src_addr;
+        l.port = meta.src_port;
+        l.key_len = meta.key_len;
+        l.key = meta.key;
+        l.since_ms = now;
+        let LgSlot {
+            session, send, out, ..
+        } = l;
+        session.expand(KV_OP_GET, &[], result, body, send, out)
+    };
+    lg_act(anchor, i, act);
+}
+
+/// Carry out what session `i` asks: its next exchange, or its answer.
+unsafe fn lg_act(
+    anchor: &mut AnchorState,
+    i: usize,
+    act: Result<kv_large::Act, kv_large::LargeError>,
+) {
+    match act {
+        Ok(kv_large::Act::Send(op, n)) => lg_send(anchor, i, op, n),
+        Ok(kv_large::Act::Done(result, n)) => lg_finish(anchor, i, result, n),
+        Ok(kv_large::Act::AsIs) => lg_finish(anchor, i, KV_RESULT_INTERNAL, 0),
+        Err(kv_large::LargeError::Overflow) => lg_finish(anchor, i, KV_RESULT_TOO_LARGE, 0),
+        Err(_) => lg_finish(anchor, i, KV_RESULT_INTERNAL, 0),
+    }
+}
+
+/// Send session `i`'s exchange (`op`, its `send[..n]`); with no room on
+/// `kv_out` it waits for [`lg_step`].
+unsafe fn lg_send(anchor: &mut AnchorState, i: usize, op: u8, n: usize) {
+    if n > LG_SEND {
+        lg_finish(anchor, i, KV_RESULT_INTERNAL, 0);
+        return;
+    }
+    let corr = anchor.next_corr();
+    let built = {
+        let AnchorState { lg, env, .. } = &mut *anchor;
+        build_request(
+            env,
+            corr,
+            LG_CHUNK_CONN,
+            REQ_SERIALIZABLE,
+            op,
+            &lg[i].send[..n],
+        )
+    };
+    let Some(total) = built else {
+        lg_finish(anchor, i, KV_RESULT_INTERNAL, 0);
+        return;
+    };
+    let (sys, kv_out) = (anchor.syscalls, anchor.kv_out);
+    let wrote = !sys.is_null()
+        && kv_out >= 0
+        && ((*sys).channel_write)(kv_out, anchor.env.as_mut_ptr(), total) == total as i32;
+    let l = &mut anchor.lg[i];
+    if wrote {
+        l.corr = corr;
+        l.unsent_op = 0;
+    } else {
+        l.corr = LG_UNSENT;
+        l.unsent_op = op;
+        l.unsent_len = n;
+    }
+}
+
+/// A reply to session `i`'s exchange.
+unsafe fn lg_reply(anchor: &mut AnchorState, i: usize, result: u8, body: &[u8]) {
+    let act = {
+        let LgSlot {
+            session, send, out, ..
+        } = &mut anchor.lg[i];
+        session.reply(&[], &[], result, body, send, out)
+    };
+    lg_act(anchor, i, act);
+}
+
+/// Answer session `i`'s GET (`result`, its value in `out[..n]`) and free
+/// the session.
+unsafe fn lg_finish(anchor: &mut AnchorState, i: usize, result: u8, n: usize) {
+    let mut len = 0usize;
+    let (req_id, addr, port) = {
+        let AnchorState { lg, reply, .. } = &mut *anchor;
+        let l = &mut lg[i];
+        let key = &l.key[..(l.key_len as usize).min(KEY_MAX)];
+        let value = &l.out[..n.min(LG_OUT)];
+        let result = if result == KV_RESULT_MANIFEST {
+            KV_RESULT_INTERNAL
+        } else {
+            result
+        };
+        encode_get_answer(reply, &mut len, false, key, result, 0, value);
+        l.corr = 0;
+        l.unsent_op = 0;
+        l.session.reset();
+        (l.req_id, l.addr, l.port)
+    };
+    send_reply(anchor, req_id, addr, port, len);
+}
+
+/// Each step: resend exchanges that found no room, and abandon sessions
+/// that never came back (unanswered: the client has asked again).
+unsafe fn lg_step(anchor: &mut AnchorState) {
+    if !anchor.lg.iter().any(|l| l.corr != 0) {
+        return;
+    }
+    let now = anchor.now_ms();
+    for i in 0..LG_SESSIONS {
+        let l = &anchor.lg[i];
+        if l.corr == 0 {
+            continue;
+        }
+        if now.saturating_sub(l.since_ms) > LG_STALL_MS {
+            let l = &mut anchor.lg[i];
+            l.corr = 0;
+            l.unsent_op = 0;
+            l.session.reset();
+            anchor.m_errors += 1;
+        } else if l.corr == LG_UNSENT && l.unsent_op != 0 {
+            let (op, n) = (l.unsent_op, l.unsent_len);
+            lg_send(anchor, i, op, n);
+        }
+    }
 }
 
 // ── Module ABI ───────────────────────────────────────────────────────
@@ -658,8 +1117,8 @@ pub extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -673,6 +1132,9 @@ pub extern "C" fn module_new(
     let sys_ptr = syscalls.cast::<SyscallTable>();
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
     anchor.init(sys_ptr);
+    if !params.is_null() && params_len >= 4 {
+        unsafe { parse_tlv(anchor, params, params_len) };
+    }
     anchor.dgram_in = in_chan;
     anchor.dgram_out = out_chan;
     unsafe {
@@ -696,6 +1158,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     unsafe {
         try_bind(anchor);
+        flush_tx(anchor);
+        lg_step(anchor);
 
         // Bounded per-tick drain — same shape as memcached_stream_anchor.
         const BUDGET: u32 = 32;
@@ -717,7 +1181,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             telemetry::emit_counters(
                 &*anchor.syscalls,
                 anchor.metrics_out,
-                &[anchor.m_requests, anchor.m_forwarded, anchor.m_errors],
+                &[
+                    anchor.m_requests,
+                    anchor.m_forwarded,
+                    anchor.m_errors,
+                    anchor.m_datagrams,
+                    anchor.m_dropped,
+                ],
             );
         }
     }

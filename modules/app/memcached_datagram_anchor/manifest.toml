@@ -7,17 +7,20 @@ hardware_targets = ["bcm2712", "linux"]
 # source/destination metadata, stateless request/response matching,
 # and reroutable datagram service. Disabled by default in graph
 # templates (`enabled: false`) per the protocol RFC; flip on in
-# memcached-UDP-heavy deployments.
+# memcached-UDP-heavy deployments. `dgram_in`/`dgram_out` carry the
+# datagram surface (the net provider's TLV frames, as `NetProto`): wire
+# them to `linux_net.net_out`/`net_in`. Replies longer than a datagram
+# go out as memcached's numbered multi-datagram response.
 
 [[ports]]
 name = "dgram_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "dgram_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "routed_in"
@@ -39,4 +42,4 @@ content_type = "OctetStream"
 # Declaration order IS the id contract (id N = the Nth name); the emitter
 # in module_step passes values in this exact order.
 [observability]
-metrics = ["requests", "forwarded", "errors"]
+metrics = ["requests", "forwarded", "errors", "reply_datagrams", "reply_dropped"]

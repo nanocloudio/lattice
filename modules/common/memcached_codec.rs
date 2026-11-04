@@ -264,6 +264,36 @@ pub fn encode_reply(
         let _ = append(sb, sl, b"SERVER_ERROR object too large for cache\r\n");
         return;
     }
+    // An op the store does not implement (connector and store built
+    // against different contracts): said as such, whatever the command.
+    if result == types::KV_RESULT_UNSUPPORTED {
+        let _ = append(sb, sl, b"SERVER_ERROR unsupported operation\r\n");
+        return;
+    }
+    // A large value (stored as chunks under a manifest) that reached the
+    // formatter unexpanded (both anchors expand a manifest GET through
+    // `kv_large` first; one that could not be): too large, never a miss.
+    if result == types::KV_RESULT_MANIFEST {
+        let _ = append(sb, sl, b"SERVER_ERROR object too large for cache\r\n");
+        return;
+    }
+    // A replicated write the group did not take (no leader, a superseded
+    // position): not stored, safe to send again.
+    if result == types::KV_RESULT_NO_LEADER {
+        let _ = append(sb, sl, b"SERVER_ERROR no leader: not stored\r\n");
+        return;
+    }
+    // A forwarded write whose leader failed before confirming it: it may
+    // have been stored. Never answered NOT_STORED, which would say it was
+    // not.
+    if result == types::KV_RESULT_OUTCOME_UNKNOWN {
+        let _ = append(
+            sb,
+            sl,
+            b"SERVER_ERROR outcome unknown: the leader failed mid-write\r\n",
+        );
+        return;
+    }
     match mem_op {
         MemOp::Get | MemOp::Gets => match result {
             KV_RESULT_OK if !body.is_empty() => {
@@ -362,4 +392,107 @@ pub fn encode_reply(
             }
         },
     }
+}
+
+/// The room a hit's `VALUE` block and `END` take beyond key and value:
+/// `VALUE `, ` 0 `, a length, ` ` and a CAS token, two CRLFs, `END\r\n`.
+pub const GET_ANSWER_OVERHEAD: usize = 6 + 3 + 20 + 1 + 20 + 2 + 2 + 5;
+
+/// A single-key `get`/`gets` answered whole: a hit's `VALUE` block and
+/// the `END` that closes it, a miss `END` alone, a refusal its own
+/// `SERVER_ERROR` line (which ends the answer). A hit that `send_buf`
+/// has no room for is `SERVER_ERROR object too large for cache`, never
+/// a `VALUE` cut short.
+pub fn encode_get_answer(
+    send_buf: &mut [u8],
+    send_len: &mut usize,
+    gets: bool,
+    key: &[u8],
+    result: u8,
+    revision: u64,
+    body: &[u8],
+) {
+    let start = *send_len;
+    let room = send_buf.len().saturating_sub(start);
+    if result == KV_RESULT_OK && key.len() + body.len() + GET_ANSWER_OVERHEAD > room {
+        let _ = append(
+            send_buf,
+            send_len,
+            b"SERVER_ERROR object too large for cache\r\n",
+        );
+        return;
+    }
+    let op = if gets { MemOp::Gets } else { MemOp::Get };
+    encode_reply(send_buf, send_len, op, key, result, revision, body);
+    let written = &send_buf[start..*send_len];
+    if written.is_empty() || written.starts_with(b"VALUE ") {
+        let _ = append(send_buf, send_len, b"END\r\n");
+    }
+}
+
+// ── UDP framing ───────────────────────────────────────────────────────
+//
+// Every memcached UDP datagram, request and response, opens with an
+// 8-byte frame header, big-endian:
+//
+//   `[request_id:u16][sequence:u16][total:u16][reserved:u16 = 0]`
+//
+// A request is one datagram (`sequence 0`, `total 1`). A response longer
+// than one datagram is cut into `total` datagrams numbered `0..total`,
+// each carrying the request's id; the client reassembles them by
+// sequence number in whatever order they arrive. Nothing is retransmitted:
+// a client missing a datagram times out and asks again, as with memcached.
+
+/// The frame header every datagram opens with.
+pub const UDP_FRAME_HEADER: usize = 8;
+/// The largest datagram a reply is cut into, header included —
+/// memcached's own `UDP_MAX_PAYLOAD_SIZE`, which clients size their
+/// receive buffers to.
+pub const UDP_DATAGRAM_MAX: usize = 1400;
+/// Reply bytes one datagram carries.
+pub const UDP_DATA_MAX: usize = UDP_DATAGRAM_MAX - UDP_FRAME_HEADER;
+
+/// A datagram's frame header: `(request_id, sequence, total)`; `None`
+/// when it is shorter than one.
+pub fn udp_header(dgram: &[u8]) -> Option<(u16, u16, u16)> {
+    if dgram.len() < UDP_FRAME_HEADER {
+        return None;
+    }
+    Some((
+        u16::from_be_bytes([dgram[0], dgram[1]]),
+        u16::from_be_bytes([dgram[2], dgram[3]]),
+        u16::from_be_bytes([dgram[4], dgram[5]]),
+    ))
+}
+
+/// How many datagrams a reply of `len` bytes is cut into: at least one
+/// (an empty reply is still answered); `None` past what `total` counts.
+pub fn udp_datagrams(len: usize) -> Option<u16> {
+    let n = if len == 0 {
+        1
+    } else {
+        len.div_ceil(UDP_DATA_MAX)
+    };
+    u16::try_from(n).ok()
+}
+
+/// Datagram `seq` of `reply` into `out` (header, then its piece of the
+/// reply): its length, or `None` when `seq` is past the last or `out`
+/// is short.
+pub fn udp_frame(request_id: u16, seq: u16, reply: &[u8], out: &mut [u8]) -> Option<usize> {
+    let total = udp_datagrams(reply.len())?;
+    if seq >= total {
+        return None;
+    }
+    let from = seq as usize * UDP_DATA_MAX;
+    let to = (from + UDP_DATA_MAX).min(reply.len());
+    let piece = reply.get(from..to)?;
+    let n = UDP_FRAME_HEADER + piece.len();
+    let o = out.get_mut(..n)?;
+    o[0..2].copy_from_slice(&request_id.to_be_bytes());
+    o[2..4].copy_from_slice(&seq.to_be_bytes());
+    o[4..6].copy_from_slice(&total.to_be_bytes());
+    o[6..8].copy_from_slice(&0u16.to_be_bytes());
+    o[UDP_FRAME_HEADER..].copy_from_slice(piece);
+    Some(n)
 }

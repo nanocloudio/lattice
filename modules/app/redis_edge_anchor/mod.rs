@@ -159,14 +159,41 @@ use abi::contracts::net::net_proto::{
 /// of state arena — comfortable for the 8 GB Pi 5.
 const MAX_CONNS: usize = 64;
 
-/// Per-slot recv buffer (partial RESP frames accumulate here).
-const RECV_BUF_SIZE: usize = 4096;
+/// Per-slot recv buffer (partial RESP frames accumulate here): a command
+/// carrying a value at the point protocols' bound (`kv_large::VALUE_MAX`)
+/// with its key and framing arrives whole.
+const RECV_BUF_SIZE: usize = kv_large::VALUE_MAX + 1024;
 
 /// Per-slot send buffer (RESP-encoded responses awaiting wire delivery).
+/// A reply longer than it streams through it (`Slot::ro_drain`).
 const SEND_BUF_SIZE: usize = 4096;
 
-/// Scratch for NET_CMD frames and KV envelopes.
-const SCRATCH_BUF_SIZE: usize = 4096 + 32;
+/// Scratch for NET_CMD frames and KV envelopes: every envelope the
+/// router writes (`wire::FRAME_PAYLOAD_MAX`) is read whole into it — one
+/// it could not hold would be discarded, and its command never answered —
+/// and a command body built from a whole recv buffer fits it.
+const SCRATCH_BUF_SIZE: usize = RECV_BUF_SIZE + 32;
+const _: () = assert!(SCRATCH_BUF_SIZE >= wire::FRAME_PAYLOAD_MAX);
+
+/// Room one reply is rendered into: a store answer at its bound (a
+/// `KV_RESPONSE_BODY_MAX` page of keys, an expanded large value), every
+/// element framed — RESP framing at most doubles an element's
+/// length-prefixed form — so a rendering never stops part-way (a reply
+/// cut mid-array is one its client waits on forever).
+const RENDER_MAX: usize = 2 * max_usize(wire::KV_RESPONSE_BODY_MAX, RLG_OUT) + 64;
+
+/// Room a reply streamed in pieces leaves in `send_buf`: an inline
+/// reply (written to `send_buf` by `dispatch`, then moved into the ring)
+/// is at most this.
+const INLINE_ROOM: usize = 1024;
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
 // `MAX_ARGS` (the per-command argv cap) lives in `redis_codec.rs`
 // alongside the parser that enforces it. The anchor's pubsub caps below
@@ -241,7 +268,9 @@ const RO_DEPTH: usize = 256;
 /// every large-value answer that can complete out of order (one per
 /// session, each up to a whole reply) and room for the rest; an answer
 /// that still finds no room is answered BUSY (retryable) in its place.
-const RO_ARENA: usize = RLG_SESSIONS * SEND_BUF_SIZE + 8192;
+const RO_ARENA: usize = RLG_SESSIONS * (RLG_OUT + 64) + RENDER_MAX;
+// Offsets and lengths in the arena are u16.
+const _: () = assert!(RO_ARENA <= u16::MAX as usize);
 
 #[derive(Clone, Copy)]
 struct RoEntry {
@@ -484,9 +513,24 @@ impl Slot {
             }
             let off = self.ro[head].off as usize;
             let len = self.ro[head].len as usize;
-            // Into send_buf when it has room; else the reply waits for
-            // the next flush (never dropped: the client counts replies).
-            if self.send_len + len > SEND_BUF_SIZE {
+            // Into send_buf as far as it has room; the rest waits for the
+            // next flush (never dropped: the client counts replies). A
+            // reply longer than send_buf goes out over several flushes,
+            // head first: nothing else is released until it has. A piece
+            // leaves `INLINE_ROOM` free, which a command answered inline
+            // while this one drains writes before the ring takes it.
+            let room = SEND_BUF_SIZE - self.send_len;
+            if len > room {
+                let room = room.saturating_sub(INLINE_ROOM);
+                if room == 0 {
+                    break;
+                }
+                self.send_buf[self.send_len..self.send_len + room]
+                    .copy_from_slice(&self.ro_arena[off..off + room]);
+                self.send_len += room;
+                self.ro[head].off = (off + room) as u16;
+                self.ro[head].len = (len - room) as u16;
+                self.ro_stall = 0;
                 break;
             }
             self.send_buf[self.send_len..self.send_len + len]
@@ -682,6 +726,8 @@ struct AnchorState {
     /// Outbound envelopes are built here; an inbound envelope is read
     /// whole into it (header room, then the payload).
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
+    /// A reply rendered before it enters its slot's reorder ring.
+    render: [u8; RENDER_MAX],
     /// Commands carried through the large-value layer, one envelope for
     /// their exchanges, and a reply waiting for a session.
     lg: [RLgSlot; RLG_SESSIONS],
@@ -714,8 +760,10 @@ const OUTQ_BYTES: usize = 65536;
 const RLG_BODY: usize = SCRATCH_BUF_SIZE - 64;
 /// The body marked, and each exchange sent.
 const RLG_WORK: usize = kv_large::mark_room(RLG_BODY);
-/// An answer's body, expanded: what one RESP reply carries.
-const RLG_OUT: usize = SEND_BUF_SIZE;
+/// An answer's body, expanded: one value at the point protocols' bound
+/// (`kv_large::VALUE_MAX`), or an MGET's values together within it. A
+/// larger one is answered `ERR value too large`, never cut.
+const RLG_OUT: usize = kv_large::VALUE_MAX + 64;
 /// A session's exchange waiting for room on `kv_out`.
 const LG_UNSENT: u64 = 1;
 /// The conn byte of chunk exchanges: no slot index is this. Content is
@@ -1822,6 +1870,13 @@ fn forward_to_router(
         }
     };
 
+    // A value past the point protocols' bound: refused before any chunk
+    // is sent, as every point edge refuses it.
+    if !kv_large::values_within(op, &body[..body_len], kv_large::VALUE_MAX) {
+        let s = &mut anchor.slots[slot_idx];
+        let _ = enc_error(&mut s.send_buf, &mut s.send_len, b"ERR value too large");
+        return Dispatch::Handled;
+    }
     let corr = anchor.next_corr();
     // A value too large for one write: its chunks go first, in order, and
     // the command after them (rewritten to name its manifest).
@@ -2033,8 +2088,8 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     // Copy the body out of scratch before mutably borrowing the slot
     // (scratch and slots both live on AnchorState; can't mutably
     // borrow one while reading the other).
-    let mut body = [0u8; 4096];
-    let blen = body_len.min(4096);
+    let mut body = [0u8; wire::KV_RESPONSE_BODY_MAX];
+    let blen = body_len.min(wire::KV_RESPONSE_BODY_MAX);
     body[..blen].copy_from_slice(&anchor.scratch[body_off..body_off + blen]);
 
     // Encode the RESP reply into a temp, then release it through the
@@ -2045,25 +2100,18 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     // entry in `forward_to_router`, so a live op always matches; a reply
     // with no matching entry is a late arrival after a session reset and
     // is correctly dropped (that session's pending replies were discarded).
-    let mut reply = [0u8; SEND_BUF_SIZE];
-    let mut reply_len = 0usize;
-    redis_codec::encode_kv_reply(&mut reply, &mut reply_len, result, &body[..blen]);
-
-    let slot = &mut anchor.slots[slot_idx];
-    if !slot.ro_fill(corr, &reply[..reply_len]) {
-        // Reorder buffer overflowed → order can no longer be guaranteed.
-        slot.phase = SlotPhase::Closing;
-    }
+    ro_answer(anchor, slot_idx, corr, result, &body[..blen]);
     true
 }
 
 /// Answer the command whose reorder entry is `corr` on `slot_idx`.
 fn ro_answer(anchor: &mut AnchorState, slot_idx: usize, corr: u64, result: u8, body: &[u8]) {
-    let mut reply = [0u8; SEND_BUF_SIZE];
+    let AnchorState { render, slots, .. } = anchor;
     let mut reply_len = 0usize;
-    redis_codec::encode_kv_reply(&mut reply, &mut reply_len, result, body);
-    let slot = &mut anchor.slots[slot_idx];
-    if !slot.ro_fill(corr, &reply[..reply_len]) {
+    redis_codec::encode_kv_reply(&mut render[..], &mut reply_len, result, body);
+    let slot = &mut slots[slot_idx];
+    if !slot.ro_fill(corr, &render[..reply_len]) {
+        // Reorder buffer overflowed → order can no longer be guaranteed.
         slot.phase = SlotPhase::Closing;
     }
 }

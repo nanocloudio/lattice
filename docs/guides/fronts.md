@@ -293,16 +293,53 @@ replicated stack. Op codes, bodies and results are `types.rs`'s
 | `KV_OP_HASH_KV` | `0x22` | the store's revision and a digest of its live keys |
 | `KV_OP_LEASE_KEYS` / `KV_OP_LEASE_REVOKE` | `0x20` / `0x1F` | a lease's keys; delete them with it |
 
+An op the answering layer does not implement — an op code past what its
+build defines (a client newer than the store: version skew), or one no
+store applies — is answered `KV_RESULT_UNSUPPORTED` (`0x1D`): by the router
+before any side effect, else by the worker, which neither applies nor logs
+it. Nothing was done; the same op at the same build cannot succeed. The
+fronts say it as their own "unimplemented" — RESP `-ERR unsupported
+operation`, memcached `SERVER_ERROR unsupported operation`, etcd gRPC 12
+`UNIMPLEMENTED`, the native data surface `UnsupportedCapability` — so skew
+never reads as `KV_RESULT_INTERNAL` (`0xFF`), a fault.
+
 A lease here is a key's `lease` field (a Put's `lease` and a Txn's lease
 compare); granting and keeping one alive is the client's own record, written
 with the same Txns. On `lattice_store_group3` every write — an ETCD_TXN
-among them — commits on a quorum before it is answered, from the leader
-only: a follower's gateway refuses the proposal, its router answers the
-write `KV_RESULT_LIN_BOUND` (`0x08`, no authority here), and the client
-writes through the leader's pair. A write that committed across a leader
-change is answered once, by the replica it was sent to, or refused; it is
+among them — commits on a quorum before it is answered, through any
+replica's pair: a follower's consensus forwards it to the leader of its
+term and it applies everywhere like a leader's write. An ETCD_TXN whose
+branches only read (Ranges, nested read-only Txns) is a read: routed with
+the consistency it asks — a linearizable one fenced through the leader's
+ReadIndex, on a follower too — never proposed. A write the group does not
+take is answered typed: `KV_RESULT_NO_LEADER` (`0x1E`: not appended — no
+leader past the hold, a superseded position, strict fallback; retry as
+it is), `KV_RESULT_QUOTA` (leader backpressure), `KV_RESULT_TOO_LARGE`, or
+`KV_RESULT_OUTCOME_UNKNOWN` (`0x1F`: forwarded to a leader that failed
+before saying — it may have committed; read back before re-sending a
+write that is not idempotent; also the answer to a replicated write with
+no answer past the router's 12 s deadline). A write that committed across
+a leader change is answered once, by the replica it was sent to; it is
 never applied twice (`tests/harness/tests/cluster.rs`,
-`an_etcd_txn_compare_and_put_is_linearizable_across_a_leader_change`).
+`an_etcd_txn_compare_and_put_is_linearizable_across_a_leader_change`,
+`etcd_writes_through_a_follower_survive_its_leader_failing`).
+
+A backup or any reader that reads the store at one revision for a while
+holds it with `KV_OP_RETAIN` (`0x2D`, `types.rs`): body `[floor:u64]
+[ttl_ms:u64][name_len:u16][name]` — `floor` `u64::MAX` takes the hold at the
+store's current revision, another floor moves or renews it, 0 releases it;
+an empty name is a query. While a hold lives (its TTL on the store's
+clock, renewed by taking it again), no Compact — a client's or the
+store's own history compaction — passes its floor, and the store's GC
+retention claim (`CLAIM_SOURCE_BACKUP`) asks for no less. Answered `[floor]
+[compact_revision][hold_floor]`; a floor already compacted is refused
+`KV_RESULT_COMPACTED`. `backup_coordinator` takes one (`bkp/<backup id>`)
+for its whole export.
+
+Values: every point edge (redis, memcached, etcd, the KV front) writes and
+reads back values up to `kv_large::VALUE_MAX` (8 KiB) whole, one past a data
+chunk stored as chunks under a manifest; a larger write is refused as each
+protocol refuses one, before any chunk is sent.
 
 ## The store stack
 

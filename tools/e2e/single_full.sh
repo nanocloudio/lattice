@@ -20,7 +20,8 @@ stop() { [ -n "$PID" ] && kill -- -"$PID" 2>/dev/null; wait "$PID" 2>/dev/null; 
 trap 'stop; rm -rf "$D"' EXIT
 start() {
   FLUXOR_LINUX_BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/fluxor-linux" \
-    setsid fluxor run configs/single.yaml >>"$D/run.log" 2>&1 &
+    setsid fluxor run configs/single.yaml \
+    --param cert=certs/dev/server.der --param key=certs/dev/server.key.der >>"$D/run.log" 2>&1 &
   PID=$!
   for _ in $(seq 1 150); do (echo >/dev/tcp/127.0.0.1/2379) 2>/dev/null && break; sleep 0.1; done
   sleep 3 # the consensus group elects itself and replays its WAL

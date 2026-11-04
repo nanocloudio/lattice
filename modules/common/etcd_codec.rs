@@ -744,6 +744,13 @@ pub fn build_range_meta_response(
 /// as `grpc-message`.
 pub const GRPC_STATUS_COMPACTED: u8 = 11;
 
+/// gRPC `UNIMPLEMENTED` (12): what Lattice returns for
+/// `KV_RESULT_UNSUPPORTED` — an op the store does not implement, i.e. a
+/// client-facing anchor built against a newer store contract than the
+/// store it reached. Clients read it as "not supported here", never as a
+/// broken server (13) worth retrying.
+pub const GRPC_STATUS_UNIMPLEMENTED: u8 = 12;
+
 /// The revision of an `etcdserverpb.CompactionRequest`
 /// (`{ int64 revision = 1; bool physical = 2; }`). `physical` asks the
 /// call to wait for the reclamation; the logical compaction it answers
@@ -1897,17 +1904,17 @@ pub fn write_keyvalue(
     mod_revision: i64,
     version: i64,
 ) -> Option<()> {
-    let mut buf = [0u8; 4096];
-    let mut sub = 0;
-    write_length_delimited(&mut buf, &mut sub, 1, key)?;
-    write_tag(&mut buf, &mut sub, 2, WIRE_VARINT)?;
-    write_varint(&mut buf, &mut sub, mod_revision as u64)?;
-    write_tag(&mut buf, &mut sub, 3, WIRE_VARINT)?;
-    write_varint(&mut buf, &mut sub, mod_revision as u64)?;
-    write_tag(&mut buf, &mut sub, 4, WIRE_VARINT)?;
-    write_varint(&mut buf, &mut sub, version as u64)?;
-    write_length_delimited(&mut buf, &mut sub, 5, value)?;
-    write_length_delimited(out, off, field_number, &buf[..sub])
+    // In place, as `write_keyvalue_full`: `out` is the only bound.
+    let at = begin_ld(out, off, field_number)?;
+    write_length_delimited(out, off, 1, key)?;
+    write_tag(out, off, 2, WIRE_VARINT)?;
+    write_varint(out, off, mod_revision as u64)?;
+    write_tag(out, off, 3, WIRE_VARINT)?;
+    write_varint(out, off, mod_revision as u64)?;
+    write_tag(out, off, 4, WIRE_VARINT)?;
+    write_varint(out, off, version as u64)?;
+    write_length_delimited(out, off, 5, value)?;
+    end_ld(out, off, at)
 }
 
 /// An `mvccpb.KeyValue` with its own metadata; zero-valued fields are
@@ -1927,23 +1934,26 @@ pub fn write_keyvalue_full(
     version: u64,
     lease: u64,
 ) -> Option<()> {
-    let mut buf = [0u8; 4096 + 320];
-    let mut sub = 0;
-    write_length_delimited(&mut buf, &mut sub, 1, key)?;
+    // Encoded in place, its length patched after (`begin_ld`/`end_ld`):
+    // a staging copy would bound the value by its own size (it once held
+    // 4 KiB, and a larger value answered no message at all), where `out`
+    // is the one bound that matters.
+    let at = begin_ld(out, off, field_number)?;
+    write_length_delimited(out, off, 1, key)?;
     for (f, v) in [(2u32, create_revision), (3, mod_revision), (4, version)] {
         if v != 0 {
-            write_tag(&mut buf, &mut sub, f, WIRE_VARINT)?;
-            write_varint(&mut buf, &mut sub, v)?;
+            write_tag(out, off, f, WIRE_VARINT)?;
+            write_varint(out, off, v)?;
         }
     }
     if !value.is_empty() {
-        write_length_delimited(&mut buf, &mut sub, 5, value)?;
+        write_length_delimited(out, off, 5, value)?;
     }
     if lease != 0 {
-        write_tag(&mut buf, &mut sub, 6, WIRE_VARINT)?;
-        write_varint(&mut buf, &mut sub, lease)?;
+        write_tag(out, off, 6, WIRE_VARINT)?;
+        write_varint(out, off, lease)?;
     }
-    write_length_delimited(out, off, field_number, &buf[..sub])
+    end_ld(out, off, at)
 }
 
 /// Build an `etcdserverpb.RangeResponse` carrying either zero or one
@@ -2562,20 +2572,19 @@ pub fn write_watch_event_full(
     meta: [u64; 4],
     prev: Option<(&[u8], [u64; 4])>,
 ) -> Option<()> {
-    // The Event holds two KeyValues (the key's and, asked, the one it
-    // replaced), each up to a 4 KiB value behind its key and metadata.
-    let mut ebuf = [0u8; 2 * (4096 + 320) + 16];
-    let mut eoff = 0;
+    // In place, its length patched after: the Event's two KeyValues
+    // (the key's and, asked, the one it replaced) are bounded by `out`.
+    let at = begin_ld(out, off, 11)?;
     if kind as u8 != 0 {
-        write_tag(&mut ebuf, &mut eoff, 1, WIRE_VARINT)?;
-        write_varint(&mut ebuf, &mut eoff, kind as u64)?;
+        write_tag(out, off, 1, WIRE_VARINT)?;
+        write_varint(out, off, kind as u64)?;
     }
     let [c, m, v, l] = meta;
-    write_keyvalue_full(&mut ebuf, &mut eoff, 2, key, value, c, m, v, l)?;
+    write_keyvalue_full(out, off, 2, key, value, c, m, v, l)?;
     if let Some((pv, [pc, pm, pver, pl])) = prev {
-        write_keyvalue_full(&mut ebuf, &mut eoff, 3, key, pv, pc, pm, pver, pl)?;
+        write_keyvalue_full(out, off, 3, key, pv, pc, pm, pver, pl)?;
     }
-    write_length_delimited(out, off, 11, &ebuf[..eoff])
+    end_ld(out, off, at)
 }
 
 pub fn write_watch_event(
@@ -2587,14 +2596,13 @@ pub fn write_watch_event(
     mod_revision: i64,
     version: i64,
 ) -> Option<()> {
-    let mut ebuf = [0u8; 4096];
-    let mut eoff = 0;
+    let at = begin_ld(out, off, 11)?;
     if kind as u8 != 0 {
-        write_tag(&mut ebuf, &mut eoff, 1, WIRE_VARINT)?;
-        write_varint(&mut ebuf, &mut eoff, kind as u64)?;
+        write_tag(out, off, 1, WIRE_VARINT)?;
+        write_varint(out, off, kind as u64)?;
     }
-    write_keyvalue(&mut ebuf, &mut eoff, 2, key, value, mod_revision, version)?;
-    write_length_delimited(out, off, 11, &ebuf[..eoff])
+    write_keyvalue(out, off, 2, key, value, mod_revision, version)?;
+    end_ld(out, off, at)
 }
 
 // ── HPACK (RFC 7541) ──────────────────────────────────────────────────

@@ -979,6 +979,16 @@ pub fn encode_kv_reply(send_buf: &mut [u8], send_len: &mut usize, result: u8, bo
         types::KV_RESULT_TOO_LARGE => {
             let _ = enc_error(sb, sl, b"ERR value too large");
         }
+        types::KV_RESULT_UNSUPPORTED => {
+            // The store (or the router before it) does not implement the
+            // op this connector sent: the two are built against different
+            // contracts. Said as such, never as an internal fault.
+            let _ = enc_error(
+                sb,
+                sl,
+                b"ERR unsupported operation: the store does not implement it",
+            );
+        }
         KV_RESULT_UNAUTH => {
             let _ = enc_error(sb, sl, b"NOAUTH Authentication required");
         }
@@ -1002,6 +1012,22 @@ pub fn encode_kv_reply(send_buf: &mut [u8], send_len: &mut usize, result: u8, bo
                 sb,
                 sl,
                 b"CLUSTERDOWN no authority available for this operation",
+            );
+        }
+        types::KV_RESULT_NO_LEADER => {
+            // A replicated write the group did not take: no leader past
+            // its hold, a superseded position, strict fallback. Nothing
+            // was applied; the same command may be sent again.
+            let _ = enc_error(sb, sl, b"CLUSTERDOWN no leader: the write was not applied");
+        }
+        types::KV_RESULT_OUTCOME_UNKNOWN => {
+            // A forwarded write whose leader failed before confirming
+            // it: it may have applied. Read back before re-sending one
+            // that is not idempotent.
+            let _ = enc_error(
+                sb,
+                sl,
+                b"CLUSTERDOWN outcome unknown: the leader failed mid-write, it may have applied",
             );
         }
         KV_RESULT_INTEGER => {

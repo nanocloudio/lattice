@@ -96,8 +96,14 @@ cannot take the majority.
 
 Independent of replication, `backup_coordinator` produces a
 consistent backup by reading every live key, with its create and mod
-revision, version and lease, at one revision R — a read that races
-compaction is aborted rather than exported partially. The manifest
+revision, version and lease, at one revision R. R is held for the whole
+export: the coordinator takes a retention hold (`KV_OP_RETAIN`) at the
+store's revision before it reads R, renews it between pages (it lives 60 s
+on the store's clock) and releases it once the manifest is durable, so no
+Compact — a client's or the store's own `history_revisions` compaction —
+passes R while it reads; a raw-pair client reading at one revision takes
+the same hold. Only history compacted before the hold was taken aborts
+a backup (never exported partially). The manifest
 carries R, the consensus index the state was applied through, the
 epoch the backup is fenced under and R's digest. A restore is EXACT and
 goes into a fresh store (its `target` pair): every key lands with the

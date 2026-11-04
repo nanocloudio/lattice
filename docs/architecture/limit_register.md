@@ -245,10 +245,18 @@ hold are `MAX_PARTICIPANTS` (the record's own) and `PARTICIPANTS`.
 | Memcached stream connections | Capacity | `MAX_CONNS` | modules/app/memcached_stream_anchor/mod.rs | 64 | Drops/refuses excess accepts. |
 | Memcached stream requests | Capacity | `MAX_INFLIGHT` | modules/app/memcached_stream_anchor/mod.rs | 256 | Answers `SERVER_ERROR backpressure`. |
 | Memcached datagram requests | Capacity | `MAX_INFLIGHT` | modules/app/memcached_datagram_anchor/mod.rs | 512 | The request datagram is dropped unanswered; the client's retransmit is the retry. |
+| Memcached datagram reply slots | Capacity | `TX_SLOTS` | modules/app/memcached_datagram_anchor/mod.rs | 4 | Replies whose datagrams the provider channel could not take at once, parked and sent on in order over the next steps. With every slot parked, the rest of a reply is dropped (counted `reply_dropped`); the client times out and asks again (memcached UDP retransmits nothing). |
+| Memcached datagram large reads | Capacity | `LG_SESSIONS` | modules/app/memcached_datagram_anchor/mod.rs | 4 | GETs answered by a manifest, their chunks fetched at once. A GET that finds every one busy answers `SERVER_ERROR too many large reads in flight`; asked again, it reads whole. |
+| Memcached datagram read stall | Pacing | `LG_STALL_MS` | modules/app/memcached_datagram_anchor/mod.rs | — | Typed `u64`, 5 s. A large read with no answer in this long is abandoned unanswered: its client has long since timed out and asked again. |
+| Memcached datagram reply | Shape | `REPLY_MAX` | modules/app/memcached_datagram_anchor/mod.rs | — | Derived as `LG_OUT + KEY_MAX + GET_ANSWER_OVERHEAD`: a `VALUE` block for a value at `kv_large::VALUE_MAX + 256` under the longest key, with `END` — at most 7 datagrams. A hit larger answers `SERVER_ERROR object too large for cache`, never a cut `VALUE`. |
+| Memcached datagram key | Shape | `KEY_MAX` | modules/app/memcached_datagram_anchor/mod.rs | 256 | A longer key answers `CLIENT_ERROR bad command line format`. |
+| Memcached datagram set body | Shape | `PUT_BODY_MAX` | modules/app/memcached_datagram_anchor/mod.rs | — | Derived as `RECV_BUF + 16`: the PUT built from one request datagram. A `set` value past one data chunk (`kv_chunks::DATA_MAX`) answers `SERVER_ERROR object too large for cache`: a request is one datagram, the chunk upload is TCP's. |
+| Memcached UDP datagram | Shape | `UDP_DATAGRAM_MAX` | modules/common/memcached_codec.rs | 1400 | memcached's `UDP_MAX_PAYLOAD_SIZE`, frame header included: a reply is cut into datagrams of at most this, numbered `seq 0..total` under the request's id. |
+| Memcached UDP datagram data | Shape | `UDP_DATA_MAX` | modules/common/memcached_codec.rs | — | Derived as `UDP_DATAGRAM_MAX - UDP_FRAME_HEADER`: reply bytes per datagram. |
 | Memcached command tokens | Shape | `MAX_TOKENS` | modules/common/memcached_codec.rs | 32 | Rejects a command with more tokens. |
 | etcd connections | Capacity | `MAX_CONNS` | modules/app/etcd_edge_anchor/mod.rs | 64 | Drops/refuses excess accepts. |
 | etcd streams per connection | Capacity | `MAX_STREAMS_PER_CONN` | modules/app/etcd_edge_anchor/mod.rs | 8 | Advertised as `SETTINGS_MAX_CONCURRENT_STREAMS`; a client opening one more is sent GOAWAY (PROTOCOL_ERROR) and closed. |
-| etcd stream body | Shape | `STREAM_BODY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 4608 | A larger request is refused as etcd refuses one ("request is too large"); the connection stays up. |
+| etcd stream body | Shape | `STREAM_BODY_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived as `kv_large::VALUE_MAX + 512`: a Put of a value at the point protocols' bound under a 256-byte key. A larger request is refused as etcd refuses one ("request is too large"); the connection stays up. |
 | etcd watches per stream | Capacity | `WATCHES_PER_STREAM` | modules/app/etcd_edge_anchor/mod.rs | 8 | Refuses another watch on the stream (created and canceled at once). |
 | ended leases awaiting key deletion | Capacity | `LEASE_END_QUEUE` | modules/app/etcd_edge_anchor/mod.rs | 32 | Leaves further `MSG_LEASE_REVOKE`s queued on the channel until a deletion completes. |
 | etcd alarms held at once | Capacity | `ALARMS_MAX` | modules/app/etcd_edge_anchor/mod.rs | 4 | A further ACTIVATE is answered but not held. |
@@ -269,6 +277,23 @@ hold are `MAX_PARTICIPANTS` (the record's own) and `PARTICIPANTS`.
 | etcd stored key | Shape | `STORE_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 2572 | Any key the store holds (its physical key less the identity; a contract test holds them together): copied whole, never clipped. |
 | etcd large-value requests at once | Capacity | `LG_SESSIONS` | modules/app/etcd_edge_anchor/mod.rs | 8 | Requests carried through the large-value layer together (an upload, an expansion, a Txn that reads); one that finds all busy waits in its stream and is sent when one frees. |
 | etcd watch event value | Shape | `WATCH_VALUE_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived: a large value (and the value it replaced) fetched for a watch event, two of them and a key fitting one encoded response; a larger one cancels the watch with the reason, never a clipped value. |
+| Point-protocol value | Shape | `VALUE_MAX` | modules/common/kv_large.rs | 8192 | The largest value the redis, memcached and etcd edges (and the KV front) write and read back whole — the store keeps any value as chunks, so this is the point protocols' object policy, one bound for every edge. A larger write is refused before any chunk is sent (`ERR value too large`, `SERVER_ERROR object too large for cache`, etcd 3 "request is too large"); a larger stored value read through an edge is answered too large, never cut. |
+| Redis reply rendering | Shape | `RENDER_MAX` | modules/app/redis_edge_anchor/mod.rs | — | Derived as twice the larger of `wire::KV_RESPONSE_BODY_MAX` and `RLG_OUT`, plus 64: RESP framing at most doubles a length-prefixed element, so a store answer at its bound (a page of keys, an expanded large value) renders whole, never cut mid-array. |
+| Redis inline headroom | Shape | `INLINE_ROOM` | modules/app/redis_edge_anchor/mod.rs | 1024 | Room a reply streamed in pieces leaves in `send_buf` for an inline reply written before the ring takes it. |
+| etcd watch event values together | Shape | `WATCH_VALUES_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived as `RESP_OUT_MAX - STORE_KEY_MAX - 512`: an event's value and the value it replaced together, with a key, in one encoded response; an event past it cancels its watch with the reason, never a clipped value. |
+| etcd net send | Pacing | `NET_CHUNK` | modules/app/etcd_edge_anchor/mod.rs | 4096 | Bytes one NET send carries: a frame the net channel can always take whole; a longer response goes out over several sends. |
+| Memcached net send | Pacing | `NET_CHUNK` | modules/app/memcached_stream_anchor/mod.rs | 4096 | As the etcd anchor's: a longer reply goes out over several sends. |
+| Memcached large-value sessions | Capacity | `LG_SESSIONS` | modules/app/memcached_stream_anchor/mod.rs | 4 | Writes carried as chunks and reads expanded from them at once. A large write that finds every one busy (or its connection already in one) answers `SERVER_ERROR busy, retry`; a large read waits, held in its connection's order, for the next to free. |
+| Memcached session body | Shape | `LG_BODY` | modules/app/memcached_stream_anchor/mod.rs | — | Derived as `SCRATCH_BUF_SIZE - 64`: the storage command's op body a session carries. |
+| Memcached session answer | Shape | `LG_OUT` | modules/app/memcached_stream_anchor/mod.rs | — | Derived as `kv_large::VALUE_MAX + 256`: one expanded value at the bound. |
+| Memcached session stall | Pacing | `LG_STALL_MS` | modules/app/memcached_stream_anchor/mod.rs | — | Typed `u64`, 30 s. A session with no answer in this long is abandoned; its command answers `SERVER_ERROR`. |
+| Memcached held answers | Capacity | `HOLD_BYTES` | modules/app/memcached_stream_anchor/mod.rs | 16384 | Answers a connection holds, in order, behind a command in a large-value session (or for room in `send_buf`). A connection whose answers outgrow it is closed: it could no longer be answered in order. |
+| Memcached held key | Shape | `KEY_HELD_MAX` | modules/app/memcached_stream_anchor/mod.rs | 250 | memcached's own key bound: what a held answer or a session keeps of a key. |
+| Memcached pipelined GET batches | Capacity | `GET_BATCHES` | modules/app/memcached_stream_anchor/mod.rs | 32 | `get`/`gets` batches one connection has in flight at once, each ending in its own `END`; a connection pipelining more is closed. |
+| Replicated write deadline | Pacing | `CONSENSUS_TIMEOUT_MS` | modules/app/kv_request_router/mod.rs | — | Typed `u64`, 12 s. A replicated write with no answer from the gateway in this long is answered `KV_RESULT_OUTCOME_UNKNOWN` (it may still commit). Past clustor's longest answer — the no-leader hold, 8 s — so the caller hears clustor's "not appended" when it is. |
+| Retention hold name | Shape | `RETAIN_NAME_MAX` | modules/common/types.rs | 64 | A longer `KV_OP_RETAIN` name is refused `KV_RESULT_INTERNAL`, nothing held. |
+| Retention holds swept per op | Capacity | `RETAIN_SWEEP` | modules/common/kv_store.rs | 4 | Lapsed hold records one `KV_OP_RETAIN` removes as it applies (a lapsed hold already holds nothing). |
+| Backup retention hold life | Pacing | `HOLD_TTL_MS` | modules/app/backup_coordinator/mod.rs | — | Typed `u64`, 60 s. The backup's hold lives this long on the store's clock unless renewed (every `HOLD_RENEW_MS`, a third of it, between pages): a coordinator that dies stops holding the store's history within it. |
 | etcd watch key + range | Shape | `WATCH_KEY_MAX` | modules/app/etcd_edge_anchor/mod.rs | 256 | Mirrors `watch_hub::WATCH_KEY_MAX` (`contract_key_profiles` holds them equal); the anchor admits `WATCH_SPAN_MAX`, which it caps. |
 | etcd watch span admitted | Shape | `WATCH_SPAN_MAX` | modules/app/etcd_edge_anchor/mod.rs | — | Derived: the smaller of `WATCH_KEY_MAX` and what the session's ingress hold (`session_anchor::HOLD_BYTES`, 320) takes behind its 3-byte envelope header and the 47-byte define head (270) — so 256 bytes of key and `range_end` together, the whole `WATCH_KEY_MAX`. A watch's define is forwarded the moment its session attaches and waits in that hold, so a longer span is refused (created and canceled), never watched cut and never answered created for a define the hold would drop. |
 | PostgreSQL connections | Capacity | `MAX_CONNS` | modules/app/pg_edge_anchor/mod.rs | 16 | Drops/refuses excess accepts. |
@@ -307,7 +332,7 @@ Fluxor's connection table is target-wide (on Linux the `linux_net` built-in's
 `max_conns`, default 128, settable 2..=65535; 65536 on the bare-metal aarch64
 profile) and can bind before the sum of several anchors. Receive/send buffers
 also impose protocol message limits: Redis 4096/4096, Memcached 8192/8192
-(datagram 2048/2048), etcd 20489/32768 with a 4608-byte request body per
+(datagram: a 2048-byte request datagram, a reply up to `REPLY_MAX` over at most 7 datagrams), etcd 20489/32768 with a 4608-byte request body per
 stream, PostgreSQL 8192/32768, MySQL 8192/32768, and the Prometheus HTTP
 anchor 16384/20480 bytes.
 
@@ -601,8 +626,8 @@ checked.
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 20489 | One maximal HTTP/2 frame (16384 + 9) and the next frame's start; a larger frame or an overflow is GOAWAY (PROTOCOL_ERROR) and close. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/lattice_data_client/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | A request that does not fit answers `SERVER_ERROR overflow` and the connection is closed. |
-| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | A command that does not fit it answers `-ERR receive buffer full` and the connection is closed. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | — | Derived as `kv_large::VALUE_MAX + 1024`: a storage command with a value at the bound arrives whole. A storage command declaring a larger value answers `SERVER_ERROR object too large for cache` and its data block is dropped as it arrives (the connection keeps answering); any other request that does not fit answers `SERVER_ERROR overflow` and the connection is closed. |
+| Recv Buf Size | Shape | `RECV_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | — | Derived as `kv_large::VALUE_MAX + 1024`: a command with a value at the bound arrives whole. A command that does not fit it answers `-ERR receive buffer full` and the connection is closed. |
 | Requirepass Max | Shape | `REQUIREPASS_MAX` | modules/app/redis_edge_anchor/mod.rs | 128 | A longer `requirepass` param refuses the anchor at construction (logged): a truncated secret would admit anyone knowing only its prefix. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
 | Scratch Buf Size | Shape | `SCRATCH_BUF_SIZE` | modules/app/kv_request_router/mod.rs | — | Derived as `wire::KV_REQUEST_PAYLOAD_MAX`: the largest request taken; a longer envelope is discarded whole by its ingress inbox (counted), unanswered. |
@@ -616,8 +641,8 @@ checked.
 | Registry scratch | Shape | `SCRATCH_BUF_SIZE` | modules/app/watch_registry/mod.rs | 8832 | The registry's envelope buffer: a watch event behind its watch id; an over-budget frame is refused, never truncated. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/etcd_edge_anchor/mod.rs | 32768 | A response that does not fit is answered gRPC RESOURCE_EXHAUSTED (8), never split. |
 | Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/lattice_data_anchor/mod.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | 8192 | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
-| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | A reply waits in the reorder arena until it fits; never dropped. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/memcached_stream_anchor/mod.rs | — | Derived as `kv_large::VALUE_MAX + 1024`: a `VALUE` reply at the bound, its line and `END`. An answer that does not fit waits in the connection's hold (`HOLD_BYTES`) for the next flush, never cut. |
+| Send Buf Size | Shape | `SEND_BUF_SIZE` | modules/app/redis_edge_anchor/mod.rs | 4096 | A reply waits in the reorder arena until it fits; one longer than it goes out through it in pieces, head first (`INLINE_ROOM` left free each time), never dropped. |
 | Store Id Max | Shape | `STORE_ID_MAX` | modules/common/fs_run_storage.rs | — | Typed `u8`, 9: the highest `store_id` the Linux layout names (`kv1/`…`kv9/`); a higher one refuses construction. |
 | Ts Request Size | Shape | `TS_REQUEST_SIZE` | modules/app/kv_state_worker/mod.rs | — | Commit timestamps one lease asks the allocator for (it may grant fewer), asked when fewer than `TS_LOW_WATER` remain. |
 | Watch Export Max | Shape | `WATCH_EXPORT_MAX` | modules/common/watch_hub.rs | — | Per-module frame/scratch buffer; an over-budget frame is refused, never truncated. |
@@ -631,7 +656,6 @@ checked.
 | Max Edge Plan Entries | Capacity | `MAX_EDGE_PLAN_ENTRIES` | modules/common/models.rs | — | Derived: two adjacency entries and `MAX_GRAPH_SYNC_INDEXES` index entries; the refusal happens at that bound. |
 | Max Groups | Capacity | `MAX_GROUPS` | modules/common/tsquery_core.rs | 128 | The contract ceiling consumers size against; the core does not check it (`TooManyGroups` is never returned), and the anchor's `MAX_SERIES_Q` binds first. |
 | Max Join Rows | Capacity | `MAX_JOIN_ROWS` | modules/app/relational_executor/mod.rs | 128 | Rows materialised for a join side; a larger join is refused. |
-| Max Per Reject | Capacity | `MAX_PER_REJECT` | modules/app/kv_request_router/mod.rs | 32 | Consensus ops of one connection failed (`KV_RESULT_LIN_BOUND`) per NOT_LEADER reject; any beyond are answered by the deadline sweep. |
 | Max Series | Capacity | `MAX_SERIES` | modules/common/tsquery_core.rs | 256 | The contract ceiling consumers size against; the core does not check it (`TooManySeries` is never returned), and the anchor's `MAX_SERIES_Q` binds first. |
 | Max Txn Slots | Capacity | `MAX_TXN_SLOTS` | modules/app/relational_executor/mod.rs | 2 | Concurrent coordinator transactions; a further BEGIN is refused. |
 | Redis pub/sub sessions | Capacity | `PS_MAX` | modules/app/redis_edge_anchor/mod.rs | 64 | Pub/sub sessions the anchor fronts, one per subscribing connection (equal to `MAX_CONNS`); a SUBSCRIBE finding none free answers `-ERR no pub/sub session is free; try again later` and leaves the connection out of subscriber mode, and its next SUBSCRIBE tries again. |
@@ -868,7 +892,7 @@ MAX_INFLIGHT | modules/app/memcached_datagram_anchor/mod.rs | 512
 MAX_TOKENS | modules/common/memcached_codec.rs | 32
 MAX_CONNS | modules/app/etcd_edge_anchor/mod.rs | 64
 MAX_STREAMS_PER_CONN | modules/app/etcd_edge_anchor/mod.rs | 8
-STREAM_BODY_MAX | modules/app/etcd_edge_anchor/mod.rs | 4608
+STREAM_BODY_MAX | modules/app/etcd_edge_anchor/mod.rs | -
 WATCHES_PER_STREAM | modules/app/etcd_edge_anchor/mod.rs | 8
 LEASE_END_QUEUE | modules/app/etcd_edge_anchor/mod.rs | 32
 ALARMS_MAX | modules/app/etcd_edge_anchor/mod.rs | 4
@@ -972,8 +996,8 @@ PASSWORD_MAX | modules/app/pg_edge_anchor/mod.rs | 64
 RECV_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 20489
 RECV_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
 RECV_BUF_SIZE | modules/app/lattice_data_client/mod.rs | -
-RECV_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
-RECV_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | 4096
+RECV_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | -
+RECV_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | -
 REQUIREPASS_MAX | modules/app/redis_edge_anchor/mod.rs | 128
 SCRATCH_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | -
 SCRATCH_BUF_SIZE | modules/app/kv_request_router/mod.rs | -
@@ -987,7 +1011,7 @@ SCRATCH_BUF_SIZE | modules/app/watch_fanout/mod.rs | 8832
 SCRATCH_BUF_SIZE | modules/app/watch_registry/mod.rs | 8832
 SEND_BUF_SIZE | modules/app/etcd_edge_anchor/mod.rs | 32768
 SEND_BUF_SIZE | modules/app/lattice_data_anchor/mod.rs | -
-SEND_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | 8192
+SEND_BUF_SIZE | modules/app/memcached_stream_anchor/mod.rs | -
 SEND_BUF_SIZE | modules/app/redis_edge_anchor/mod.rs | 4096
 STORE_ID_MAX | modules/common/fs_run_storage.rs | -
 TS_REQUEST_SIZE | modules/app/kv_state_worker/mod.rs | -
@@ -997,7 +1021,6 @@ MAX_COLS | modules/app/pg_edge_anchor/mod.rs | 32
 MAX_EDGE_PLAN_ENTRIES | modules/common/models.rs | -
 MAX_GROUPS | modules/common/tsquery_core.rs | 128
 MAX_JOIN_ROWS | modules/app/relational_executor/mod.rs | 128
-MAX_PER_REJECT | modules/app/kv_request_router/mod.rs | 32
 MAX_SERIES | modules/common/tsquery_core.rs | 256
 MAX_TXN_SLOTS | modules/app/relational_executor/mod.rs | 2
 PS_MAX | modules/app/redis_edge_anchor/mod.rs | 64
@@ -1136,6 +1159,31 @@ HEADERS_MAX | modules/app/exchange_cli/mod.rs | 256
 SELECT_MAX | modules/app/exchange_cli/mod.rs | 8
 ANSWER_MAX | modules/app/exchange_cli/mod.rs | 8192
 LINE_MAX | modules/app/exchange_cli/mod.rs | -
+VALUE_MAX | modules/common/kv_large.rs | 8192
+RENDER_MAX | modules/app/redis_edge_anchor/mod.rs | -
+INLINE_ROOM | modules/app/redis_edge_anchor/mod.rs | 1024
+WATCH_VALUES_MAX | modules/app/etcd_edge_anchor/mod.rs | -
+NET_CHUNK | modules/app/etcd_edge_anchor/mod.rs | 4096
+NET_CHUNK | modules/app/memcached_stream_anchor/mod.rs | 4096
+LG_SESSIONS | modules/app/memcached_stream_anchor/mod.rs | 4
+LG_BODY | modules/app/memcached_stream_anchor/mod.rs | -
+LG_OUT | modules/app/memcached_stream_anchor/mod.rs | -
+LG_STALL_MS | modules/app/memcached_stream_anchor/mod.rs | 30_000
+HOLD_BYTES | modules/app/memcached_stream_anchor/mod.rs | 16384
+KEY_HELD_MAX | modules/app/memcached_stream_anchor/mod.rs | 250
+GET_BATCHES | modules/app/memcached_stream_anchor/mod.rs | 32
+CONSENSUS_TIMEOUT_MS | modules/app/kv_request_router/mod.rs | 12_000
+RETAIN_NAME_MAX | modules/common/types.rs | 64
+RETAIN_SWEEP | modules/common/kv_store.rs | 4
+HOLD_TTL_MS | modules/app/backup_coordinator/mod.rs | 60_000
+TX_SLOTS | modules/app/memcached_datagram_anchor/mod.rs | 4
+LG_SESSIONS | modules/app/memcached_datagram_anchor/mod.rs | 4
+LG_STALL_MS | modules/app/memcached_datagram_anchor/mod.rs | 5_000
+REPLY_MAX | modules/app/memcached_datagram_anchor/mod.rs | -
+KEY_MAX | modules/app/memcached_datagram_anchor/mod.rs | 256
+PUT_BODY_MAX | modules/app/memcached_datagram_anchor/mod.rs | -
+UDP_DATAGRAM_MAX | modules/common/memcached_codec.rs | 1400
+UDP_DATA_MAX | modules/common/memcached_codec.rs | -
 ```
 
 ## Exempt names

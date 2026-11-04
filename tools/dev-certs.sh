@@ -8,13 +8,15 @@
 #
 # Out (certs/dev/, gitignored):
 #   ca.pem, ca.der              the dev CA — what a client trusts (etcdctl --cacert)
-#   server.der, server.key.der  the server's certificate and key (`cert_file` /
-#                               `key_file`), valid for localhost and 127.0.0.1
+#   server.der, server.key.der  the server's certificate and key (the graphs'
+#                               `cert` / `key` params, which `tls` reads at
+#                               runtime as `cert_file` / `key_file`), valid
+#                               for localhost and 127.0.0.1
 #
 # The server certificate has the shape fluxor's chain validator demands of a
 # leaf (CA:FALSE, digitalSignature, serverAuth), so the same CA also serves
 # graphs that turn on client-certificate authentication (`peer_auth: 2`).
-# A deployment points `cert_file` / `key_file` at its own material instead.
+# A deployment passes the absolute paths of its own material instead.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

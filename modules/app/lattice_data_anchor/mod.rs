@@ -470,6 +470,28 @@ const fn map_result(result: u8) -> (Outcome, Option<DataRetryClass>) {
             (Outcome::Refused, Some(DataRetryClass::Malformed))
         }
 
+        // A replicated write the group did not take (no leader past its
+        // hold, a superseded position, strict fallback): nothing applied,
+        // the same request may be retried.
+        types::KV_RESULT_NO_LEADER => {
+            (Outcome::Refused, Some(DataRetryClass::UnavailableAuthority))
+        }
+
+        // A forwarded write whose leader failed before confirming it: it
+        // may have applied. Not a refusal — the caller's idempotency
+        // identity is how it finds out.
+        types::KV_RESULT_OUTCOME_UNKNOWN => (
+            Outcome::Indeterminate,
+            Some(DataRetryClass::AmbiguousDelivery),
+        ),
+
+        // The store does not implement the op: this composition lacks
+        // the capability (a peer built against a newer contract).
+        types::KV_RESULT_UNSUPPORTED => (
+            Outcome::Refused,
+            Some(DataRetryClass::UnsupportedCapability),
+        ),
+
         // An unknown result code. Not `Ok` — we cannot say an operation
         // succeeded on the strength of a byte this build does not
         // recognise — and not `Indeterminate` either, since the router

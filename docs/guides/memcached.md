@@ -62,10 +62,35 @@ anchor's telemetry port (`cmd_get`, `cmd_set`,
 ## UDP
 
 `memcached_datagram_anchor` implements the standard 8-byte UDP
-frame header and serves single-key `get`, `set`, and `delete`; any
-other command gets the generic unknown-command reply, and multi-key
-`get` is TCP-only. UDP exists in a deployment only when the
-datagram anchor module is in the graph.
+frame header (`[request id][sequence][total][reserved]`, big-endian)
+and serves single-key `get`, `set`, `delete` and `version`; any other
+command gets the generic unknown-command reply, and multi-key `get` is
+TCP-only. Its port is the `listen_port` param (11211 by default). UDP
+exists in a deployment only when the datagram anchor module is in the
+graph (`configs/single-minimal-memcache-udp.yaml` runs it beside the
+TCP anchor on one `linux_net`).
+
+A request is one datagram (`sequence 0`, `total 1`); anything else is
+answered `ERROR`. A reply longer than one datagram is cut into
+datagrams of at most 1400 bytes, header included (memcached's
+`UDP_MAX_PAYLOAD_SIZE`), each under the request's id and numbered
+`sequence 0..total`, every one but the last full. The client
+reassembles them by sequence in any arrival order. A `get` answers any
+value up to the point protocols' bound (`kv_large::VALUE_MAX`, 8192
+bytes) whole — a value stored as chunks is fetched through a
+large-read session first — as `VALUE … END`; a miss is `END`. Up to 4
+large reads run at once; a fifth answers `SERVER_ERROR too many large
+reads in flight` and reads whole when asked again.
+
+Loss is memcached's: nothing is retransmitted. A reply the provider
+channel cannot take at once is parked in one of 4 reply slots and sent
+on over the next steps; past that its remaining datagrams are dropped,
+and a client missing a datagram times out and asks again (under a new
+request id).
+
+A `set` carries its value inline in its one datagram: a value past one
+data chunk (1969 bytes) answers `SERVER_ERROR object too large for
+cache` — write it over TCP; it reads back over UDP.
 
 ## Errors
 

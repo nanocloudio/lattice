@@ -95,7 +95,7 @@ use etcd_codec::{
     LeaseGrantRequest, LeaseKeepAliveRequest, LeaseRevokeRequest, LeaseTimeToLiveRequest,
     PutRequest, RangeRequest, SettingsIter, WatchEventKind, WatchOp, WatchRequest, ERROR_NO_ERROR,
     ERROR_PROTOCOL_ERROR, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_HEADER_LEN,
-    GRPC_FRAME_HEADER_LEN, GRPC_STATUS_COMPACTED, HTTP2_PREFACE_LEN,
+    GRPC_FRAME_HEADER_LEN, GRPC_STATUS_COMPACTED, GRPC_STATUS_UNIMPLEMENTED, HTTP2_PREFACE_LEN,
 };
 use session_anchor::session_core::session_ctrl as sc;
 use session_anchor::session_core::{
@@ -316,11 +316,11 @@ const RECV_BUF_SIZE: usize = 20489;
 /// acks queued beside it. Flushed to the network in NET-frame chunks.
 const SEND_BUF_SIZE: usize = 32768;
 
-/// Per-stream request body buffer: an etcd request as large as the store
-/// takes (a Put of a 4 KiB value under a 256-byte key, in its gRPC
-/// frame). A larger body is refused as etcd refuses one: "request is
-/// too large".
-const STREAM_BODY_MAX: usize = 4608;
+/// Per-stream request body buffer: an etcd request as large as the point
+/// edges take (a Put of a `kv_large::VALUE_MAX` value under a 256-byte
+/// key, in its gRPC frame). A larger body is refused as etcd refuses one:
+/// "request is too large".
+const STREAM_BODY_MAX: usize = kv_large::VALUE_MAX + 512;
 
 /// One encoded gRPC response: a worker answer as large as it builds
 /// (8 KiB) re-encoded as protobuf, in one DATA frame (at most 16384).
@@ -330,8 +330,9 @@ const RESP_OUT_MAX: usize = 16000;
 /// (one HEADERS block worth, since we reset between blocks).
 const HPACK_SCRATCH_LEN: usize = 4096;
 
-/// Scratch for NET_CMD frames and KV envelopes.
-const SCRATCH_BUF_SIZE: usize = 4096 + 64;
+/// Scratch for NET_CMD frames and KV envelopes: an op body built from a
+/// whole request body.
+const SCRATCH_BUF_SIZE: usize = STREAM_BODY_MAX + 64;
 
 /// One inbound envelope of the KV or watch path: the worker's largest
 /// answer (8192 bytes) behind the router's head and fence tail, or the
@@ -756,8 +757,12 @@ const LG_UNSENT: u64 = 1;
 const LG_CHUNK_CONN: u8 = u8::MAX;
 
 /// The longest value a watch event carries once its manifest is fetched:
-/// it and the value it replaced, with a key, fit one encoded response.
-const WATCH_VALUE_MAX: usize = (RESP_OUT_MAX - STORE_KEY_MAX - 512) / 2;
+/// any value the point edges write (`kv_large::VALUE_MAX`).
+const WATCH_VALUE_MAX: usize = kv_large::VALUE_MAX;
+/// What an event's value and the value it replaced together come to at
+/// most, with a key, in one encoded response.
+const WATCH_VALUES_MAX: usize = RESP_OUT_MAX - STORE_KEY_MAX - 512;
+const _: () = assert!(WATCH_VALUES_MAX >= WATCH_VALUE_MAX);
 
 /// A watch event whose value, or the value it replaced, is a large
 /// value's manifest, held while the value is fetched. One at a time:
@@ -2383,6 +2388,19 @@ fn dispatch_kv(anchor: &mut AnchorState, slot_idx: usize, strm: usize) {
         anchor.slots[slot_idx].free_stream(strm);
         return;
     };
+    // A value past the point protocols' bound: refused before any chunk
+    // is sent, as every point edge refuses it (etcd's ErrRequestTooLarge).
+    if !kv_large::values_within(
+        op,
+        &anchor.scratch[op_body_start..op_body_start + op_body_len],
+        kv_large::VALUE_MAX,
+    ) {
+        let mut m = [0u8; 96];
+        let n = msg_request_too_large(&mut m);
+        send_grpc_error_msg(anchor, slot_idx, stream_id, 3, &m[..n]);
+        anchor.slots[slot_idx].free_stream(strm);
+        return;
+    }
     let consistency = read_consistency(anchor, slot_idx, strm, method);
     let via_layer = {
         let body = &anchor.scratch[op_body_start..op_body_start + op_body_len];
@@ -2752,10 +2770,26 @@ fn wlg_begin(anchor: &mut AnchorState, len: usize) {
         );
         return;
     };
+    // Each fetched value within its buffer, and both together (an inline
+    // one as it stands in the frame) within one response.
+    let inline = |m: &Option<Manifest>, span: Option<(usize, usize)>| -> u64 {
+        match (m, span) {
+            (None, Some((a, b))) => b.saturating_sub(a) as u64,
+            _ => 0,
+        }
+    };
+    let together = [value_m, prev_m]
+        .iter()
+        .flatten()
+        .map(|m| m.total)
+        .sum::<u64>()
+        + inline(&value_m, Some(f.value))
+        + inline(&prev_m, f.prev.map(|p| p.0));
     let too_large = [value_m, prev_m]
         .iter()
         .flatten()
-        .any(|m| m.total > WATCH_VALUE_MAX as u64);
+        .any(|m| m.total > WATCH_VALUE_MAX as u64)
+        || together > WATCH_VALUES_MAX as u64;
     if too_large {
         wlg_cancel(
             anchor,
@@ -4038,6 +4072,15 @@ fn write_response_frames(
         // No authority answered in time (a write on a follower, a read
         // fence unresolved): etcd's ErrTimeout, UNAVAILABLE — retryable.
         types::KV_RESULT_LIN_BOUND => 14,
+        // A replicated write not appended (no leader, a superseded
+        // position, strict fallback): etcd's ErrNoLeader, UNAVAILABLE —
+        // safe to retry as it is.
+        types::KV_RESULT_NO_LEADER => 14,
+        // A forwarded write whose leader failed before saying whether it
+        // appended it: etcd's ErrTimeoutDueToLeaderFail, UNAVAILABLE. It
+        // may have committed; a client reads back before retrying a
+        // write that is not idempotent.
+        types::KV_RESULT_OUTCOME_UNKNOWN => 14,
         // The routing epoch moved under the request: etcd's
         // ErrLeaderChanged, UNAVAILABLE — retry after re-resolving.
         types::KV_RESULT_DIRTY_EPOCH => 14,
@@ -4046,6 +4089,9 @@ fn write_response_frames(
         // An operation spanning ranges the range map splits: it cannot
         // run as asked on this graph.
         types::KV_RESULT_CROSS_RANGE => 9,
+        // An op the store does not implement (anchor and store built
+        // against different contracts): gRPC UNIMPLEMENTED.
+        types::KV_RESULT_UNSUPPORTED => GRPC_STATUS_UNIMPLEMENTED,
         _ => 13,
     };
 
@@ -4103,12 +4149,18 @@ fn write_response_frames(
         msg_request_too_large(&mut msg)
     } else if result == types::KV_RESULT_LIN_BOUND {
         msg_timed_out(&mut msg)
+    } else if result == types::KV_RESULT_NO_LEADER {
+        msg_no_leader(&mut msg)
+    } else if result == types::KV_RESULT_OUTCOME_UNKNOWN {
+        msg_timed_out_leader_fail(&mut msg)
     } else if result == types::KV_RESULT_DIRTY_EPOCH {
         msg_leader_changed(&mut msg)
     } else if result == types::KV_RESULT_QUOTA {
         msg_too_many_requests(&mut msg)
     } else if result == types::KV_RESULT_CROSS_RANGE {
         msg_cross_range(&mut msg)
+    } else if result == types::KV_RESULT_UNSUPPORTED {
+        msg_unsupported(&mut msg)
     } else {
         0
     };
@@ -4561,11 +4613,20 @@ etcd_msg!(
 etcd_msg!(msg_password_empty, b"etcdserver: password is empty");
 etcd_msg!(msg_auth_busy, b"etcdserver: too many requests");
 etcd_msg!(msg_timed_out, b"etcdserver: request timed out");
+etcd_msg!(msg_no_leader, b"etcdserver: no leader");
+etcd_msg!(
+    msg_timed_out_leader_fail,
+    b"etcdserver: request timed out, possibly due to previous leader failure"
+);
 etcd_msg!(msg_leader_changed, b"etcdserver: leader changed");
 etcd_msg!(msg_too_many_requests, b"etcdserver: too many requests");
 etcd_msg!(
     msg_cross_range,
     b"lattice: the operation spans ranges this graph keeps apart"
+);
+etcd_msg!(
+    msg_unsupported,
+    b"lattice: the store does not implement this operation"
 );
 
 /// A refusal: gRPC status, and etcd's message in `m[..n]`.
@@ -5500,9 +5561,21 @@ fn auth_job_done(anchor: &mut AnchorState, result: u8, revision: i64) {
             // Not committed: a replica that cannot (a follower, a group
             // between leaders) is UNAVAILABLE, retryably, as for any
             // write; anything else is the store's fault.
-            if result == types::KV_RESULT_LIN_BOUND || result == types::KV_RESULT_DIRTY_EPOCH {
+            if matches!(
+                result,
+                types::KV_RESULT_LIN_BOUND
+                    | types::KV_RESULT_DIRTY_EPOCH
+                    | types::KV_RESULT_NO_LEADER
+                    | types::KV_RESULT_OUTCOME_UNKNOWN
+            ) {
                 let mut m = [0u8; 96];
-                let n = msg_timed_out(&mut m);
+                let n = if result == types::KV_RESULT_NO_LEADER {
+                    msg_no_leader(&mut m)
+                } else if result == types::KV_RESULT_OUTCOME_UNKNOWN {
+                    msg_timed_out_leader_fail(&mut m)
+                } else {
+                    msg_timed_out(&mut m)
+                };
                 send_grpc_error_msg(anchor, slot_idx, stream_id, 14, &m[..n]);
             } else {
                 send_grpc_error(anchor, slot_idx, stream_id, 13);
@@ -7197,7 +7270,12 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
         // net_send_data_pic_from_frame stages through anchor.scratch, so
         // each chunk is copied to frame_payload first (idle between
         // poll_net_in and the next process_one_frame).
-        const NET_CHUNK: usize = SCRATCH_BUF_SIZE - NET_FRAME_HDR - CONN_ID_LEN;
+        // 4 KiB a send, whatever the scratch holds: a frame the net
+        // channel cannot take whole (its buffer, the net contract's
+        // `MAX_CMD_DATA`) is never taken, and the connection would stall
+        // on it — which a response larger than the old scratch did.
+        const NET_CHUNK: usize = 4096;
+        const _: () = assert!(NET_CHUNK + NET_FRAME_HDR + CONN_ID_LEN <= SCRATCH_BUF_SIZE);
         let mut sent = 0usize;
         while sent < send_len {
             let n = (send_len - sent).min(NET_CHUNK);

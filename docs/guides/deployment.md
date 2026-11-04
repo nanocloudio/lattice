@@ -66,7 +66,9 @@ anchor, since an instance claims the connections of the one listener
 its anchor binds. `configs/single.yaml` (etcd and Redis) and
 `configs/single-minimal-etcd-tls.yaml` are TLS-fronted;
 `tools/dev-certs.sh` mints their development certificate, and a
-deployment points `cert_file` / `key_file` at its own.
+deployment passes its own as the `cert` / `key` params: absolute paths
+`tls` reads at runtime (`cert_file` / `key_file`), re-read when they
+change.
 
 ## Running
 

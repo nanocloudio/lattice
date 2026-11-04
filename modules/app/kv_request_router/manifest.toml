@@ -284,9 +284,10 @@ metrics = [
     # are reaching a node that cannot commit them, most often a
     # follower.
     "inflight_timeouts",
-    # Writes failed FAST because the gateway said NOT_LEADER. Zero on a
-    # leader. Compare with inflight_timeouts: refusals landing there
-    # instead of here mean the gateway_reject wire is down.
+    # Writes the gateway refused NOT_LEADER or FALLBACK (not appended:
+    # no leader past the hold, a superseded position, strict fallback).
+    # A write on a follower is forwarded to the leader, so this stays
+    # zero on a healthy group on every node.
     "not_leader_rejects",
     # Cross-partition transaction helping: helps started on TXN_PENDING
     # replies with a remote home, and helps whose carried decision was
@@ -297,4 +298,12 @@ metrics = [
     # RESP_STASH_WAIT_MS (a stuck consumer). A burst waits and is
     # delivered; non-zero here means an anchor stopped draining.
     "resp_drops",
+    # Requests whose op code this build does not define, answered
+    # KV_RESULT_UNSUPPORTED: a client built against a newer store
+    # contract than this router (version skew). Zero when they match.
+    "unsupported_ops",
+    # Replicated writes answered KV_RESULT_OUTCOME_UNKNOWN: the gateway's
+    # OUTCOME_UNKNOWN (a forward whose leader failed before saying) or no
+    # answer by the consensus deadline. Either may have committed.
+    "outcome_unknown",
 ]

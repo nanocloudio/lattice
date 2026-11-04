@@ -174,7 +174,8 @@ use wire::{
 #[path = "../../common/compaction_floor.rs"]
 mod compaction_floor;
 use compaction_floor::{
-    GcFloorRecord, RetentionClaim, CLAIM_SOURCE_ACTIVE_READ, GC_CLAIM_WIRE_LEN, GC_FLOOR_WIRE_LEN,
+    GcFloorRecord, RetentionClaim, CLAIM_SOURCE_ACTIVE_READ, CLAIM_SOURCE_BACKUP,
+    GC_CLAIM_WIRE_LEN, GC_FLOOR_WIRE_LEN,
 };
 
 const SCRATCH_BUF_SIZE: usize = 8192;
@@ -741,6 +742,9 @@ struct WorkerState {
     m_scan_retries_adopted: u64,
     /// Ops that wrote more versions than `kv_store::write_bound` allows.
     m_write_bound_exceeded: u64,
+    /// Ops answered `KV_RESULT_UNSUPPORTED` (an op this store does not
+    /// implement: a newer peer's).
+    m_unsupported: u64,
     /// Disk provider: a bounded compaction is in flight (one
     /// `COMPACT_STEP_RECORDS` step per module step).
     disk_compact_active: bool,
@@ -1221,6 +1225,7 @@ impl WorkerState {
         self.m_scan_hold_refusals = 0;
         self.m_scan_retries_adopted = 0;
         self.m_write_bound_exceeded = 0;
+        self.m_unsupported = 0;
         self.disk_compact_active = false;
         self.disk_compact_cursor = 0;
         self.disk_compact_floor = 0;
@@ -1319,6 +1324,16 @@ const fn op_only_reads(op: u8) -> bool {
             | types::KV_OP_HASH_KV
             | types::KV_OP_GET_CHUNK
     )
+}
+
+/// [`op_only_reads`] for one request: an etcd Txn whose branches only
+/// read (`types::etcd_txn_read_only`) changes nothing either — it is not
+/// logged and needs no room, as the router routes it as a read — nor does
+/// a retention hold query (`types::retain_is_query`).
+fn request_only_reads(op: u8, body: &[u8]) -> bool {
+    op_only_reads(op)
+        || (op == KV_OP_ETCD_TXN && types::etcd_txn_read_only(body))
+        || (op == types::KV_OP_RETAIN && types::retain_is_query(body))
 }
 
 /// Once a step, with the disk store serving: after recovery, find the
@@ -1491,6 +1506,20 @@ fn write_bound(op: u8, body: &[u8]) -> Option<usize> {
     }
 }
 
+/// Whether this worker applies `op`: an op of the engine
+/// ([`kv_store::implements`]) or a store provider's origin entry (applied
+/// by its origin's record). Any other is answered `KV_RESULT_UNSUPPORTED`.
+const fn store_applies(op: u8) -> bool {
+    kv_store::implements(op)
+        || matches!(
+            op,
+            types::KV_OP_ORIGIN_REGISTER
+                | types::KV_OP_ORIGIN_WRITE
+                | types::KV_OP_ORIGIN_IMPORT
+                | types::KV_OP_ORIGIN_CHUNK
+        )
+}
+
 /// May a write be applied now? A disk store admits a write only with
 /// room for every memtable entry it can add ([`write_bound`]):
 /// the engine applies an op one version at a time, so a write that met a
@@ -1502,7 +1531,10 @@ fn write_bound(op: u8, body: &[u8]) -> Option<usize> {
 /// caller waits (a command stays on its channel, a provider call drives
 /// maintenance) and asks again.
 unsafe fn admit(worker: &mut WorkerState, op: u8, body: &[u8]) -> bool {
-    if worker.state_store != STATE_STORE_DISK || op_only_reads(op) {
+    // An op the store does not implement adds nothing: it is answered
+    // unsupported ([`apply_to_store`]).
+    if worker.state_store != STATE_STORE_DISK || request_only_reads(op, body) || !store_applies(op)
+    {
         return true;
     }
     let s = &worker.disk_state;
@@ -1860,8 +1892,8 @@ unsafe fn propose_chunk_sweep(worker: &mut WorkerState) {
 /// Keep `history_revisions` of history on a store consensus orders
 /// (`sweep_wrap` 1): the Compact is proposed on `sweep_out`, as a chunk
 /// sweep is, and applies on every replica at the revision the command
-/// names (a follower's gateway refuses its own proposal, so the leader's
-/// is the one that commits). Proposed once the store passes the last
+/// names (a follower's is forwarded to the leader too; a second Compact
+/// at or below the first answers COMPACTED and changes nothing). Proposed once the store passes the last
 /// Compact by the window and an eighth more, and again after
 /// `SWEEP_RETRY_STEPS` if none has applied. A store with its own command
 /// log compacts through it instead ([`retain_history`]).
@@ -2470,10 +2502,35 @@ unsafe fn apply_to_store(
     body: &[u8],
     out: &mut [u8],
 ) -> Applied {
+    if !kv_store::implements(op) {
+        // An op the store does not implement (a newer peer's, or one no
+        // store applies): answered as such before anything else — never
+        // admitted, applied, logged or counted as a mutation.
+        worker.m_unsupported = worker.m_unsupported.wrapping_add(1);
+        if worker.m_unsupported.is_power_of_two() {
+            // Said, not every time: the first, then ever more rarely.
+            let mut buf = [0u8; 64];
+            let mut n = write_prefix(&mut buf, 0, b"[kvw] unsupported op=");
+            n = write_dec(&mut buf, n, u64::from(op));
+            n = write_prefix(&mut buf, n, b" count=");
+            n = write_dec(&mut buf, n, worker.m_unsupported);
+            log_line(worker, &buf, n);
+        }
+        return Applied {
+            result: types::KV_RESULT_UNSUPPORTED,
+            len: 0,
+            revision: store_revision(worker),
+            paused: false,
+            busy: false,
+            changed: false,
+            waited: false,
+            logging: false,
+        };
+    }
     if worker.state_store != STATE_STORE_DISK {
         return apply_to_store_once(worker, op, identity, consistency, head_commit_ts, body, out);
     }
-    if worker.clog_phase == CLOG_LIVE && !op_only_reads(op) && !settle_log(worker) {
+    if worker.clog_phase == CLOG_LIVE && !request_only_reads(op, body) && !settle_log(worker) {
         return Applied::waited(store_revision(worker));
     }
     let outer = worker.scope_depth == 0;
@@ -2812,7 +2869,7 @@ unsafe fn apply_to_store_once(
     // The worker's own log, when nothing orders it: the op is durable
     // before anyone is answered. A log that cannot take it stops the
     // store — an answer the log does not hold would be undone by a crash.
-    if worker.clog_phase == CLOG_LIVE && !op_only_reads(op) && !busy {
+    if worker.clog_phase == CLOG_LIVE && !request_only_reads(op, body) && !busy {
         let rec = command_log::Record {
             commit_ts,
             now_ms,
@@ -6615,6 +6672,43 @@ unsafe fn publish_retention_claim(worker: &mut WorkerState) {
         expiry_unix_ms: dev_millis(sys).saturating_add(GC_CLAIM_TTL_MS),
         seq: worker.gc_claim_seq,
     };
+    send_retention_claim(worker, &claim);
+    // The store's retention holds (`KV_OP_RETAIN`: a backup reading at one
+    // revision): the lowest live one's floor, `u64::MAX` (needs nothing)
+    // with none. Asked of the store itself each time, so a hold that
+    // lapsed stops holding and one taken through another replica counts
+    // once it has applied here. A store that cannot say claims nothing
+    // new: the last claim stands until it is stale.
+    let query = [0u8; 18];
+    let mut ans = [0u8; types::RETAIN_ANSWER_LEN];
+    let a = apply_to_store(
+        worker,
+        types::KV_OP_RETAIN,
+        (0, 0, 0),
+        kv_store::ReadPolicy::LATEST.consistency,
+        0,
+        &query,
+        &mut ans,
+    );
+    if a.result != KV_RESULT_OK || a.len != types::RETAIN_ANSWER_LEN {
+        return;
+    }
+    let held = u64::from_le_bytes(ans[16..24].try_into().unwrap_or([0; 8]));
+    let claim = RetentionClaim {
+        kpg_id: worker.gc_claim_kpg,
+        source: CLAIM_SOURCE_BACKUP,
+        claim_id: u64::from(worker.cluster_epoch),
+        floor_revision: held,
+        expiry_unix_ms: dev_millis(&*worker.syscalls).saturating_add(GC_CLAIM_TTL_MS),
+        seq: worker.gc_claim_seq,
+    };
+    send_retention_claim(worker, &claim);
+}
+
+/// One `MSG_RETENTION_CLAIM` on `compaction_floor_out`, counted when the
+/// channel takes it whole.
+unsafe fn send_retention_claim(worker: &mut WorkerState, claim: &RetentionClaim) {
+    let sys = &*worker.syscalls;
     let mut body = [0u8; GC_CLAIM_WIRE_LEN];
     if claim.encode(&mut body).is_none() {
         return;

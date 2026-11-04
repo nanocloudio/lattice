@@ -55,7 +55,8 @@ use types::{
 };
 use types::{
     KV_OP_COMPACT, KV_OP_ETCD_TXN, KV_OP_HASH_KV, KV_OP_LEASE_KEYS, KV_OP_LEASE_REVOKE,
-    KV_OP_RESTORE, KV_RESULT_DUPLICATE, KV_RESULT_ETCD_TXN, KV_RESULT_EXISTS,
+    KV_OP_RESTORE, KV_OP_RETAIN, KV_RESULT_DUPLICATE, KV_RESULT_ETCD_TXN, KV_RESULT_EXISTS,
+    KV_RESULT_UNSUPPORTED,
 };
 
 // ── Capacities ────────────────────────────────────────────────────────
@@ -1852,7 +1853,8 @@ pub fn apply_mat_ctx<M: Materializer>(
         KV_OP_RANGE_META => apply_range_meta(store, body, out_body, now_ms),
         KV_OP_DELETE_META => batched(store, |s| apply_delete_meta(s, body, out_body, now_ms)),
         KV_OP_LEASE_REVOKE => batched(store, |s| apply_lease_keys(s, body, out_body, now_ms, true)),
-        KV_OP_COMPACT => apply_compact(store, body),
+        KV_OP_COMPACT => apply_compact(store, body, now_ms),
+        KV_OP_RETAIN => batched(store, |s| apply_retain(s, body, out_body, now_ms)),
         KV_OP_RESTORE => batched(store, |s| apply_restore(s, body, out_body, now_ms)),
         KV_OP_HASH_KV => apply_hash_kv(store, body, out_body, now_ms),
         KV_OP_LEASE_KEYS => apply_lease_keys(store, body, out_body, now_ms, false),
@@ -1881,8 +1883,59 @@ pub fn apply_mat_ctx<M: Materializer>(
                 (KV_RESULT_INTERNAL, 0)
             }
         }
-        _ => (KV_RESULT_INTERNAL, 0),
+        // An op this store does not implement: one from a newer peer
+        // (version skew), or one no store applies. Typed, so the skew is
+        // read as skew and never as a fault.
+        _ => (KV_RESULT_UNSUPPORTED, 0),
     }
+}
+
+/// Whether [`apply_mat_ctx`] implements `op` — exactly the ops it does
+/// not answer [`KV_RESULT_UNSUPPORTED`]. A caller that must not log, admit
+/// or account an op the store cannot apply asks this first.
+pub const fn implements(op: u8) -> bool {
+    matches!(
+        op,
+        KV_OP_GET
+            | KV_OP_PUT
+            | types::KV_OP_PUT_MANIFEST
+            | types::KV_OP_PUT_CHUNK
+            | types::KV_OP_GET_CHUNK
+            | KV_OP_CHUNK_SWEEP
+            | KV_OP_DELETE
+            | KV_OP_INCR
+            | KV_OP_DECR
+            | KV_OP_APPEND
+            | KV_OP_PREPEND
+            | KV_OP_EXISTS
+            | KV_OP_STRLEN
+            | KV_OP_MGET
+            | KV_OP_MSET
+            | KV_OP_SCAN
+            | KV_OP_RANGE
+            | KV_OP_RANGE_SCAN
+            | KV_OP_RANGE_META
+            | KV_OP_DELETE_META
+            | KV_OP_LEASE_REVOKE
+            | KV_OP_COMPACT
+            | KV_OP_RESTORE
+            | KV_OP_RETAIN
+            | KV_OP_HASH_KV
+            | KV_OP_LEASE_KEYS
+            | KV_OP_ETCD_TXN
+            | KV_OP_SCAN_VERSIONS
+            | KV_OP_SNAPSHOT_VERSIONS
+            | KV_OP_GET_AT
+            | KV_OP_SCAN_AT
+            | KV_OP_CAS
+            | KV_OP_TXN
+            | KV_OP_TXN_PREPARE
+            | KV_OP_TXN_RESOLVE
+            | KV_OP_TXN_RECORD
+            | KV_OP_IDEMPOTENT
+            | KV_OP_IDEMPOTENT_LOOKUP
+            | KV_OP_FLUSH
+    )
 }
 
 /// `true` iff the record carries an absolute deadline that has passed.
@@ -2408,12 +2461,18 @@ impl KvStore {
         let count_at = out_off;
         out_off += 2;
 
-        let mut idx = (cursor as usize) % MAX_KEYS;
-        let start = idx;
+        // One sweep of the slots, from the cursor's to the last: a page
+        // ends at `limit` keys, or where the answer is full — at the slot
+        // whose key did not fit, so the next page starts with it — and
+        // the cursor is where the next page starts (0: the sweep is
+        // done). Never wrapping past the last slot: slots below the
+        // cursor are earlier pages', and walking them again would answer
+        // their keys twice.
+        let mut idx = cursor as usize;
         let mut emitted: u16 = 0;
-        let mut new_cursor: u64 = cursor;
+        let mut new_cursor: u64 = 0;
 
-        loop {
+        while idx < MAX_KEYS {
             let record = &self.records[idx];
             if record.used && !is_expired(record, now_ms) {
                 let stored = record.key_bytes();
@@ -2423,6 +2482,8 @@ impl KvStore {
                 // never the internal prefix.
                 if let Some(key) = stored.strip_prefix(&self.key_identity[..]) {
                     if out_off + 4 + key.len() > out.len() {
+                        // `idx` > 0 here: a page holds at least one key.
+                        new_cursor = idx as u64;
                         break;
                     }
                     let len = key.len() as u32;
@@ -2432,16 +2493,16 @@ impl KvStore {
                     out_off += key.len();
                     emitted += 1;
                     if emitted >= limit {
-                        new_cursor = ((idx + 1) % MAX_KEYS) as u64;
+                        new_cursor = if idx + 1 < MAX_KEYS {
+                            (idx + 1) as u64
+                        } else {
+                            0
+                        };
                         break;
                     }
                 }
             }
-            idx = (idx + 1) % MAX_KEYS;
-            if idx == start {
-                new_cursor = 0;
-                break;
-            }
+            idx += 1;
         }
 
         out[cursor_at..cursor_at + 8].copy_from_slice(&new_cursor.to_le_bytes());
@@ -4322,6 +4383,9 @@ impl<S: RunStorage> DiskMaterializer<'_, S> {
                 }
                 let ulen = dec.user_key_len;
                 if out_off + 4 + ulen > out.len() {
+                    // The answer is full: the next page starts with this
+                    // key, never past it.
+                    resume -= 1;
                     break 'outer;
                 }
                 out[out_off..out_off + 4].copy_from_slice(&(ulen as u32).to_le_bytes());
@@ -5297,6 +5361,8 @@ pub fn write_bound(op: u8, body: &[u8]) -> Option<usize> {
             let n = body.get(16..18).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
             Some(1 + usize::from(n))
         }
+        // The hold, and the lapsed ones it sweeps.
+        KV_OP_RETAIN => Some(1 + RETAIN_SWEEP),
         _ => None,
     }
 }
@@ -6464,7 +6530,12 @@ fn apply_restore<M: Materializer>(
 
 /// [`KV_OP_COMPACT`]: etcd's Compact, refused as etcd refuses it — a
 /// revision already compacted, or one the store has not reached.
-fn apply_compact<M: Materializer>(store: &mut M, body: &[u8]) -> (u8, usize) {
+///
+/// A live retention hold ([`KV_OP_RETAIN`]) below `rev` stops it there:
+/// the store compacts to the lowest hold's floor (no further when that is
+/// already its floor) and answers `KV_RESULT_OK` all the same — what the
+/// Compact asked for that a hold keeps is released when the hold is.
+fn apply_compact<M: Materializer>(store: &mut M, body: &[u8], now_ms: u64) -> (u8, usize) {
     let mut off = 0usize;
     let Some(rev) = read_u64(body, &mut off) else {
         return (KV_RESULT_INTERNAL, 0);
@@ -6475,8 +6546,158 @@ fn apply_compact<M: Materializer>(store: &mut M, body: &[u8]) -> (u8, usize) {
     if rev > store.revision() {
         return (KV_RESULT_FUTURE_REV, 0);
     }
-    store.set_compact_revision(rev);
+    let Some(held) = hold_floor(store, now_ms) else {
+        return (KV_RESULT_INTERNAL, 0);
+    };
+    let to = rev.min(held);
+    if to > store.compact_revision() {
+        store.set_compact_revision(to);
+    }
     (KV_RESULT_OK, 0)
+}
+
+/// Retention holds' keyspace ([`KV_OP_RETAIN`]): the store's own, under
+/// the zero tenant and database whoever takes one (compaction is the
+/// store's, not one identity's). A hold is `name` →
+/// `[floor:u64 LE][expires_ms:u64 LE]` (0: never), on the store's clock.
+pub const KS_RETENTION_HOLD: u32 = 0x800D_0002;
+/// Lapsed holds one [`KV_OP_RETAIN`] removes as it applies.
+const RETAIN_SWEEP: usize = 4;
+const HOLD_VALUE_LEN: usize = 16;
+
+fn in_hold_space<M: Materializer, R>(store: &mut M, f: impl FnOnce(&mut M) -> R) -> R {
+    let (t, d, k) = store.key_identity();
+    store.set_key_identity(0, 0, KS_RETENTION_HOLD);
+    let r = f(store);
+    store.set_key_identity(t, d, k);
+    r
+}
+
+/// A hold record's `(floor, expires_ms)`.
+fn hold_value(v: &[u8]) -> Option<(u64, u64)> {
+    let v = v.get(..HOLD_VALUE_LEN)?;
+    Some((
+        u64::from_le_bytes(v[0..8].try_into().ok()?),
+        u64::from_le_bytes(v[8..16].try_into().ok()?),
+    ))
+}
+
+fn hold_lives(expires_ms: u64, now_ms: u64) -> bool {
+    expires_ms == 0 || now_ms < expires_ms
+}
+
+/// Remove the hold record `name` when there is one: `false` on a fault.
+fn remove_hold<M: Materializer>(store: &mut M, name: &[u8], now_ms: u64) -> bool {
+    in_hold_space(store, |s| {
+        let mut v = [0u8; HOLD_VALUE_LEN];
+        match s.get_live(name, now_ms, &mut v) {
+            GetOutcome::Absent => true,
+            GetOutcome::Found { .. } | GetOutcome::TooBig => s.remove_meta(name),
+            GetOutcome::Fault => false,
+        }
+    })
+}
+
+/// The lowest live hold's floor (`u64::MAX`: none); `None` on a fault.
+pub fn hold_floor<M: Materializer>(store: &mut M, now_ms: u64) -> Option<u64> {
+    let mut low = u64::MAX;
+    let r = in_hold_space(store, |s| {
+        s.walk_live_meta(&[], &[], 0, now_ms, |_, v, _| {
+            if let Some((floor, exp)) = hold_value(v) {
+                if hold_lives(exp, now_ms) && floor < low {
+                    low = floor;
+                }
+            }
+            true
+        })
+    });
+    (r == KV_RESULT_OK).then_some(low)
+}
+
+/// [`KV_OP_RETAIN`]: take, move, renew or release one hold (the rules
+/// are the op's docs).
+fn apply_retain<M: Materializer>(
+    store: &mut M,
+    body: &[u8],
+    out: &mut [u8],
+    now_ms: u64,
+) -> (u8, usize) {
+    const BAD: (u8, usize) = (KV_RESULT_INTERNAL, 0);
+    let mut off = 0usize;
+    let (Some(floor), Some(ttl)) = (read_u64(body, &mut off), read_u64(body, &mut off)) else {
+        return BAD;
+    };
+    let Some(name) = read_key(body, &mut off) else {
+        return BAD;
+    };
+    if name.len() > types::RETAIN_NAME_MAX
+        || off != body.len()
+        || out.len() < types::RETAIN_ANSWER_LEN
+    {
+        return BAD;
+    }
+    let mut at = 0u64;
+    if !name.is_empty() {
+        // Lapsed holds go first, a few per op (a lapsed hold already
+        // holds nothing: this is only its record).
+        let mut lapsed = [[0u8; types::RETAIN_NAME_MAX]; RETAIN_SWEEP];
+        let mut lapsed_len = [0usize; RETAIN_SWEEP];
+        let mut n = 0usize;
+        let walked = in_hold_space(store, |s| {
+            s.walk_live_meta(&[], &[], 0, now_ms, |k, v, _| {
+                let gone = hold_value(v).is_none_or(|(_, exp)| !hold_lives(exp, now_ms));
+                if gone && k != name && k.len() <= types::RETAIN_NAME_MAX {
+                    lapsed[n][..k.len()].copy_from_slice(k);
+                    lapsed_len[n] = k.len();
+                    n += 1;
+                }
+                n < RETAIN_SWEEP
+            })
+        });
+        if walked != KV_RESULT_OK {
+            return BAD;
+        }
+        for i in 0..n {
+            if !remove_hold(store, &lapsed[i][..lapsed_len[i]], now_ms) {
+                return BAD;
+            }
+        }
+        if floor == 0 {
+            if !remove_hold(store, name, now_ms) {
+                return BAD;
+            }
+        } else {
+            at = if floor == types::RETAIN_AT_CURRENT {
+                store.revision()
+            } else {
+                floor
+            };
+            if at < store.compact_revision() {
+                return (KV_RESULT_COMPACTED, 0);
+            }
+            if at > store.revision() {
+                return (KV_RESULT_FUTURE_REV, 0);
+            }
+            let expires = if ttl == 0 {
+                0
+            } else {
+                now_ms.saturating_add(ttl).max(1)
+            };
+            let mut v = [0u8; HOLD_VALUE_LEN];
+            v[0..8].copy_from_slice(&at.to_le_bytes());
+            v[8..16].copy_from_slice(&expires.to_le_bytes());
+            if !in_hold_space(store, |s| s.put_meta(name, &v)) {
+                return BAD;
+            }
+        }
+    }
+    let Some(low) = hold_floor(store, now_ms) else {
+        return BAD;
+    };
+    out[0..8].copy_from_slice(&at.to_le_bytes());
+    out[8..16].copy_from_slice(&store.compact_revision().to_le_bytes());
+    out[16..24].copy_from_slice(&low.to_le_bytes());
+    (KV_RESULT_OK, types::RETAIN_ANSWER_LEN)
 }
 
 /// [`KV_OP_HASH_KV`]: an order-free digest of the live keys at a
@@ -6852,6 +7073,11 @@ fn apply_etcd_txn<M: Materializer>(
         let Some((kind, len)) = etcd_op_head(ops, p) else {
             return (KV_RESULT_INTERNAL, 0);
         };
+        if !(types::ETCD_OP_RANGE..=types::ETCD_OP_PUT_MANIFEST).contains(&kind) {
+            // A branch op kind from a newer peer: refused before any op of
+            // the branch applies.
+            return (KV_RESULT_UNSUPPORTED, 0);
+        }
         let key = etcd_op_key(kind, &ops[p + 5..p + 5 + len]);
         let mut q = p + 5 + len;
         if let Some(k) = key {
@@ -6887,7 +7113,8 @@ fn apply_etcd_txn<M: Materializer>(
             types::ETCD_OP_PUT_MANIFEST => apply_put(store, op_body, sub, now_ms, true),
             3 => apply_delete_meta(store, op_body, sub, now_ms),
             4 => apply_etcd_txn(store, op_body, sub, now_ms, depth + 1),
-            _ => (KV_RESULT_INTERNAL, 0),
+            // A branch op kind from a newer peer.
+            _ => (KV_RESULT_UNSUPPORTED, 0),
         };
         if !matches!(r, KV_RESULT_OK | KV_RESULT_KVS | KV_RESULT_ETCD_TXN) {
             // An op the store refused ends the transaction with its reason.

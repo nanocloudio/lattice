@@ -59,6 +59,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/types.rs"]
 mod types;
 
+#[path = "../../common/kv_large.rs"]
+mod kv_large;
+
 #[path = "../../common/wire.rs"]
 mod wire;
 
@@ -104,9 +107,40 @@ use abi::contracts::net::net_proto::{
 /// Active client slots — same rationale as `redis_edge_anchor`. 64
 /// slots × ~16 KiB per slot ≈ 1 MiB of state arena.
 const MAX_CONNS: usize = 64;
-const RECV_BUF_SIZE: usize = 8192;
-const SEND_BUF_SIZE: usize = 8192;
-const SCRATCH_BUF_SIZE: usize = 8192 + 64;
+/// A storage command with a value at the point protocols' bound
+/// (`kv_large::VALUE_MAX`), its line and its data block, arrives whole.
+const RECV_BUF_SIZE: usize = kv_large::VALUE_MAX + 1024;
+/// A `VALUE` reply at the bound, with its line and `END`, and room for
+/// the replies beside it.
+const SEND_BUF_SIZE: usize = kv_large::VALUE_MAX + 1024;
+/// Scratch for NET_CMD frames and KV envelopes: every envelope the
+/// router writes (`wire::FRAME_PAYLOAD_MAX`) is read whole into it.
+const SCRATCH_BUF_SIZE: usize = RECV_BUF_SIZE + 64;
+const _: () = assert!(SCRATCH_BUF_SIZE >= wire::FRAME_PAYLOAD_MAX);
+/// Bytes one NET send carries: a frame the net channel can always take
+/// whole (a longer one is never taken, and the connection would stall).
+const NET_CHUNK: usize = 4096;
+/// Large-value sessions at once (a write carried as chunks, or a read
+/// expanded from them). A command that finds every one busy waits, in
+/// its connection's order, for the next to free.
+const LG_SESSIONS: usize = 4;
+/// A session's request body, marked or rewritten, and each exchange.
+const LG_BODY: usize = SCRATCH_BUF_SIZE - 64;
+const LG_WORK: usize = kv_large::mark_room(LG_BODY);
+/// A session's answer, expanded: one value at the bound.
+const LG_OUT: usize = kv_large::VALUE_MAX + 256;
+/// The conn byte of chunk exchanges (no slot index is this).
+const LG_CHUNK_CONN: u8 = u8::MAX;
+/// A session's exchange waiting for room on `kv_out`.
+const LG_UNSENT: u64 = 1;
+/// A session that has not finished in this long is abandoned; its
+/// command is answered `SERVER_ERROR`.
+const LG_STALL_MS: u64 = 30_000;
+/// Answers a connection holds while one of its commands is carried
+/// through a session, in order, raw: replayed once it is answered.
+const HOLD_BYTES: usize = 16384;
+/// `get`/`gets` batches one connection has in flight at once (pipelined).
+const GET_BATCHES: usize = 32;
 const MAX_INFLIGHT: usize = 256;
 const DEFAULT_LISTEN_PORT: u16 = 11211;
 
@@ -139,18 +173,33 @@ enum SlotPhase {
 struct Slot {
     conn_id: u16,
     phase: SlotPhase,
-    // Number of GET requests currently in flight for the current
-    // `get`/`gets` batch on this slot. `END\r\n` is emitted only when
-    // this drains to 0 AND `pending_get_emit_end` is true — guarantees
-    // VALUE lines precede the END terminator on the wire.
-    pending_gets: u16,
-    pending_get_emit_end: bool,
+    // The keys each `get`/`gets` batch in flight on this slot has still to
+    // answer, oldest first (a ring of `GET_BATCHES` from `batch_head`):
+    // its `END\r\n` goes out once its last key is answered — after every
+    // VALUE line of it, and before anything a later command answers. One
+    // counter for every batch (the earlier shape) wrote one END for two
+    // pipelined batches, and the client waited on the other forever.
+    batches: [u16; GET_BATCHES],
+    batch_head: u8,
+    batch_len: u8,
     _pad: u8,
     tenant: u32,
     recv_buf: [u8; RECV_BUF_SIZE],
     recv_len: usize,
     send_buf: [u8; SEND_BUF_SIZE],
     send_len: usize,
+    /// Data-block bytes still to discard (a storage command refused for
+    /// its size: its block is read and dropped, never parsed).
+    swallow: usize,
+    /// One of this connection's commands is in a large-value session;
+    /// every answer after it waits in `held`.
+    lg_active: bool,
+    /// Answers waiting behind the session, in arrival order, each
+    /// `[kind:u8][len:u16][…]`: kind 0 a raw KV answer
+    /// (`[op:u8][key_len:u8][key][result:u8][revision:u64][body]`),
+    /// kind 1 a reply already rendered.
+    held: [u8; HOLD_BYTES],
+    held_len: usize,
 }
 
 impl Slot {
@@ -158,14 +207,19 @@ impl Slot {
         Self {
             conn_id: SLOT_FREE,
             phase: SlotPhase::Open,
-            pending_gets: 0,
-            pending_get_emit_end: false,
+            batches: [0; GET_BATCHES],
+            batch_head: 0,
+            batch_len: 0,
             _pad: 0,
             tenant: DEFAULT_TENANT,
             recv_buf: [0; RECV_BUF_SIZE],
             recv_len: 0,
             send_buf: [0; SEND_BUF_SIZE],
             send_len: 0,
+            swallow: 0,
+            lg_active: false,
+            held: [0; HOLD_BYTES],
+            held_len: 0,
         }
     }
 
@@ -173,9 +227,35 @@ impl Slot {
         self.tenant = DEFAULT_TENANT;
         self.recv_len = 0;
         self.send_len = 0;
-        self.pending_gets = 0;
-        self.pending_get_emit_end = false;
+        self.batch_head = 0;
+        self.batch_len = 0;
+        self.swallow = 0;
+        self.lg_active = false;
+        self.held_len = 0;
     }
+}
+
+/// One large-value session: the command it carries, its exchange in
+/// flight, and whom it answers.
+struct LgSlot {
+    session: kv_large::Session,
+    /// The exchange in flight; [`LG_UNSENT`] waiting for room; 0 = free.
+    corr: u64,
+    slot_idx: usize,
+    conn_id: u16,
+    mem_op: u8,
+    key_len: u8,
+    key: [u8; 250],
+    tenant: u32,
+    consistency: u8,
+    since_ms: u64,
+    unsent_op: u8,
+    unsent_len: usize,
+    req_len: usize,
+    req: [u8; LG_BODY],
+    work: [u8; LG_WORK],
+    send: [u8; LG_WORK],
+    out: [u8; LG_OUT],
 }
 
 // ── Anchor ────────────────────────────────────────────────────────────
@@ -245,6 +325,9 @@ struct AnchorState {
     /// Outbound envelopes are built here; an inbound envelope is read
     /// whole into it (header room, then the payload).
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
+    /// Large values: the sessions, and one envelope for their exchanges.
+    lg: [LgSlot; LG_SESSIONS],
+    lg_env: [u8; 3 + wire::KV_REQUEST_PAYLOAD_MAX],
 }
 
 impl AnchorState {
@@ -273,6 +356,10 @@ impl AnchorState {
         while i < MAX_CONNS {
             self.slots[i] = Slot::free();
             i += 1;
+        }
+        for l in self.lg.iter_mut() {
+            l.corr = 0;
+            l.session = kv_large::Session::new();
         }
     }
 
@@ -570,13 +657,20 @@ unsafe fn handle_get(anchor: &mut AnchorState, slot_idx: usize, line: &Line, get
     // slot to emit END when the response handler drains the last GET.
     // For an empty key list (shouldn't happen — the line parser
     // requires at least one key after `get`), emit END immediately.
-    let slot = &mut anchor.slots[slot_idx];
     if dispatched == 0 {
-        let _ = append(&mut slot.send_buf, &mut slot.send_len, b"END\r\n");
-    } else {
-        slot.pending_gets = slot.pending_gets.saturating_add(dispatched);
-        slot.pending_get_emit_end = true;
+        reply_in_order(anchor, slot_idx, b"END\r\n");
+        return;
     }
+    let slot = &mut anchor.slots[slot_idx];
+    if slot.batch_len as usize == GET_BATCHES {
+        // More batches in flight than the ring holds: their ENDs could no
+        // longer be placed, so the connection is closed.
+        slot.phase = SlotPhase::Closing;
+        return;
+    }
+    let at = (slot.batch_head as usize + slot.batch_len as usize) % GET_BATCHES;
+    slot.batches[at] = dispatched;
+    slot.batch_len += 1;
 }
 
 unsafe fn handle_storage(
@@ -661,6 +755,33 @@ unsafe fn handle_storage(
             );
             return;
         }
+    }
+
+    // A value past the point protocols' bound: memcached's own answer,
+    // before anything is sent.
+    if value.len() > kv_large::VALUE_MAX {
+        reply_in_order(
+            anchor,
+            slot_idx,
+            b"SERVER_ERROR object too large for cache\r\n",
+        );
+        return;
+    }
+    // A value past one replicated write goes as chunks, then a manifest
+    // write, through a large-value session.
+    if op == KV_OP_PUT && kv_large::carries_large(op, &body[..at], kv_large::ENTRY_BODY_MAX) {
+        if !lg_begin(
+            anchor,
+            slot_idx,
+            op,
+            REQ_LINEARIZABLE,
+            mem_op,
+            key,
+            &body[..at],
+        ) {
+            reply_in_order(anchor, slot_idx, b"SERVER_ERROR busy, retry\r\n");
+        }
+        return;
     }
 
     if !send_envelope(
@@ -861,6 +982,29 @@ unsafe fn dispatch_one(anchor: &mut AnchorState, slot_idx: usize) -> bool {
         let bytes_token = line.tokens[4];
         let bytes_value =
             parse_u32_dec(token_bytes(&anchor.slots[slot_idx].recv_buf, bytes_token)).unwrap_or(0);
+        if bytes_value as usize > kv_large::VALUE_MAX {
+            // Larger than any value this edge takes: refused as memcached
+            // refuses one, its data block read and dropped as it arrives.
+            reply_in_order(
+                anchor,
+                slot_idx,
+                b"SERVER_ERROR object too large for cache\r\n",
+            );
+            let s = &mut anchor.slots[slot_idx];
+            let consumed = line.line_end.min(s.recv_len);
+            let rest = s.recv_len - consumed;
+            let block = bytes_value as usize + 2;
+            let drop = rest.min(block);
+            s.swallow = block - drop;
+            let from = consumed + drop;
+            if from >= s.recv_len {
+                s.recv_len = 0;
+            } else {
+                s.recv_buf.copy_within(from..s.recv_len, 0);
+                s.recv_len -= from;
+            }
+            return true;
+        }
         let data_start = line.line_end;
         let data_total = data_start + bytes_value as usize + 2; // includes trailing \r\n
         if anchor.slots[slot_idx].recv_len < data_total {
@@ -980,9 +1124,19 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     }
 
     // Copy body before mutating slots (scratch + slots both live in AnchorState).
-    let mut body = [0u8; 4096];
-    let blen = body_len.min(4096);
+    let mut body = [0u8; wire::KV_RESPONSE_BODY_MAX];
+    let blen = body_len.min(body.len());
     body[..blen].copy_from_slice(&anchor.scratch[body_off..body_off + blen]);
+
+    // An exchange of a large-value session.
+    if let Some(i) = anchor
+        .lg
+        .iter()
+        .position(|l| l.corr == corr_id && l.corr > LG_UNSENT)
+    {
+        lg_reply(anchor, i, result, &body[..blen]);
+        return true;
+    }
 
     let Some(inflight) = anchor.inflight.remove(corr_id) else {
         return true;
@@ -994,10 +1148,69 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
     if slot_idx >= MAX_CONNS || anchor.slots[slot_idx].conn_id == SLOT_FREE {
         return true;
     }
+    let key = &inflight.key[..(inflight.key_len as usize).min(KEY_HELD_MAX)];
+    deliver(
+        anchor,
+        slot_idx,
+        inflight.op,
+        key,
+        result,
+        revision,
+        &body[..blen],
+    );
+    true
+}
 
+/// The longest key a held answer or a session keeps (memcached keys are
+/// at most 250 bytes).
+const KEY_HELD_MAX: usize = 250;
+
+/// Answer one command on `slot_idx`, in its connection's order: rendered
+/// now, or held behind a command still in a large-value session (or
+/// behind answers already held, or for room in `send_buf`); a GET that
+/// met a large value is expanded through a session first.
+fn deliver(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    op: u8,
+    key: &[u8],
+    result: u8,
+    revision: u64,
+    body: &[u8],
+) {
+    let mem_op = MemOp::from_u8(op).unwrap_or(MemOp::Get);
+    let s = &anchor.slots[slot_idx];
+    let room = SEND_BUF_SIZE - s.send_len;
+    if s.lg_active || s.held_len > 0 || room < body.len() + key.len() + 96 {
+        hold_raw(anchor, slot_idx, op, key, result, revision, body);
+        return;
+    }
+    if result == types::KV_RESULT_MANIFEST
+        && !body.is_empty()
+        && matches!(mem_op, MemOp::Get | MemOp::Gets)
+    {
+        // Everything behind it waits; with no session free, it waits too.
+        anchor.slots[slot_idx].lg_active = true;
+        if !lg_expand(anchor, slot_idx, op, key, result, body) {
+            hold_raw(anchor, slot_idx, op, key, result, revision, body);
+        }
+        return;
+    }
+    render(anchor, slot_idx, mem_op, key, result, revision, body);
+}
+
+/// The reply to one command into `send_buf`, and the `END` of a GET
+/// batch once its last key is answered.
+fn render(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    mem_op: MemOp,
+    key: &[u8],
+    result: u8,
+    revision: u64,
+    body: &[u8],
+) {
     let slot = &mut anchor.slots[slot_idx];
-    let mem_op = MemOp::from_u8(inflight.op).unwrap_or(MemOp::Get);
-    let key = &inflight.key[..inflight.key_len as usize];
     encode_reply(
         &mut slot.send_buf,
         &mut slot.send_len,
@@ -1005,21 +1218,385 @@ unsafe fn handle_kv_response(anchor: &mut AnchorState) -> bool {
         key,
         result,
         revision,
-        &body[..blen],
+        body,
     );
     // GET/GETS batches: decrement the pending counter and emit the
     // terminating END\r\n once the final response lands. This ordering
     // (VALUE lines first, then END) is what real memcached clients
     // require — the dispatch-side shortcut of emitting END synchronously
     // caused VALUE bytes to arrive after END and desynchronised parsers.
-    if matches!(mem_op, MemOp::Get | MemOp::Gets) && slot.pending_gets > 0 {
-        slot.pending_gets -= 1;
-        if slot.pending_gets == 0 && slot.pending_get_emit_end {
-            slot.pending_get_emit_end = false;
+    if matches!(mem_op, MemOp::Get | MemOp::Gets) && slot.batch_len > 0 {
+        let h = slot.batch_head as usize;
+        slot.batches[h] = slot.batches[h].saturating_sub(1);
+        if slot.batches[h] == 0 {
+            slot.batch_head = ((h + 1) % GET_BATCHES) as u8;
+            slot.batch_len -= 1;
             let _ = append(&mut slot.send_buf, &mut slot.send_len, b"END\r\n");
         }
     }
+}
+
+/// An inline reply, in its connection's order: behind held answers when
+/// there are any.
+fn reply_in_order(anchor: &mut AnchorState, slot_idx: usize, text: &[u8]) {
+    let s = &mut anchor.slots[slot_idx];
+    if s.lg_active || s.held_len > 0 {
+        hold_push(s, 1, &[text]);
+    } else {
+        let _ = append(&mut s.send_buf, &mut s.send_len, text);
+    }
+}
+
+fn hold_raw(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    op: u8,
+    key: &[u8],
+    result: u8,
+    revision: u64,
+    body: &[u8],
+) {
+    let kl = key.len().min(KEY_HELD_MAX);
+    let s = &mut anchor.slots[slot_idx];
+    hold_push(
+        s,
+        0,
+        &[
+            &[op, kl as u8],
+            &key[..kl],
+            &[result],
+            &revision.to_le_bytes(),
+            body,
+        ],
+    );
+}
+
+/// Append one held entry. A connection whose answers outgrow the hold can
+/// no longer be answered in order, and is closed.
+fn hold_push(s: &mut Slot, kind: u8, parts: &[&[u8]]) {
+    let mut len = 0usize;
+    for p in parts {
+        len += p.len();
+    }
+    if s.held_len + 3 + len > HOLD_BYTES || len > u16::MAX as usize {
+        s.phase = SlotPhase::Closing;
+        return;
+    }
+    let at = s.held_len;
+    s.held[at] = kind;
+    s.held[at + 1..at + 3].copy_from_slice(&(len as u16).to_le_bytes());
+    let mut p = at + 3;
+    for part in parts {
+        s.held[p..p + part.len()].copy_from_slice(part);
+        p += part.len();
+    }
+    s.held_len = p;
+}
+
+/// Answer held entries in order while the connection waits on no session
+/// and `send_buf` has room; the rest stay held.
+fn release_held(anchor: &mut AnchorState, slot_idx: usize) {
+    let mut at = 0usize;
+    loop {
+        let s = &anchor.slots[slot_idx];
+        if s.lg_active || at >= s.held_len {
+            break;
+        }
+        let kind = s.held[at];
+        let len = u16::from_le_bytes([s.held[at + 1], s.held[at + 2]]) as usize;
+        if SEND_BUF_SIZE - s.send_len < len + 300 {
+            break;
+        }
+        let mut e = [0u8; HOLD_BYTES];
+        e[..len].copy_from_slice(&s.held[at + 3..at + 3 + len]);
+        if kind == 1 {
+            at += 3 + len;
+            let s = &mut anchor.slots[slot_idx];
+            let _ = append(&mut s.send_buf, &mut s.send_len, &e[..len]);
+            continue;
+        }
+        let (op, kl) = (e[0], e[1] as usize);
+        let mut key = [0u8; KEY_HELD_MAX];
+        key[..kl].copy_from_slice(&e[2..2 + kl]);
+        let result = e[2 + kl];
+        let revision = u64::from_le_bytes(e[3 + kl..11 + kl].try_into().unwrap_or([0; 8]));
+        let body = &e[11 + kl..len];
+        let mem_op = MemOp::from_u8(op).unwrap_or(MemOp::Get);
+        if result == types::KV_RESULT_MANIFEST
+            && !body.is_empty()
+            && matches!(mem_op, MemOp::Get | MemOp::Gets)
+        {
+            anchor.slots[slot_idx].lg_active = true;
+            if !lg_expand(anchor, slot_idx, op, &key[..kl], result, body) {
+                // Still no session free: it stays at the head.
+                break;
+            }
+            at += 3 + len;
+            continue;
+        }
+        at += 3 + len;
+        render(anchor, slot_idx, mem_op, &key[..kl], result, revision, body);
+    }
+    let s = &mut anchor.slots[slot_idx];
+    let at = at.min(s.held_len);
+    s.held.copy_within(at..s.held_len, 0);
+    s.held_len -= at;
+}
+
+// ── Large values ──────────────────────────────────────────────────────
+
+/// Carry a write with a large value through a free session. `false`: none
+/// is free, or the connection already waits on one (its order would not
+/// hold) — the caller answers busy.
+unsafe fn lg_begin(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    op: u8,
+    consistency: u8,
+    mem_op: MemOp,
+    key: &[u8],
+    body: &[u8],
+) -> bool {
+    if anchor.slots[slot_idx].lg_active || anchor.slots[slot_idx].held_len > 0 {
+        return false;
+    }
+    let Some(i) = anchor.lg.iter().position(|l| l.corr == 0) else {
+        return false;
+    };
+    if body.len() > LG_BODY {
+        return false;
+    }
+    lg_claim(anchor, i, slot_idx, mem_op as u8, key, consistency);
+    let act = {
+        let l = &mut anchor.lg[i];
+        l.req[..body.len()].copy_from_slice(body);
+        l.req_len = body.len();
+        let LgSlot {
+            session,
+            req,
+            req_len,
+            work,
+            send,
+            ..
+        } = l;
+        session.begin(op, &req[..*req_len], work, send)
+    };
+    anchor.slots[slot_idx].lg_active = true;
+    lg_act(anchor, i, act, None);
     true
+}
+
+/// Expand a GET's manifest answer through a free session: `false` when
+/// none is free.
+fn lg_expand(
+    anchor: &mut AnchorState,
+    slot_idx: usize,
+    op: u8,
+    key: &[u8],
+    result: u8,
+    body: &[u8],
+) -> bool {
+    let Some(i) = anchor.lg.iter().position(|l| l.corr == 0) else {
+        return false;
+    };
+    lg_claim(anchor, i, slot_idx, op, key, REQ_SERIALIZABLE);
+    let act = {
+        let l = &mut anchor.lg[i];
+        l.req_len = 0;
+        let LgSlot {
+            session, send, out, ..
+        } = l;
+        session.expand(KV_OP_GET, &[], result, body, send, out)
+    };
+    lg_act(anchor, i, act, None);
+    true
+}
+
+fn lg_claim(
+    anchor: &mut AnchorState,
+    i: usize,
+    slot_idx: usize,
+    op: u8,
+    key: &[u8],
+    consistency: u8,
+) {
+    let now = if anchor.syscalls.is_null() {
+        0
+    } else {
+        unsafe { dev_millis(&*anchor.syscalls) }
+    };
+    let (conn_id, tenant) = (
+        anchor.slots[slot_idx].conn_id,
+        anchor.slots[slot_idx].tenant,
+    );
+    let l = &mut anchor.lg[i];
+    l.corr = LG_UNSENT;
+    l.unsent_op = 0;
+    l.unsent_len = 0;
+    l.slot_idx = slot_idx;
+    l.conn_id = conn_id;
+    l.tenant = tenant;
+    l.mem_op = op;
+    let kl = key.len().min(KEY_HELD_MAX);
+    l.key[..kl].copy_from_slice(&key[..kl]);
+    l.key_len = kl as u8;
+    l.consistency = consistency;
+    l.since_ms = now;
+}
+
+/// Carry out what session `i` asks: its next exchange, or its answer.
+/// `as_is`: the reply that ended it.
+fn lg_act(
+    anchor: &mut AnchorState,
+    i: usize,
+    act: Result<kv_large::Act, kv_large::LargeError>,
+    as_is: Option<(u8, &[u8])>,
+) {
+    match act {
+        Ok(kv_large::Act::Send(op, n)) => lg_send(anchor, i, op, n),
+        Ok(kv_large::Act::Done(result, n)) => {
+            let mut out = [0u8; LG_OUT];
+            let n = n.min(LG_OUT);
+            out[..n].copy_from_slice(&anchor.lg[i].out[..n]);
+            lg_finish(anchor, i, result, &out[..n]);
+        }
+        Ok(kv_large::Act::AsIs) => match as_is {
+            Some((result, body)) => lg_finish(anchor, i, result, body),
+            None => lg_finish(anchor, i, KV_RESULT_INTERNAL, &[]),
+        },
+        Err(kv_large::LargeError::Overflow) => {
+            lg_finish(anchor, i, types::KV_RESULT_TOO_LARGE, &[])
+        }
+        Err(_) => lg_finish(anchor, i, KV_RESULT_INTERNAL, &[]),
+    }
+}
+
+/// Send session `i`'s exchange (`op`, its `send[..n]`); with no room on
+/// `kv_out` it waits for [`lg_step`].
+fn lg_send(anchor: &mut AnchorState, i: usize, op: u8, n: usize) {
+    const REQ_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
+    let payload = REQ_HEAD + n;
+    if payload > wire::KV_REQUEST_PAYLOAD_MAX || n > LG_WORK {
+        lg_finish(anchor, i, types::KV_RESULT_TOO_LARGE, &[]);
+        return;
+    }
+    let corr = anchor.next_corr();
+    let chunk = op == kv_large::UPLOAD_OP || op == kv_large::FETCH_OP;
+    let (slot_byte, consistency) = if chunk {
+        (LG_CHUNK_CONN, REQ_SERIALIZABLE)
+    } else {
+        (anchor.lg[i].slot_idx as u8, anchor.lg[i].consistency)
+    };
+    let tenant = anchor.lg[i].tenant;
+    {
+        let AnchorState { lg, lg_env, .. } = &mut *anchor;
+        lg_env[0] = MSG_KV_REQUEST;
+        lg_env[1..3].copy_from_slice(&(payload as u16).to_le_bytes());
+        lg_env[3..11].copy_from_slice(&corr.to_le_bytes());
+        lg_env[11] = PROTO_MEMCACHED;
+        lg_env[12..16].copy_from_slice(&tenant.to_le_bytes());
+        lg_env[16] = slot_byte;
+        lg_env[17] = consistency;
+        lg_env[18] = op;
+        lg_env[19..21].copy_from_slice(&(n as u16).to_le_bytes());
+        lg_env[21..21 + n].copy_from_slice(&lg[i].send[..n]);
+    }
+    let total = 3 + payload;
+    let (sys, kv_out) = (anchor.syscalls, anchor.kv_out);
+    let wrote = !sys.is_null()
+        && kv_out >= 0
+        && unsafe { ((*sys).channel_write)(kv_out, anchor.lg_env.as_mut_ptr(), total) }
+            == total as i32;
+    let l = &mut anchor.lg[i];
+    if wrote {
+        l.corr = corr;
+    } else {
+        l.corr = LG_UNSENT;
+        l.unsent_op = op;
+        l.unsent_len = n;
+    }
+}
+
+/// A reply to session `i`'s exchange.
+fn lg_reply(anchor: &mut AnchorState, i: usize, result: u8, body: &[u8]) {
+    let act = {
+        let LgSlot {
+            session,
+            req,
+            req_len,
+            work,
+            send,
+            out,
+            ..
+        } = &mut anchor.lg[i];
+        session.reply(&req[..*req_len], work, result, body, send, out)
+    };
+    lg_act(anchor, i, act, Some((result, body)));
+}
+
+/// Answer session `i`'s command, free the session, and release what its
+/// connection — and any connection waiting for a session — holds.
+fn lg_finish(anchor: &mut AnchorState, i: usize, result: u8, body: &[u8]) {
+    let (slot_idx, conn_id, op, kl) = (
+        anchor.lg[i].slot_idx,
+        anchor.lg[i].conn_id,
+        anchor.lg[i].mem_op,
+        anchor.lg[i].key_len as usize,
+    );
+    let mut key = [0u8; KEY_HELD_MAX];
+    key[..kl].copy_from_slice(&anchor.lg[i].key[..kl]);
+    anchor.lg[i].corr = 0;
+    anchor.lg[i].session.reset();
+    if anchor.slots[slot_idx].conn_id == conn_id {
+        anchor.slots[slot_idx].lg_active = false;
+        let mem_op = MemOp::from_u8(op).unwrap_or(MemOp::Get);
+        render(anchor, slot_idx, mem_op, &key[..kl], result, 0, body);
+        release_held(anchor, slot_idx);
+    }
+    release_waiting(anchor);
+}
+
+/// Connections holding a large answer no session took: a free session
+/// takes it (`release_held` starts it), in slot order.
+fn release_waiting(anchor: &mut AnchorState) {
+    for s in 0..MAX_CONNS {
+        if !anchor.lg.iter().any(|l| l.corr == 0) {
+            return;
+        }
+        let busy = anchor.lg.iter().any(|l| l.corr != 0 && l.slot_idx == s);
+        let slot = &anchor.slots[s];
+        if slot.conn_id != SLOT_FREE && slot.lg_active && !busy && slot.held_len > 0 {
+            anchor.slots[s].lg_active = false;
+            release_held(anchor, s);
+        }
+    }
+}
+
+/// Each step: resend exchanges that found no room, abandon sessions that
+/// never came back, and release held answers `send_buf` now has room for.
+fn lg_step(anchor: &mut AnchorState) {
+    if !anchor.syscalls.is_null() && anchor.lg.iter().any(|l| l.corr != 0) {
+        let now = unsafe { dev_millis(&*anchor.syscalls) };
+        for i in 0..LG_SESSIONS {
+            let l = &anchor.lg[i];
+            if l.corr == 0 {
+                continue;
+            }
+            if now.saturating_sub(l.since_ms) > LG_STALL_MS {
+                lg_finish(anchor, i, KV_RESULT_INTERNAL, &[]);
+            } else if l.corr == LG_UNSENT && l.unsent_op != 0 {
+                let (op, n) = (l.unsent_op, l.unsent_len);
+                lg_send(anchor, i, op, n);
+            }
+        }
+    }
+    for s in 0..MAX_CONNS {
+        let slot = &anchor.slots[s];
+        if slot.conn_id != SLOT_FREE && !slot.lg_active && slot.held_len > 0 {
+            release_held(anchor, s);
+        }
+    }
+    release_waiting(anchor);
 }
 
 // ── NET-side handling ─────────────────────────────────────────────────
@@ -1196,6 +1773,13 @@ unsafe fn net_send_data(anchor: &mut AnchorState, conn_id: u16, data: &[u8]) -> 
 }
 
 fn handle_client_data(anchor: &mut AnchorState, slot_idx: usize, data: &[u8]) {
+    // What is left of a refused data block goes first, unread.
+    let skip = anchor.slots[slot_idx].swallow.min(data.len());
+    anchor.slots[slot_idx].swallow -= skip;
+    let data = &data[skip..];
+    if data.is_empty() {
+        return;
+    }
     {
         let slot = &mut anchor.slots[slot_idx];
         let avail = RECV_BUF_SIZE - slot.recv_len;
@@ -1228,12 +1812,21 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
             i += 1;
             continue;
         }
-        if send_len > 0 {
-            let mut tmp = [0u8; SEND_BUF_SIZE];
-            tmp[..send_len].copy_from_slice(&anchor.slots[i].send_buf[..send_len]);
-            if net_send_data(anchor, conn_id, &tmp[..send_len]) {
-                anchor.slots[i].send_len = 0;
+        // Out in NET_CHUNK pieces, as far as the channel takes them.
+        let mut sent = 0usize;
+        while sent < send_len {
+            let n = (send_len - sent).min(NET_CHUNK);
+            let mut tmp = [0u8; NET_CHUNK];
+            tmp[..n].copy_from_slice(&anchor.slots[i].send_buf[sent..sent + n]);
+            if !net_send_data(anchor, conn_id, &tmp[..n]) {
+                break;
             }
+            sent += n;
+        }
+        if sent > 0 {
+            let s = &mut anchor.slots[i];
+            s.send_buf.copy_within(sent..s.send_len, 0);
+            s.send_len -= sent;
         }
         if phase == SlotPhase::Closing && anchor.slots[i].send_len == 0 {
             let _ = net_send_close(anchor, conn_id);
@@ -1317,6 +1910,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         poll_net_in(anchor);
         poll_kv_in(anchor);
+        lg_step(anchor);
         flush_slots(anchor);
 
         // Emit module-scope counters on `metrics_out` at a
