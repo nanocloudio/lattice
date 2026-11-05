@@ -245,6 +245,7 @@ unsafe fn put(
     arg[p] = 0; // precondition ANY
     arg[p + 1] = 0;
     p += 2;
+    p += 10; // no key reference, no retention, no hold
     arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
     arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());

@@ -99,6 +99,7 @@ row fails.
 | Change-log checkpoints | Shape | `CHECKPOINTS` | modules/common/change_ring.rs | 512 | Seek points kept into the change log, one per `CHECK_EVERY` entries: a seek scans at most that many entries past the nearest. Older checkpoints are overwritten as the log moves on. |
 | Key log per command | Capacity | `KEYLOG_BYTES` | modules/common/kv_store.rs | — | Bytes of keys one command may stage for the store provider's change log. A command whose keys overflow it (or that clears the keyspace, `FLUSH`) is a gap: every subscriber reads again and the log answers only from after it — never a silent loss. |
 | Store key | Shape | `KEY_MAX` | modules/common/store_provider.rs | 255 | The longest key the `storage.object`/`storage.namespace` provider takes (a LIST entry and a cursor carry its length in a byte). A longer key is refused `EINVAL` before the store is touched. |
+| Store key reference | Shape | `KEY_REF_MAX` | modules/common/store_provider.rs | 64 | fluxor's `KEY_REF_MAX`, the longest `key_ref` a `PUT` may name. This store keeps none: a longer one is malformed (`EINVAL`), a shorter one refused `ENOSYS`. |
 | Store inline value | Shape | `INLINE_MAX` | modules/common/store_provider.rs | — | Derived: one chunk's data (`kv_chunks::DATA_MAX`). A value up to it is stored whole and a read slot holds it inline; a larger one is uploaded as chunks under a manifest and read back through the value cache. |
 | Store fence buffer | Shape | `FENCE_WIRE_MAX` | modules/common/store_provider.rs | 62 | fluxor's `fence::WIRE_MAX_LEN`: a fence query's buffer holds any fence. A caller's fence buffer shorter than a fence gets none written, never a partial one. |
 | Store LIST trailer | Shape | `TRAILER_MAX` | modules/common/store_provider.rs | — | Derived: `3 + KEY_MAX`, the page trailer and the longest cursor. An entry that would leave the page no room for it ends the page there, that entry's key its cursor (the next page starts at it). |
@@ -772,6 +773,7 @@ WINDOW | modules/common/store_provider.rs | 8
 CHUNK_WINDOW | modules/common/store_provider.rs | 4
 SCOPE_NAME_MAX | modules/common/store_provider.rs | 63
 SCOPED_MAX | modules/common/store_provider.rs | 512
+KEY_REF_MAX | modules/common/store_provider.rs | 64
 SCOPE_HEAD_MAX | modules/common/store_provider.rs | -
 SCOPED_ARG_MAX | modules/common/store_provider.rs | 1024
 ORIGIN_SKIP_LOG_MAX | modules/app/kv_state_worker/mod.rs | 32

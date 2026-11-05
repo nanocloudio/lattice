@@ -115,6 +115,9 @@ pub const OBJ_HEAD: u32 = 0x1422;
 pub const OBJ_RANGE_GET: u32 = 0x1423;
 pub const OBJ_DELETE: u32 = 0x1424;
 pub const OBJ_CLOSE: u32 = 0x1425;
+/// Not served: this store keeps no retention. Answered `ENOSYS`, store or no
+/// store, never "ask again".
+pub const OBJ_RETAIN: u32 = 0x142C;
 pub const NS_LIST: u32 = 0x1302;
 pub const NS_SUBSCRIBE: u32 = 0x1305;
 pub const NS_CLOSE: u32 = 0x1306;
@@ -168,9 +171,15 @@ const FENCE_DURABLE_LEN: usize = 9;
 /// `fence::WIRE_MAX_LEN`: a fence query's buffer holds any fence.
 pub const FENCE_WIRE_MAX: usize = 62;
 
-/// HEAD's record: `[size u64][mtime u64][ct_len u8][etag_len u8][etag]`.
-pub const HEAD_LEN: usize = 50;
+/// HEAD's record: `[size u64][mtime u64][ct_len u8][etag_len u8][etag]`
+/// and an empty kept block.
+pub const HEAD_LEN: usize = 8 + 8 + 1 + 1 + ETAG_LEN + KEPT_FIXED_LEN;
 const ETAG_LEN: usize = 32;
+/// The kept block besides its key reference:
+/// `[key_ref_len u8][retain_until_ms u64][legal_hold u8]`.
+const KEPT_FIXED_LEN: usize = 1 + 8 + 1;
+/// Longest key reference a write may name.
+const KEY_REF_MAX: usize = 64;
 
 /// LIST's page trailer `[FF][FF][cursor_len u8]`, and the most a cursor
 /// (a key) adds to it.
@@ -1572,6 +1581,27 @@ fn precondition(a: &[u8], p: &mut usize) -> Option<(u8, u64)> {
     }
 }
 
+/// The kept block `[key_ref_len u8][key_ref][retain_until_ms u64]
+/// [legal_hold u8]` at `a[*p..]`. This store keeps none of it: a request for
+/// any of it is `ENOSYS`, so a write asked to be immutable is never stored as
+/// a deletable one. A malformed block is `EINVAL`.
+fn nothing_kept(a: &[u8], p: &mut usize) -> Result<(), i32> {
+    let len = *a.get(*p).ok_or(EINVAL)? as usize;
+    if len > KEY_REF_MAX {
+        return Err(EINVAL);
+    }
+    let until = rd64(a, *p + 1 + len).ok_or(EINVAL)?;
+    let hold = *a.get(*p + 1 + len + 8).ok_or(EINVAL)?;
+    if hold > 1 {
+        return Err(EINVAL);
+    }
+    *p += KEPT_FIXED_LEN + len;
+    if len != 0 || until != 0 || hold != 0 {
+        return Err(ENOSYS);
+    }
+    Ok(())
+}
+
 /// `[key_len u16][key]` at `a[*p..]`: a key the store can hold.
 fn key_at<'a>(a: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
     let k = field16(a, p)?;
@@ -1594,7 +1624,7 @@ struct WriteArgs<'a> {
 }
 
 /// `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64]
-/// [precondition][fence_ptr u64][fence_cap u16]`.
+/// [precondition][kept][fence_ptr u64][fence_cap u16]`.
 ///
 /// # Safety
 /// The contract names `body_len` readable bytes at `body_ptr`.
@@ -1609,6 +1639,7 @@ unsafe fn put_args(a: &[u8]) -> Result<WriteArgs<'_>, i32> {
     };
     p += 16;
     let (pre, rev) = precondition(a, &mut p).ok_or(EINVAL)?;
+    nothing_kept(a, &mut p)?;
     let body_len = usize::try_from(body_len).map_err(|_| EOVERFLOW)?;
     Ok(WriteArgs {
         key,
@@ -2137,7 +2168,8 @@ fn obj_range_get<B: Backend>(
 }
 
 /// `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64]
-/// [fence_cap u16]`: the 50-byte record.
+/// [fence_cap u16]`: the [`HEAD_LEN`]-byte record. A null `out_ptr` is
+/// `EINVAL`; an `out_cap` that cannot hold the record is `ENOMEM`.
 fn obj_head<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
     let mut p = 0usize;
     let Some(key) = key_at(a, &mut p) else {
@@ -2152,16 +2184,22 @@ fn obj_head<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
         Ok(None) => return ENXIO,
         Ok(Some(v)) => v,
     };
-    if out_ptr != 0 && out_cap >= HEAD_LEN {
-        let mut rec = [0u8; HEAD_LEN];
-        let mut at = 0usize;
-        let _ = put(&mut rec, &mut at, &u64::from(len).to_le_bytes());
-        let _ = put(&mut rec, &mut at, &0u64.to_le_bytes());
-        let _ = put(&mut rec, &mut at, &[0, ETAG_LEN as u8]);
-        let _ = put(&mut rec, &mut at, &rev.to_le_bytes());
-        // SAFETY: the contract names `out_cap` writable bytes.
-        copy(unsafe { caller_out(out_ptr, HEAD_LEN) }, &rec);
+    if out_ptr == 0 {
+        return EINVAL;
     }
+    if out_cap < HEAD_LEN {
+        return ENOMEM;
+    }
+    // The etag's tail and the kept block stay zero: this store keeps nothing
+    // with an object besides its bytes.
+    let mut rec = [0u8; HEAD_LEN];
+    let mut at = 0usize;
+    let _ = put(&mut rec, &mut at, &u64::from(len).to_le_bytes());
+    let _ = put(&mut rec, &mut at, &0u64.to_le_bytes());
+    let _ = put(&mut rec, &mut at, &[0, ETAG_LEN as u8]);
+    let _ = put(&mut rec, &mut at, &rev.to_le_bytes());
+    // SAFETY: the contract names `out_cap` writable bytes.
+    copy(unsafe { caller_out(out_ptr, HEAD_LEN) }, &rec);
     // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
     unsafe { write_fence(FENCE_VIEW_CONSISTENT, b.revision(), fence_ptr, fence_cap) };
     HEAD_LEN as i32
@@ -4420,7 +4458,7 @@ pub fn store_log_head(h: &[u8]) -> Option<(u8, usize, usize)> {
 pub unsafe fn needs_store(op: u32, _arg: *const u8, _arg_len: usize) -> bool {
     !matches!(
         op,
-        OBJ_CLOSE | NS_CLOSE | NS_CAPS | NS_SUBSCRIBE | NS_TAKE_RUNG
+        OBJ_CLOSE | OBJ_RETAIN | NS_CLOSE | NS_CAPS | NS_SUBSCRIBE | NS_TAKE_RUNG
     )
 }
 
