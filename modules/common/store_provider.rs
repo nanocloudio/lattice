@@ -115,6 +115,9 @@ pub const OBJ_HEAD: u32 = 0x1422;
 pub const OBJ_RANGE_GET: u32 = 0x1423;
 pub const OBJ_DELETE: u32 = 0x1424;
 pub const OBJ_CLOSE: u32 = 0x1425;
+/// Not served: this store keeps no retention. Answered `ENOSYS`, store or no
+/// store, never "ask again".
+pub const OBJ_RETAIN: u32 = 0x142C;
 pub const NS_LIST: u32 = 0x1302;
 pub const NS_SUBSCRIBE: u32 = 0x1305;
 pub const NS_CLOSE: u32 = 0x1306;
@@ -168,9 +171,15 @@ const FENCE_DURABLE_LEN: usize = 9;
 /// `fence::WIRE_MAX_LEN`: a fence query's buffer holds any fence.
 pub const FENCE_WIRE_MAX: usize = 62;
 
-/// HEAD's record: `[size u64][mtime u64][ct_len u8][etag_len u8][etag]`.
-pub const HEAD_LEN: usize = 50;
+/// HEAD's record: `[size u64][mtime u64][ct_len u8][etag_len u8][etag]`
+/// and an empty kept block.
+pub const HEAD_LEN: usize = 8 + 8 + 1 + 1 + ETAG_LEN + KEPT_FIXED_LEN;
 const ETAG_LEN: usize = 32;
+/// The kept block besides its key reference:
+/// `[key_ref_len u8][retain_until_ms u64][legal_hold u8]`.
+const KEPT_FIXED_LEN: usize = 1 + 8 + 1;
+/// Longest key reference a write may name.
+const KEY_REF_MAX: usize = 64;
 
 /// LIST's page trailer `[FF][FF][cursor_len u8]`, and the most a cursor
 /// (a key) adds to it.
@@ -1178,8 +1187,9 @@ fn slot_of(handle: i32) -> usize {
     (handle & SLOT_MASK) as usize
 }
 
-/// A fence into the caller's `[ptr, cap)`: `kind` at `rev`; its length,
-/// 0 when it does not fit (and is not written, as the host store does).
+/// A fence into the caller's `[ptr, cap)`: `kind` at `rev`; its length, 0
+/// when it does not fit and is not written. Requests name a place that fits
+/// ([`fence_out`]); only a write the store makes for itself names none.
 ///
 /// # Safety
 /// As [`caller_out`].
@@ -1572,6 +1582,34 @@ fn precondition(a: &[u8], p: &mut usize) -> Option<(u8, u64)> {
     }
 }
 
+/// The kept block `[key_ref_len u8][key_ref][retain_until_ms u64]
+/// [legal_hold u8]` at `a[*p..]`: whether it asks for anything, `None` when
+/// malformed. This store keeps none of it, so its caller answers a request
+/// for any of it `ENOSYS`: a write asked to be immutable is never stored as a
+/// deletable one.
+fn kept_asked(a: &[u8], p: &mut usize) -> Option<bool> {
+    let len = *a.get(*p)? as usize;
+    if len > KEY_REF_MAX {
+        return None;
+    }
+    let until = rd64(a, *p + 1 + len)?;
+    let hold = *a.get(*p + 1 + len + 8)?;
+    if hold > 1 {
+        return None;
+    }
+    *p += KEPT_FIXED_LEN + len;
+    Some(len != 0 || until != 0 || hold != 0)
+}
+
+/// The `[fence_ptr u64][fence_cap u16]` pair at `a[p..]`, `None` when it is
+/// cut short, null or below [`FENCE_WIRE_MAX`]. Every such request is `EINVAL`
+/// before the op acts: an answer whose fence cannot be delivered is not an
+/// answer.
+fn fence_out(a: &[u8], p: usize) -> Option<(u64, usize)> {
+    let (ptr, cap) = (rd64(a, p)?, rd16(a, p + 8)?);
+    (ptr != 0 && cap >= FENCE_WIRE_MAX).then_some((ptr, cap))
+}
+
 /// `[key_len u16][key]` at `a[*p..]`: a key the store can hold.
 fn key_at<'a>(a: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
     let k = field16(a, p)?;
@@ -1594,7 +1632,7 @@ struct WriteArgs<'a> {
 }
 
 /// `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64]
-/// [precondition][fence_ptr u64][fence_cap u16]`.
+/// [precondition][kept][fence_ptr u64][fence_cap u16]`.
 ///
 /// # Safety
 /// The contract names `body_len` readable bytes at `body_ptr`.
@@ -1609,14 +1647,19 @@ unsafe fn put_args(a: &[u8]) -> Result<WriteArgs<'_>, i32> {
     };
     p += 16;
     let (pre, rev) = precondition(a, &mut p).ok_or(EINVAL)?;
+    let asked = kept_asked(a, &mut p).ok_or(EINVAL)?;
+    let (fence_ptr, fence_cap) = fence_out(a, p).ok_or(EINVAL)?;
+    if asked {
+        return Err(ENOSYS);
+    }
     let body_len = usize::try_from(body_len).map_err(|_| EOVERFLOW)?;
     Ok(WriteArgs {
         key,
         value: Some(caller_bytes(body_ptr, body_len)),
         pre,
         rev,
-        fence_ptr: rd64(a, p).unwrap_or(0),
-        fence_cap: rd16(a, p + 8).unwrap_or(0),
+        fence_ptr,
+        fence_cap,
         mark: None,
     })
 }
@@ -1626,13 +1669,14 @@ fn delete_args(a: &[u8]) -> Result<WriteArgs<'_>, i32> {
     let mut p = 0usize;
     let key = key_at(a, &mut p).ok_or(EINVAL)?;
     let (pre, rev) = precondition(a, &mut p).ok_or(EINVAL)?;
+    let (fence_ptr, fence_cap) = fence_out(a, p).ok_or(EINVAL)?;
     Ok(WriteArgs {
         key,
         value: None,
         pre,
         rev,
-        fence_ptr: rd64(a, p).unwrap_or(0),
-        fence_cap: rd16(a, p + 8).unwrap_or(0),
+        fence_ptr,
+        fence_cap,
         mark: None,
     })
 }
@@ -2137,31 +2181,40 @@ fn obj_range_get<B: Backend>(
 }
 
 /// `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64]
-/// [fence_cap u16]`: the 50-byte record.
+/// [fence_cap u16]`: the [`HEAD_LEN`]-byte record. A null `out_ptr` or an
+/// undeliverable fence is `EINVAL`, whatever the key holds; an `out_cap` that
+/// cannot hold the record of a key that is there is `ENOMEM`.
 fn obj_head<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
     let mut p = 0usize;
     let Some(key) = key_at(a, &mut p) else {
         return EINVAL;
     };
-    let out_ptr = rd64(a, p).unwrap_or(0);
-    let out_cap = rd32(a, p + 8).unwrap_or(0);
-    let fence_ptr = rd64(a, p + 12).unwrap_or(0);
-    let fence_cap = rd16(a, p + 20).unwrap_or(0);
+    let (Some(out_ptr), Some(out_cap), Some((fence_ptr, fence_cap))) =
+        (rd64(a, p), rd32(a, p + 8), fence_out(a, p + 12))
+    else {
+        return EINVAL;
+    };
+    if out_ptr == 0 {
+        return EINVAL;
+    }
     let (rev, len) = match lookup(b, bufs, key) {
         Err(e) => return e,
         Ok(None) => return ENXIO,
         Ok(Some(v)) => v,
     };
-    if out_ptr != 0 && out_cap >= HEAD_LEN {
-        let mut rec = [0u8; HEAD_LEN];
-        let mut at = 0usize;
-        let _ = put(&mut rec, &mut at, &u64::from(len).to_le_bytes());
-        let _ = put(&mut rec, &mut at, &0u64.to_le_bytes());
-        let _ = put(&mut rec, &mut at, &[0, ETAG_LEN as u8]);
-        let _ = put(&mut rec, &mut at, &rev.to_le_bytes());
-        // SAFETY: the contract names `out_cap` writable bytes.
-        copy(unsafe { caller_out(out_ptr, HEAD_LEN) }, &rec);
+    if out_cap < HEAD_LEN {
+        return ENOMEM;
     }
+    // The etag's tail and the kept block stay zero: this store keeps nothing
+    // with an object besides its bytes.
+    let mut rec = [0u8; HEAD_LEN];
+    let mut at = 0usize;
+    let _ = put(&mut rec, &mut at, &u64::from(len).to_le_bytes());
+    let _ = put(&mut rec, &mut at, &0u64.to_le_bytes());
+    let _ = put(&mut rec, &mut at, &[0, ETAG_LEN as u8]);
+    let _ = put(&mut rec, &mut at, &rev.to_le_bytes());
+    // SAFETY: the contract names `out_cap` writable bytes.
+    copy(unsafe { caller_out(out_ptr, HEAD_LEN) }, &rec);
     // SAFETY: the contract names `fence_cap` bytes at `fence_ptr`.
     unsafe { write_fence(FENCE_VIEW_CONSISTENT, b.revision(), fence_ptr, fence_cap) };
     HEAD_LEN as i32
@@ -2186,14 +2239,14 @@ fn ns_list<B: Backend>(b: &mut B, bufs: &mut Bufs<'_>, a: &[u8]) -> i32 {
         return EINVAL;
     }
     // The whole fixed tail, so a mis-stated cursor length is caught.
-    if a.len() < p + 22 {
-        return EINVAL;
-    }
-    let (Some(out_ptr), Some(out_cap), Some(fence_ptr), Some(fence_cap)) =
-        (rd64(a, p), rd32(a, p + 8), rd64(a, p + 12), rd16(a, p + 20))
+    let (Some(out_ptr), Some(out_cap), Some((fence_ptr, fence_cap))) =
+        (rd64(a, p), rd32(a, p + 8), fence_out(a, p + 12))
     else {
         return EINVAL;
     };
+    if out_ptr == 0 {
+        return EINVAL;
+    }
     // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
     let out = unsafe { caller_out(out_ptr, out_cap) };
     let mut end = [0u8; KEY_MAX + 1];
@@ -3018,12 +3071,12 @@ fn ns_changes<B: Backend>(
     if a.len() != p + 22 {
         return EINVAL;
     }
-    let (Some(out_ptr), Some(out_cap), Some(fence_ptr), Some(fence_cap)) =
-        (rd64(a, p), rd32(a, p + 8), rd64(a, p + 12), rd16(a, p + 20))
+    let (Some(out_ptr), Some(out_cap), Some((fence_ptr, fence_cap))) =
+        (rd64(a, p), rd32(a, p + 8), fence_out(a, p + 12))
     else {
         return EINVAL;
     };
-    if out_ptr == 0 || fence_ptr == 0 || fence_cap < FENCE_WIRE_MAX {
+    if out_ptr == 0 {
         return EINVAL;
     }
     // SAFETY: the contract names `out_cap` writable bytes at `out_ptr`.
@@ -4420,7 +4473,7 @@ pub fn store_log_head(h: &[u8]) -> Option<(u8, usize, usize)> {
 pub unsafe fn needs_store(op: u32, _arg: *const u8, _arg_len: usize) -> bool {
     !matches!(
         op,
-        OBJ_CLOSE | NS_CLOSE | NS_CAPS | NS_SUBSCRIBE | NS_TAKE_RUNG
+        OBJ_CLOSE | OBJ_RETAIN | NS_CLOSE | NS_CAPS | NS_SUBSCRIBE | NS_TAKE_RUNG
     )
 }
 

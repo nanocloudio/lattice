@@ -245,6 +245,7 @@ unsafe fn put(
     arg[p] = 0; // precondition ANY
     arg[p + 1] = 0;
     p += 2;
+    p += 10; // no key reference, no retention, no hold
     arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
     arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
@@ -261,6 +262,7 @@ fn caller(sys: &SyscallTable) -> impl FnMut(i32, u32, &mut [u8]) -> i32 + '_ {
 /// errno.
 unsafe fn count_keys(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 {
     let mut arg = [0u8; 64];
+    let mut fence = [0u8; FENCE_CAP];
     let mut p = 0usize;
     arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
     p += 2;
@@ -271,7 +273,10 @@ unsafe fn count_keys(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 
     p += 8;
     arg[p..p + 4].copy_from_slice(&(page.len() as u32).to_le_bytes());
     p += 4;
-    p += 10; // no fence
+    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
+    p += 8;
+    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
+    p += 2;
     let n = (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), p);
     if n < 0 {
         return n;

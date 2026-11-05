@@ -49,9 +49,9 @@ keeps. Any other configuration registers no contract and logs
 
 | Op | Id | Argument | Answer |
 |---|---|---|---|
-| `PUT` | `0x1420` | `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64][precondition][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
+| `PUT` | `0x1420` | `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64][precondition][kept][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
 | `GET` | `0x1421` | the key | a read slot's handle on the value as it is now |
-| `HEAD` | `0x1422` | `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | the 50-byte record `[size u64][mtime u64][ct_len u8][etag_len u8][etag]` |
+| `HEAD` | `0x1422` | `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | the 60-byte record `[size u64][mtime u64][ct_len u8][etag_len u8][etag][kept]`; `EINVAL` for a null `out_ptr`, `ENOMEM` when `out_cap` cannot hold it, `ENXIO` before `ENOMEM` for a key that is not there |
 | `RANGE_GET` | `0x1423` | on a read slot: `[off u64][len u32][out_ptr u64]` | bytes copied; 0 at or past the end |
 | `DELETE` | `0x1424` | `[key_len u16][key][precondition][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
 | `CLOSE` | `0x1425` | on a read slot | 0 |
@@ -64,7 +64,11 @@ keeps. Any other configuration registers no contract and logs
 | fence query | `0x00FE` | on a read slot or subscription | the `ViewConsistent` fence of what it observed |
 
 A precondition is `[kind u8][len u8][bytes]`: 0 any, 1 the key must be
-absent, 2 an etag (its first eight bytes, the revision it names). Keys are
+absent, 2 an etag (its first eight bytes, the revision it names). The kept
+block is `[key_ref_len u8][key_ref][retain_until_ms u64][legal_hold u8]`. This
+store keeps none of it: a `PUT` asking for any of it is refused `ENOSYS`, a
+`HEAD` record's block is empty, and `RETAIN` and the `PUT_STREAMED_*` sequence
+are not served (`ENOSYS`). Keys are
 1..=255 bytes (`KEY_MAX`). Read slots are handles `0..SLOTS`; subscriptions
 are `SUB_BAND + id` (a registry id), so a fence query or `CLOSE` names one
 thing. Every handle answers only the owner that opened it: to any other
@@ -74,7 +78,7 @@ caller it is as if it were not open, as the host stores answer.
 
 | Answer | Meaning |
 |---|---|
-| `EINVAL` | a malformed or short argument, a key past `KEY_MAX`, a subscription event that is not the calling module's, a durable subscription's owner name outside 1..=32 printable bytes or holding `/` |
+| `EINVAL` | a malformed or short argument, a null output pointer, a fence pair that is missing, null or below 62 bytes on `PUT`, `HEAD`, `DELETE`, `LIST` or `CHANGES` (refused before the op acts: nothing written, no page or fence delivered, even while the store would otherwise wait), a key past `KEY_MAX`, a subscription event that is not the calling module's, a durable subscription's owner name outside 1..=32 printable bytes or holding `/` |
 | `ENXIO` | `GET` or `HEAD` of a key that is not there |
 | `EEXIST` | a create-if-absent `PUT` lost to an existing key |
 | `EAGAIN` on a read | the store cannot answer now — its device is busy, it is still recovering, a walk is still paused, or this step's history budget is spent; a durable `SUBSCRIBE` whose cursor read the store refuses waits the same way. Nothing moved (no handle opened or closed, no page or fence written); ask again with the same request on a later step, never within the same one |
