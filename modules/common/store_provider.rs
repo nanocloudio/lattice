@@ -106,25 +106,25 @@ use super::watch_cursor::{self, Resume, WatchCursor};
 
 // ── The contracts' wire ─────────────────────────────────────────────
 
-pub const CONTRACT_NAMESPACE: u16 = 0x0013;
-pub const CONTRACT_OBJECT: u16 = 0x0014;
+pub const CONTRACT_NAMESPACE: u16 = crate::abi::registry::storage_namespace::ID;
+pub const CONTRACT_OBJECT: u16 = crate::abi::registry::storage_object::ID;
 
-pub const OBJ_PUT: u32 = 0x1420;
-pub const OBJ_GET: u32 = 0x1421;
-pub const OBJ_HEAD: u32 = 0x1422;
-pub const OBJ_RANGE_GET: u32 = 0x1423;
-pub const OBJ_DELETE: u32 = 0x1424;
-pub const OBJ_CLOSE: u32 = 0x1425;
+pub const OBJ_PUT: u32 = crate::abi::registry::storage_object::PUT;
+pub const OBJ_GET: u32 = crate::abi::registry::storage_object::GET;
+pub const OBJ_HEAD: u32 = crate::abi::registry::storage_object::HEAD;
+pub const OBJ_RANGE_GET: u32 = crate::abi::registry::storage_object::RANGE_GET;
+pub const OBJ_DELETE: u32 = crate::abi::registry::storage_object::DELETE;
+pub const OBJ_CLOSE: u32 = crate::abi::registry::storage_object::CLOSE;
 /// Not served: this store keeps no retention. Answered `ENOSYS`, store or no
 /// store, never "ask again".
-pub const OBJ_RETAIN: u32 = 0x142C;
-pub const NS_LIST: u32 = 0x1302;
-pub const NS_SUBSCRIBE: u32 = 0x1305;
-pub const NS_CLOSE: u32 = 0x1306;
-pub const NS_CHANGES: u32 = 0x1307;
+pub const OBJ_RETAIN: u32 = crate::abi::registry::storage_object::RETAIN;
+pub const NS_LIST: u32 = crate::abi::registry::storage_namespace::LIST;
+pub const NS_SUBSCRIBE: u32 = crate::abi::registry::storage_namespace::SUBSCRIBE;
+pub const NS_CLOSE: u32 = crate::abi::registry::storage_namespace::CLOSE;
+pub const NS_CHANGES: u32 = crate::abi::registry::storage_namespace::CHANGES;
 /// Which of the caller's subscriptions on an event have rung.
-pub const NS_TAKE_RUNG: u32 = 0x1309;
-pub const NS_CAPS: u32 = 0x13FF;
+pub const NS_TAKE_RUNG: u32 = crate::abi::registry::storage_namespace::TAKE_RUNG;
+pub const NS_CAPS: u32 = crate::abi::registry::storage_namespace::CAPS;
 /// `fence::QUERY_OP`: the fence of what a handle observed.
 pub const QUERY_OP: u32 = 0x00FE;
 /// `caps::SUBSCRIBE | caps::CHANGES`.

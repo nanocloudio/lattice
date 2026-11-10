@@ -233,10 +233,10 @@ const WEDGE_TIMER_MS: u32 = 10_500;
 /// from the kernel ABI: `CREATE` mints a one-shot fd, `SET` arms it for
 /// `arg[0..4]` ms. A fired timer fd makes this module runnable, which is
 /// how the watchdog is reached without incoming SQL.
-const TIMER_CONTRACT: u32 = 0x0006;
-const TIMER_CREATE: u32 = 0x0604;
-const TIMER_SET: u32 = 0x0605;
-const TIMER_CANCEL: u32 = 0x0606;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
+const TIMER_CREATE: u32 = abi::registry::timer::CREATE;
+const TIMER_SET: u32 = abi::registry::timer::SET;
+const TIMER_CANCEL: u32 = abi::registry::timer::CANCEL;
 
 const P_IDLE: u8 = 0;
 

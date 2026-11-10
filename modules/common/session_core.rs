@@ -23,18 +23,9 @@
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface"
 )]
 
-/// The single mount of Fluxor's SessionCtrlV1 contract for this tree.
-/// Consumers reach it as `session_core::session_ctrl` rather than
-/// mounting the file a second time, which rustc would treat as an
-/// unrelated module.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/net/session_ctrl.rs"]
-#[allow(
-    dead_code,
-    clippy::duplicate_mod,
-    reason = "platform contract mounted wholesale; each consumer uses a subset"
-)]
-#[rustfmt::skip]
-pub mod session_ctrl;
+/// Fluxor's SessionCtrlV1 contract, through the module's own `abi` mount.
+/// Consumers reach it as `session_core::session_ctrl`.
+pub use crate::abi::contracts::net::session_ctrl;
 
 pub use session_ctrl::{ANCHOR_ID_BYTES, SESSION_ID_BYTES, WORKER_ID_BYTES};
 

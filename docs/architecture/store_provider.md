@@ -3,7 +3,7 @@
 `kv_state_worker_store` is the state worker built with the store
 provider (`modules/common/store_provider.rs`): besides everything
 `kv_state_worker` does, it serves fluxor's `storage.object` (contract
-`0x14`) and `storage.namespace` (`0x13`) over its own store. A graph whose
+`0x0f`) and `storage.namespace` (`0x0e`) over its own store. A graph whose
 store is lattice's keeps every connector as it is — they reach the store by
 contract — and gains one clock, one history and one store for them,
 lattice's own surfaces and the document executor alike. Each call is
@@ -49,18 +49,18 @@ keeps. Any other configuration registers no contract and logs
 
 | Op | Id | Argument | Answer |
 |---|---|---|---|
-| `PUT` | `0x1420` | `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64][precondition][kept][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
-| `GET` | `0x1421` | the key | a read slot's handle on the value as it is now |
-| `HEAD` | `0x1422` | `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | the 60-byte record `[size u64][mtime u64][ct_len u8][etag_len u8][etag][kept]`; `EINVAL` for a null `out_ptr`, `ENOMEM` when `out_cap` cannot hold it, `ENXIO` before `ENOMEM` for a key that is not there |
-| `RANGE_GET` | `0x1423` | on a read slot: `[off u64][len u32][out_ptr u64]` | bytes copied; 0 at or past the end |
-| `DELETE` | `0x1424` | `[key_len u16][key][precondition][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
-| `CLOSE` | `0x1425` | on a read slot | 0 |
-| `LIST` | `0x1302` | `[prefix_len u16][prefix][cursor_len u16][cursor][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | a page of `[len u8][kind 0][key]` entries, then `[FF][FF][cursor_len u8][cursor]`: the key the next page starts at, none at the end |
-| `SUBSCRIBE` | `0x1305` | `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now; bit 1: durable, then `[shard u16][owner_len u8][owner]`) | a subscription's handle |
-| `CLOSE` | `0x1306` | on a subscription | 0 |
-| `CHANGES` | `0x1307` | `[prefix_len u16][prefix][sub i32][token_len u16][token][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | one page (below) |
-| `TAKE_RUNG` | `0x1309` | `[event i32][out_ptr u64][out_cap u32]` | `[more u8][count u16][handle i32]…` |
-| `CAPS` | `0x13FF` | — | `SUBSCRIBE \| CHANGES` (`0x18`) |
+| `PUT` | `0x0f20` | `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64][precondition][kept][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
+| `GET` | `0x0f21` | the key | a read slot's handle on the value as it is now |
+| `HEAD` | `0x0f22` | `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | the 60-byte record `[size u64][mtime u64][ct_len u8][etag_len u8][etag][kept]`; `EINVAL` for a null `out_ptr`, `ENOMEM` when `out_cap` cannot hold it, `ENXIO` before `ENOMEM` for a key that is not there |
+| `RANGE_GET` | `0x0f23` | on a read slot: `[off u64][len u32][out_ptr u64]` | bytes copied; 0 at or past the end |
+| `DELETE` | `0x0f24` | `[key_len u16][key][precondition][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
+| `CLOSE` | `0x0f25` | on a read slot | 0 |
+| `LIST` | `0x0e02` | `[prefix_len u16][prefix][cursor_len u16][cursor][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | a page of `[len u8][kind 0][key]` entries, then `[FF][FF][cursor_len u8][cursor]`: the key the next page starts at, none at the end |
+| `SUBSCRIBE` | `0x0e05` | `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now; bit 1: durable, then `[shard u16][owner_len u8][owner]`) | a subscription's handle |
+| `CLOSE` | `0x0e06` | on a subscription | 0 |
+| `CHANGES` | `0x0e07` | `[prefix_len u16][prefix][sub i32][token_len u16][token][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | one page (below) |
+| `TAKE_RUNG` | `0x0e09` | `[event i32][out_ptr u64][out_cap u32]` | `[more u8][count u16][handle i32]…` |
+| `CAPS` | `0x0eff` | — | `SUBSCRIBE \| CHANGES` (`0x18`) |
 | fence query | `0x00FE` | on a read slot or subscription | the `ViewConsistent` fence of what it observed |
 
 A precondition is `[kind u8][len u8][bytes]`: 0 any, 1 the key must be

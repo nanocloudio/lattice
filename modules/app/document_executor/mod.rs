@@ -216,10 +216,10 @@ const DATABASE_ID: u32 = 0;
 
 const WEDGE_TIMEOUT_MS: u64 = 10_000;
 const WEDGE_TIMER_MS: u32 = 10_500;
-const TIMER_CONTRACT: u32 = 0x0006;
-const TIMER_CREATE: u32 = 0x0604;
-const TIMER_SET: u32 = 0x0605;
-const TIMER_CANCEL: u32 = 0x0606;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
+const TIMER_CREATE: u32 = abi::registry::timer::CREATE;
+const TIMER_SET: u32 = abi::registry::timer::SET;
+const TIMER_CANCEL: u32 = abi::registry::timer::CANCEL;
 
 // ── Phases: what the in-flight KV reply belongs to ─────────────────────
 

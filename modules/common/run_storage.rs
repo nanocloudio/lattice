@@ -120,7 +120,7 @@ pub type FsyncTicket = u64;
 /// a fence and returns a ticket, `fsync_poll` reports whether it has
 /// completed. A caller driven by a scheduler steps out between the two
 /// and the barrier leaves the step budget entirely. This mirrors the
-/// FS contract's `FSYNC_SUBMIT`/`FSYNC_POLL` (0x0910/0x0911, capability
+/// FS contract's `FSYNC_SUBMIT`/`FSYNC_POLL` (0x0d10/0x0d11, capability
 /// `FS_CAP_FSYNC_ASYNC`) and the proven idiom in clustor's WAL on this
 /// exact device.
 ///

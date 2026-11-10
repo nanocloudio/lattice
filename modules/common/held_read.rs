@@ -18,9 +18,9 @@
 //! No allocation and no panic path: mounted by PIC modules.
 
 /// `storage.object` opcodes and the answers a read tells apart.
-pub const OBJ_GET: u32 = 0x1421;
-pub const OBJ_RANGE_GET: u32 = 0x1423;
-pub const OBJ_CLOSE: u32 = 0x1425;
+pub const OBJ_GET: u32 = crate::abi::registry::storage_object::GET;
+pub const OBJ_RANGE_GET: u32 = crate::abi::registry::storage_object::RANGE_GET;
+pub const OBJ_CLOSE: u32 = crate::abi::registry::storage_object::CLOSE;
 pub const EAGAIN: i32 = -11;
 
 /// The most one `RANGE_GET` asks for (the provider may answer less).

@@ -3896,18 +3896,18 @@ const MODULE_LIVE: u32 = 11;
 const EVENT_OWNER: u32 = 12;
 /// `kernel_abi::event::SIGNAL`.
 #[cfg(feature = "store_provider")]
-const EVENT_SIGNAL: u32 = 0x0B01;
+const EVENT_SIGNAL: u32 = abi::registry::event::SIGNAL;
 /// `internal::reconfigure::OWNER_RELEASED`, and its `[slot][0][generation]`
 /// argument.
 #[cfg(feature = "store_provider")]
-const OWNER_RELEASED: u32 = 0x0C22;
+const OWNER_RELEASED: u32 = abi::registry::reconfigure::OWNER_RELEASED;
 /// `resource::POOL_SAMPLE` (the ledger asks how much of a pool is in use),
 /// `resource::LEDGER_DENY` (a refusal counted against it), and the pool
 /// this provider serves, `resource::POOL_STORE_SUBS`.
 #[cfg(feature = "store_provider")]
-const POOL_SAMPLE: u32 = 0x0C25;
+const POOL_SAMPLE: u32 = abi::registry::resource::POOL_SAMPLE;
 #[cfg(feature = "store_provider")]
-const LEDGER_DENY: u32 = 0x0C24;
+const LEDGER_DENY: u32 = abi::registry::resource::LEDGER_DENY;
 #[cfg(feature = "store_provider")]
 const POOL_STORE_SUBS: u16 = 0x000A;
 
@@ -3926,7 +3926,7 @@ impl WorkerBackend<'_> {
 }
 /// `kernel_abi::RANDOM_FILL`.
 #[cfg(feature = "store_provider")]
-const RANDOM_FILL: u32 = 0x0C3C;
+const RANDOM_FILL: u32 = abi::registry::kernel::RANDOM_FILL;
 
 // An origin entry is the largest proposal the replicated path carries.
 #[cfg(feature = "store_provider")]

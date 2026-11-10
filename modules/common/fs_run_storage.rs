@@ -98,23 +98,23 @@ use core::cell::Cell;
 
 // FS opcodes (`modules/sdk/contracts/storage/fs.rs`) — same local-const
 // idiom as clustor's durability WAL.
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
+const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
+const FS_READ: u32 = crate::abi::registry::fs::READ;
+const FS_SEEK: u32 = crate::abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
+const FS_STAT: u32 = crate::abi::registry::fs::STAT;
+const FS_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = crate::abi::registry::fs::WRITE;
+const FS_OPENDIR: u32 = crate::abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = crate::abi::registry::fs::READDIR;
 /// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
 /// contract, so every write path opens through the write tier.
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
+const FS_OPEN_CREATE: u32 = crate::abi::registry::fs::OPEN_CREATE;
+const FS_UNLINK: u32 = crate::abi::registry::fs::UNLINK;
 /// Durable publication of a path's directory entry (`fs.rs::FSYNC_NAME`).
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_FSYNC_NAME: u32 = crate::abi::registry::fs::FSYNC_NAME;
 /// FS capability-discovery opcode + bits (`fs.rs::{CAPS, caps}`).
-const FS_CAPS: u32 = 0x09FF;
+const FS_CAPS: u32 = crate::abi::registry::fs::CAPS;
 /// `last_errno` after `list` overflowed its table: a sentinel, not a
 /// provider errno (those are small negatives).
 const FS_E_LIST_OVERFLOW: i32 = -1000;
@@ -131,8 +131,8 @@ const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 /// + `caps::FSYNC_ASYNC`). Same opcodes and same capability bit
 ///   clustor's WAL uses on this device — see
 ///   `clustor/.context/rfc_async_wal_fsync.md`.
-const FS_FSYNC_SUBMIT: u32 = 0x0910;
-const FS_FSYNC_POLL: u32 = 0x0911;
+const FS_FSYNC_SUBMIT: u32 = crate::abi::registry::fs::FSYNC_SUBMIT;
+const FS_FSYNC_POLL: u32 = crate::abi::registry::fs::FSYNC_POLL;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 /// `FSYNC_POLL` return codes: 0 = durable, 1 = still pending,
 /// negative = the fenced write FAILED.
