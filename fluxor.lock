@@ -1464,27 +1464,27 @@ kind = "runtime"
 name = "fluxor"
 project = "fluxor"
 target = "aarch64-unknown-linux-gnu"
-digest = "sha256:327e73d1de3fb83c4c6ad12777d362b382f71592f83c8321c66b60892a6cd18b"
+digest = "sha256:615257507b235a40cccbfa6c88ad5b808e0045dd6b2c347c2ed5028c53cf5fff"
 reference = "fluxor/run/fluxor-aarch64-unknown-linux-gnu:0.0.1"
-content = "sha256:a7ed350172b484232ac95897b953c09e7c37498bf86fcab7825dfa7f9e36d3e4"
+content = "sha256:b2076fa7b557c79a284748692aacd9048d9432986dae4e03f8b466d2bbd3e608"
 
 [[artifact]]
 kind = "runtime"
 name = "fluxor-linux"
 project = "fluxor"
 target = "aarch64-unknown-linux-gnu"
-digest = "sha256:e0f346cbaecad83c3ec1ead10693eec5a02f5c0ca4dc8ffd3766c371bbc98780"
+digest = "sha256:c350acebcb33b702f479471985a38876c7d2555df1a47ee6c7bcc0839ff04709"
 reference = "fluxor/run/fluxor-linux-aarch64-unknown-linux-gnu:0.0.1"
-content = "sha256:1066619b735fd9f4a809a29ae2a5bb242fa8f100dc0343863b4148cd32087c28"
+content = "sha256:c224df48bc8dfceed698e95b63b5733751a25966ff783eac436a863c1e4ce637"
 
 [[artifact]]
 kind = "runtime"
 name = "fluxor.wasm"
 project = "fluxor"
 target = "wasm32-unknown-unknown"
-digest = "sha256:7d6ea4cbc53835a7d77e93411d2c622cdc4e5c87a3545bdf8075155adf5dfadd"
+digest = "sha256:5f751f99c4bebdf561d23fc4ee7f37ae77d6ea2b401384ecc97362eca5dc77f5"
 reference = "fluxor/run/fluxor.wasm-wasm32-unknown-unknown:0.0.1"
-content = "sha256:72679e76f38a0e57eaf610d93ce8f85e1a5d99e9a122689632be1e5f65fdcc19"
+content = "sha256:0981552dbbbc69ec5bdedb60f04b0a12b9e51f9a2ede06cc1a48eccf48419e6f"
 
 [[artifact]]
 kind = "source"

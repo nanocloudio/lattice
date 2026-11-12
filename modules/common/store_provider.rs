@@ -126,7 +126,7 @@ pub const NS_CHANGES: u32 = crate::abi::registry::storage_namespace::CHANGES;
 pub const NS_TAKE_RUNG: u32 = crate::abi::registry::storage_namespace::TAKE_RUNG;
 pub const NS_CAPS: u32 = crate::abi::registry::storage_namespace::CAPS;
 /// `fence::QUERY_OP`: the fence of what a handle observed.
-pub const QUERY_OP: u32 = 0x00FE;
+pub const QUERY_OP: u32 = crate::abi::registry::kernel::QUERY_OP;
 /// `caps::SUBSCRIBE | caps::CHANGES`.
 pub const NS_CAPS_SERVED: i32 = 0x18;
 
@@ -145,11 +145,17 @@ pub const PRE_ANY: u8 = 0;
 pub const PRE_ABSENT: u8 = 1;
 pub const PRE_ETAG: u8 = 2;
 
-/// Handle tags: `(tag << 26) | slot`.
-pub const TAG_NAMESPACE: i32 = 22;
-pub const TAG_OBJECT: i32 = 23;
-const TAG_SHIFT: u32 = 26;
-const SLOT_MASK: i32 = (1 << TAG_SHIFT) - 1;
+/// Handle tags, placed by `fd::tag_fd` above the slot.
+///
+/// A contract's FD tag IS its registry id, and the kernel resolves a
+/// handle-bound op from the tag rather than from the opcode's class byte —
+/// `fence::QUERY_OP` (class 0x00) above all. A literal here is a tag that
+/// stops naming this contract the moment the ids are renumbered: the
+/// handles keep working for every op routed by class, and the fence query
+/// alone lands on whichever contract now holds the number, which owns no
+/// such handle and answers ENOSYS. So they come from the registry.
+pub const TAG_NAMESPACE: i32 = crate::abi::registry::storage_namespace::FD_TAG;
+pub const TAG_OBJECT: i32 = crate::abi::registry::storage_object::FD_TAG;
 
 /// The source fences and events carry: the host store's, so revisions a
 /// consumer recorded against one remain comparable against the other.
@@ -195,7 +201,12 @@ pub const KEY_MAX: usize = 255;
 /// is the memory they hold, not this figure.
 pub const SLOTS: usize = 4096;
 /// Subscription handles' band in the slot field: `SUB_BAND + id`.
-pub const SUB_BAND: usize = 1 << 24;
+///
+/// `fd::SLOT_FIELD_BITS` is what a provider's own index may use; the bit
+/// above it belongs to the kernel (routed handles, the vault's hardware
+/// field), so the band sits below it and leaves room for `SLOTS` objects
+/// and a subscription quota beneath that.
+pub const SUB_BAND: usize = 1 << (crate::abi::registry::fd::SLOT_FIELD_BITS - 1);
 /// SUBSCRIBE flag bit 0: ring once now.
 const SUB_RING_NOW: u8 = 1;
 /// SUBSCRIBE flag bit 1: a durable subscription — `[shard u16]
@@ -1176,15 +1187,26 @@ unsafe fn caller_out<'a>(ptr: u64, len: usize) -> &'a mut [u8] {
     core::slice::from_raw_parts_mut(ptr as usize as *mut u8, len)
 }
 
+/// A handle this provider mints. The encoding is the kernel's, not ours:
+/// `fd::tag_fd` places the tag at `fd::TAG_SHIFT`, which is what
+/// `fd::untag_fd` reads back when the kernel resolves a handle-bound op
+/// from its FD tag. A shift of our own puts the tag where the kernel does
+/// not look: it reads some other number, and either finds no minting
+/// contract (every class-routed op still works, and `fence::QUERY_OP` —
+/// class 0x00, deliberately not class-routed — answers ENOSYS) or finds
+/// the wrong one and dispatches our handle to it.
 fn tagged(tag: i32, slot: usize) -> i32 {
-    (tag << TAG_SHIFT) | slot as i32
+    let Ok(slot) = i32::try_from(slot) else {
+        return EINVAL;
+    };
+    crate::abi::registry::fd::tag_fd(tag, slot)
 }
 
 fn slot_of(handle: i32) -> usize {
     if handle < 0 {
         return usize::MAX;
     }
-    (handle & SLOT_MASK) as usize
+    crate::abi::registry::fd::slot_of(handle) as usize
 }
 
 /// A fence into the caller's `[ptr, cap)`: `kind` at `rev`; its length, 0

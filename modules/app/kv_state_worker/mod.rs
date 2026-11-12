@@ -4592,7 +4592,13 @@ unsafe fn import_slice(
                 Ok(n) => filled += n,
                 // Not read yet: the same record next step, from its head.
                 Err(kv_store::disk_store::run_storage::StorageError::Again) => return,
-                Err(_) => break,
+                // A record that cannot be read is not the log's end: ending
+                // there would serve a store missing everything after it.
+                Err(_) => {
+                    log_disk_errno(worker, b"[kvw] import read failed, QUARANTINE errno=");
+                    worker.disk_phase = DISK_PHASE_QUARANTINED;
+                    return;
+                }
             }
         }
         if filled < body.len() {
@@ -4753,12 +4759,15 @@ unsafe fn import_done(worker: &mut WorkerState, meta: (u32, u32, u32), consisten
     import_logged(worker);
 }
 
-/// `[kvw] store.log imported n=`: the records this start imported.
+/// `[kvw] store.log imported n= at=`: the records this start imported,
+/// and the offset the log ended at.
 #[cfg(feature = "store_provider")]
 unsafe fn import_logged(worker: &WorkerState) {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 80];
     let mut n = write_prefix(&mut buf, 0, b"[kvw] store.log imported n=");
     n = write_dec(&mut buf, n, worker.prov.import_n);
+    n = write_prefix(&mut buf, n, b" at=");
+    n = write_dec(&mut buf, n, worker.prov.import_at);
     log_line(worker, &buf, n);
 }
 
