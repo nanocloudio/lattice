@@ -67,24 +67,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -114,9 +111,8 @@ use abi::contracts::net::net_proto::{
 use authority::{Authority, PORT_LATTICE_DATA};
 
 use data_surface::{
-    decode_response_frame, encode_request_frame, isolation_for, read_policy, Consistency, DataOp,
-    DataRequest, DataRetryClass, Durability, Isolation, Outcome, RequestContext,
-    DATA_FRAME_MAX_PAYLOAD, REQUEST_FRAME_HEADER_LEN, REQUEST_FRAME_MAX_LEN,
+    decode_response_frame, encode_request_frame, isolation_for, read_policy, DataOp, DataRequest,
+    DataRetryClass, Durability, Outcome, DATA_FRAME_MAX_PAYLOAD, REQUEST_FRAME_MAX_LEN,
     RESPONSE_FRAME_HEADER_LEN,
 };
 use types::{
@@ -124,7 +120,7 @@ use types::{
     KV_OP_GET_AT, KV_OP_INCR, KV_OP_MGET, KV_OP_MSET, KV_OP_PREPEND, KV_OP_PUT, KV_OP_RANGE,
     KV_OP_RANGE_META, KV_OP_RANGE_SCAN, KV_OP_SCAN, KV_OP_SCAN_AT, KV_OP_SCAN_VERSIONS,
     KV_OP_STRLEN, KV_OP_TXN, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE,
-    KV_RESULT_CROSS_RANGE, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND, KV_RESULT_OK, KV_RESULT_QUOTA,
+    KV_RESULT_CROSS_RANGE, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND, KV_RESULT_QUOTA,
 };
 use wire::{KV_RESPONSE_FENCE_TAIL_LEN, MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -147,7 +143,7 @@ const REDIAL_STEPS: u32 = 2000;
 /// 0xFFFF is unreachable long before the tables bind.
 const NO_CONN: u16 = 0xFFFF;
 
-define_params! {
+fluxor_rt::define_params! {
     ClientState;
 
     // Tags 1, 2, 8, 9, 10 and 11 are retired.
@@ -156,7 +152,7 @@ define_params! {
     // cache this module will own — see the module header. Written
     // into the low 8
     // bytes of the 16-byte range identity.
-    // u32 rather than u64 because `define_params!` has no u64 type.
+    // u32 rather than u64 because `fluxor_rt::define_params!` has no u64 type.
     // Not a constraint worth working around: this is a configured
     // stand-in for a routing cache, not a real range identity, and the
     // real one arrives as 16 bytes from `subscribe_topology`.
@@ -1089,11 +1085,7 @@ unsafe fn lost_connection(client: &mut ClientState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ClientState>() as u32
-}
+fluxor_rt::module_facts! { state: ClientState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1166,13 +1158,13 @@ const STEP_BURST: i32 = 2;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let client = unsafe { &mut *state.cast::<ClientState>() };
     if client.syscalls.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let more = unsafe {
@@ -1219,8 +1211,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         m_net || m_kv
     };
     if more {
-        STEP_BURST
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }

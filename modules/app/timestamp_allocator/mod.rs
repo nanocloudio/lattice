@@ -65,24 +65,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -95,10 +92,9 @@ mod mvcc;
 
 use mvcc::{
     encode_grant, encode_reject, IssueError, LeaseRequest, ReservePhase, ReserveState,
-    TimestampLease, DEFAULT_ADVANCE_CHUNK, ISSUED_TO_NONE, LEASE_GRANT_WIRE_LEN,
-    LEASE_REJECT_WIRE_LEN, LEASE_REQUEST_WIRE_LEN, LEASE_WIRE_LEN, MSG_TS_LEASE,
-    MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REJECT, MSG_TS_LEASE_REQUEST, MSG_WAL_REPLAY_COMPLETE,
-    REJECT_QUEUE_FULL,
+    TimestampLease, DEFAULT_ADVANCE_CHUNK, LEASE_GRANT_WIRE_LEN, LEASE_REJECT_WIRE_LEN,
+    LEASE_REQUEST_WIRE_LEN, LEASE_WIRE_LEN, MSG_TS_LEASE, MSG_TS_LEASE_GRANT, MSG_TS_LEASE_REJECT,
+    MSG_TS_LEASE_REQUEST, MSG_WAL_REPLAY_COMPLETE, REJECT_QUEUE_FULL,
 };
 
 #[path = "../../common/telemetry.rs"]
@@ -249,7 +245,7 @@ impl AllocState {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     AllocState;
 
     // Allocator identity (leases carry identities). Distinct per
@@ -479,11 +475,7 @@ unsafe fn serve(s: &mut AllocState, sys: &SyscallTable, req: LeaseRequest, queue
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AllocState>() as u32
-}
+fluxor_rt::module_facts! { state: AllocState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -528,14 +520,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = unsafe { &mut *state.cast::<AllocState>() };
     let sys = s.syscalls;
     if sys.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     unsafe {
         let sys = &*sys;
@@ -580,7 +572,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Try to serve the oldest held request. Returns true when an envelope

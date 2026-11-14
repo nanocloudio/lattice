@@ -65,33 +65,25 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Shared, host-tested cores.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
+use fluxor_sdk::crypto::b64::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../../common/scram_core.rs");
 include!("../../common/pg_core.rs");
 include!("../../common/pg_reply.rs");
@@ -216,7 +208,7 @@ struct PgState {
     out: [u8; RECORD_MAX],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     PgState;
 
     // Tags 1 and 5 are retired.
@@ -246,11 +238,7 @@ define_params! {
     };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<PgState>() as u32
-}
+fluxor_rt::module_facts! { state: PgState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -684,7 +672,7 @@ unsafe fn take_request(s: &mut PgState) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut PgState);
         let sys = &*s.syscalls;
@@ -858,9 +846,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             && matches!(s.phase, DISCONNECTED | READY)
         {
             close_conn(s);
-            return 1;
+            return StepReturn::Done;
         }
-        0
+        StepReturn::Continue
     }
 }
 

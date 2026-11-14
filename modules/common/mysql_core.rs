@@ -23,8 +23,8 @@
     reason = "shared SDK surface across modules: include! consumers already carry the crypto primitives in the outer scope, so this copy is dead there; the #[path] mod mount is the case that needs it"
 )]
 mod sdk {
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs");
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+    pub use fluxor_sdk::crypto::sha1::*;
+    pub use fluxor_sdk::crypto::sha256::*;
 }
 #[allow(
     unused_imports,

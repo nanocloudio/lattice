@@ -46,28 +46,24 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
     clippy::missing_safety_doc,
     clippy::not_unsafe_ptr_arg_deref,
-    reason = "fluxor module ABI: raw pointers are the contract; the PIC build path-mounts the fluxor SDK wholesale and each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref: the module ABI entry points take raw state and syscall pointers whose validity is the runtime's half of the contract"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
 
 #[path = "../../common/wire.rs"]
 mod wire;
-
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/txn_coordinator.rs"]
 mod coord;
@@ -83,7 +79,6 @@ use coord::{Coordinator, Participant, Phase, Step, TransactionRecord, TxnOutcome
 use types::{
     KV_OP_PUT, KV_OP_TARGETED, KV_OP_TXN_PREPARE, KV_OP_TXN_RECORD, KV_OP_TXN_RESOLVE,
     KV_RESULT_CAS_FAILED, KV_RESULT_INTEGER, KV_RESULT_OK, PROTO_INTERNAL_LIFECYCLE,
-    TXN_CMP_MOD_EQUAL,
 };
 use wire::{
     MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_TXN_SUBMIT, MSG_TXN_SUBMIT_RESULT, TXN_SUBMIT_ABORTED,
@@ -215,7 +210,7 @@ impl CoordState {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     CoordState;
 
     // 0 = inert. An inert coordinator is legal and costs nothing: wire
@@ -824,11 +819,7 @@ fn on_kv_response(s: &mut CoordState, result: u8, record_status: u8) {
 
 // ── ABI ───────────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<CoordState>() as u32
-}
+fluxor_rt::module_facts! { state: CoordState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -953,15 +944,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the pointer handed to `module_new`.
     let s = unsafe { &mut *state.cast::<CoordState>() };
     let sys_ptr = s.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: sys_ptr non-null.
     let now = unsafe { dev_millis(&*sys_ptr) };
@@ -1060,7 +1051,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Stamp the 3-byte envelope header over a payload already staged at

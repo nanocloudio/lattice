@@ -17,25 +17,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -51,7 +47,7 @@ const ENV_BUF: usize = 4096;
 /// Egress ports part0_out..part7_out.
 const MAX_LOCAL_PARTITIONS: usize = 8;
 
-define_params! {
+fluxor_rt::define_params! {
     DemuxState;
 
     // Partitions this instance serves (1..=8). A tag at or above this is
@@ -90,11 +86,7 @@ impl DemuxState {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<DemuxState>() as u32
-}
+fluxor_rt::module_facts! { state: DemuxState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -144,14 +136,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = unsafe { &mut *state.cast::<DemuxState>() };
     let sys_ptr = s.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // Fan a bounded number of frames per step so one busy demux cannot
@@ -198,7 +190,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             telemetry::emit_counters(&*sys_ptr, s.metrics_out, &[s.m_routed, s.m_dropped]);
         }
     }
-    0
+    StepReturn::Continue
 }
 
 unsafe fn write_envelope(

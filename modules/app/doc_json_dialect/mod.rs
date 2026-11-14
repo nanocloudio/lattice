@@ -24,16 +24,14 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "duplicate_mod: a shared core is mounted under more than one path; clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments: the module ABI entry points take raw state and syscall pointers whose validity is the runtime's half of the contract"
 )]
 #![allow(
     unexpected_cfgs,
@@ -41,12 +39,10 @@
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -84,7 +80,7 @@ use envelope::{read_envelope, Inbox};
 use doc_catalog::DescriptorWriter;
 use doc_exec::*;
 use doc_json::*;
-use doc_render::{conflict_json, owners_dialect, owners_json, Out};
+use doc_render::{conflict_json, owners_dialect, Out};
 use doc_tree::{Value, Writer};
 use wire::{MSG_DOC_REQUEST, MSG_DOC_RESPONSE, MSG_JSON_DOC_REQUEST, MSG_JSON_DOC_RESPONSE};
 
@@ -166,7 +162,7 @@ const PHASE_TO_CLIENT: u8 = 3;
 /// no look-alikes: Kubernetes' choice, and a reasonable default).
 const NAME_SUFFIX: u8 = 5;
 
-define_params! {
+fluxor_rt::define_params! {
     DialectState;
 
     1, schema, str_chunked, 0
@@ -304,8 +300,10 @@ const BUFFER_BYTES: usize =
 /// The big build's heap: the buffers, and the allocator's rounding.
 #[cfg(feature = "big")]
 const ARENA_BYTES: usize = BUFFER_BYTES + 64 * 1024;
-#[cfg(feature = "big")]
-declare_module_arena_bytes!(ARENA_BYTES);
+/// The default build keeps its buffers in state and takes no heap.
+#[cfg(not(feature = "big"))]
+const ARENA_BYTES: usize = 0;
+fluxor_rt::module_facts! { state: DialectState, arena: ARENA_BYTES }
 
 // ── Channels ─────────────────────────────────────────────────────────
 
@@ -1506,12 +1504,6 @@ fn on_client(st: &mut DialectState, msg: u8, n: usize) {
 // ── Module ABI ───────────────────────────────────────────────────────
 
 #[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<DialectState>() as u32
-}
-
-#[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
@@ -1601,14 +1593,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let st = unsafe { &mut *state.cast::<DialectState>() };
     let sys_ptr = st.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let sys = unsafe { &*sys_ptr };
     // What is leaving goes first.
@@ -1715,5 +1707,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

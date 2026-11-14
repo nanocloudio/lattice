@@ -31,11 +31,9 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
     clippy::duplicate_mod,
-    reason = "PIC build path-mounts the fluxor SDK wholesale and shares common files via #[path]; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; duplicate_mod: a shared core is mounted under more than one path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -44,12 +42,10 @@
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/envelope.rs"]
 mod envelope;
@@ -68,13 +64,12 @@ mod types;
 #[path = "../../common/wire.rs"]
 mod wire;
 use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
-// MetricsQL carries the PromQL front-end as `metricsql_front::promql`; the
-// anchor uses that one copy for PromQL/MetricsQL and its core (`tq`).
-#[path = "../../common/metricsql_front.rs"]
-mod metricsql_front;
-use metricsql_front::promql as promql_front;
+// MetricsQL carries the PromQL front-end and re-exports its core
+// (`metricsql_front::core`); the anchor uses that one copy (`tq`).
 #[path = "../../common/kql_front.rs"]
 mod kql_front;
+#[path = "../../common/metricsql_front.rs"]
+mod metricsql_front;
 #[path = "../../common/prom_result.rs"]
 mod prom_result;
 
@@ -89,7 +84,7 @@ use types::{
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
 // Core types via one of the mounted front-ends (all mount the same source).
-use promql_front::core as tq;
+use metricsql_front::core as tq;
 
 // ── Capacities ───────────────────────────────────────────────────────
 
@@ -150,7 +145,7 @@ impl Slot {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     AnchorState;
 
     1, listen_port, u16, 9090
@@ -763,9 +758,9 @@ fn handle_query(anchor: &mut AnchorState, req: &http_min::Request<'_>) {
     // Parse + lower via MetricsQL — a PromQL superset, so this endpoint
     // accepts both PromQL and MetricsQL over the same core.
     let mut scratch = [0u8; 1024];
-    let mut mb = [promql_front::core::Matcher {
+    let mut mb = [tq::Matcher {
         name: b"",
-        op: promql_front::core::MatchOp::Eq,
+        op: tq::MatchOp::Eq,
         value: b"",
     }; tq::MAX_MATCHERS];
     let mut gb: [&[u8]; tq::MAX_LABELS] = [b""; tq::MAX_LABELS];
@@ -792,11 +787,11 @@ fn handle_query(anchor: &mut AnchorState, req: &http_min::Request<'_>) {
         anchor.q_has_grouping = true;
         anchor.q_without = g.without;
         anchor.q_combine = match g.combine {
-            promql_front::core::SpatialOp::Sum => 0,
-            promql_front::core::SpatialOp::Min => 1,
-            promql_front::core::SpatialOp::Max => 2,
-            promql_front::core::SpatialOp::Avg => 3,
-            promql_front::core::SpatialOp::Count => 4,
+            tq::SpatialOp::Sum => 0,
+            tq::SpatialOp::Min => 1,
+            tq::SpatialOp::Max => 2,
+            tq::SpatialOp::Avg => 3,
+            tq::SpatialOp::Count => 4,
         };
         let mut gp = 0usize;
         for name in g.group {
@@ -825,8 +820,8 @@ fn handle_query(anchor: &mut AnchorState, req: &http_min::Request<'_>) {
     let mut mp = 0usize;
     for m in q.matchers {
         let op = match m.op {
-            promql_front::core::MatchOp::Eq => 0u8,
-            promql_front::core::MatchOp::Ne => 1u8,
+            tq::MatchOp::Eq => 0u8,
+            tq::MatchOp::Ne => 1u8,
         };
         if mp + 3 + m.name.len() + m.value.len() > MATCHER_BUF {
             reply_error(anchor, 400, b"Bad Request", b"selector too large");
@@ -845,7 +840,7 @@ fn handle_query(anchor: &mut AnchorState, req: &http_min::Request<'_>) {
     }
     anchor.q_matchers_n = q.matchers.len() as u8;
     anchor.q_temporal = match q.temporal {
-        promql_front::core::TemporalOp::Rate { .. } => T_RATE,
+        tq::TemporalOp::Rate { .. } => T_RATE,
         _ => T_LAST,
     };
     anchor.q_range_ms = q.range_ms;
@@ -1269,9 +1264,9 @@ fn handle_series(anchor: &mut AnchorState, req: &http_min::Request<'_>) {
         }
     };
     let mut scratch = [0u8; 1024];
-    let mut mb = [promql_front::core::Matcher {
+    let mut mb = [tq::Matcher {
         name: b"",
-        op: promql_front::core::MatchOp::Eq,
+        op: tq::MatchOp::Eq,
         value: b"",
     }; tq::MAX_MATCHERS];
     let mut gb: [&[u8]; tq::MAX_LABELS] = [b""; tq::MAX_LABELS];
@@ -1292,8 +1287,8 @@ fn handle_series(anchor: &mut AnchorState, req: &http_min::Request<'_>) {
     let mut mp = 0usize;
     for m in q.matchers {
         let op = match m.op {
-            promql_front::core::MatchOp::Eq => 0u8,
-            promql_front::core::MatchOp::Ne => 1u8,
+            tq::MatchOp::Eq => 0u8,
+            tq::MatchOp::Ne => 1u8,
         };
         if mp + 3 + m.name.len() + m.value.len() > MATCHER_BUF {
             reply_error(anchor, 400, b"Bad Request", b"selector too large");
@@ -1914,7 +1909,7 @@ fn decode_preimage<'a>(buf: &'a [u8], out: &mut [prom_result::core::Label<'a>]) 
 
 /// Check the owned matchers against a series' preimage label bytes.
 fn preimage_matches(anchor: &AnchorState, preimage: &[u8]) -> bool {
-    let mut lbuf = [promql_front::core::Label {
+    let mut lbuf = [tq::Label {
         name: b"",
         value: b"",
     }; tq::MAX_LABELS];
@@ -1928,17 +1923,17 @@ fn preimage_matches(anchor: &AnchorState, preimage: &[u8]) -> bool {
         let name = &anchor.q_matchers[at..at + nlen];
         at += nlen;
         let op = if anchor.q_matchers[at] == 0 {
-            promql_front::core::MatchOp::Eq
+            tq::MatchOp::Eq
         } else {
-            promql_front::core::MatchOp::Ne
+            tq::MatchOp::Ne
         };
         at += 1;
         let vlen = anchor.q_matchers[at] as usize;
         at += 1;
         let value = &anchor.q_matchers[at..at + vlen];
         at += vlen;
-        let m = promql_front::core::Matcher { name, op, value };
-        if !promql_front::core::matcher_matches(&m, &lbuf[..nl]) {
+        let m = tq::Matcher { name, op, value };
+        if !tq::matcher_matches(&m, &lbuf[..nl]) {
             return false;
         }
         checked += 1;
@@ -1946,7 +1941,7 @@ fn preimage_matches(anchor: &AnchorState, preimage: &[u8]) -> bool {
     true
 }
 
-fn decode_preimage_pf<'a>(buf: &'a [u8], out: &mut [promql_front::core::Label<'a>]) -> usize {
+fn decode_preimage_pf<'a>(buf: &'a [u8], out: &mut [tq::Label<'a>]) -> usize {
     let mut n = 0usize;
     let mut at = 0usize;
     while at < buf.len() && n < out.len() {
@@ -1967,7 +1962,7 @@ fn decode_preimage_pf<'a>(buf: &'a [u8], out: &mut [promql_front::core::Label<'a
         }
         let value = &buf[at..at + vl];
         at += vl;
-        out[n] = promql_front::core::Label { name, value };
+        out[n] = tq::Label { name, value };
         n += 1;
     }
     n
@@ -2152,11 +2147,7 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
 
 // ── Module ABI ───────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AnchorState>() as u32
-}
+fluxor_rt::module_facts! { state: AnchorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -2199,14 +2190,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
     let sys_ptr = anchor.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     if anchor.phase == PHASE_INIT && unsafe { net_bind(anchor) } {
         anchor.phase = PHASE_WAIT_BOUND;
@@ -2262,5 +2253,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

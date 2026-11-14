@@ -29,7 +29,7 @@
 /// SHA-256 from the SDK, for the password hash.
 #[allow(dead_code, reason = "the SDK hasher is mounted whole")]
 pub mod sha {
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+    pub use fluxor_sdk::crypto::sha256::*;
 }
 use sha::Sha256;
 

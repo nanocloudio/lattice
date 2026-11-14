@@ -40,25 +40,22 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
     unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface. unreachable_patterns: defensive `_ =>` fallthroughs keep the parser strict against unexpected envelopes"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -89,24 +86,23 @@ use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use etcd_codec::{
     build_grpc_trailers_block, build_lease_grant_response, build_lease_keepalive_response,
-    build_lease_revoke_response, build_put_response, build_range_response,
-    build_response_headers_block, build_watch_response_header_full, preface_matches,
-    write_watch_event, DeleteRangeRequest, FrameHeader, FrameType, GrpcMessageHeader, HpackDecoder,
-    LeaseGrantRequest, LeaseKeepAliveRequest, LeaseRevokeRequest, LeaseTimeToLiveRequest,
-    PutRequest, RangeRequest, SettingsIter, WatchEventKind, WatchOp, WatchRequest, ERROR_NO_ERROR,
-    ERROR_PROTOCOL_ERROR, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_HEADER_LEN,
-    GRPC_FRAME_HEADER_LEN, GRPC_STATUS_COMPACTED, GRPC_STATUS_UNIMPLEMENTED, HTTP2_PREFACE_LEN,
+    build_lease_revoke_response, build_range_response, build_response_headers_block,
+    build_watch_response_header_full, preface_matches, DeleteRangeRequest, FrameHeader, FrameType,
+    GrpcMessageHeader, HpackDecoder, LeaseGrantRequest, LeaseKeepAliveRequest, LeaseRevokeRequest,
+    LeaseTimeToLiveRequest, PutRequest, RangeRequest, SettingsIter, WatchEventKind, WatchOp,
+    WatchRequest, ERROR_PROTOCOL_ERROR, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM,
+    FRAME_HEADER_LEN, GRPC_FRAME_HEADER_LEN, GRPC_STATUS_COMPACTED, GRPC_STATUS_UNIMPLEMENTED,
+    HTTP2_PREFACE_LEN,
 };
 use session_anchor::session_core::session_ctrl as sc;
 use session_anchor::session_core::{
-    anchor_id as make_anchor_id, mint_session_id, session_app_id, CLASS_LEASE, CLASS_WATCH,
-    FIRST_EPOCH, NO_WORKER,
+    anchor_id as make_anchor_id, mint_session_id, CLASS_LEASE, CLASS_WATCH, FIRST_EPOCH, NO_WORKER,
 };
-use session_anchor::{AnchorAction, SessionAnchor, Target};
+use session_anchor::{SessionAnchor, Target};
 use types::{KV_OP_COMPACT, KV_OP_HASH_KV, KV_OP_LEASE_KEYS, KV_OP_LEASE_REVOKE};
 use types::{
     KV_OP_DELETE, KV_OP_DELETE_META, KV_OP_GET, KV_OP_GET_AT, KV_OP_PUT, KV_OP_RANGE_META,
-    KV_OP_RANGE_SCAN, KV_RESULT_COMPACTED, KV_RESULT_FUTURE_REV, KV_RESULT_INTEGER, KV_RESULT_KVS,
+    KV_RESULT_COMPACTED, KV_RESULT_FUTURE_REV, KV_RESULT_INTEGER, KV_RESULT_KVS,
     KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_RANGE, PROTO_ETCD, PUT_FLAG_IGNORE_LEASE,
     PUT_FLAG_IGNORE_VALUE, PUT_FLAG_LEASE, PUT_FLAG_PREV_META,
 };
@@ -1342,7 +1338,7 @@ impl AnchorState {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     AnchorState;
 
     // TCP port the anchor binds for etcd clients (etcd's default 2379).
@@ -2737,7 +2733,7 @@ fn lg_reply(anchor: &mut AnchorState, i: usize, result: u8, revision: i64, off: 
 
 /// Hold the watch frame in `reply[..len]` and fetch its manifests' values.
 fn wlg_begin(anchor: &mut AnchorState, len: usize) {
-    use kv_large::kv_chunks::{Manifest, Reader};
+    use kv_large::kv_chunks::Manifest;
     let now = unsafe { dev_millis(&*anchor.syscalls) };
     let parsed = {
         let AnchorState { wlg, reply, .. } = &mut *anchor;
@@ -7357,11 +7353,7 @@ unsafe fn net_send_data_pic_from_frame(
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AnchorState>() as u32
-}
+fluxor_rt::module_facts! { state: AnchorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -7433,9 +7425,9 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
 
@@ -7446,7 +7438,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         },
         AnchorPhase::WaitBound | AnchorPhase::Listening => {}
-        AnchorPhase::Error => return -1,
+        AnchorPhase::Error => return StepReturn::error(-1),
     }
 
     // Drain both channels in a per-tick loop so we don't gate every
@@ -7495,5 +7487,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

@@ -22,25 +22,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -81,7 +77,7 @@ use types::{
     KV_OP_LEASE_KEYS, KV_OP_LEASE_REVOKE, KV_OP_RANGE_META, KV_OP_RANGE_SCAN, KV_OP_SCAN_VERSIONS,
     KV_RESULT_CROSS_RANGE, KV_RESULT_DIRTY_EPOCH, KV_RESULT_INTERNAL, KV_RESULT_LIN_BOUND,
     KV_RESULT_RANGE, PROTO_ETCD, PROTO_INTERNAL_SQL, PROTO_INTERNAL_WATCH, PROTO_MEMCACHED,
-    PROTO_MEMCACHED_UDP, PROTO_REDIS, PROTO_UNKNOWN, REQ_LINEARIZABLE,
+    PROTO_MEMCACHED_UDP, PROTO_REDIS, REQ_LINEARIZABLE,
 };
 use wire::{
     CLIENT_REJECT_NOT_LEADER, LATTICE_ENTRY_TAG, MSG_APP_APPLIED_POS, MSG_CLIENT_PROPOSAL,
@@ -1252,7 +1248,7 @@ fn fence_key(proto: u8, conn: u8) -> Option<usize> {
     Some(p * 256 + conn as usize)
 }
 
-define_params! {
+fluxor_rt::define_params! {
     RouterState;
 
     // 1 = classify ALL reads as linearizable (take the ReadIndex fence
@@ -4070,11 +4066,7 @@ unsafe fn flush_reply(router: &mut RouterState) -> bool {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RouterState>() as u32
-}
+fluxor_rt::module_facts! { state: RouterState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -4249,9 +4241,9 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let router = unsafe { &mut *state.cast::<RouterState>() };
 
@@ -4385,7 +4377,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Cadence for the O(FENCE_KEYS) recovery sweeps (see `sweep_ctr`).

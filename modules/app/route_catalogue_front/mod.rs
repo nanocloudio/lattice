@@ -40,24 +40,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/route_catalogue.rs"]
 mod route_catalogue;
@@ -127,7 +124,7 @@ struct FrontState {
     out: [u8; RECORD_MAX],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     FrontState;
 
     1, proto, u32, 1
@@ -183,11 +180,7 @@ impl FrontIo for ShellIo<'_> {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<FrontState>() as u32
-}
+fluxor_rt::module_facts! { state: FrontState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -327,7 +320,7 @@ unsafe fn read_answers(s: &mut FrontState) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut FrontState);
         let sys = &*s.syscalls;
@@ -385,8 +378,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 4. Drain: once nothing is held or owed, report Done.
         if s.draining == 1 && s.front.idle() && !s.outbox.holding() {
-            return 1;
+            return StepReturn::Done;
         }
-        0
+        StepReturn::Continue
     }
 }

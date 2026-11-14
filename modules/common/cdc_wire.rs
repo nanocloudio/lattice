@@ -6,7 +6,7 @@
 //! `modules/sdk/contracts/exchange.rs` in the fluxor repo
 //! (`deps/fluxor/modules/sdk/contracts/exchange.rs` in this checkout), and
 //! PIC modules mount the built copy `fluxor build` vendors into
-//! `target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`. Edits to the
+//! `fluxor_abi::contracts::exchange`. Edits to the
 //! record layout go to the fluxor SDK, never here.
 //!
 //! The surface is an SDK contract because it is not a CDC concept:

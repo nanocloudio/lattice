@@ -22,10 +22,9 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
     clippy::duplicate_mod,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; duplicate_mod: a shared core is mounted under more than one path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -35,12 +34,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -92,7 +89,7 @@ struct RelocatorState {
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     RelocatorState;
 
     // Number of anchor workers to alternate between (2 by default).
@@ -139,11 +136,7 @@ fn emit_relocate(st: &mut RelocatorState, target: u8) {
     st.next_target ^= 1;
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RelocatorState>() as u32
-}
+fluxor_rt::module_facts! { state: RelocatorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -187,15 +180,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let st = unsafe { &mut *state.cast::<RelocatorState>() };
     unsafe {
         let sys_ptr = st.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
 
@@ -235,5 +228,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             telemetry::emit_counters(&*st.syscalls, st.metrics_out, &[st.m_relocations]);
         }
     }
-    0
+    StepReturn::Continue
 }

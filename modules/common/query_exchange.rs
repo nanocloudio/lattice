@@ -3,7 +3,7 @@
 //!
 //! A database or cache client (`pg_client`, `redis_client`, `mongo_client`)
 //! and the reference sink (`loopback_sink`) take requests as exchange
-//! records (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`) and answer
+//! records (`fluxor_abi::contracts::exchange`) and answer
 //! each exactly once. What differs between them is the backend; what does
 //! not differ is everything here:
 //!
@@ -48,8 +48,7 @@
 // The single mount of the SDK contract for this file. A module reaches the
 // contract through this mount (`query_exchange::exchange`) so the types it
 // hands back here are the same types.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-pub mod exchange;
+pub use fluxor_abi::contracts::exchange;
 
 use exchange::{
     flag, link, parse_request, write_body, write_credit, write_link, write_response_head,

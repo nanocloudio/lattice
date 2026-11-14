@@ -22,25 +22,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -67,7 +63,7 @@ use placement::{
     Recommendation,
 };
 use types::{KV_OP_RANGE_SCAN, KV_RESULT_RANGE, PROTO_INTERNAL_JOB};
-use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_PLACEMENT_RELOCATE_CMD, MSG_PLACEMENT_SPLIT_CMD};
+use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE, MSG_PLACEMENT_RELOCATE_CMD};
 
 const ENV_BUF: usize = 4096;
 /// Records requested per survey page. Only the count matters, but the
@@ -85,7 +81,7 @@ const S_SCAN: u8 = 1;
 // must not gate a survey that does not track per-range op timestamps yet.
 const NO_RECENT_OP_MS: u64 = 10_000_000;
 
-define_params! {
+fluxor_rt::define_params! {
     RebalState;
 
     // The ordered range map, hex (TLV str chunks append). Same encoding the
@@ -487,11 +483,7 @@ fn emit_relocate(s: &mut RebalState, range_index: u8, from_node: u32, to_node: u
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RebalState>() as u32
-}
+fluxor_rt::module_facts! { state: RebalState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -570,14 +562,14 @@ fn decode_range_map(s: &mut RebalState) -> bool {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = unsafe { &mut *state.cast::<RebalState>() };
     let sys_ptr = s.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let now = unsafe { dev_millis(&*sys_ptr) };
     if s.boot_ms == 0 {
@@ -618,7 +610,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 unsafe fn write_envelope(

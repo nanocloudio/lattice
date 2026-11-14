@@ -20,18 +20,16 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -267,11 +265,7 @@ unsafe fn flush_pending(s: &mut BridgeState) -> bool {
     true
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<BridgeState>() as u32
-}
+fluxor_rt::module_facts! { state: BridgeState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -373,14 +367,14 @@ unsafe fn heartbeat(s: &BridgeState) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = unsafe { &mut *state.cast::<BridgeState>() };
     let sys = s.syscalls;
     if sys.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     // Drain up to N committed entries per tick; raft's commit
     // horizon can advance by many entries in one tick under load.
@@ -549,5 +543,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

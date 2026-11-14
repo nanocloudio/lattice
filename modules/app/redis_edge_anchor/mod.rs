@@ -37,25 +37,22 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
     unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface. unreachable_patterns: defensive `_ => Error` arms in match statements are intentional — adding a new variant should not silently bypass the error path"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -83,12 +80,10 @@ use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use redis_codec::{
     enc_array_header, enc_bulk, enc_error, enc_integer, enc_line_text, enc_null_bulk, enc_raw,
-    enc_simple_str, eq_ascii_ci, itoa, parse_i64, parse_one, ArgView, Argv, Built, ParseStep,
+    enc_simple_str, eq_ascii_ci, parse_i64, parse_one, Argv, Built, ParseStep,
 };
 use session_anchor::session_core::session_ctrl as sc;
-use session_anchor::session_core::{
-    anchor_id as make_anchor_id, mint_session_id, session_app_id, CLASS_PUBSUB,
-};
+use session_anchor::session_core::{session_app_id, CLASS_PUBSUB};
 use session_anchor::{AnchorAction, SessionAnchor, Target};
 
 /// Write one `[msg][len:2 LE][payload…]` envelope to `chan`.
@@ -209,7 +204,7 @@ const DEFAULT_TENANT: u32 = 0;
 /// conventions with room to spare.
 const REQUIREPASS_MAX: usize = 128;
 
-define_params! {
+fluxor_rt::define_params! {
     AnchorState;
 
     // TCP port the anchor binds for RESP clients. Overridable so
@@ -2823,11 +2818,7 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AnchorState>() as u32
-}
+fluxor_rt::module_facts! { state: AnchorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -2907,9 +2898,9 @@ const STEP_BURST: i32 = 2;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
 
@@ -2920,7 +2911,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         },
         AnchorPhase::WaitBound | AnchorPhase::Listening => { /* event-driven below */ }
-        AnchorPhase::Error => return -1,
+        AnchorPhase::Error => return StepReturn::error(-1),
     }
 
     let more = unsafe {
@@ -2958,9 +2949,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         m_net || m_kv || m_ps
     };
     if more {
-        STEP_BURST
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 

@@ -3,6 +3,10 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 provides         = ["storage.object", "storage.namespace"]
+provider_contracts = ["storage.object", "storage.namespace"]
+deferred_ready = true
+observes_owner_release = true
+samples_pool = true
 # mod.rs is a SYMLINK to ../kv_state_worker/mod.rs: the same source, built
 # with `store_provider`. (A symlink, not an `entry` outside this directory:
 # the build's staleness check walks the module's own directory.)
@@ -18,15 +22,15 @@ provides         = ["storage.object", "storage.namespace"]
 # replica of a replicated store (`sweep_wrap: 1`, `prov_out` wired to
 # consensus, `replica_id` its own) proposes it and answers EINPROGRESS until
 # it has applied here, then with a `ReplicatedDurable` fence
-# (`group_durable: 1`). Any other configuration registers no contract and
-# logs `[kvw] store provider=0 (why)`.
+# (`group_durable: 1`). Any other configuration answers every store call
+# ENOSYS and logs `[kvw] store provider=0 (why)`.
 #
 # A replica on a node with private records names them (`scope`: the node,
 # `scoped`: its prefixes, comma-separated): its graph keeps the plain
 # names, the store keeps them under `/~node/<scope>`, so every replica
 # holds each node's apart. A LIST, CHANGES or subscription on a scoped
 # prefix answers in the graph's names; one on a broader prefix sees the
-# store's. A scope it cannot keep registers no contract.
+# store's. A scope it cannot keep answers every store call ENOSYS.
 #
 # ⚠ TEST-ONLY FAULT INJECTION — never in a shipped graph.
 # `fault_read_eagain_every: N` (param 20, default 0 = off) makes one step

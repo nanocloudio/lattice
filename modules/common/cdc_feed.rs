@@ -120,8 +120,7 @@ pub mod cdc_wire;
 // The single mount of the SDK contract for this tree. Consumers that mount
 // `cdc_feed` reach it as `cdc_feed::exchange` rather than mounting the file a
 // second time, which rustc would treat as an unrelated module.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-pub mod exchange;
+pub use fluxor_abi::contracts::exchange;
 
 #[path = "db_ops.rs"]
 pub mod db_ops;

@@ -1,5 +1,5 @@
 //! `FsRunStorage` — `RunStorage` over the Fluxor FS provider contract
-//! (`target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`), for the PIC
+//! (`fluxor_abi::contracts::storage::fs`), for the PIC
 //! module build of the ordered disk state-store provider
 //! (`disk_store.rs`).
 //!
@@ -9,7 +9,7 @@
 //! `UNLINK`, `FSYNC`) — `EINPROGRESS` (-36, taken; re-ask the
 //! byte-identical request, a later answer decides), and `READ`/`WRITE`
 //! may move a short count (see the fs contract,
-//! `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`). This backend
+//! `fluxor_abi::contracts::storage::fs`). This backend
 //! turns all of that into the `RunStorage` contract's
 //! [`StorageError::Again`], and keeps the call's progress so the SAME call
 //! asked again continues it rather than starting over:

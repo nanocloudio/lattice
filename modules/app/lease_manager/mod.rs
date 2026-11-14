@@ -28,11 +28,9 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
     clippy::duplicate_mod,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; duplicate_mod: a shared core is mounted under more than one path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -42,12 +40,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -72,7 +68,7 @@ use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{
     placement_event_epoch, session_app_id, worker_id, SessionId, CLASS_LEASE,
 };
-use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
+use session_worker::{SessionWorker, WorkerAction};
 use ttl_scheduler::{ExpiryEntry, TtlQueue, EXPIRY_KIND_LEASE};
 use wire::{
     LEASE_STATE_GONE, LEASE_STATE_OK, MSG_LEASE_CTRL, MSG_LEASE_REVOKE, MSG_LEASE_STATE,
@@ -181,7 +177,7 @@ struct LeaseManagerState {
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     LeaseManagerState;
 
     1, worker_id, u8, 0
@@ -586,11 +582,7 @@ fn handle_epoch_event(_mgr: &mut LeaseManagerState, msg_type: u8, payload: &[u8]
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<LeaseManagerState>() as u32
-}
+fluxor_rt::module_facts! { state: LeaseManagerState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -640,15 +632,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let mgr = unsafe { &mut *state.cast::<LeaseManagerState>() };
     unsafe {
         let sys_ptr = mgr.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
         if let Some((mt, len)) =
@@ -693,5 +685,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

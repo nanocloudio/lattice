@@ -32,23 +32,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -60,8 +58,6 @@ use wire::{
     LATTICE_RECORD_TAG, MSG_CLIENT_PROPOSAL, MSG_COMPACTION_FLOOR, MSG_GC_FLOOR_COMMITTED,
     MSG_GC_FLOOR_PROPOSE, MSG_RETENTION_CLAIM, MSG_RETENTION_FLOOR,
 };
-
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/compaction_floor.rs"]
 mod compaction_floor;
@@ -92,7 +88,7 @@ const PROPOSE_INTERVAL_STEPS: u64 = 1000;
 /// Scratch large enough for the biggest inbound payload.
 const SCRATCH: usize = 64;
 
-define_params! {
+fluxor_rt::define_params! {
     CompState;
 
     // How many revisions below the allocator's committed high water the
@@ -223,11 +219,7 @@ unsafe fn write_envelope(sys: &SyscallTable, chan: i32, mt: u8, body: &[u8]) -> 
     (sys.channel_write)(chan, buf.as_mut_ptr(), total) == total as i32
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<CompState>() as u32
-}
+fluxor_rt::module_facts! { state: CompState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -423,14 +415,14 @@ unsafe fn evaluate(s: &mut CompState, sys: &SyscallTable, now_ms: u64) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = unsafe { &mut *state.cast::<CompState>() };
     let sys = s.syscalls;
     if sys.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     let mut scratch = [0u8; ENVELOPE_HDR + SCRATCH];
     unsafe {
@@ -473,5 +465,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

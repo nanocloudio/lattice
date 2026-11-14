@@ -60,7 +60,6 @@ use doc_exec::*;
 
 // The SDK's pointer-free name tables (`runtime/names.rs`): the module's
 // crate root includes them with the runtime, the host tests directly.
-use crate::{name_table_len, NameTable};
 
 pub use codec::{
     elements, find, int_value, str_value, truthy, BsonError, B_DATETIME, B_NULL, B_OBJECT_ID,
@@ -928,7 +927,7 @@ pub fn insert_tree(doc: &[u8], minted: &[u8; 12], out: &mut [u8]) -> Result<usiz
 // ── Answers ───────────────────────────────────────────────────────────
 
 // An outcome's MongoDB message: one table (see `outcome_refusal`).
-name_table!(
+fluxor_rt::name_table!(
     OUTCOME_MESSAGES = [
         b"E11000 duplicate key error",
         b"ns not found",

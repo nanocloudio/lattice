@@ -81,25 +81,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -187,7 +183,7 @@ const S_RELOC: u8 = 10; // op_kind 3: relocation driver active
 /// simply re-sent on this cadence until the JOINT/NEW commit lands.
 const RELOC_REISSUE_TICKS: u32 = 200;
 
-define_params! {
+fluxor_rt::define_params! {
     SupState;
 
     // 0 = idle (module inert), 1 = split. Merge (2) / relocate (3)
@@ -1603,11 +1599,7 @@ fn on_settled(sup: &mut SupState) {
 
 // ── Module ABI ───────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<SupState>() as u32
-}
+fluxor_rt::module_facts! { state: SupState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1777,14 +1769,14 @@ fn decode_range_map(sup: &mut SupState) -> bool {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let sup = unsafe { &mut *state.cast::<SupState>() };
     let sys_ptr = sup.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let now = unsafe { dev_millis(&*sys_ptr) };
     if sup.boot_ms == 0 {
@@ -1937,7 +1929,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Stamp the 3-byte envelope header over a payload already staged at

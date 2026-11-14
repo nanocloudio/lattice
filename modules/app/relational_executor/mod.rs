@@ -59,19 +59,16 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
     unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface. unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -99,8 +96,8 @@ use sql_core::relational::{
     MAX_KEY_COLUMNS, MAX_PRIMARY_KEY_LEN, MAX_ROW_BYTES,
 };
 use sql_core::{
-    bind_access, bind_create_table, bind_insert_row, bind_projection, bound_row_key_values,
-    error_code, parse, Access, BoundColumn, Dialect, SqlError, Statement,
+    bind_create_table, bind_insert_row, bind_projection, bound_row_key_values, error_code, parse,
+    Access, BoundColumn, Dialect, Statement,
 };
 use sql_exec::{
     kv_key, prefix_successor, ResponseBuilder, ERR_BUSY, ERR_CORRUPT, ERR_DUPLICATE_KEY,
@@ -5835,11 +5832,7 @@ fn after_drop_name(exec: &mut ExecState, result: u8) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ExecState>() as u32
-}
+fluxor_rt::module_facts! { state: ExecState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -5904,15 +5897,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let exec = unsafe { &mut *state.cast::<ExecState>() };
     unsafe {
         let sys_ptr = exec.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
 
@@ -6070,5 +6063,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

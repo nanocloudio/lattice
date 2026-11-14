@@ -43,25 +43,22 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
     unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface. unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each; unreachable_patterns: defensive `_ =>` arms are intentional so a new variant cannot silently bypass the error path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -85,7 +82,7 @@ use abi::contracts::net::net_proto::{
     CONN_ID_LEN, MAX_CMD_DATA, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
-use pg::relational::{LogicalType, Value};
+use pg::relational::LogicalType;
 use pg::sql_exec;
 use wire::{MSG_SQL_REQUEST, MSG_SQL_RESPONSE};
 
@@ -230,7 +227,7 @@ struct AnchorState {
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     AnchorState;
 
     1, listen_port, u16, 5432
@@ -1053,11 +1050,7 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AnchorState>() as u32
-}
+fluxor_rt::module_facts! { state: AnchorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1120,15 +1113,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
     unsafe {
         let sys_ptr = anchor.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
 
@@ -1136,7 +1129,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if net_bind(anchor) {
                 anchor.phase = PHASE_WAIT_BOUND;
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Executor replies first: they unblock busy slots, and a slot that
@@ -1195,5 +1188,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

@@ -64,18 +64,16 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -970,11 +968,7 @@ fn send_window(fanout: &mut FanoutState) -> bool {
     true
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<FanoutState>() as u32
-}
+fluxor_rt::module_facts! { state: FanoutState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1019,15 +1013,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let fanout = unsafe { &mut *state.cast::<FanoutState>() };
     unsafe {
         let sys_ptr = fanout.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
         // The rest of a window the channel had no room for goes first.
@@ -1075,5 +1069,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

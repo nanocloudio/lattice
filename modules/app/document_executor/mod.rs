@@ -52,25 +52,21 @@
     reason = "`big` is document_executor_big's feature; this file is also document_executor, whose build declares none"
 )]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "duplicate_mod: a shared core is mounted under more than one path; clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments: the module ABI entry points take raw state and syscall pointers whose validity is the runtime's half of the contract"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -134,9 +130,8 @@ use doc_exec::doc_tree::{
 use doc_exec::*;
 use types::{
     KV_OP_INCR, KV_OP_RANGE_META, KV_OP_SCAN_VERSIONS, KV_OP_TXN, KV_OP_TXN_STAGED,
-    KV_RESULT_CAS_FAILED, KV_RESULT_COMPACTED, KV_RESULT_FUTURE_REV, KV_RESULT_INTEGER,
-    KV_RESULT_KVS, KV_RESULT_NOT_FOUND, KV_RESULT_OK, KV_RESULT_QUOTA, KV_RESULT_TOO_LARGE,
-    KV_RESULT_TXN, KV_RESULT_VERSIONS, PROTO_INTERNAL_SQL, TXN_CMP_MOD_EQUAL,
+    KV_RESULT_COMPACTED, KV_RESULT_INTEGER, KV_RESULT_KVS, KV_RESULT_OK, KV_RESULT_QUOTA,
+    KV_RESULT_TOO_LARGE, KV_RESULT_TXN, KV_RESULT_VERSIONS, PROTO_INTERNAL_SQL, TXN_CMP_MOD_EQUAL,
 };
 use wire::{MSG_DOC_REQUEST, MSG_DOC_RESPONSE, MSG_KV_PENDING, MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -203,8 +198,10 @@ const BUFFER_BYTES: usize = 2 * REQ_BUF
 /// The big build's heap: the buffers, and the allocator's rounding.
 #[cfg(feature = "big")]
 const ARENA_BYTES: usize = BUFFER_BYTES + 64 * 1024;
-#[cfg(feature = "big")]
-declare_module_arena_bytes!(ARENA_BYTES);
+/// The default build keeps its buffers in state and takes no heap.
+#[cfg(not(feature = "big"))]
+const ARENA_BYTES: usize = 0;
+fluxor_rt::module_facts! { state: ExecState, arena: ARENA_BYTES }
 /// A KV key: keyspace prefix and the model key.
 const KEY_MAX: usize = 4 + models::DOCUMENT_KEY_MAX_LEN;
 /// Documents per list or filter page.
@@ -521,7 +518,7 @@ struct ExecState {
     follow_buf: [u8; FOLLOW_REQ_MAX + wire::ENVELOPE_HDR + 16],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     ExecState;
 
     // How often every followed watch is read again whatever notified it:
@@ -669,7 +666,7 @@ fn msg_bad_op() -> &'static [u8] {
 // A refusal's reason, as text: one table, indexed by `Reason`'s
 // declaration order (a `match` returning literals would be a table of
 // absolute pointers, which a module image cannot hold).
-name_table!(
+fluxor_rt::name_table!(
     REASON_MESSAGES = [
         b"the path runs through a value that is not an object or array",
         b"the value is not a number",
@@ -5622,12 +5619,6 @@ fn dispatch_reply(exec: &mut ExecState, result: u8, revision: u64, body: &[u8]) 
 // ── Module ABI ────────────────────────────────────────────────────────
 
 #[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ExecState>() as u32
-}
-
-#[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
@@ -5733,15 +5724,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let exec = unsafe { &mut *state.cast::<ExecState>() };
     unsafe {
         let sys_ptr = exec.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
         // An answer still leaving goes first; then KV replies, which
@@ -5805,5 +5796,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

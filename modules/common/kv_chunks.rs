@@ -44,7 +44,7 @@
 //! what it always did.
 
 pub mod sha {
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+    pub use fluxor_sdk::crypto::sha256::*;
 }
 
 use sha::Sha256;

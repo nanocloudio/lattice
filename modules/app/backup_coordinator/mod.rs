@@ -67,25 +67,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -109,8 +105,7 @@ use db_ops::{
 use types::{
     KV_OP_GET, KV_OP_HASH_KV, KV_OP_PUT, KV_OP_RANGE_META, KV_OP_RESTORE, KV_OP_RETAIN,
     KV_RESULT_COMPACTED, KV_RESULT_EXISTS, KV_RESULT_KVS, KV_RESULT_MANIFEST, KV_RESULT_NOT_FOUND,
-    KV_RESULT_OK, PROTO_ETCD, RESTORE_HEAD_LEN, RESTORE_META_LEN, RETAIN_ANSWER_LEN,
-    RETAIN_AT_CURRENT,
+    KV_RESULT_OK, PROTO_ETCD, RESTORE_META_LEN, RETAIN_ANSWER_LEN, RETAIN_AT_CURRENT,
 };
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -155,7 +150,7 @@ const HOLD_TTL_MS: u64 = 60_000;
 /// life: two renewals may be lost before it lapses).
 const HOLD_RENEW_MS: u64 = HOLD_TTL_MS / 3;
 
-define_params! {
+fluxor_rt::define_params! {
     CoordState;
 
     // 0 = inert, 1 = take a backup, 2 = restore the named backup.
@@ -1064,11 +1059,7 @@ fn on_kv_response(c: &mut CoordState, result: u8, body: &[u8], applied_index: u6
 
 // ── Module ABI ───────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<CoordState>() as u32
-}
+fluxor_rt::module_facts! { state: CoordState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1152,14 +1143,14 @@ unsafe fn take_answer(c: &mut CoordState, target: bool) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let c = unsafe { &mut *state.cast::<CoordState>() };
     let sys_ptr = c.syscalls;
     if sys_ptr.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let now = unsafe { dev_millis(&*sys_ptr) };
     if c.boot_ms == 0 {
@@ -1191,7 +1182,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 unsafe fn write_envelope(

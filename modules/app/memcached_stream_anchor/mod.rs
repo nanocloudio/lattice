@@ -36,25 +36,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -79,16 +75,15 @@ mod envelope;
 use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use memcached_codec::{
-    append, append_decimal_u64, encode_reply, eq_ascii_ci, find_crlf, itoa_i64, itoa_u64,
-    parse_i64_dec, parse_line, parse_u32_dec, token_bytes, Line, MemOp, Token, MAX_TOKENS,
+    append, append_decimal_u64, encode_reply, eq_ascii_ci, parse_i64_dec, parse_line,
+    parse_u32_dec, token_bytes, Line, MemOp,
 };
 
 use collections::InflightTable;
 use types::{
     KV_OP_APPEND, KV_OP_DECR, KV_OP_DELETE, KV_OP_FLUSH, KV_OP_GET, KV_OP_INCR, KV_OP_PREPEND,
-    KV_OP_PUT, KV_RESULT_CAS_FAILED, KV_RESULT_INTEGER, KV_RESULT_INTERNAL, KV_RESULT_NOT_FOUND,
-    KV_RESULT_OK, KV_RESULT_WRONG_TYPE, PROTO_MEMCACHED, PUT_FLAG_NX, PUT_FLAG_XX,
-    REQ_LINEARIZABLE, REQ_SERIALIZABLE,
+    KV_OP_PUT, KV_RESULT_INTERNAL, PROTO_MEMCACHED, PUT_FLAG_NX, PUT_FLAG_XX, REQ_LINEARIZABLE,
+    REQ_SERIALIZABLE,
 };
 use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
@@ -144,7 +139,7 @@ const GET_BATCHES: usize = 32;
 const MAX_INFLIGHT: usize = 256;
 const DEFAULT_LISTEN_PORT: u16 = 11211;
 
-define_params! {
+fluxor_rt::define_params! {
     AnchorState;
 
     // TCP port the anchor binds for memcached clients.
@@ -1838,11 +1833,7 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AnchorState>() as u32
-}
+fluxor_rt::module_facts! { state: AnchorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1893,9 +1884,9 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
     match anchor.phase {
@@ -1905,7 +1896,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         },
         AnchorPhase::WaitBound | AnchorPhase::Listening => {}
-        AnchorPhase::Error => return -1,
+        AnchorPhase::Error => return StepReturn::error(-1),
     }
     unsafe {
         poll_net_in(anchor);
@@ -1925,5 +1916,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

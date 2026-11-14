@@ -60,10 +60,8 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::duplicate_mod,
@@ -73,12 +71,10 @@
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -103,9 +99,8 @@ use session_worker::session_core::session_ctrl as sc;
 use session_worker::session_core::{placement_event_epoch, worker_id, SessionId, CLASS_WATCH};
 use session_worker::{SessionWorker, WorkerAction, WPHASE_DRAINING};
 use watch_hub::{
-    catch_up_step, match_event_from, CatchUp, MatchedWatch, MutationTail, WatchHub, WatchRecord,
-    MAX_WATCHES, WATCH_EVENT_DELETE, WATCH_EVENT_PUT, WATCH_EXPORT_MAX, WATCH_PHASE_ACTIVE,
-    WATCH_PHASE_DRAINED, WATCH_PHASE_DRAINING, WATCH_PHASE_IMPORTED,
+    catch_up_step, match_event_from, CatchUp, MutationTail, WatchHub, WatchRecord, MAX_WATCHES,
+    WATCH_EVENT_DELETE, WATCH_EVENT_PUT, WATCH_EXPORT_MAX, WATCH_PHASE_ACTIVE, WATCH_PHASE_DRAINED,
 };
 use wire::{
     MSG_PLACEMENT_EPOCH_EVENT, MSG_RETENTION_FLOOR, MSG_WATCH_CTRL, MSG_WATCH_EVENT,
@@ -190,7 +185,7 @@ struct RegistryState {
     scratch: [u8; ENVELOPE_HDR + SCRATCH_BUF_SIZE],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     RegistryState;
 
     // Which of the anchor's workers this instance is (0 = the one new
@@ -1027,11 +1022,7 @@ fn handle_epoch_event(reg: &mut RegistryState, msg_type: u8, payload: &[u8]) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RegistryState>() as u32
-}
+fluxor_rt::module_facts! { state: RegistryState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1081,15 +1072,15 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let reg = unsafe { &mut *state.cast::<RegistryState>() };
     unsafe {
         let sys_ptr = reg.syscalls;
         if sys_ptr.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*sys_ptr;
 
@@ -1153,5 +1144,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }

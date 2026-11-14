@@ -51,12 +51,7 @@
     reason = "shared via #[path] into the front module and the host suite; each uses a subset of the surface"
 )]
 
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-#[allow(
-    clippy::duplicate_mod,
-    reason = "the SDK contract is mounted by every exchange-facing core"
-)]
-pub mod exchange;
+pub use fluxor_abi::contracts::exchange;
 
 use super::route_catalogue::{
     each_snapshot_record, Changes, ChangesError, ChangesPage, DeclareError, DeclarePhase, Declarer,

@@ -71,24 +71,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
@@ -127,7 +124,7 @@ use types::{
     KV_RESULT_TXN, KV_RESULT_TXN_PENDING, KV_RESULT_UNAUTH, KV_RESULT_VERSIONS,
     KV_RESULT_WRONG_TYPE, PROTO_INTERNAL_DATA,
 };
-use wire::{KV_RESPONSE_FENCE_TAIL_LEN, MSG_KV_REQUEST, MSG_KV_RESPONSE};
+use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 
 // ── Capacities ────────────────────────────────────────────────────────
 
@@ -156,7 +153,7 @@ const DEFAULT_LISTEN_PORT: u16 = 7432;
 /// 0xFFFF is unreachable long before the tables bind.
 const SLOT_FREE: u16 = 0xFFFF;
 
-define_params! {
+fluxor_rt::define_params! {
     AnchorState;
 
     // TCP port the anchor binds for data clients. Overridable so a
@@ -1236,11 +1233,7 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<AnchorState>() as u32
-}
+fluxor_rt::module_facts! { state: AnchorState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1290,9 +1283,9 @@ const STEP_BURST: i32 = 2;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let anchor = unsafe { &mut *state.cast::<AnchorState>() };
 
@@ -1303,7 +1296,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         },
         AnchorPhase::WaitBound | AnchorPhase::Listening => {}
-        AnchorPhase::Error => return -1,
+        AnchorPhase::Error => return StepReturn::error(-1),
     }
 
     let more = unsafe {
@@ -1329,8 +1322,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         m_net || m_kv
     };
     if more {
-        STEP_BURST
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }

@@ -87,8 +87,7 @@ pub mod cdc_wire;
 
 // The single mount of the SDK contract for this tree; consumers reach it as
 // `cdc_subscribe::exchange`.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-pub mod exchange;
+pub use fluxor_abi::contracts::exchange;
 
 use cdc_wire::{CdcEvent, CDC_KIND_DELETE, CDC_KIND_PUT};
 use exchange::{

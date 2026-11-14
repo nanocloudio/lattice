@@ -7,24 +7,21 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared common code"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/held_read.rs"]
 mod held_read;
@@ -82,7 +79,7 @@ const fn page_bytes(big: usize) -> usize {
 /// cap reached. The cap is the largest configuration's allocation and the
 /// allocator's rounding.
 const ARENA_BYTES: usize = page_bytes(BIG_MAX) + BIG_MAX + 64 * 1024;
-declare_module_arena_bytes!(ARENA_BYTES);
+fluxor_rt::module_facts! { state: ProbeState, arena: ARENA_BYTES }
 
 const PHASE_WRITE: u8 = 0;
 const PHASE_BIG: u8 = 1;
@@ -142,7 +139,7 @@ struct ProbeState {
 /// Nodes whose large values are read back, at most.
 const MAX_NODES: usize = 8;
 
-define_params! {
+fluxor_rt::define_params! {
     ProbeState;
 
     // This node's number: its keys are `/probe/n<node>/…`.
@@ -589,12 +586,6 @@ unsafe fn step_verify(s: &mut ProbeState, sys: &SyscallTable) {
 }
 
 #[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ProbeState>() as u32
-}
-
-#[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
@@ -644,13 +635,13 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let s = unsafe { &mut *state.cast::<ProbeState>() };
     if s.syscalls.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     let sys = unsafe { &*s.syscalls };
     s.step = s.step.wrapping_add(1);
@@ -663,5 +654,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             step_verify(s, sys);
         }
     }
-    0
+    StepReturn::Continue
 }

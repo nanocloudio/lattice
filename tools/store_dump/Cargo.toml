@@ -13,6 +13,12 @@ description = "Print a lattice disk store's live keys and values: recover its ru
 # (the module build); here they are a whole surface this tool uses a subset
 # of, with the module ABI's arities. Those allows are structural, so they
 # are stated here rather than at the crate root.
+[dependencies]
+# Fluxor's module SDK as `fluxor sync` stages it under target/fluxor/: the
+# store cores this tool mounts import it, as they do in a module build.
+fluxor-abi = { path = "../../target/fluxor/fluxor-abi" }
+fluxor-sdk = { path = "../../target/fluxor/fluxor-sdk" }
+
 [lints.rust]
 # The cores' own unsafe (the SDK's SHA-256, the no_std buffers) and this
 # tool's one zeroed heap allocation of the provider state.

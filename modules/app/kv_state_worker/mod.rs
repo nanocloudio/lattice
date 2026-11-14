@@ -66,32 +66,27 @@
     reason = "`store_provider` is kv_state_worker_store's feature; this file is also kv_state_worker, whose build declares none"
 )]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the fluxor SDK wholesale; each module consumes only a subset of the ABI surface"
+    reason = "dead_code: mounts shared cores from modules/common whole and uses a subset of each"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::too_many_arguments,
     clippy::duplicate_mod,
-    reason = "fluxor module ABI: raw-pointer entry points are the contract, ABI fns carry a fixed arity, and the PIC build #[path]-remounts shared SDK/common code"
+    reason = "duplicate_mod: a shared core is mounted under more than one path; clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments: the module ABI entry points take raw state and syscall pointers whose validity is the runtime's half of the contract"
 )]
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/types.rs"]
 mod types;
 
 #[path = "../../common/wire.rs"]
 mod wire;
-
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/kv_store.rs"]
 mod kv_store;
@@ -314,7 +309,7 @@ const DISK_HEARTBEAT_LOG_MS: u64 = 2000;
 /// to carry level 2 to the UDP drain.
 const DISK_LOG_LEVEL: u8 = 2;
 
-define_params! {
+fluxor_rt::define_params! {
     WorkerState;
 
     // Physical state-store provider, selected at graph construction.
@@ -672,7 +667,7 @@ struct WorkerState {
     /// pre-substrate so single-node graphs keep working.
     cluster_epoch: u32,
 
-    // ── state_store provider selection (params; see define_params!) ──
+    // ── state_store provider selection (params; see fluxor_rt::define_params!) ──
     state_store: u8,
     root_path: u8,
     store_id: u8,
@@ -3635,7 +3630,7 @@ const ARENA_BYTES: usize =
 /// Without the provider, the heap is the command log's (when it is on).
 #[cfg(not(feature = "store_provider"))]
 const ARENA_BYTES: usize = CLOG_ARENA + 16 * 1024;
-declare_module_arena_bytes!(ARENA_BYTES);
+fluxor_rt::module_facts! { state: WorkerState, arena: ARENA_BYTES }
 
 /// The provider, held on the heap beside the worker's state (so a call
 /// holds both at once), and its buffers.
@@ -4340,7 +4335,7 @@ const READY_ROUNDS: u32 = 1 << 20;
 /// Where it cannot — its FS provider is not up yet, as on bare metal, where
 /// the disk mounts only once the graph steps (nvme, then fat32) — the store
 /// is constructed anyway and recovers through its own steps. It is
-/// deferred-ready (`module_deferred_ready`): it signals Ready the first step
+/// deferred-ready (the manifest's `deferred_ready`): it signals Ready the first step
 /// it serves, and the kernel holds every module requiring its contracts
 /// until then (fluxor's contract-readiness gate), so no consumer meets it
 /// unready. Waiting here instead could never end on metal: the loader
@@ -4783,46 +4778,6 @@ pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
     unsafe { (*state.cast::<WorkerState>()).selector }
 }
 
-/// Marks this provider as the ledger's sampler for the pool it serves
-/// (`store_subs`): the kernel asks `POOL_SAMPLE` once a PSTATUS round.
-#[cfg(feature = "store_provider")]
-#[no_mangle]
-#[link_section = ".text.module_samples_pool"]
-pub extern "C" fn module_samples_pool() -> u32 {
-    1
-}
-
-/// Subscribes this provider to `OWNER_RELEASED`: a released owner's
-/// subscriptions are dropped at once (see `module_provider_dispatch`).
-#[cfg(feature = "store_provider")]
-#[no_mangle]
-#[link_section = ".text.module_observes_owner_release"]
-pub extern "C" fn module_observes_owner_release() -> u32 {
-    1
-}
-
-/// `[0x14, 0x13]`: objects and their namespace, from one store — or
-/// nothing, when this worker does not provide (see above).
-#[cfg(feature = "store_provider")]
-#[no_mangle]
-#[link_section = ".text.module_provides_contracts"]
-pub extern "C" fn module_provides_contracts(state: *mut u8, out: *mut u16, cap: u32) -> u32 {
-    if state.is_null() || out.is_null() || cap < 2 {
-        return 0;
-    }
-    // SAFETY: the kernel passes this module's state after `module_new`,
-    // and `cap` u16s at `out`.
-    unsafe {
-        let worker = &*state.cast::<WorkerState>();
-        if !worker.prov.provides {
-            return 0;
-        }
-        *out = store_provider::CONTRACT_OBJECT;
-        *out.add(1) = store_provider::CONTRACT_NAMESPACE;
-    }
-    2
-}
-
 /// A store contract call, answered in the call. Until the disk store has
 /// recovered every call is `EAGAIN` (ask again); a quarantined store
 /// answers `ERROR`.
@@ -4947,12 +4902,6 @@ pub extern "C" fn module_provider_dispatch(
 }
 
 // ── Module ABI ────────────────────────────────────────────────────────
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<WorkerState>() as u32
-}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -5392,29 +5341,9 @@ unsafe fn maybe_request_ts_lease(worker: &mut WorkerState) {
     let _ = (sys.channel_write)(worker.lease_request_out, frame.as_mut_ptr(), frame.len());
 }
 
-/// The store variant is deferred-ready: it is not `Ready` until its disk
-/// store serves, and the kernel holds back every module that requires a
-/// contract it provides until then (fluxor's contract-readiness gate). On
-/// Linux the store recovers at construction and is ready on its first step;
-/// on bare metal its disk mounts only once the graph steps, and a connector
-/// whose first call met `EAGAIN` would otherwise conclude the store refused
-/// it.
-///
-/// Ready means the DISK serves, not that the store has imported a host log
-/// through the replicated log: that import needs the consensus path, which
-/// is downstream of this module on its edges and so is held by the kernel's
-/// edge gate until this module is Ready. Waiting for the import here would
-/// deadlock the graph; calls meanwhile are answered `EAGAIN`, as before.
-#[cfg(feature = "store_provider")]
-#[no_mangle]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     #[cfg(feature = "store_provider")]
     if !state.is_null() {
         // SAFETY: the kernel passes this module's own state.
@@ -5427,7 +5356,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
     let rc = step(state);
     #[cfg(feature = "store_provider")]
-    if rc == 0 && !state.is_null() {
+    if rc == StepReturn::Continue && !state.is_null() {
         // SAFETY: the kernel passes this module's own state.
         let worker = unsafe { &mut *state.cast::<WorkerState>() };
         // A worker that registered no contract gates nothing: Ready at once,
@@ -5442,15 +5371,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let m = b"[kvw] store serving: Ready";
                 unsafe { dev_log(&*worker.syscalls, DISK_LOG_LEVEL, m.as_ptr(), m.len()) };
             }
-            return 3;
+            return StepReturn::Ready;
         }
     }
     rc
 }
 
-fn step(state: *mut u8) -> i32 {
+fn step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let worker = unsafe { &mut *state.cast::<WorkerState>() };
     unsafe {
@@ -5653,7 +5582,7 @@ fn step(state: *mut u8) -> i32 {
             );
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Ids 17-18: the EFFECTIVE `state_store` / `root_path` this instance

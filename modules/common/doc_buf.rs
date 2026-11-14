@@ -14,7 +14,7 @@
 //!
 //! Mounted beside the module's `abi` (reached as `super::abi`). A module
 //! whose `big` build uses it declares its arena
-//! (`declare_module_arena_bytes!`) as the sum of its buffers plus one
+//! (`module_facts!`'s `arena`) as the sum of its buffers plus one
 //! allocation's rounding.
 
 #[cfg(feature = "big")]
