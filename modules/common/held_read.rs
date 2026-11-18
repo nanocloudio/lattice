@@ -22,6 +22,9 @@ pub const OBJ_GET: u32 = crate::abi::registry::storage_object::GET;
 pub const OBJ_RANGE_GET: u32 = crate::abi::registry::storage_object::RANGE_GET;
 pub const OBJ_CLOSE: u32 = crate::abi::registry::storage_object::CLOSE;
 pub const EAGAIN: i32 = -11;
+pub const EINVAL: i32 = -22;
+/// The longest key a `GET` names (`handle::STORAGE_KEY_MAX`).
+pub const KEY_MAX: usize = 255;
 
 /// The most one `RANGE_GET` asks for (the provider may answer less).
 pub const RANGE_ASK_MAX: u32 = 1048576;
@@ -63,17 +66,24 @@ impl HeldRead {
     }
 
     /// Read `key` whole into `dst`, or as far as the store answers now.
-    /// `call(handle, op, arg)` is the module's `provider_call`. A
+    /// `call(handle, op, arg, data)` is the module's `provider_call`. A
     /// [`Read::Pending`] keeps what has arrived in `dst`; the caller asks
     /// again with the same `key` and `dst` on a later step.
-    pub fn step<F: FnMut(i32, u32, &mut [u8]) -> i32>(
+    pub fn step<F: FnMut(i32, u32, &mut [u8], &mut [u8]) -> i32>(
         &mut self,
         call: &mut F,
-        key: &mut [u8],
+        key: &[u8],
         dst: &mut [u8],
     ) -> Read {
         if !self.held {
-            let h = call(-1, OBJ_GET, key);
+            // `[key_len u16][key]`.
+            let mut arg = [0u8; 2 + KEY_MAX];
+            if key.len() > KEY_MAX {
+                return Read::Failed(EINVAL);
+            }
+            put(&mut arg, 0, &(key.len() as u16).to_le_bytes());
+            put(&mut arg, 2, key);
+            let h = call(-1, OBJ_GET, &mut arg[..2 + key.len()], &mut []);
             if h == EAGAIN {
                 return Read::Pending;
             }
@@ -90,14 +100,12 @@ impl HeldRead {
                 return self.finish(call, Read::Done(got));
             }
             let room = ((dst.len() - got) as u64).min(u64::from(RANGE_ASK_MAX)) as u32;
-            let Some(out) = dst.get_mut(got..) else {
+            let Some(out) = dst.get_mut(got..got + room as usize) else {
                 return self.finish(call, Read::Done(got));
             };
-            let mut arg = [0u8; 20];
-            put(&mut arg, 0, &(got as u64).to_le_bytes());
-            put(&mut arg, 8, &room.to_le_bytes());
-            put(&mut arg, 12, &(out.as_mut_ptr() as u64).to_le_bytes());
-            let n = call(self.handle, OBJ_RANGE_GET, &mut arg);
+            // `[offset u64]`, the range into `data`.
+            let mut arg = (got as u64).to_le_bytes();
+            let n = call(self.handle, OBJ_RANGE_GET, &mut arg, out);
             if n == EAGAIN {
                 // Held: the same range of the same handle, next step.
                 return Read::Pending;
@@ -113,15 +121,18 @@ impl HeldRead {
     }
 
     /// Let a held read go (its handle closed), whatever it had read.
-    pub fn abandon<F: FnMut(i32, u32, &mut [u8]) -> i32>(&mut self, call: &mut F) {
+    pub fn abandon<F: FnMut(i32, u32, &mut [u8], &mut [u8]) -> i32>(&mut self, call: &mut F) {
         if self.held {
-            let mut none = [0u8; 0];
-            call(self.handle, OBJ_CLOSE, &mut none);
+            call(self.handle, OBJ_CLOSE, &mut [], &mut []);
         }
         *self = HeldRead::new();
     }
 
-    fn finish<F: FnMut(i32, u32, &mut [u8]) -> i32>(&mut self, call: &mut F, r: Read) -> Read {
+    fn finish<F: FnMut(i32, u32, &mut [u8], &mut [u8]) -> i32>(
+        &mut self,
+        call: &mut F,
+        r: Read,
+    ) -> Read {
         self.abandon(call);
         r
     }

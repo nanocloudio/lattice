@@ -36,41 +36,49 @@ content_type = "OctetStream"
 name = "part0_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part1_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part2_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part3_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part4_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part5_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part6_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "part7_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

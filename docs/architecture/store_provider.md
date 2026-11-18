@@ -47,20 +47,26 @@ keeps. Any other configuration registers no contract and logs
 
 ## Operations
 
+Every op is one flat `arg` record and at most one `data` span; no field is
+an address. `PUT`, `HEAD`, `DELETE`, `LIST` and `CHANGES` end their `arg`
+with the fence trailer (`fence::trailer`, 64 bytes), which the provider
+writes as `[fence_len u16][fence]`.
+
 | Op | Id | Argument | Answer |
 |---|---|---|---|
-| `PUT` | `0x0f20` | `[key_len u16][key][ct_len u8][ct][body_ptr u64][body_len u64][precondition][kept][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
-| `GET` | `0x0f21` | the key | a read slot's handle on the value as it is now |
-| `HEAD` | `0x0f22` | `[key_len u16][key][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | the 60-byte record `[size u64][mtime u64][ct_len u8][etag_len u8][etag][kept]`; `EINVAL` for a null `out_ptr`, `ENOMEM` when `out_cap` cannot hold it, `ENXIO` before `ENOMEM` for a key that is not there |
-| `RANGE_GET` | `0x0f23` | on a read slot: `[off u64][len u32][out_ptr u64]` | bytes copied; 0 at or past the end |
-| `DELETE` | `0x0f24` | `[key_len u16][key][precondition][fence_ptr u64][fence_cap u16]` | 0, and the write's fence |
+| `PUT` | `0x0f20` | `[key_len u16][key][ct_len u8][ct][precondition][kept]` and the trailer; `data` is the value | 0, and the write's fence |
+| `GET` | `0x0f21` | `[key_len u16][key]` | a read slot's index on the value as it is now |
+| `HEAD` | `0x0f22` | `[key_len u16][key]`, room for the answer, and the trailer | the 60-byte record `[size u64][mtime u64][ct_len u8][etag_len u8][etag][kept]` written over `arg` from byte 0; `ENOMEM` when the room before the trailer cannot hold it, `ENXIO` before `ENOMEM` for a key that is not there |
+| `RANGE_GET` | `0x0f23` | on a read slot: `[off u64]`; `data` receives the bytes | bytes copied; 0 at or past the end |
+| `DELETE` | `0x0f24` | `[key_len u16][key][precondition]` and the trailer | 0, and the write's fence |
 | `CLOSE` | `0x0f25` | on a read slot | 0 |
-| `LIST` | `0x0e02` | `[prefix_len u16][prefix][cursor_len u16][cursor][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | a page of `[len u8][kind 0][key]` entries, then `[FF][FF][cursor_len u8][cursor]`: the key the next page starts at, none at the end |
-| `SUBSCRIBE` | `0x0e05` | `[prefix_len u16][prefix][event i32][flags u8]` (bit 0: ring now; bit 1: durable, then `[shard u16][owner_len u8][owner]`) | a subscription's handle |
+| `CAPS` | `0x0fff` | a 4-byte `arg` | 0; the word `WRITE \| IF_ABSENT \| IF_ETAG` |
+| `LIST` | `0x0e02` | `[prefix_len u16][prefix][cursor_len u16][cursor]` and the trailer; `data` receives the page | a page of `[len u8][kind 0][key]` entries, then `[FF][FF][cursor_len u8][cursor]`: the last key on the page, which the next page resumes strictly after; none at the end |
+| `SUBSCRIBE` | `0x0e05` | `[prefix_len u16][prefix][flags u8]` (bit 0: ring now; bit 1: durable, then `[shard u16][owner_len u8][owner]`) | a subscription's index; the kernel mints its handle and hands its doorbell over with `BIND_DOORBELL` |
+| `BIND_DOORBELL` | `0x0054` | on a subscription: `[doorbell u32][contract u16][0 u16]` | 0; `EBADF` for another owner's subscription or one already bound |
 | `CLOSE` | `0x0e06` | on a subscription | 0 |
-| `CHANGES` | `0x0e07` | `[prefix_len u16][prefix][sub i32][token_len u16][token][out_ptr u64][out_cap u32][fence_ptr u64][fence_cap u16]` | one page (below) |
-| `TAKE_RUNG` | `0x0e09` | `[event i32][out_ptr u64][out_cap u32]` | `[more u8][count u16][handle i32]…` |
-| `CAPS` | `0x0eff` | — | `SUBSCRIBE \| CHANGES` (`0x18`) |
+| `CHANGES` | `0x0e07` | on the subscription it serves, or `-1`: `[prefix_len u16][prefix][token_len u16][token]` and the trailer; `data` receives the page | one page (below); `EBADF` for a subscription that is not the caller's |
+| `CAPS` | `0x0eff` | a 4-byte `arg` | 0; the word `SUBSCRIBE \| CHANGES` |
 | fence query | `0x00FE` | on a read slot or subscription | the `ViewConsistent` fence of what it observed |
 
 A precondition is `[kind u8][len u8][bytes]`: 0 any, 1 the key must be
@@ -69,16 +75,17 @@ block is `[key_ref_len u8][key_ref][retain_until_ms u64][legal_hold u8]`. This
 store keeps none of it: a `PUT` asking for any of it is refused `ENOSYS`, a
 `HEAD` record's block is empty, and `RETAIN` and the `PUT_STREAMED_*` sequence
 are not served (`ENOSYS`). Keys are
-1..=255 bytes (`KEY_MAX`). Read slots are handles `0..SLOTS`; subscriptions
-are `SUB_BAND + id` (a registry id), so a fence query or `CLOSE` names one
-thing. Every handle answers only the owner that opened it: to any other
+1..=255 bytes (`KEY_MAX`). Read slots are indices `0..SLOTS`; subscriptions
+are `SUB_BAND + ordinal` (the subscription's place among the registry's
+subscription pages), so a fence query or `CLOSE` names one thing; the kernel
+wraps each index in a handle of its own minting. Every handle answers only the owner that opened it: to any other
 caller it is as if it were not open, as the host stores answer.
 
 ## Answers
 
 | Answer | Meaning |
 |---|---|
-| `EINVAL` | a malformed or short argument, a null output pointer, a fence pair that is missing, null or below 62 bytes on `PUT`, `HEAD`, `DELETE`, `LIST` or `CHANGES` (refused before the op acts: nothing written, no page or fence delivered, even while the store would otherwise wait), a key past `KEY_MAX`, a subscription event that is not the calling module's, a durable subscription's owner name outside 1..=32 printable bytes or holding `/` |
+| `EINVAL` | a malformed or short argument, an `arg` without its fence trailer on `PUT`, `HEAD`, `DELETE`, `LIST` or `CHANGES` (refused before the op acts: nothing written, no page or fence delivered, even while the store would otherwise wait), a key past `KEY_MAX`, a durable subscription's owner name outside 1..=32 printable bytes or holding `/` |
 | `ENXIO` | `GET` or `HEAD` of a key that is not there |
 | `EEXIST` | a create-if-absent `PUT` lost to an existing key |
 | `EAGAIN` on a read | the store cannot answer now — its device is busy, it is still recovering, a walk is still paused, or this step's history budget is spent; a durable `SUBSCRIBE` whose cursor read the store refuses waits the same way. Nothing moved (no handle opened or closed, no page or fence written); ask again with the same request on a later step, never within the same one |
@@ -120,20 +127,20 @@ subscriptions are this replica's, at the revision it has applied.
 
 ## Subscriptions and the change log
 
-Subscriptions are level-triggered doorbells. A subscription names the
-subscriber's own kernel event; the provider never writes a consumer's
-channel. Every command that stands notes the keys it changed
+Subscriptions are doorbells. The kernel hands the provider one per
+subscription handle (`BIND_DOORBELL`); the provider never writes a
+consumer's channel. Every command that stands notes the keys it changed
 (`kv_store::KeyLog`); the provider takes them into its change log
 (`change_ring.rs`), matches each against the registry of watched prefixes
-(`store_registry.rs`), and rings each matching subscriber once — a rung
-bit and a signal — until the subscriber takes it with `TAKE_RUNG` and reads
-what changed with `CHANGES`. Nothing is pushed, copied per subscriber, or
-lost to a full channel. A subscription whose module is gone, or whose event
-slot another module now holds, is dropped instead of signalled.
-`SUBSCRIBE` is idempotent on (owner, module, event, prefix, and a durable
-subscription's shard and owner name), and a plain one is served while the
-store is still recovering, so a consumer that subscribes at start is
-registered rather than refused.
+(`store_registry.rs`), and rings each matching subscriber's doorbell
+(`DOORBELL_RING`) once until the subscriber reads what changed with
+`CHANGES` through its subscription. A ring due before the doorbell arrives
+is owed and rung when it does. Nothing is pushed, copied per subscriber, or
+lost to a full channel. A subscription whose module is gone, or whose
+doorbell rings nothing (its handle closed), is dropped instead of rung.
+Each `SUBSCRIBE` is a subscription of its own; a plain one and its doorbell
+are served while the store is still recovering, so a consumer that
+subscribes at start is registered rather than refused.
 
 The change log is a key-only ring of `[rev u64][hint u8][kl u8][key]`
 entries in apply order, bounded below by a base: it answers for every

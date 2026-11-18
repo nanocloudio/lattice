@@ -69,7 +69,8 @@ impl Watch {
 #[derive(Clone, Copy)]
 pub struct Sub {
     pub used: bool,
-    /// Rung and not yet taken.
+    /// Rung (or, before its doorbell arrives, owed a ring) and not read
+    /// since: a later change needs no second ring until it reads.
     pub rung: bool,
     /// A read it named was refused for now; it is rung again when the cause
     /// clears.
@@ -83,8 +84,9 @@ pub struct Sub {
     /// The next deferred subscriber, or [`NIL`].
     pub defer_next: u32,
     pub watch: u32,
-    /// The caller's tagged event fd.
-    pub event: i32,
+    /// The doorbell the kernel handed for its handle (`BIND_DOORBELL`), or
+    /// -1 until it arrives.
+    pub doorbell: i32,
     /// The subscriber's owner record (`CALLER_OWNER`).
     pub owner: [u8; 8],
     /// The subscriber's module occupancy (`CALLER_MODULE`).
@@ -151,7 +153,7 @@ impl Slot for Sub {
         next: NIL,
         defer_next: NIL,
         watch: NIL,
-        event: -1,
+        doorbell: -1,
         owner: [0; 8],
         module: [0; 8],
         prio: 0,
@@ -358,6 +360,32 @@ impl Registry {
 
     pub fn sub(&self, id: u32) -> Option<&Sub> {
         Slab::<Sub>::get(&self.pages, id).filter(|s| s.used)
+    }
+
+    /// Subscriber `id`'s ordinal: its place among the subscriber pages,
+    /// dense from 0, which a narrower index can carry where an id (a page of
+    /// the whole registry) cannot. `None` for a record that is not live.
+    pub fn sub_ordinal(&self, id: u32) -> Option<u32> {
+        self.sub(id)?;
+        let raw = id.checked_sub(1)?;
+        let (page, slot) = ((raw >> 8) as u16, raw & 0xFF);
+        let k = self
+            .subs
+            .pages
+            .get(..self.subs.n_pages)?
+            .iter()
+            .position(|p| *p == page)?;
+        u32::try_from(k * per_page::<Sub>()).ok()?.checked_add(slot)
+    }
+
+    /// The live subscriber at `ordinal` ([`Registry::sub_ordinal`]).
+    pub fn sub_at(&self, ordinal: u32) -> Option<u32> {
+        let per = per_page::<Sub>();
+        let k = ordinal as usize / per;
+        let slot = (ordinal as usize % per) as u32;
+        let page = u32::from(*self.subs.pages.get(..self.subs.n_pages)?.get(k)?);
+        let id = ((page << 8) | slot) + 1;
+        self.sub(id).map(|_| id)
     }
 
     pub fn sub_mut(&mut self, id: u32) -> Option<&mut Sub> {

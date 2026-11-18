@@ -64,6 +64,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_SPAN_BARRIER / MSG_RANGE_MAP_UPDATE to kv_request_router
 # .map_update: the cutover barrier and the atomic map publication.
@@ -71,6 +72,7 @@ content_type = "OctetStream"
 name = "map_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -93,6 +95,7 @@ content_type = "OctetStream"
 name = "admin_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [observability]
 #   0 phase     current SplitPhase (1..8; 8 = TombstoneRetained/done)

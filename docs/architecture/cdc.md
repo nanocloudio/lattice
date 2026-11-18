@@ -53,7 +53,7 @@ The pump is a requester of fluxor's exchange contract
 (`contracts/exchange.rs` in the fluxor SDK): `request_out` and
 `response_in` wire to the `request_in` and `response_out` of any module
 declaring the `stream.ordered_ack.sink` capability. Each event is one
-`METHOD_PUBLISH` exchange carried whole in its request HEAD:
+`PUBLISH` exchange carried whole in its request HEAD:
 
 | Part | Value |
 |---|---|

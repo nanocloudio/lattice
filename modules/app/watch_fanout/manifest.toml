@@ -46,12 +46,14 @@ content_type = "OctetStream"
 name = "frames_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Progress ack back to watch_registry.
 [[ports]]
 name = "progress"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Backfill reads out to kv_request_router. On a MSG_WATCH_REPLAY_PLAN
 # the fanout issues MSG_KV_REQUEST envelopes carrying
@@ -64,6 +66,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_KV_RESPONSE envelopes back from kv_request_router carrying
 # KV_RESULT_VERSIONS pages.

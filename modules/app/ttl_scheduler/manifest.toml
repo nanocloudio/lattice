@@ -70,12 +70,14 @@ required = true
 name = "expire_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Tick fan-out to lease_manager.
 [[ports]]
 name = "tick_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -93,6 +95,7 @@ name = "propose_out"
 index = 3
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Params (TLV, parsed by the module):
 #   tick_interval_ms  default 250 — milliseconds between proposed ticks,

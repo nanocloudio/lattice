@@ -39,6 +39,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -53,6 +54,7 @@ name = "records_out"
 index = 2
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ──────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.

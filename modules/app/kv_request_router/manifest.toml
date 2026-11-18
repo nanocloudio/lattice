@@ -75,38 +75,45 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Routed control out to watch_registry / lease_manager.
 [[ports]]
 name = "watch_ctrl"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "lease_ctrl"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Responses back to each anchor.
 [[ports]]
 name = "etcd_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "redis_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "memcached_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "memcached_udp_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Worker responses joined back into the router.
 [[ports]]
@@ -127,6 +134,7 @@ content_type = "OctetStream"
 name = "proposal_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Linearizable-read fence. Reads classified
 # linearizable (envelope consistency REQ_LINEARIZABLE, or ALL reads via
@@ -138,6 +146,7 @@ content_type = "OctetStream"
 name = "lin_read_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Fence releases: wire from `consensus.applied`. Carries
 # MSG_CLIENT_READ_RESPONSE (release the stashed read to the worker),
@@ -219,6 +228,7 @@ content_type = "OctetStream"
 name = "internal_watch_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Replies to whichever compute ingress this graph wired: the in-graph
 # relational executor (PROTO_INTERNAL_SQL) or the remote data anchor
@@ -227,6 +237,7 @@ content_type = "OctetStream"
 name = "compute_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Ordered multi-range partitions ──────────────────────────────────
 #
@@ -241,17 +252,20 @@ content_type = "OctetStream"
 name = "kv1_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "proposal1_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Replies to the range supervisor (PROTO_INTERNAL_LIFECYCLE).
 [[ports]]
 name = "internal_lifecycle_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Replies to the index-backfill worker (PROTO_INTERNAL_JOB). The 16th
 # and LAST output slot — fluxor caps outputs at 16.
@@ -259,6 +273,7 @@ content_type = "OctetStream"
 name = "internal_job_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ─────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.

@@ -80,8 +80,8 @@ row fails.
 | Command-log answer room | Shape | `CLOG_OUT_MAX` | modules/app/kv_state_worker/mod.rs | 65536 | The largest answer room an op is applied with (a store-provider call's); a logged op replays with the room it first had, capped here. |
 | Imported host-log record | Shape | `IMPORT_RECORD_MAX` | modules/app/kv_state_worker/mod.rs | 3149824 | One record of a fluxor host `store.log` being imported (`kv_state_worker_store`): the largest object (3 MiB) and its key. A larger record stops the import and quarantines the store rather than skip it. |
 | Held single-store write answers | Format bound | `LOCAL_ANSWERS` | modules/common/store_provider.rs | 1024 | The most single-store write answers (and request identities) the provider can index: each is a record made from the worker's heap as a caller's write waits on its log record, kept under `(caller, request bytes)` until collected, until that caller's next different write is taken, or for `IDLE_STEPS` steps unasked. The heap, not this figure, is the working ceiling: spent, a new write is not taken (`EINPROGRESS`, taken when asked again once one goes) — another caller's answer is never dropped — and a new caller's identity replaces the least recently asked (an identity let go costs one hash on its next ask). |
-| Store read slots | Format bound | `SLOTS` | modules/common/store_provider.rs | 4096 | The most `GET`-opened read slots the provider can index (a slot's index is its handle, below `SUB_BAND`). Each slot is made from the worker's heap as a read opens and reused once closed; spent heap refuses the open `ENOMEM`. |
-| Subscription handle band | Format bound | `SUB_BAND` | modules/common/store_provider.rs | — | Where subscription handles start in the handle slot field the kernel gives a provider (`fd::SLOT_FIELD_BITS`; the bit above it is the kernel's): `SUB_BAND + id`, apart from read slots, so a fence query or `CLOSE` names one thing. |
+| Store read slots | Format bound | `SLOTS` | modules/common/store_provider.rs | 4096 | The most `GET`-opened read slots the provider can index (a slot's index is what the provider answers, below `SUB_BAND`). Each slot is made from the worker's heap as a read opens and reused once closed; spent heap refuses the open `ENOMEM`. |
+| Subscription index band | Format bound | `SUB_BAND` | modules/common/store_provider.rs | — | Where subscription indices start in the index a kernel handle carries (`handle::INDEX_LIMIT / 2`, above every read slot): `SUB_BAND + ordinal`, the subscription's place among the registry's subscription pages, so a fence query or `CLOSE` names one thing. Subscriptions whose ordinal passes the index field are refused `ENOMEM`. |
 | Workload subscription quota | Policy | `DEFAULT_SUB_QUOTA` | modules/common/store_provider.rs | — | Typed `u32`: 256 (`pi5`), 32 (`rp2350`), 4,096 (`server`) — a route-catalogue director holds one subscription per catalogue shard it serves (256 shards a tenant): one tenant's on `pi5`, sixteen tenants' on `server`. Subscriptions one workload owner may hold unless the `store_sub_quota` param says otherwise; the system owner (the node's own controllers) is not held to it. Past it SUBSCRIBE is `ENOMEM`, counted and reported to the kernel ledger against `store_subs`, after the owner's dead subscriptions are swept. |
 | Store change log | Sized | `CHANGE_LOG_DEFAULT` | modules/common/store_provider.rs | — | Bytes of the key-only change log (`change_ring.rs`) subscriptions are rung from and `CHANGES` is served from, when the `store_change_log` param names none. Overrun evicts the oldest entries and raises the log's base: a read from before it walks the store's history (or is LOST on a store without one), never an empty answer. |
 | CHANGES scan per call | Pacing | `LOG_SCAN_MAX` | modules/common/store_provider.rs | — | Typed `u32`, 4096. Change-log entries one `CHANGES` call scans; spent, the page ends with a continuation token and the caller asks again. |
@@ -101,8 +101,7 @@ row fails.
 | Store key | Shape | `KEY_MAX` | modules/common/store_provider.rs | 255 | The longest key the `storage.object`/`storage.namespace` provider takes (a LIST entry and a cursor carry its length in a byte). A longer key is refused `EINVAL` before the store is touched. |
 | Store key reference | Shape | `KEY_REF_MAX` | modules/common/store_provider.rs | 64 | fluxor's `KEY_REF_MAX`, the longest `key_ref` a `PUT` may name. This store keeps none: a longer one is malformed (`EINVAL`), a shorter one refused `ENOSYS`. |
 | Store inline value | Shape | `INLINE_MAX` | modules/common/store_provider.rs | — | Derived: one chunk's data (`kv_chunks::DATA_MAX`). A value up to it is stored whole and a read slot holds it inline; a larger one is uploaded as chunks under a manifest and read back through the value cache. |
-| Store fence buffer | Shape | `FENCE_WIRE_MAX` | modules/common/store_provider.rs | 62 | fluxor's `fence::WIRE_MAX_LEN`: a fence query's buffer holds any fence. A caller's fence buffer shorter than a fence gets none written, never a partial one. |
-| Store LIST trailer | Shape | `TRAILER_MAX` | modules/common/store_provider.rs | — | Derived: `3 + KEY_MAX`, the page trailer and the longest cursor. An entry that would leave the page no room for it ends the page there, that entry's key its cursor (the next page starts at it). |
+| Store fence buffer | Shape | `FENCE_WIRE_MAX` | modules/common/store_provider.rs | 62 | fluxor's `fence::WIRE_MAX_LEN` (asserted equal): a fence query's buffer holds any fence, and a one-shot op's fence trailer is `[fence_len u16]` and this. A shorter fence query is refused `EINVAL`, never answered with a partial fence. |
 | Store walk re-drives | Pacing | `REDRIVE_MAX` | modules/common/store_provider.rs | — | `1 << 20` re-drives of one paused store walk in a call. Spent, the read answers `EAGAIN` (nothing moved; the store keeps its place and the re-ask continues it). |
 | Replica proposal body | Shape | `ENTRY_BODY_MAX` | modules/common/store_provider.rs | — | Derived: `kv_large::ENTRY_BODY_MAX`, the largest origin entry body a replicated write proposes (a chunk entry fills it). A larger body is never built: values past it go as chunks. |
 | Replica writes held | Capacity | `PENDING_WRITES` | modules/common/store_provider.rs | 32 | Writes a replica holds for its callers at once: queued, uploading chunks, in the group's log, or decided and not yet collected. Only `WINDOW` of them are in the log undecided at once, because the origin record keeps outcomes for `origin::RING` (16) writes per origin and a write past what it keeps cannot be decided from it (it is refused); the rest wait queued for a seq. Past 32 a new write is not taken (`EINPROGRESS`, taken when asked again once one is collected, or let go after `IDLE_STEPS` unasked); a held write is never dropped to make room. |
@@ -377,15 +376,16 @@ application that swaps one for the other meets the same refusals.
 | Catalogue snapshot token | Shape | `TOKEN_MAX` | modules/common/route_catalogue.rs | — | Derived: the revision, the count, the digest chain and the last key (118 bytes at `KEY_MAX`); a malformed continuation, or one whose revision is not the `at` asked for, is refused (`400` at the front). |
 | Garbage-collection markers | Capacity | `GC_MARKERS` | modules/common/route_catalogue.rs | 64 | Generations one pass reclaims at most: the marker listing stops once this many are doomed, and the rest wait for the next pass, which lists from the start, so none is skipped. |
 | Catalogue front target | Shape | `TARGET_MAX` | modules/common/route_catalogue_front.rs | — | Derived: `/rc/`, two 32-digit hex identities and the verb (79 bytes); longer is `413`. |
-| Catalogue front headers | Shape | `HEADERS_MAX` | modules/common/route_catalogue_front.rs | 512 | A request's header block at most; longer is `413`. |
+| Catalogue front meta | Shape | `META_MAX` | modules/common/route_catalogue_front.rs | 512 | A request's meta at most; longer is `413`. |
 | Publication item | Shape | `ITEM_MAX` | modules/common/route_catalogue_front.rs | — | Derived: the kind, the route, the 16-byte id and the largest envelope (4,114 bytes), the request-body credit granted per item; an inline HEAD item over it is `413`. |
-| Catalogue front answer headers | Shape | `RESP_HEADERS` | modules/common/route_catalogue_front.rs | 512 | An answer's header block: asserted to hold a snapshot page's `revision`, `more` and a hex continuation at `TOKEN_MAX`, so no header is ever dropped. |
-| Catalogue front page | Shape | `PAGE_MAX` | modules/common/route_catalogue_front.rs | — | Derived as 7635: an exchange record less its head, content type and `RESP_HEADERS`, the snapshot page one answer carries (asserted to hold the largest record with its key and lengths, and an inline publication item). A page is also capped by the requester's response credit: one that fills stops after its last whole record and continues from it, never cut; a credit too small for one record is `413`. |
+| Catalogue front answer meta | Shape | `RESP_META` | modules/common/route_catalogue_front.rs | 512 | An answer's meta: asserted to hold the content type and a snapshot page's `revision`, `more` and a hex continuation at `TOKEN_MAX`, so no field is ever dropped. |
+| Catalogue front page | Shape | `PAGE_MAX` | modules/common/route_catalogue_front.rs | — | Derived as 7659: an exchange record less its head and `RESP_META`, the snapshot page one answer carries (asserted to hold the largest record with its key and lengths, and an inline publication item). A page is also capped by the requester's response credit: one that fills stops after its last whole record and continues from it, never cut; a credit too small for one record is `413`. |
 | Catalogue front store answer | Shape | `KV_IN_MAX` | modules/app/route_catalogue_front/mod.rs | — | Derived: one channel frame behind the envelope header; every router answer fits. |
 | Catalogue front store request | Shape | `KV_OUT_MAX` | modules/app/route_catalogue_front/mod.rs | — | Derived: the envelope header, the `MSG_KV_REQUEST` head and `route_catalogue::KV_BODY_MAX`, the largest body the machines send. |
 | CDC subscription prefix | Shape | `PREFIX_MAX` | modules/common/cdc_subscribe.rs | 256 | `cdc_pump`'s keyrange bound: a longer prefix makes the target past `TARGET_MAX`, refused 413. |
 | CDC subscription target | Shape | `TARGET_MAX` | modules/common/cdc_subscribe.rs | — | Derived: `/cdc/` and `PREFIX_MAX` in hex (517 bytes); longer is refused 413. |
-| CDC subscription headers | Shape | `HEADERS_MAX` | modules/common/cdc_subscribe.rs | 256 | A larger header block is refused 413. |
+| CDC subscription meta | Shape | `META_MAX` | modules/common/cdc_subscribe.rs | 256 | A larger request meta is refused 413. |
+| CDC subscription answer meta | Shape | `RESP_META_MAX` | modules/common/cdc_subscribe.rs | — | Derived: the `revision` field with a 20-digit value, the most an open subscription's HEAD carries. |
 | CDC feed page request | Pacing | `PAGE_LIMIT` | modules/common/cdc_subscribe.rs | — | 16 changes per feed read (`cdc_pump`'s default); a window past one page is narrowed until it fits, a single revision past it walked page by page. |
 | CDC staged page entries | Capacity | `PAGE_ENTRIES` | modules/common/cdc_subscribe.rs | 16 | The page limit: a page answering more is a failed read (retried, then `FAILED`). |
 | CDC staged page | Shape | `PAGE_MAX` | modules/common/cdc_subscribe.rs | — | Derived: `KV_RESPONSE_BODY_MAX`, one whole answer body. |
@@ -396,6 +396,7 @@ application that swaps one for the other meets the same refusals.
 | CDC front records per step | Pacing | `RECORDS_PER_STEP` | modules/app/cdc_front/mod.rs | 16 | Records written per step; the rest go on the next step. |
 | Exchange CLI target | Shape | `TARGET_MAX` | modules/app/exchange_cli/mod.rs | 128 | A longer `target` param refuses construction. |
 | Exchange CLI headers | Shape | `HEADERS_MAX` | modules/app/exchange_cli/mod.rs | 256 | A longer `headers` param refuses construction. |
+| Exchange CLI meta | Shape | `META_MAX` | modules/app/exchange_cli/mod.rs | — | Derived: `HEADERS_MAX`; every `name: value` line of the `headers` param costs at least its own bytes as a meta field. |
 | Exchange CLI select | Shape | `SELECT_MAX` | modules/app/exchange_cli/mod.rs | 8 | A longer `select` param refuses construction. |
 | Exchange CLI answer | Shape | `ANSWER_MAX` | modules/app/exchange_cli/mod.rs | 8192 | The response credit each request grants: a provider never sends more. |
 | Exchange CLI line | Shape | `LINE_MAX` | modules/app/exchange_cli/mod.rs | — | Derived: a whole record in hex and its label; every line written fits. |
@@ -474,7 +475,7 @@ application that swaps one for the other meets the same refusals.
 | JSON dialect followed watches | Capacity | `MAX_SESSIONS` | modules/app/doc_json_dialect/mod.rs | 16 | A further `J_FLAG_FOLLOW` is answered busy. |
 | JSON dialect followed request | Shape | `SESSION_REQ_MAX` | modules/app/doc_json_dialect/mod.rs | 1024 | A longer followed watch request is answered too-large. |
 | Document-wire answers queued | Capacity | `SEND_BUF` | modules/app/doc_wire_anchor/mod.rs | — | Derived as one `DOC_RESPONSE_MAX` frame; a client that does not read its answers is closed. |
-| Document-wire net chunk | Pacing | `NET_CHUNK` | modules/app/doc_wire_anchor/mod.rs | — | Derived: the net contract's `MAX_CMD_DATA`, and no more than one channel frame holds beside the connection id (`wire::FRAME_PAYLOAD_MAX` − 2); answers leave in chunks of this size. |
+| Document-wire net chunk | Pacing | `NET_CHUNK` | modules/app/doc_wire_anchor/mod.rs | — | Derived: what one channel frame holds beside the connection id (`wire::FRAME_PAYLOAD_MAX` − 2), the frame `net_out` declares as its `max_record`; answers leave in chunks of this size. |
 | Lost compare-and-set retries | Semantic | `MAX_CAS_RETRIES` | modules/app/document_executor/mod.rs | 3 | Answers conflict; the client retries. |
 | Followed watches | Capacity | `MAX_FOLLOWS` | modules/app/document_executor/mod.rs | 16 | A further `FLAG_FOLLOW` is answered busy; a pull watch still serves. |
 | Followed watch request | Shape | `FOLLOW_REQ_MAX` | modules/app/document_executor/mod.rs | 1024 | A longer watch request cannot be followed: answered too-large. |
@@ -692,6 +693,7 @@ checked.
 | Ttl Resume Budget | Pacing | `TTL_RESUME_BUDGET` | modules/app/kv_state_worker/mod.rs | 32 | Bounds work per step; the held remainder is re-driven on the next tick. |
 | Wedge Budget | Pacing | `WEDGE_BUDGET` | modules/common/cdc_feed.rs | — | Consecutive internal-error answers before the feed goes WEDGED (terminal; distinct from STALLED). |
 | Held read range ask | Pacing | `RANGE_ASK_MAX` | modules/common/held_read.rs | — | The most one `RANGE_GET` of a held whole-value read asks for; the read asks again for the rest, in the same step unless the store answers `EAGAIN` (then on a later one, same handle, same offset). |
+| Held read key | Shape | `KEY_MAX` | modules/common/held_read.rs | 255 | The longest key a held read's `GET` names: `handle::STORAGE_KEY_MAX`. A longer key is refused `EINVAL` before anything is asked. |
 
 ### Module topology bounds
 
@@ -743,7 +745,7 @@ CLOG_OUT_MAX | modules/app/kv_state_worker/mod.rs | 65536
 IMPORT_RECORD_MAX | modules/app/kv_state_worker/mod.rs | 3149824
 LOCAL_ANSWERS | modules/common/store_provider.rs | 1024
 SLOTS | modules/common/store_provider.rs | 4096
-SUB_BAND | modules/common/store_provider.rs | 1 << (crate::abi::registry::fd::SLOT_FIELD_BITS - 1)
+SUB_BAND | modules/common/store_provider.rs | crate::abi::registry::handle::INDEX_LIMIT / 2
 DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 256 | pi5
 DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 32 | rp2350
 DEFAULT_SUB_QUOTA | modules/common/store_provider.rs | 4096 | server
@@ -765,7 +767,6 @@ KEYLOG_BYTES | modules/common/kv_store.rs | 32 * 1024
 KEY_MAX | modules/common/store_provider.rs | 255
 INLINE_MAX | modules/common/store_provider.rs | -
 FENCE_WIRE_MAX | modules/common/store_provider.rs | 62
-TRAILER_MAX | modules/common/store_provider.rs | -
 REDRIVE_MAX | modules/common/store_provider.rs | -
 ENTRY_BODY_MAX | modules/common/store_provider.rs | -
 PENDING_WRITES | modules/common/store_provider.rs | 32
@@ -1108,6 +1109,7 @@ SEND_BUF | modules/app/doc_wire_anchor/mod.rs | -
 NET_CHUNK | modules/app/doc_wire_anchor/mod.rs | -
 KV_REQUEST_PAYLOAD_MAX | modules/common/wire.rs | 4160
 RANGE_ASK_MAX | modules/common/held_read.rs | -
+KEY_MAX | modules/common/held_read.rs | 255
 QUERY_MAX | modules/app/sql_front/mod.rs | 4096
 TARGET_MAX | modules/app/sql_front/mod.rs | 64
 SLOTS | modules/app/sql_front/mod.rs | 4
@@ -1130,7 +1132,8 @@ RESP_DEPTH_MAX | modules/common/resp_core.rs | 8
 SUBS | modules/common/cdc_subscribe.rs | 4
 PREFIX_MAX | modules/common/cdc_subscribe.rs | 256
 TARGET_MAX | modules/common/cdc_subscribe.rs | -
-HEADERS_MAX | modules/common/cdc_subscribe.rs | 256
+META_MAX | modules/common/cdc_subscribe.rs | 256
+RESP_META_MAX | modules/common/cdc_subscribe.rs | -
 PAGE_LIMIT | modules/common/cdc_subscribe.rs | 16
 PAGE_ENTRIES | modules/common/cdc_subscribe.rs | 16
 PAGE_MAX | modules/common/cdc_subscribe.rs | -
@@ -1148,9 +1151,9 @@ KV_BODY_MAX | modules/common/route_catalogue.rs | 4160 - 3 - 35
 TOKEN_MAX | modules/common/route_catalogue.rs | -
 GC_MARKERS | modules/common/route_catalogue.rs | 64
 TARGET_MAX | modules/common/route_catalogue_front.rs | -
-HEADERS_MAX | modules/common/route_catalogue_front.rs | 512
+META_MAX | modules/common/route_catalogue_front.rs | 512
 ITEM_MAX | modules/common/route_catalogue_front.rs | -
-RESP_HEADERS | modules/common/route_catalogue_front.rs | 512
+RESP_META | modules/common/route_catalogue_front.rs | 512
 PAGE_MAX | modules/common/route_catalogue_front.rs | -
 KV_IN_MAX | modules/app/route_catalogue_front/mod.rs | -
 KV_OUT_MAX | modules/app/route_catalogue_front/mod.rs | -
@@ -1158,6 +1161,7 @@ KV_IN_MAX | modules/app/cdc_front/mod.rs | -
 RECORDS_PER_STEP | modules/app/cdc_front/mod.rs | 16
 TARGET_MAX | modules/app/exchange_cli/mod.rs | 128
 HEADERS_MAX | modules/app/exchange_cli/mod.rs | 256
+META_MAX | modules/app/exchange_cli/mod.rs | -
 SELECT_MAX | modules/app/exchange_cli/mod.rs | 8
 ANSWER_MAX | modules/app/exchange_cli/mod.rs | 8192
 LINE_MAX | modules/app/exchange_cli/mod.rs | -

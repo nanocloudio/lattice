@@ -27,23 +27,23 @@
 //!
 //! # Request
 //!
-//! Method POST; `target` empty; headers ignored; body = the value to insert,
+//! Op CALL, verb 0; `target` empty; meta ignored; body = the value to insert,
 //! at least one byte, stored as `{ value: <body> }` (a BSON string) in
 //! `database.collection`; the whole insert command must fit 512 BSON bytes. Requests are performed one at a time, in arrival
 //! order, once the session is authenticated; until then they wait.
 //!
 //! # Answer
 //!
-//! One answer per request, no content type, no headers:
+//! One answer per request, no meta:
 //!
-//! | Status | When | Body |
+//! | Outcome | When | Body |
 //! |---|---|---|
-//! | 200 | the server acknowledged the insert (`ok` set, no write errors) | empty |
-//! | 400 | the server refused the insert | its `errmsg` when the reply names one at top level, else empty |
-//! | 400 | another method, a non-empty target, an empty body, no `collection` configured | empty |
-//! | 413 | a body whose insert command exceeds 512 BSON bytes | empty |
-//! | 503 | four requests already held, or draining | empty |
-//! | 504 | no reply within 15 s (the connection is closed and reopened; the insert's effect is unknown) | empty |
+//! | OK | the server acknowledged the insert (`ok` set, no write errors) | empty |
+//! | REFUSED | the server refused the insert | its `errmsg` when the reply names one at top level, else empty |
+//! | REFUSED | another op or a verb, a non-empty target, an empty body, no `collection` configured | empty |
+//! | TOO_LARGE | a body whose insert command exceeds 512 BSON bytes | empty |
+//! | BUSY | four requests already held, or draining | empty |
+//! | TIMEOUT | no reply within 15 s (the connection is closed and reopened; the insert's effect is unknown) | empty |
 //!
 //! # LINK
 //!
@@ -87,7 +87,7 @@ use authority::{Authority, PORT_MONGO};
 
 #[path = "../../common/query_exchange.rs"]
 mod query_exchange;
-use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::exchange::{op, outcome, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 use abi::contracts::net::net_proto::{
@@ -207,8 +207,8 @@ fluxor_rt::define_params! {
         }
     };
     5, collection, str, 0 => |s, d, len| {
-        // Gate on len>0: set_defaults() fires every closure, so an absent
-        // param must not flip the module into insert mode.
+        // Gate on len>0: an empty value names no collection, so it must
+        // not flip the module into insert mode.
         if len > 0 {
             let mut i = 0usize;
             while i < len && (s.collection_len as usize) < NAME_BUF {
@@ -219,7 +219,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: MongoState }
+fluxor_rt::module_facts! {
+    state: MongoState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = NET_BUF],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -285,7 +288,7 @@ pub extern "C" fn module_new(
         s.inserted = 0;
         s.retry_at_ms = 0;
         s.backoff_ms = RETRY_MIN_MS;
-        s.desk.reset(METHOD_POST, 0);
+        s.desk.reset(op::CALL, 0);
         s.outbox = ExchangeOutbox::new();
         parse_tlv(s, params, params_len);
         if !s.authority.adopt(PORT_MONGO) {
@@ -341,7 +344,7 @@ unsafe fn feed(s: &mut MongoState, sys: &SyscallTable, ev: MEv, now: u64) {
     match action {
         MAct::Connect => {
             let mut payload = [0u8; CONNECT_TO_MAX];
-            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            let n = s.authority.connect_record(&mut payload, s.tag);
             if n > 0 {
                 net_write_frame(
                     sys,
@@ -383,13 +386,13 @@ unsafe fn feed(s: &mut MongoState, sys: &SyscallTable, ev: MEv, now: u64) {
         MAct::DeliverReply => {}
         MAct::Fail => {
             if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let close = abi::contracts::net::net_proto::close(s.conn_id, false);
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    CONN_ID_LEN,
+                    close.len(),
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -511,7 +514,7 @@ unsafe fn on_reply(s: &mut MongoState, body: &[u8], now: u64) {
             if bson_ok(body) && bson_find(body, b"writeErrors").is_none() {
                 s.inserted = s.inserted.wrapping_add(1);
                 emit_status(s, b"mongo: inserted\n");
-                s.desk.finish(status::OK, 0);
+                s.desk.finish(outcome::OK, 0);
             } else {
                 s.errors = s.errors.wrapping_add(1);
                 emit_status(s, b"mongo: insert failed\n");
@@ -523,7 +526,7 @@ unsafe fn on_reply(s: &mut MongoState, body: &[u8], now: u64) {
                     }
                     None => 0,
                 };
-                s.desk.finish(status::BAD_REQUEST, n);
+                s.desk.finish(outcome::REFUSED, n);
             }
             s.phase = MPhase::InsertIdle;
         }
@@ -576,8 +579,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 let pl = core::slice::from_raw_parts(payload, plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == MPhase::Connecting => {
-                        if plen >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
+                        if let Some(c) = connected_parts(pl) {
+                            let (id, tag) = (c.conn_id, c.requester_tag);
                             if tag == s.tag || tag == REQUESTER_TAG_NONE {
                                 s.conn_id = id;
                                 feed(s, sys, MEv::Connected, now);
@@ -617,19 +620,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             feed(s, sys, MEv::PeerClosed, now);
                         }
                     }
-                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                    NET_MSG_ERROR => {
                         // A tagged error is a connect-phase failure and is
                         // ours by tag alone; an untagged one belongs to an
                         // established connection and routes by conn id.
-                        let (id, _errno, tag) = error_parts(pl);
-                        let ours = if tag == REQUESTER_TAG_NONE {
-                            (s.phase == MPhase::Connecting)
-                                || (s.phase != MPhase::Disconnected && id == s.conn_id)
-                        } else {
-                            s.phase == MPhase::Connecting && tag == s.tag
-                        };
-                        if ours {
-                            feed(s, sys, MEv::NetError, now);
+                        if let Some((id, _errno, tag)) = error_parts(pl) {
+                            let ours = if tag == REQUESTER_TAG_NONE {
+                                (s.phase == MPhase::Connecting)
+                                    || (s.phase != MPhase::Disconnected && id == s.conn_id)
+                            } else {
+                                s.phase == MPhase::Connecting && tag == s.tag
+                            };
+                            if ours {
+                                feed(s, sys, MEv::NetError, now);
+                            }
                         }
                     }
                     _ => {}
@@ -668,19 +672,19 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
 
         // Timeouts. An insert the server has not acknowledged is answered
-        // 504 and its connection reopened; any other stalled phase is a
+        // `TIMEOUT` and its connection reopened; any other stalled phase is a
         // lost session.
         if s.phase == MPhase::InsertWait && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
-            s.desk.finish(status::TIMEOUT, 0);
+            s.desk.finish(outcome::TIMEOUT, 0);
             s.errors = s.errors.wrapping_add(1);
             if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let close = abi::contracts::net::net_proto::close(s.conn_id, false);
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    CONN_ID_LEN,
+                    close.len(),
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -716,13 +720,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             )
         {
             if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let close = abi::contracts::net::net_proto::close(s.conn_id, false);
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    CONN_ID_LEN,
+                    close.len(),
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -792,7 +796,7 @@ unsafe fn take_request(s: &mut MongoState, now: u64) {
         return;
     };
     if s.inserting == 0 || target != 0 || value.is_empty() {
-        s.desk.refuse(at, status::BAD_REQUEST);
+        s.desk.refuse(at, outcome::REFUSED);
         return;
     }
     let dl = s.database_len as usize;
@@ -805,7 +809,7 @@ unsafe fn take_request(s: &mut MongoState, now: u64) {
         value,
         &mut out,
     ) else {
-        s.desk.refuse(at, status::TOO_LARGE);
+        s.desk.refuse(at, outcome::TOO_LARGE);
         return;
     };
     s.req_id = s.req_id.wrapping_add(1);

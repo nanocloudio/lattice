@@ -1,6 +1,6 @@
-//! cdc_subscribe — the CDC feed as held exchanges: a subscriber's GET on a
-//! feed target is answered `200` flagged `HOLD|MORE`, then one BODY per
-//! change event, never past the subscriber's credit.
+//! cdc_subscribe — the CDC feed as held exchanges: a subscriber's HTTP-bound
+//! GET on a feed target is answered `200` flagged `HOLD|MORE`, then one
+//! BODY per change event, never past the subscriber's credit.
 //!
 //! Dual-target facade: `#[path]`-mounted by `modules/app/cdc_front` (which
 //! owns channels, params and the syscall table) and by the host suite
@@ -13,14 +13,14 @@
 //!
 //! | Request | |
 //! |---|---|
-//! | method | `GET` |
+//! | op, verb | `CALL`, `GET` (the `exchange_http` binding) |
 //! | target | `/cdc/<prefix hex>` — the keyrange, as `cdc_pump`'s `prefix` param spells it: 1..=256 bytes, not starting `0x00` (the system prefix), not all `0xFF` |
-//! | `after: <revision>` | optional: resume after this commit position (decimal). Without it the feed starts at the store's head: changes committed after the subscription opened |
-//! | `feed-id: <n>`, `table-id: <n>` | optional: the envelope's identity fields (defaults: the module's `feed_id`, `table_id` params, whose defaults are `cdc_pump`'s) |
+//! | meta `after` | optional: resume after this commit position (decimal). Without it the feed starts at the store's head: changes committed after the subscription opened |
+//! | meta `feed-id`, `table-id` | optional: the envelope's identity fields (defaults: the module's `feed_id`, `table_id` params, whose defaults are `cdc_pump`'s) |
 //! | body | none |
 //!
 //! The answer is a response HEAD `200` flagged `HOLD|MORE`, carrying the
-//! header `revision: <n>` — the position the feed starts after — and no
+//! meta field `revision` (decimal) — the position the feed starts after — and no
 //! body. Then each change in the keyrange is one BODY record flagged `MORE`
 //! whose payload is the `cdc_wire::CdcEvent` envelope `cdc_pump` publishes
 //! for the same change, byte for byte: kind put/delete, flags 0, the feed and
@@ -38,9 +38,9 @@
 //! | Status | When |
 //! |---|---|
 //! | 200 `HOLD\|MORE` | the subscription is open |
-//! | 400 | another method, a request body, a target that is not `/cdc/<hex>` of a legal prefix, a malformed `after`, `feed-id` or `table-id` |
+//! | 400 | another op or verb, a request body, a target that is not `/cdc/<hex>` of a legal prefix, a malformed `after`, `feed-id` or `table-id` |
 //! | 410 | the `after` position is no longer retained: the store compacted past it |
-//! | 413 | a target over 517 bytes, headers over 256 |
+//! | 413 | a target over 517 bytes, meta over 256 |
 //! | 502 | the store kept failing the feed read, or the keyrange holds a large value (stored as chunks), which the envelope cannot carry |
 //! | 503 | four subscriptions already held, or draining |
 //! | 504 | the store did not answer the opening read within 15 s |
@@ -91,9 +91,10 @@ pub use fluxor_abi::contracts::exchange;
 
 use cdc_wire::{CdcEvent, CDC_KIND_DELETE, CDC_KIND_PUT};
 use exchange::{
-    abort, flag, header, parse_request, seal_body, status, write_abort, write_response_head,
-    ExchangeId, Record, ResponseHead, HDR, METHOD_GET,
+    abort, flag, kind, meta_get, op, parse_request, record_id, record_kind, seal_body, write_abort,
+    write_response_head, ExchangeId, MetaWriter, Record, HDR,
 };
+use fluxor_abi::contracts::exchange_http::{self as http, method, status, Http};
 use types::{
     KV_OP_GET, KV_OP_SCAN_VERSIONS, KV_RESULT_COMPACTED, KV_RESULT_MANIFEST, KV_RESULT_NOT_FOUND,
     KV_RESULT_OK, KV_RESULT_VERSIONS, PROTO_ETCD, VERSION_KIND_DELETE,
@@ -106,8 +107,8 @@ pub const SUBS: usize = 4;
 pub const PREFIX_MAX: usize = 256;
 /// Longest target: `/cdc/` and the prefix in hex.
 pub const TARGET_MAX: usize = 5 + 2 * PREFIX_MAX;
-/// Largest header block read.
-pub const HEADERS_MAX: usize = 256;
+/// Largest request meta read.
+pub const META_MAX: usize = 256;
 /// Changes asked for per feed page (`cdc_pump`'s default).
 pub const PAGE_LIMIT: u16 = 16;
 /// Entries one staged page holds: the page limit.
@@ -141,6 +142,10 @@ const CORR_BASE: u64 = 0x1000_0000_0000_0000;
 /// version. An answer about the position, not a status the provider raises
 /// (it is not marked `RAISED`).
 pub const GONE: u16 = 410;
+/// The response HEAD's meta key carrying the start position.
+const REVISION_META: &[u8] = b"revision";
+/// The response HEAD's meta: the `revision` field and its decimal value.
+const RESP_META_MAX: usize = exchange::meta_field_len(REVISION_META.len(), 20);
 /// A versions entry's fixed part: revision, commit_ts, kind, key length,
 /// value length.
 const ENTRY_FIXED: usize = 8 + 8 + 1 + 2 + 4;
@@ -352,10 +357,10 @@ impl Subscriptions {
 
     /// Take one request record.
     pub fn accept(&mut self, record: &[u8], now_ms: u64) {
-        match parse_request(record) {
-            Some(Record::Head(h)) => {
+        match parse_request::<Http>(record) {
+            Ok(Record::Head(h)) => {
                 let verdict = if self.draining {
-                    Err(status::BUSY)
+                    Err(status::SERVICE_UNAVAILABLE)
                 } else {
                     self.judge(&h)
                 };
@@ -367,7 +372,7 @@ impl Subscriptions {
                     }
                 };
                 let Some(i) = self.subs.iter().position(|s| !s.live()) else {
-                    self.refuse(h.id, status::BUSY);
+                    self.refuse(h.id, status::SERVICE_UNAVAILABLE);
                     return;
                 };
                 let s = &mut self.subs[i];
@@ -397,12 +402,12 @@ impl Subscriptions {
                 s.count = 0;
                 s.next = 0;
             }
-            Some(Record::Credit { id, bytes }) => {
+            Ok(Record::Credit { id, bytes }) => {
                 if let Some(s) = self.subs.iter_mut().find(|s| s.live() && s.id == id) {
                     s.credit = s.credit.saturating_add(bytes);
                 }
             }
-            Some(Record::Abort { id, .. }) => {
+            Ok(Record::Abort { id, .. }) => {
                 if let Some(i) = self.find(&id) {
                     self.free(i);
                     self.m_ended = self.m_ended.wrapping_add(1);
@@ -411,6 +416,13 @@ impl Subscriptions {
                     Owed::Answer { id: x, .. } | Owed::Abort { id: x, .. } => x != id,
                 });
             }
+            // A HEAD that breaks the binding's rules still names its
+            // exchange, and is owed an answer.
+            Err(_) => {
+                if let (Some(kind::HEAD), Some(id)) = (record_kind(record), record_id(record)) {
+                    self.refuse(id, status::BAD_REQUEST);
+                }
+            }
             _ => {}
         }
     }
@@ -418,10 +430,14 @@ impl Subscriptions {
     /// Judge a subscription request: what it asks for, or the status that
     /// refuses it.
     fn judge(&self, h: &exchange::RequestHead<'_>) -> Result<Wanted, u16> {
-        if h.target.len() > TARGET_MAX || h.headers.len() > HEADERS_MAX {
-            return Err(status::TOO_LARGE);
+        if h.target.len() > TARGET_MAX || h.meta.len() > META_MAX {
+            return Err(status::PAYLOAD_TOO_LARGE);
         }
-        if h.method != METHOD_GET || h.flags & flag::MORE != 0 || !h.body.is_empty() {
+        if h.op != op::CALL
+            || h.verb != method::GET
+            || h.flags & flag::MORE != 0
+            || !h.body.is_empty()
+        {
             return Err(status::BAD_REQUEST);
         }
         let mut w = Wanted {
@@ -437,13 +453,13 @@ impl Subscriptions {
         if prefix.first() == Some(&0x00) || prefix.iter().all(|b| *b == 0xFF) {
             return Err(status::BAD_REQUEST);
         }
-        if let Some(v) = header(h.headers, b"after") {
+        if let Some(v) = meta_get(h.meta, b"after") {
             w.after = Some(parse_decimal(v).ok_or(status::BAD_REQUEST)?);
         }
-        if let Some(v) = header(h.headers, b"feed-id") {
+        if let Some(v) = meta_get(h.meta, b"feed-id") {
             w.feed_id = Some(parse_decimal(v).ok_or(status::BAD_REQUEST)?);
         }
-        if let Some(v) = header(h.headers, b"table-id") {
+        if let Some(v) = meta_get(h.meta, b"table-id") {
             let t = parse_decimal(v).ok_or(status::BAD_REQUEST)?;
             w.table_id = Some(u32::try_from(t).map_err(|_| status::BAD_REQUEST)?);
         }
@@ -486,7 +502,7 @@ impl Subscriptions {
         self.draining = true;
         for i in 0..SUBS {
             if self.subs[i].live() {
-                self.end(i, status::BUSY, abort::DRAINING);
+                self.end(i, status::SERVICE_UNAVAILABLE, abort::DRAINING);
             }
         }
     }
@@ -503,7 +519,7 @@ impl Subscriptions {
                 && !s.head_sent
                 && now_ms.saturating_sub(s.opened_ms) > OPEN_TIMEOUT_MS
             {
-                self.end(i, status::TIMEOUT, abort::FAILED);
+                self.end(i, status::GATEWAY_TIMEOUT, abort::FAILED);
             }
         }
         if self.kv_busy {
@@ -705,19 +721,13 @@ impl Subscriptions {
     pub fn next_record(&mut self, now_ms: u64, out: &mut [u8]) -> Option<usize> {
         if self.owed_len > 0 {
             let n = match self.owed[0] {
-                Owed::Answer { id, status } => write_response_head(
-                    &ResponseHead {
-                        id,
-                        // Every status but `GONE` is one the provider
-                        // raises itself.
-                        flags: if status == GONE { 0 } else { flag::RAISED },
-                        status,
-                        content_type: &[],
-                        headers: &[],
-                        body: &[],
-                    },
-                    out,
-                )?,
+                Owed::Answer { id, status } => {
+                    let mut head = http::head(id, status, &[], &[])?;
+                    // Every status but `GONE` is one the provider raises
+                    // itself.
+                    head.flags = if status == GONE { 0 } else { flag::RAISED };
+                    write_response_head::<Http>(&head, out)?
+                }
                 Owed::Abort { id, reason } => write_abort(&id, reason, out)?,
             };
             self.owed.copy_within(1..self.owed_len, 0);
@@ -740,21 +750,15 @@ impl Subscriptions {
             return None;
         }
         if s.head_owed {
-            let mut hdr = [0u8; 32];
-            let mut n = put_text(&mut hdr, 0, b"revision: ")?;
-            n = put_decimal(&mut hdr, n, s.from)?;
-            n = put_text(&mut hdr, n, b"\r\n")?;
-            let len = write_response_head(
-                &ResponseHead {
-                    id: s.id,
-                    flags: flag::HOLD | flag::MORE,
-                    status: status::OK,
-                    content_type: &[],
-                    headers: &hdr[..n],
-                    body: &[],
-                },
-                out,
-            )?;
+            let mut digits = [0u8; 20];
+            let n = put_decimal(&mut digits, 0, s.from)?;
+            let mut meta = [0u8; RESP_META_MAX];
+            let mut w = MetaWriter::new(&mut meta);
+            w.put(REVISION_META, &digits[..n]);
+            let meta_len = w.finish()?;
+            let mut head = http::head(s.id, status::OK, &meta[..meta_len], &[])?;
+            head.flags = flag::HOLD | flag::MORE;
+            let len = write_response_head::<Http>(&head, out)?;
             s.head_owed = false;
             s.head_sent = true;
             return Some(len);
@@ -950,11 +954,6 @@ fn successor(prefix: &[u8], out: &mut [u8; PREFIX_MAX]) -> Option<usize> {
 fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Option<()> {
     out.get_mut(at..at + bytes.len())?.copy_from_slice(bytes);
     Some(())
-}
-
-fn put_text(out: &mut [u8], at: usize, bytes: &[u8]) -> Option<usize> {
-    put(out, at, bytes)?;
-    Some(at + bytes.len())
 }
 
 fn put_decimal(out: &mut [u8], at: usize, v: u64) -> Option<usize> {

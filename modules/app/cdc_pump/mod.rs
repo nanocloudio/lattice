@@ -15,7 +15,7 @@
 //! `KV_OP_SNAPSHOT_VERSIONS`, and checkpoints with `KV_OP_GET` /
 //! `KV_OP_PUT` / `KV_OP_CAS` — the same surface any external feed
 //! consumer sees, with no privileged read path. Each event leaves as one
-//! METHOD_PUBLISH exchange on `request_out` (target = the ordering key,
+//! PUBLISH exchange on `request_out` (target = the ordering key,
 //! body = the `cdc_wire::CdcEvent` envelope); the sink answers on
 //! `response_in`, and the DURABLE checkpoint advances only past the
 //! contiguous prefix answered 200.

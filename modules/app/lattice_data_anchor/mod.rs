@@ -1072,15 +1072,14 @@ unsafe fn net_send_bind_pic(anchor: &mut AnchorState) -> bool {
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let port = anchor.listen_port.to_le_bytes();
-    let payload = [port[0], port[1]];
+    let port = abi::contracts::net::net_proto::bind(anchor.listen_port, 0);
     let scratch = anchor.scratch.as_mut_ptr();
     net_write_frame(
         &*sys,
         out_chan,
         NET_CMD_BIND,
-        payload.as_ptr(),
-        2,
+        port.as_ptr(),
+        port.len(),
         scratch,
         SCRATCH_BUF_SIZE,
     ) > 0
@@ -1092,14 +1091,14 @@ unsafe fn net_send_close_pic(anchor: &mut AnchorState, conn_id: u16) -> bool {
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload = conn_id.to_le_bytes();
+    let payload = abi::contracts::net::net_proto::close(conn_id, false);
     let scratch = anchor.scratch.as_mut_ptr();
     net_write_frame(
         &*sys,
         out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        CONN_ID_LEN,
+        payload.len(),
         scratch,
         SCRATCH_BUF_SIZE,
     ) > 0
@@ -1233,7 +1232,10 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = SCRATCH_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = SCRATCH_BUF_SIZE],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

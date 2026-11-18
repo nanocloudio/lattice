@@ -56,7 +56,7 @@ use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use abi::contracts::net::net_proto::{
     conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
-    CONN_ID_LEN, MAX_CMD_DATA, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
 use doc_exec::{DOC_REQUEST_HEAD, DOC_REQUEST_MAX, DOC_RESPONSE_HEAD, DOC_RESPONSE_MAX};
@@ -74,15 +74,10 @@ const SEND_BUF: usize = 2 * (4 + DOC_RESPONSE_MAX);
 /// past one channel frame streams to the executor as `wire::MSG_PART`
 /// parts (one session at a time), whose build decides what it takes.
 const WIRE_FRAME_MAX: usize = 16777216;
-/// The most answer bytes one `CMD_SEND` carries: the net contract's
-/// `MAX_CMD_DATA`, and no more than one channel frame holds beside the
-/// connection id — a frame past its channel can never be written, and
+/// The most answer bytes one `CMD_SEND` carries: what one channel frame
+/// holds beside the connection id — a frame past its channel can never be written, and
 /// the session would stall at the first full chunk.
-const NET_CHUNK: usize = if MAX_CMD_DATA < wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN {
-    MAX_CMD_DATA
-} else {
-    wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN
-};
+const NET_CHUNK: usize = wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN;
 const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 27100;
 
@@ -172,14 +167,13 @@ unsafe fn net_bind(a: &mut AnchorState) -> bool {
     if sys.is_null() || a.net_out < 0 {
         return false;
     }
-    let port = a.listen_port.to_le_bytes();
+    let port = abi::contracts::net::net_proto::bind(a.listen_port, 0);
     let n = &mut a.net;
     n[0] = NET_CMD_BIND;
-    n[1] = 2;
+    n[1] = port.len() as u8;
     n[2] = 0;
-    n[NET_FRAME_HDR] = port[0];
-    n[NET_FRAME_HDR + 1] = port[1];
-    let total = NET_FRAME_HDR + 2;
+    n[NET_FRAME_HDR..NET_FRAME_HDR + port.len()].copy_from_slice(&port);
+    let total = NET_FRAME_HDR + port.len();
     ((*sys).channel_write)(a.net_out, n.as_mut_ptr(), total) == total as i32
 }
 
@@ -443,7 +437,12 @@ unsafe fn on_net(a: &mut AnchorState, msg: u8, p: &[u8]) {
                     a.m_sessions = a.m_sessions.wrapping_add(1);
                 }
                 None => {
-                    let _ = net_send(a, NET_CMD_CLOSE, id, &[]);
+                    let _ = net_send(
+                        a,
+                        NET_CMD_CLOSE,
+                        id,
+                        &[abi::contracts::net::net_proto::CLOSE_ORDERLY],
+                    );
                 }
             }
         }
@@ -480,7 +479,10 @@ unsafe fn on_net(a: &mut AnchorState, msg: u8, p: &[u8]) {
     }
 }
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = ENVELOPE_HDR + RECV_BUF, out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + CONN_ID_LEN + NET_CHUNK],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -599,7 +601,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
         if a.slots[i].closing {
             let conn = a.slots[i].conn_id;
-            let _ = unsafe { net_send(a, NET_CMD_CLOSE, conn, &[]) };
+            let _ = unsafe {
+                net_send(
+                    a,
+                    NET_CMD_CLOSE,
+                    conn,
+                    &[abi::contracts::net::net_proto::CLOSE_ORDERLY],
+                )
+            };
             a.slots[i].conn_id = SLOT_FREE;
             if a.up_slot == i {
                 a.up_slot = usize::MAX;

@@ -18,11 +18,14 @@ capabilities = ["transport.anchor.stream.secure"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 8768
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 4101
+buffer_size = 8192
 
 # Routed responses from kv_request_router (KV/Txn responses).
 [[ports]]
@@ -85,22 +88,26 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "watch_ctrl"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "lease_ctrl"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # The standby lease_manager (two-worker handoff graphs).
 [[ports]]
 name = "lease_ctrl2"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -112,6 +119,7 @@ content_type = "OctetStream"
 name = "watch_ctrl2"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.

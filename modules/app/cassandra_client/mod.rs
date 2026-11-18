@@ -111,7 +111,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: CqlState }
+fluxor_rt::module_facts! {
+    state: CqlState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = NET_BUF],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -191,7 +194,7 @@ unsafe fn feed(s: &mut CqlState, sys: &SyscallTable, ev: CEv, now: u64) {
     match action {
         CAct::Connect => {
             let mut payload = [0u8; CONNECT_TO_MAX];
-            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            let n = s.authority.connect_record(&mut payload, s.tag);
             if n > 0 {
                 net_write_frame(
                     sys,
@@ -232,13 +235,13 @@ unsafe fn feed(s: &mut CqlState, sys: &SyscallTable, ev: CEv, now: u64) {
         }
         CAct::Fail => {
             if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let close = abi::contracts::net::net_proto::close(s.conn_id, false);
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    CONN_ID_LEN,
+                    close.len(),
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -285,8 +288,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 let pl = core::slice::from_raw_parts(payload, plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == CPhase::Connecting => {
-                        if plen >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
+                        if let Some(c) = connected_parts(pl) {
+                            let (id, tag) = (c.conn_id, c.requester_tag);
                             if tag == s.tag || tag == REQUESTER_TAG_NONE {
                                 s.conn_id = id;
                                 feed(s, sys, CEv::Connected, now);
@@ -339,19 +342,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             feed(s, sys, CEv::PeerClosed, now);
                         }
                     }
-                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                    NET_MSG_ERROR => {
                         // A tagged error is a connect-phase failure and is
                         // ours by tag alone; an untagged one belongs to an
                         // established connection and routes by conn id.
-                        let (id, _errno, tag) = error_parts(pl);
-                        let ours = if tag == REQUESTER_TAG_NONE {
-                            (s.phase == CPhase::Connecting)
-                                || (s.phase != CPhase::Disconnected && id == s.conn_id)
-                        } else {
-                            s.phase == CPhase::Connecting && tag == s.tag
-                        };
-                        if ours {
-                            feed(s, sys, CEv::NetError, now);
+                        if let Some((id, _errno, tag)) = error_parts(pl) {
+                            let ours = if tag == REQUESTER_TAG_NONE {
+                                (s.phase == CPhase::Connecting)
+                                    || (s.phase != CPhase::Disconnected && id == s.conn_id)
+                            } else {
+                                s.phase == CPhase::Connecting && tag == s.tag
+                            };
+                            if ours {
+                                feed(s, sys, CEv::NetError, now);
+                            }
                         }
                     }
                     _ => {}
@@ -401,13 +405,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         if s.draining == 1 && matches!(s.phase, CPhase::Disconnected | CPhase::Ready) {
             if s.conn_id != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let close = abi::contracts::net::net_proto::close(s.conn_id, false);
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    CONN_ID_LEN,
+                    close.len(),
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );

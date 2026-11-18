@@ -243,6 +243,10 @@ struct CoordState {
     m_errors: u64,
     step_ctr: u32,
     logged_fault: u8,
+    /// When the request in flight was sent, and the corr of the last one
+    /// reported as unanswered (each is reported once).
+    sent_ms: u64,
+    stall_logged: u64,
 }
 
 impl CoordState {
@@ -288,6 +292,8 @@ impl CoordState {
         self.m_errors = 0;
         self.step_ctr = 0;
         self.logged_fault = 0;
+        self.sent_ms = 0;
+        self.stall_logged = 0;
     }
 
     fn backup_id(&self) -> [u8; 16] {
@@ -342,6 +348,7 @@ fn kv_send(c: &mut CoordState, pair: Pair, op: u8, body_len: usize, next: u8) ->
     };
     if sent {
         c.state = next;
+        c.sent_ms = now_ms(c);
     }
     sent
 }
@@ -461,25 +468,49 @@ const RANGE_ID: [u8; 16] = [1u8; 16];
 
 // ── The pump ─────────────────────────────────────────────────────────
 
+/// `LOG_WRITE` levels.
+const LOG_ERROR: u8 = 1;
+const LOG_WARN: u8 = 2;
+const LOG_INFO: u8 = 3;
+
+/// How long a request may go unanswered before it is reported (once; the
+/// coordinator keeps waiting: the store answers every request it takes).
+const STALL_REPORT_MS: u64 = 10_000;
+
+/// The job stops here: logged once, as an error.
 fn fault(c: &mut CoordState, what: &[u8]) {
     c.state = S_FAULT;
     c.m_errors = c.m_errors.wrapping_add(1);
     if c.logged_fault == 0 {
         c.logged_fault = 1;
-        unsafe {
-            if !c.syscalls.is_null() {
-                dev_log(&*c.syscalls, 3, what.as_ptr(), what.len());
-            }
-        }
+        log_at(c, LOG_ERROR, what);
     }
 }
 
 fn log_info(c: &CoordState, msg: &[u8]) {
+    log_at(c, LOG_INFO, msg);
+}
+
+fn log_at(c: &CoordState, level: u8, msg: &[u8]) {
     unsafe {
         if !c.syscalls.is_null() {
-            dev_log(&*c.syscalls, 2, msg.as_ptr(), msg.len());
+            dev_log(&*c.syscalls, level, msg.as_ptr(), msg.len());
         }
     }
+}
+
+/// A request in flight past [`STALL_REPORT_MS`]: which step waits, and on
+/// which corr.
+fn report_stall(c: &mut CoordState, now: u64) {
+    let waiting = !matches!(c.state, S_IDLE | S_WAIT | S_DONE | S_FAULT);
+    if !waiting || c.stall_logged == c.corr || now.wrapping_sub(c.sent_ms) < STALL_REPORT_MS {
+        return;
+    }
+    c.stall_logged = c.corr;
+    let mut msg = *b"[bkp] no answer within 10 s: state=00 corr=0000000000";
+    digits(&mut msg, 35, 2, u64::from(c.state));
+    digits(&mut msg, 43, 10, c.corr);
+    log_at(c, LOG_WARN, &msg);
 }
 
 /// `v` as `width` decimal digits into `out` at `at`.
@@ -1163,6 +1194,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             take_answer(c, true);
         }
     }
+
+    report_stall(c, now);
 
     if c.state == S_WAIT && now.wrapping_sub(c.boot_ms) >= c.start_delay_ms as u64 {
         match c.mode {

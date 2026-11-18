@@ -25,24 +25,24 @@
 //!
 //! # Request
 //!
-//! Method POST; `target` empty; headers ignored; body = the SQL text of one
+//! Op CALL, verb 0; `target` empty; meta ignored; body = the SQL text of one
 //! simple query (1..=4096 bytes, no NUL byte), sent to the server verbatim.
 //! The body may arrive inline in the HEAD or in BODY records (the module
 //! grants the credit for the rest at once).
 //!
 //! # Answer
 //!
-//! One answer per request, no content type, no headers:
+//! One answer per request, no meta:
 //!
-//! | Status | When | Body |
+//! | Outcome | When | Body |
 //! |---|---|---|
-//! | 200 | the query completed — for a write, the server has committed it (the answer follows ReadyForQuery) | the first column of every row, in row order, joined by `\n` (0x0A); no trailing separator; a NULL first column contributes no row; a statement with no rows answers an empty body |
-//! | 400 | the server refused the query (ErrorResponse) | the server's message text (the `M` field), UTF-8 as sent |
-//! | 400 | another method, a non-empty target, an empty body, a NUL in the body | empty |
-//! | 413 | a body over 4096 bytes, a target over 64, headers over 256 | empty |
-//! | 502 | the server could not be reached or refused the session before the link was ever up (the server's message text when it sent one), or a result set over 8192 bytes (refused whole, never truncated) | as stated |
-//! | 503 | four requests already held, or draining | empty |
-//! | 504 | the server did not finish the query within 15 s (the connection is closed; the query's effect is unknown) | empty |
+//! | OK | the query completed — for a write, the server has committed it (the answer follows ReadyForQuery) | the first column of every row, in row order, joined by `\n` (0x0A); no trailing separator; a NULL first column contributes no row; a statement with no rows answers an empty body |
+//! | REFUSED | the server refused the query (ErrorResponse) | the server's message text (the `M` field), UTF-8 as sent |
+//! | REFUSED | another op or a verb, a non-empty target, an empty body, a NUL in the body | empty |
+//! | TOO_LARGE | a body over 4096 bytes, a target over 64, meta over 256 | empty |
+//! | UNAVAILABLE | the server could not be reached or refused the session before the link was ever up (the server's message text when it sent one), or a result set over 8192 bytes (refused whole, never truncated) | as stated |
+//! | BUSY | four requests already held, or draining | empty |
+//! | TIMEOUT | the server did not finish the query within 15 s (the connection is closed; the query's effect is unknown) | empty |
 //!
 //! The body streams under the requester's response credit: the HEAD carries
 //! as much as `resp_credit` allows, BODY records the rest as CREDIT arrives.
@@ -98,7 +98,7 @@ use authority::{Authority, PORT_PG};
 
 #[path = "../../common/query_exchange.rs"]
 mod query_exchange;
-use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::exchange::{op, outcome, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 use abi::contracts::net::net_proto::{
@@ -183,7 +183,7 @@ struct PgState {
     result_len: u16,
     have_result: u8,
     // Set when a row would overflow `result`: the whole answer is refused
-    // (502) rather than truncated to a plausible-looking prefix.
+    // (`UNAVAILABLE`) rather than truncated to a plausible-looking prefix.
     result_overflow: u8,
     // Set when the server refused the query; `result` holds its message.
     query_error: u8,
@@ -238,7 +238,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: PgState }
+fluxor_rt::module_facts! {
+    state: PgState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = NET_BUF],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -305,7 +308,7 @@ pub extern "C" fn module_new(
         s.acc_len = 0;
         s.completed = 0;
         s.errors = 0;
-        s.desk.reset(METHOD_POST, 0);
+        s.desk.reset(op::CALL, 0);
         s.outbox = ExchangeOutbox::new();
         parse_tlv(s, params, params_len);
         if !s.authority.adopt(PORT_PG) {
@@ -371,13 +374,13 @@ unsafe fn send_startup(s: &mut PgState, now: u64) {
 unsafe fn close_conn(s: &mut PgState) {
     let sys = &*s.syscalls;
     if s.conn_id != 0 {
-        let close = s.conn_id.to_le_bytes();
+        let close = abi::contracts::net::net_proto::close(s.conn_id, false);
         net_write_frame(
             sys,
             s.net_out,
             NET_CMD_CLOSE,
             close.as_ptr(),
-            2,
+            close.len(),
             s.nbuf.as_mut_ptr(),
             NET_BUF,
         );
@@ -392,7 +395,7 @@ unsafe fn close_conn(s: &mut PgState) {
 /// The connection failed or dropped. After the link was up this is a LINK
 /// DOWN (every request held is dropped for the requester to re-issue) and
 /// reconnecting is the module's own business; before it ever came up there
-/// was nothing to report, so the request being performed is answered 502
+/// was nothing to report, so the request being performed is answered `UNAVAILABLE`
 /// here, with the first `text_len` bytes of `result` (the server's message,
 /// when it sent one) as the body.
 unsafe fn connection_lost(s: &mut PgState, now: u64, text_len: usize) {
@@ -413,7 +416,8 @@ unsafe fn connection_lost(s: &mut PgState, now: u64, text_len: usize) {
         return;
     }
     if s.has_query == 1 {
-        s.desk.finish(status::BAD_GATEWAY, text_len.min(RESULT_MAX));
+        s.desk
+            .finish(outcome::UNAVAILABLE, text_len.min(RESULT_MAX));
         s.has_query = 0;
     }
 }
@@ -438,7 +442,7 @@ unsafe fn on_message(s: &mut PgState, tag: u8, len: usize, now: u64, text_len: &
         if s.phase == QUERYING {
             // A statement-level error (duplicate key, missing relation, …)
             // is an ordinary query outcome: the server stays open and
-            // ReadyForQuery follows, which completes the exchange with 400
+            // ReadyForQuery follows, which completes the exchange with `REFUSED`
             // and the server's message as the body.
             if s.query_error == 0 {
                 s.query_error = 1;
@@ -571,14 +575,14 @@ unsafe fn on_message(s: &mut PgState, tag: u8, len: usize, now: u64, text_len: &
 /// The query's ReadyForQuery arrived: answer it.
 unsafe fn finish_query(s: &mut PgState) {
     let (code, len) = if s.query_error == 1 {
-        (status::BAD_REQUEST, s.result_len as usize)
+        (outcome::REFUSED, s.result_len as usize)
     } else if s.result_overflow == 1 {
         // The set did not fit: refused whole. A truncated result would be
         // indistinguishable from a complete one downstream.
         s.errors = s.errors.wrapping_add(1);
-        (status::BAD_GATEWAY, 0)
+        (outcome::UNAVAILABLE, 0)
     } else {
-        (status::OK, s.result_len as usize)
+        (outcome::OK, s.result_len as usize)
     };
     s.desk.finish(code, len);
     s.has_query = 0;
@@ -656,7 +660,7 @@ unsafe fn take_request(s: &mut PgState) {
         return;
     };
     if target != 0 || body.is_empty() || has_nul(body) {
-        s.desk.refuse(at, status::BAD_REQUEST);
+        s.desk.refuse(at, outcome::REFUSED);
         return;
     }
     let n = body.len();
@@ -694,7 +698,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             && s.phase == DISCONNECTED;
         if connect {
             let mut payload = [0u8; CONNECT_TO_MAX];
-            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            let n = s.authority.connect_record(&mut payload, s.tag);
             if n > 0 {
                 net_write_frame(
                     sys,
@@ -733,8 +737,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 let pl = core::slice::from_raw_parts(payload, plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == CONNECTING => {
-                        if plen >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
+                        if let Some(c) = connected_parts(pl) {
+                            let (id, tag) = (c.conn_id, c.requester_tag);
                             if tag == s.tag || tag == REQUESTER_TAG_NONE {
                                 s.conn_id = id;
                                 send_startup(s, now);
@@ -766,18 +770,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             connection_lost(s, now, 0);
                         }
                     }
-                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                    NET_MSG_ERROR => {
                         // A tagged error is a connect-phase failure and is
                         // ours by tag alone; an untagged one belongs to an
                         // established connection and routes by conn id.
-                        let (id, _errno, tag) = error_parts(pl);
-                        let ours = if tag == REQUESTER_TAG_NONE {
-                            (s.phase == CONNECTING) || (s.phase != DISCONNECTED && id == s.conn_id)
-                        } else {
-                            s.phase == CONNECTING && tag == s.tag
-                        };
-                        if ours {
-                            connection_lost(s, now, 0);
+                        if let Some((id, _errno, tag)) = error_parts(pl) {
+                            let ours = if tag == REQUESTER_TAG_NONE {
+                                (s.phase == CONNECTING)
+                                    || (s.phase != DISCONNECTED && id == s.conn_id)
+                            } else {
+                                s.phase == CONNECTING && tag == s.tag
+                            };
+                            if ours {
+                                connection_lost(s, now, 0);
+                            }
                         }
                     }
                     _ => {}
@@ -817,11 +823,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             }
         }
 
-        // 6. Timeouts. A query the server has not finished is answered 504
+        // 6. Timeouts. A query the server has not finished is answered `TIMEOUT`
         //    and its connection closed (the next request reconnects); a
         //    handshake that stalls is a lost connection.
         if s.phase == QUERYING && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
-            s.desk.finish(status::TIMEOUT, 0);
+            s.desk.finish(outcome::TIMEOUT, 0);
             s.has_query = 0;
             s.errors = s.errors.wrapping_add(1);
             close_conn(s);
@@ -857,7 +863,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 unsafe fn overflowed(s: &mut PgState, _now: u64) {
     s.errors = s.errors.wrapping_add(1);
     if s.phase == QUERYING {
-        s.desk.finish(status::BAD_GATEWAY, 0);
+        s.desk.finish(outcome::UNAVAILABLE, 0);
         s.has_query = 0;
     }
     close_conn(s);

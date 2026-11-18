@@ -9,11 +9,12 @@
 //!
 //! - collecting each request whole (`Collector`), granting the body credit it
 //!   owes and answering the refusals it raises;
-//! - judging the request: the one method the module serves, and only the
-//!   flags that method may carry, else 400;
+//! - judging the request: the one op the module serves (verb 0: a desk
+//!   speaks no binding), and only the flags that op may carry, else
+//!   `REFUSED`;
 //! - the order requests are served in — the order they completed;
 //! - streaming the answer under the requester's response credit: a HEAD
-//!   carrying the status and as much of the body as the credit allows, then
+//!   carrying the outcome and as much of the body as the credit allows, then
 //!   BODY records as further CREDIT arrives;
 //! - the queue of small records owed on `response_out` (credits, refusals,
 //!   LINK), which never drops one: the module reads a request only while
@@ -51,15 +52,15 @@
 pub use fluxor_abi::contracts::exchange;
 
 use exchange::{
-    flag, link, parse_request, write_body, write_credit, write_link, write_response_head,
-    Collector, ExchangeId, Record, Request, ResponseHead, BODY_MAX, HDR, RECORD_MAX,
+    flag, link, outcome, parse_request, write_body, write_credit, write_link, write_response_head,
+    Collector, ExchangeId, Plain, Record, Request, ResponseHead, BODY_MAX, HDR, RECORD_MAX,
     RESP_HEAD_FIXED,
 };
 
-/// Largest header block a request may carry. No module here reads a
-/// request header, so the bound is room for what a requester attaches,
-/// not a field anyone uses.
-pub const HEADERS_MAX: usize = 256;
+/// Largest meta a request may carry. No module here reads a request's
+/// meta, so the bound is room for what a requester attaches, not a field
+/// anyone uses.
+pub const META_MAX: usize = 256;
 
 /// Records owed per request record read, at most: one credit or one
 /// refusal.
@@ -67,8 +68,7 @@ const OWED_PER_READ: usize = 1;
 /// LINK records the queue can hold at its tail: a `DOWN` and the `UP` after
 /// it. A later `DOWN` cancels a queued `UP` rather than following it.
 const LINK_RESERVE: usize = 2;
-/// The most body bytes a response HEAD can carry with no content type and
-/// no headers.
+/// The most body bytes a response HEAD can carry with no meta.
 const HEAD_BODY_MAX: usize = RECORD_MAX - HDR - RESP_HEAD_FIXED;
 
 /// One small record owed on `response_out`.
@@ -77,7 +77,7 @@ enum Owed {
     /// A whole answer with an empty body: a refusal.
     Answer {
         id: ExchangeId,
-        status: u16,
+        outcome: u8,
     },
     Credit {
         id: ExchangeId,
@@ -132,7 +132,7 @@ impl Current {
 struct Answer {
     live: bool,
     id: ExchangeId,
-    status: u16,
+    outcome: u8,
     len: u32,
     sent: u32,
     credit: u32,
@@ -143,7 +143,7 @@ impl Answer {
     const NONE: Answer = Answer {
         live: false,
         id: ExchangeId::NONE,
-        status: 0,
+        outcome: 0,
         len: 0,
         sent: 0,
         credit: 0,
@@ -156,12 +156,12 @@ impl Answer {
 /// small records owed on `response_out`.
 pub struct QueryDesk<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: usize>
 {
-    requests: Collector<SLOTS, TARGET, HEADERS_MAX, BODY>,
+    requests: Collector<Plain, SLOTS, TARGET, META_MAX, BODY>,
     /// Completion order per slot; 0 = not a complete request.
     order: [u32; SLOTS],
     next_order: u32,
-    /// The one method this provider serves, and the request flags it takes.
-    method: u8,
+    /// The one op this provider serves, and the request flags it takes.
+    op: u8,
     flags_allowed: u8,
     queue: [Owed; QUEUE],
     head: usize,
@@ -181,15 +181,15 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
     /// ever refused room.
     const QUEUE_FITS: () = assert!(QUEUE >= SLOTS + OWED_PER_READ + LINK_RESERVE);
 
-    /// A desk serving `method`, whose requests may carry `flags_allowed`
+    /// A desk serving `op`, whose requests may carry `flags_allowed`
     /// (`MORE` is always allowed: a body may follow any HEAD).
-    pub const fn new(method: u8, flags_allowed: u8) -> Self {
+    pub const fn new(op: u8, flags_allowed: u8) -> Self {
         let () = Self::QUEUE_FITS;
         QueryDesk {
             requests: Collector::new(),
             order: [0; SLOTS],
             next_order: 1,
-            method,
+            op,
             flags_allowed: flags_allowed | flag::MORE,
             queue: [Owed::NONE; QUEUE],
             head: 0,
@@ -204,7 +204,7 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
 
     /// Return to the state of [`QueryDesk::new`], in place — for a module
     /// whose state arrives as raw memory.
-    pub fn reset(&mut self, method: u8, flags_allowed: u8) {
+    pub fn reset(&mut self, op: u8, flags_allowed: u8) {
         let () = Self::QUEUE_FITS;
         for at in 0..SLOTS {
             self.requests.release(at);
@@ -213,7 +213,7 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
         let _ = self.requests.take_refusal();
         self.order = [0; SLOTS];
         self.next_order = 1;
-        self.method = method;
+        self.op = op;
         self.flags_allowed = flags_allowed | flag::MORE;
         self.head = 0;
         self.len = 0;
@@ -266,17 +266,17 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
             return;
         }
         if self.draining {
-            if let Some(Record::Head(h)) = parse_request(record) {
+            if let Ok(Record::Head(h)) = parse_request::<Plain>(record) {
                 self.push(Owed::Answer {
                     id: h.id,
-                    status: exchange::status::BUSY,
+                    outcome: outcome::BUSY,
                 });
                 return;
             }
         }
-        match parse_request(record) {
-            Some(Record::Abort { id, .. }) => self.abort(id),
-            Some(Record::Credit { id, bytes }) => {
+        match parse_request::<Plain>(record) {
+            Ok(Record::Abort { id, .. }) => self.abort(id),
+            Ok(Record::Credit { id, bytes }) => {
                 if self.answer.live && self.answer.id == id {
                     self.answer.credit = self.answer.credit.saturating_add(bytes);
                 } else if self.current.live && self.current.id == id {
@@ -292,28 +292,30 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
         if let Some((id, why)) = self.requests.take_refusal() {
             self.push(Owed::Answer {
                 id,
-                status: why.status(),
+                outcome: why.outcome(),
             });
         }
         let Some(at) = taken.ok().flatten() else {
             return;
         };
-        let Some((id, method, flags)) =
-            self.requests.request(at).map(|r| (r.id, r.method, r.flags))
+        let Some((id, asked, flags)) = self.requests.request(at).map(|r| (r.id, r.op, r.flags))
         else {
             self.requests.release(at);
             return;
         };
-        let status = if self.draining {
-            exchange::status::BUSY
-        } else if method != self.method || flags & !self.flags_allowed != 0 {
-            exchange::status::BAD_REQUEST
+        let verdict = if self.draining {
+            outcome::BUSY
+        } else if asked != self.op || flags & !self.flags_allowed != 0 {
+            outcome::REFUSED
         } else {
-            exchange::status::OK
+            outcome::OK
         };
-        if status != exchange::status::OK {
+        if verdict != outcome::OK {
             self.requests.release(at);
-            self.push(Owed::Answer { id, status });
+            self.push(Owed::Answer {
+                id,
+                outcome: verdict,
+            });
             return;
         }
         self.order[at] = self.next_order;
@@ -358,11 +360,11 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
     }
 
     /// Answer the request in slot `at` with a refusal of the module's own
-    /// (400 for a request it cannot perform, 413 for one past what its
-    /// backend takes) and free the slot.
-    pub fn refuse(&mut self, at: usize, status: u16) {
+    /// (`REFUSED` for a request it cannot perform, `TOO_LARGE` for one
+    /// past what its backend takes) and free the slot.
+    pub fn refuse(&mut self, at: usize, outcome: u8) {
         if let Some(id) = self.request(at).map(|r| r.id) {
-            self.push(Owed::Answer { id, status });
+            self.push(Owed::Answer { id, outcome });
         }
         if at < SLOTS {
             self.order[at] = 0;
@@ -380,12 +382,12 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
         self.current.live
     }
 
-    /// The request being performed is answered: `status`, and the first
+    /// The request being performed is answered: `outcome`, and the first
     /// `body_len` bytes of the module's answer buffer as the body. That
     /// buffer must hold them until the answer has left
     /// ([`QueryDesk::busy`] turns false). Nothing is written for a request
     /// the requester aborted.
-    pub fn finish(&mut self, status: u16, body_len: usize) {
+    pub fn finish(&mut self, outcome: u8, body_len: usize) {
         if !self.current.live {
             return;
         }
@@ -397,7 +399,7 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
         self.answer = Answer {
             live: true,
             id: c.id,
-            status,
+            outcome,
             len: body_len as u32,
             sent: 0,
             credit: c.credit,
@@ -412,7 +414,8 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
     /// answer still streaming is withdrawn, `DOWN` is owed, and request
     /// records are dropped until the `UP`. Returns false — and changes
     /// nothing — when the link never came up: the caller then answers the
-    /// request it is performing itself (502), since nothing was reported.
+    /// request it is performing itself (`UNAVAILABLE`), since nothing was
+    /// reported.
     pub fn link_down(&mut self) -> bool {
         if self.seen != LinkSeen::Up {
             return false;
@@ -464,10 +467,10 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
     // ── Draining ─────────────────────────────────────────────────────
 
     /// Stop taking requests: every request held and not yet performed is
-    /// answered 503 (it may be repeated elsewhere), as far as the queue has
-    /// room — call once per step until [`QueryDesk::idle`]. A request whose
-    /// body is still arriving is answered 503 once it completes, and a new
-    /// request is answered 503 as it is read. The request being performed
+    /// answered `BUSY` (it may be repeated elsewhere), as far as the queue
+    /// has room — call once per step until [`QueryDesk::idle`]. A request
+    /// whose body is still arriving is answered `BUSY` once it completes, and
+    /// a new request is answered `BUSY` as it is read. The request being performed
     /// finishes normally.
     pub fn drain(&mut self) {
         self.draining = true;
@@ -478,7 +481,7 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
             if let Some(id) = self.request(at).map(|r| r.id) {
                 self.push(Owed::Answer {
                     id,
-                    status: exchange::status::BUSY,
+                    outcome: outcome::BUSY,
                 });
                 self.order[at] = 0;
                 self.requests.release(at);
@@ -513,17 +516,9 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
         }
         let owed = self.at(0);
         let n = match owed {
-            Owed::Answer { id, status } => write_response_head(
-                &ResponseHead {
-                    id,
-                    flags: 0,
-                    status,
-                    content_type: &[],
-                    headers: &[],
-                    body: &[],
-                },
-                out,
-            )?,
+            Owed::Answer { id, outcome } => {
+                write_response_head::<Plain>(&ResponseHead::answer(id, outcome, &[], &[]), out)?
+            }
             Owed::Credit { id, bytes } => write_credit(&id, bytes, out)?,
             Owed::Link(state) => write_link(state, out)?,
         };
@@ -549,24 +544,16 @@ impl<const SLOTS: usize, const TARGET: usize, const BODY: usize, const QUEUE: us
             self.answer = Answer::NONE;
             self.push(Owed::Answer {
                 id: a.id,
-                status: exchange::status::FAILED,
+                outcome: outcome::FAILED,
             });
             return None;
         };
         if !a.head_sent {
             let inline = src.len().min(a.credit as usize).min(HEAD_BODY_MAX);
             let flags = if inline < src.len() { flag::MORE } else { 0 };
-            let n = write_response_head(
-                &ResponseHead {
-                    id: a.id,
-                    flags,
-                    status: a.status,
-                    content_type: &[],
-                    headers: &[],
-                    body: &src[..inline],
-                },
-                out,
-            )?;
+            let mut head = ResponseHead::answer(a.id, a.outcome, &[], &src[..inline]);
+            head.flags = flags;
+            let n = write_response_head::<Plain>(&head, out)?;
             self.advance(inline);
             return Some(n);
         }

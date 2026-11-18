@@ -1202,7 +1202,14 @@ fn arm_timer(exec: &mut ExecState, ms: u32) {
             return;
         }
         let mut ms = ms.to_le_bytes();
-        ((*sys).provider_call)(exec.timer_fd, TIMER_SET, ms.as_mut_ptr(), 4);
+        ((*sys).provider_call)(
+            exec.timer_fd,
+            TIMER_SET,
+            ms.as_mut_ptr(),
+            4,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -1219,7 +1226,14 @@ fn disarm_watchdog(exec: &mut ExecState) {
         if sys.is_null() {
             return;
         }
-        ((*sys).provider_call)(exec.timer_fd, TIMER_CANCEL, core::ptr::null_mut(), 0);
+        ((*sys).provider_call)(
+            exec.timer_fd,
+            TIMER_CANCEL,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 

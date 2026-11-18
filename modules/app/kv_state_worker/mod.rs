@@ -3822,14 +3822,18 @@ impl store_provider::Backend for WorkerBackend<'_> {
         rc == 1
     }
 
-    fn event_owner(&self, event: i32) -> Option<[u8; 8]> {
-        self.query(event, EVENT_OWNER, [0; 8])
-    }
-
-    fn signal(&mut self, event: i32) -> i32 {
-        // SAFETY: the worker's syscall table; SIGNAL takes no argument.
+    fn ring(&mut self, doorbell: u32) -> i32 {
+        let mut arg = abi::kernel_abi::doorbell::ring_arg(doorbell);
+        // SAFETY: the worker's syscall table; `[doorbell u32]`.
         unsafe {
-            ((*self.worker.syscalls).provider_call)(event, EVENT_SIGNAL, core::ptr::null_mut(), 0)
+            ((*self.worker.syscalls).provider_call)(
+                -1,
+                abi::kernel_abi::doorbell::DOORBELL_RING,
+                arg.as_mut_ptr(),
+                arg.len(),
+                core::ptr::null_mut(),
+                0,
+            )
         }
     }
 
@@ -3865,7 +3869,14 @@ impl store_provider::Backend for WorkerBackend<'_> {
         let mut pool = POOL_STORE_SUBS.to_le_bytes();
         // SAFETY: the worker's syscall table; `[pool u16]`.
         unsafe {
-            ((*self.worker.syscalls).provider_call)(-1, LEDGER_DENY, pool.as_mut_ptr(), pool.len());
+            ((*self.worker.syscalls).provider_call)(
+                -1,
+                LEDGER_DENY,
+                pool.as_mut_ptr(),
+                pool.len(),
+                core::ptr::null_mut(),
+                0,
+            );
         }
     }
 
@@ -3880,18 +3891,13 @@ impl store_provider::Backend for WorkerBackend<'_> {
 
 /// `query_key::CALLER_OWNER`: the module a provider call serves.
 #[cfg(feature = "store_provider")]
-const CALLER_OWNER: u32 = 9;
-/// `query_key::CALLER_MODULE`, `MODULE_LIVE`, `EVENT_OWNER`: the calling
-/// module's occupancy, whether one still stands, and whose an event is.
+const CALLER_OWNER: u32 = abi::kernel_abi::query_key::CALLER_OWNER;
+/// `query_key::CALLER_MODULE`, `MODULE_LIVE`: the calling module's
+/// occupancy, and whether one still stands.
 #[cfg(feature = "store_provider")]
-const CALLER_MODULE: u32 = 10;
+const CALLER_MODULE: u32 = abi::kernel_abi::query_key::CALLER_MODULE;
 #[cfg(feature = "store_provider")]
-const MODULE_LIVE: u32 = 11;
-#[cfg(feature = "store_provider")]
-const EVENT_OWNER: u32 = 12;
-/// `kernel_abi::event::SIGNAL`.
-#[cfg(feature = "store_provider")]
-const EVENT_SIGNAL: u32 = abi::registry::event::SIGNAL;
+const MODULE_LIVE: u32 = abi::kernel_abi::query_key::MODULE_LIVE;
 /// `internal::reconfigure::OWNER_RELEASED`, and its `[slot][0][generation]`
 /// argument.
 #[cfg(feature = "store_provider")]
@@ -3983,7 +3989,15 @@ unsafe fn provider_new(worker: &mut WorkerState) {
     // (a restarted replica's must differ); a host store it imports goes
     // through the log too, a record at a time.
     let mut nonce = [0u8; 8];
-    let random = !replicated || (sys.provider_call)(-1, RANDOM_FILL, nonce.as_mut_ptr(), 8) == 0;
+    let random = !replicated
+        || (sys.provider_call)(
+            -1,
+            RANDOM_FILL,
+            core::ptr::null_mut(),
+            0,
+            nonce.as_mut_ptr(),
+            8,
+        ) == 0;
     let wanted =
         worker.state_store == STATE_STORE_DISK && (!replicated || (worker.prov_out >= 0 && random));
     let p = &mut worker.prov;
@@ -4195,8 +4209,6 @@ unsafe fn provider_heartbeat(worker: &WorkerState) {
         n = write_dec(&mut buf, n, u64::from(m.reaped));
         n = write_prefix(&mut buf, n, b" sub_refused=");
         n = write_dec(&mut buf, n, u64::from(m.refused));
-        n = write_prefix(&mut buf, n, b" owner_checks_failed=");
-        n = write_dec(&mut buf, n, u64::from(m.owner_checks_failed));
         n = write_prefix(&mut buf, n, b" walk_refused=");
         n = write_dec(&mut buf, n, u64::from(m.walk_refused));
         let (base, frontier, used) = pv.log_span();
@@ -4790,6 +4802,8 @@ pub extern "C" fn module_provider_dispatch(
     op: u32,
     arg: *mut u8,
     arg_len: usize,
+    data: *mut u8,
+    data_len: usize,
 ) -> i32 {
     if state.is_null() {
         return store_provider::EINVAL;
@@ -4838,9 +4852,6 @@ pub extern "C" fn module_provider_dispatch(
             _ => 7,
         };
         worker.prov.m_ops[class] = worker.prov.m_ops[class].wrapping_add(1);
-        if op == store_provider::NS_CAPS {
-            return store_provider::NS_CAPS_SERVED;
-        }
         if !provider_ready(worker) && store_provider::needs_store(op, arg, arg_len) {
             worker.prov.m_not_serving = worker.prov.m_not_serving.wrapping_add(1);
             return if worker.disk_phase == DISK_PHASE_QUARANTINED {
@@ -4866,6 +4877,8 @@ pub extern "C" fn module_provider_dispatch(
             op,
             arg,
             arg_len,
+            data,
+            data_len,
         );
         worker.prov.in_call = false;
         // A call refused for a reason other than the contract's own answers

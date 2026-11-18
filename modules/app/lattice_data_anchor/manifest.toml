@@ -32,12 +32,15 @@ hardware_targets = ["bcm2712", "linux"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 8710
 
 # NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 8710
+buffer_size = 16384
 
 # MSG_KV_REQUEST envelopes out to kv_request_router's
 # `internal_data_in`, stamped PROTO_INTERNAL_DATA.
@@ -45,6 +48,7 @@ content_type = "NetProto"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_KV_RESPONSE envelopes in from kv_request_router's `compute_out`.
 [[ports]]

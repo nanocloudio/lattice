@@ -8,13 +8,17 @@
 //!
 //! | Tag | Name        | Type | Default  | Description                               |
 //! |-----|-------------|------|----------|-------------------------------------------|
-//! | 1   | method      | u32  | 3 (POST) | Exchange method constant of each request  |
+//! | 1   | method      | u32  | 3 (POST) | HTTP method of each request on `request_out` (`exchange_http::method`) |
 //! | 2   | target      | str  | (empty)  | Request target, up to 128 bytes           |
-//! | 3   | headers     | str  | (empty)  | Request header block, `name: value` lines each ended `\r\n`, up to 256 bytes |
+//! | 3   | headers     | str  | (empty)  | Request meta as `name: value` lines each ended `\r\n`, up to 256 bytes: each line one meta field, its name lower-cased |
 //! | 4   | hold        | u32  | 0        | 1: send one request at start, with no body, and read a held answer |
 //! | 5   | abort_after | u32  | 0        | With `hold`: ABORT the exchange after this many BODY records (0: never) |
 //! | 6   | select      | str  | (empty)  | Take only stdin chunks that begin with these bytes (up to 8), the prefix dropped from the body — so one stdin can feed several requesters |
 //! | 7   | framed      | u32  | 0        | 1: a chunk is items, `[len u16 LE][item]` each, sent as one request of several records — the first inline in the HEAD, each other a BODY as the provider's request-body CREDIT admits it |
+//!
+//! Every request is a CALL. On `request_out` it speaks the `exchange_http`
+//! binding and carries `method` as its verb; on `call_out`, for a provider
+//! that speaks no binding, it carries verb 0. A graph wires one of the two.
 //!
 //! A `target`, `headers` or `select` past its bound refuses construction. A
 //! body that does not fit one request record is written to `text_out` as
@@ -25,7 +29,7 @@
 //!
 //! With `hold: 1` the module issues its one request when it starts and
 //! prints a held answer as it streams: its HEAD as `HOLD <status>` and its
-//! header lines (one space between them), every BODY record as `BODY ` and the
+//! meta fields as `name: value` (one space between them), every BODY record as `BODY ` and the
 //! record's bytes in hex, a provider ABORT as `ABORT <reason>` (the reason
 //! code in three digits, `ABORT 005` for `DRAINING`), and the
 //! ABORT it sends itself after `abort_after` records as `ABORTED`. Each
@@ -51,6 +55,7 @@ use fluxor_abi as abi;
 use fluxor_rt::*;
 
 use abi::contracts::exchange as ex;
+use abi::contracts::exchange_http::{self as http, Http};
 
 /// The longest request target the `target` param holds.
 const TARGET_MAX: usize = 128;
@@ -58,6 +63,10 @@ const TARGET_MAX: usize = 128;
 const ANSWER_MAX: usize = 8192;
 /// The longest request header block the `headers` param holds.
 const HEADERS_MAX: usize = 256;
+/// The longest request meta: every line of the largest header block as a
+/// field costs at most its own bytes (`: ` and CRLF pay for the field's
+/// key and value lengths).
+const META_MAX: usize = HEADERS_MAX;
 /// The longest `select` prefix.
 const SELECT_MAX: usize = 8;
 /// The longest text line: a whole record in hex, and its label.
@@ -70,12 +79,17 @@ struct CliState {
     response_in: i32,
     request_out: i32,
     text_out: i32,
+    /// `call_out` is the wired request port: requests carry verb 0.
+    plain: u8,
 
     method: u8,
     target: [u8; TARGET_MAX],
     target_len: u16,
     headers: [u8; HEADERS_MAX],
     headers_len: u16,
+    /// The `headers` param as a meta run.
+    meta: [u8; META_MAX],
+    meta_len: u16,
     /// A string param past its bound: the module refuses to construct.
     bad_param: u8,
     /// `select` param: the prefix a stdin chunk carries to be this module's.
@@ -201,12 +215,15 @@ pub extern "C" fn module_new(
         let sys = &*syscalls.cast::<SyscallTable>();
         s.syscalls = sys;
         s.body_in = in_chan;
-        s.request_out = out_chan;
+        let call_out = dev_channel_port(sys, 1, 2);
+        s.plain = u8::from(call_out >= 0);
+        s.request_out = if out_chan >= 0 { out_chan } else { call_out };
         s.response_in = dev_channel_port(sys, 0, 1);
         s.text_out = dev_channel_port(sys, 1, 1);
-        s.method = ex::METHOD_POST;
+        s.method = http::method::POST;
         s.target_len = 0;
         s.headers_len = 0;
+        s.meta_len = 0;
         s.select_len = 0;
         s.bad_param = 0;
         s.hold = 0;
@@ -230,12 +247,26 @@ pub extern "C" fn module_new(
             dev_log(sys, 2, m.as_ptr(), m.len());
             return -1;
         }
+        match http::meta_from_header_lines(&s.headers[..s.headers_len as usize], &mut s.meta) {
+            Some(n) => s.meta_len = n as u16,
+            None => {
+                let m = b"[exchange_cli] refusing to construct: headers do not form meta fields";
+                dev_log(sys, 2, m.as_ptr(), m.len());
+                return -1;
+            }
+        }
+        if out_chan >= 0 && call_out >= 0 {
+            let m =
+                b"[exchange_cli] refusing to construct: request_out and call_out are both wired";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
+        }
         if s.hold == 1 {
             // The one request goes out at once, with no body.
             stage_request(s, 0);
         }
         if s.request_out < 0 || s.response_in < 0 {
-            let m = b"[exchange_cli] refusing to construct: request_out and response_in must both be wired";
+            let m = b"[exchange_cli] refusing to construct: request_out (or call_out) and response_in must both be wired";
             dev_log(sys, 2, m.as_ptr(), m.len());
             return -1;
         }
@@ -270,7 +301,7 @@ unsafe fn flush_line(s: &mut CliState, sys: &SyscallTable) -> bool {
 /// Stage `status` and `body` as one text line.
 fn stage_line(s: &mut CliState, status: u16, body_len: usize) {
     let mut n = 0usize;
-    if status != ex::status::OK {
+    if status != http::status::OK {
         n = put_status(&mut s.line, status);
         s.line[3] = b' ';
         n += 1;
@@ -320,38 +351,38 @@ fn put_status(out: &mut [u8], status: u16) -> usize {
 
 /// Append `text` to the staged line.
 fn line_push(s: &mut CliState, text: &[u8]) {
-    let n = s.line_len as usize;
-    let take = text.len().min(LINE_MAX - n);
-    s.line[n..n + take].copy_from_slice(&text[..take]);
-    s.line_len = (n + take) as u16;
+    push_text(&mut s.line, &mut s.line_len, text);
 }
 
-/// Stage a held answer's HEAD: `HOLD <status>` and its header lines.
-fn stage_hold(s: &mut CliState, status: u16, hdr_at: usize, hdr_len: usize) {
-    s.line_len = 0;
-    line_push(s, b"HOLD ");
+/// Append `text` to a line being staged.
+fn push_text(line: &mut [u8; LINE_MAX], line_len: &mut u16, text: &[u8]) {
+    let n = *line_len as usize;
+    let take = text.len().min(LINE_MAX - n);
+    line[n..n + take].copy_from_slice(&text[..take]);
+    *line_len = (n + take) as u16;
+}
+
+/// Stage a held answer's HEAD: `HOLD <status>` and its meta fields, each
+/// `name: value`, one space before each.
+fn stage_hold(s: &mut CliState, status: u16, meta_at: usize, meta_len: usize) {
+    let CliState {
+        rec,
+        line,
+        line_len,
+        ..
+    } = s;
+    *line_len = 0;
+    push_text(line, line_len, b"HOLD ");
     let mut digits = [0u8; 3];
     put_status(&mut digits, status);
-    line_push(s, &digits);
-    let mut i = 0usize;
-    while i < hdr_len {
-        let c = s.rec[hdr_at + i];
-        if c == b'\r' {
-            i += 1;
-            continue;
-        }
-        if i == 0 {
-            line_push(s, b" ");
-        }
-        // Each line's end is a space; the block's last, nothing.
-        if c != b'\n' {
-            line_push(s, &[c]);
-        } else if i + 1 < hdr_len {
-            line_push(s, b" ");
-        }
-        i += 1;
+    push_text(line, line_len, &digits);
+    for (key, val) in ex::meta_fields(&rec[meta_at..meta_at + meta_len]) {
+        push_text(line, line_len, b" ");
+        push_text(line, line_len, key);
+        push_text(line, line_len, b": ");
+        push_text(line, line_len, val);
     }
-    line_push(s, b"\n");
+    push_text(line, line_len, b"\n");
 }
 
 /// Stage one BODY record of a held answer: `BODY ` and its bytes in hex.
@@ -383,7 +414,7 @@ fn stage_request(s: &mut CliState, body_len: usize) {
             s.answer_len = 0;
             let msg = b"malformed framed body";
             s.answer[..msg.len()].copy_from_slice(msg);
-            stage_line(s, ex::status::BAD_REQUEST, msg.len());
+            stage_line(s, http::status::BAD_REQUEST, msg.len());
             return;
         };
         s.items_at = next as u16;
@@ -399,14 +430,20 @@ fn stage_request(s: &mut CliState, body_len: usize) {
     let head = ex::RequestHead {
         id: s.id,
         flags,
-        method: s.method,
+        op: ex::op::CALL,
+        verb: if s.plain != 0 { 0 } else { s.method },
         target: &s.target[..s.target_len as usize],
-        headers: &s.headers[..s.headers_len as usize],
+        meta: &s.meta[..s.meta_len as usize],
         peer: &[],
         resp_credit: ANSWER_MAX as u32,
         body: &s.input[body_at..body_at + inline],
     };
-    match ex::write_request_head(&head, &mut s.req) {
+    let written = if s.plain != 0 {
+        ex::write_request_head::<ex::Plain>(&head, &mut s.req)
+    } else {
+        ex::write_request_head::<Http>(&head, &mut s.req)
+    };
+    match written {
         Some(len) => {
             s.req_len = len as u16;
             s.phase = 1;
@@ -415,7 +452,7 @@ fn stage_request(s: &mut CliState, body_len: usize) {
             s.answer_len = 0;
             let msg = b"request too large";
             s.answer[..msg.len()].copy_from_slice(msg);
-            stage_line(s, ex::status::TOO_LARGE, msg.len());
+            stage_line(s, http::status::PAYLOAD_TOO_LARGE, msg.len());
         }
     }
 }
@@ -478,8 +515,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             }
             // Offsets, not borrows: the record buffer is read again below.
             let base = s.rec.as_ptr() as usize;
-            let (more, data_at, data_len) = match ex::parse_response(&s.rec[..n as usize]) {
-                Some(ex::Record::Link { state }) => {
+            let parsed = if s.plain != 0 {
+                ex::parse_response::<ex::Plain>(&s.rec[..n as usize])
+            } else {
+                ex::parse_response::<Http>(&s.rec[..n as usize])
+            };
+            let (more, data_at, data_len) = match parsed {
+                Ok(ex::Record::Link { state }) => {
                     if state == ex::link::DOWN {
                         s.down = 1;
                         if s.phase == 2 {
@@ -500,22 +542,22 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     s.line_len = text.len() as u16;
                     break;
                 }
-                Some(ex::Record::Head(h)) if h.id == s.id && s.phase == 2 => {
+                Ok(ex::Record::Head(h)) if h.id == s.id && s.phase == 2 => {
                     if s.hold == 1 && h.flags & ex::flag::HOLD != 0 {
                         let (status, at, len) = (
-                            h.status,
-                            h.headers.as_ptr() as usize - base,
-                            h.headers.len(),
+                            http::status_of(&h),
+                            h.meta.as_ptr() as usize - base,
+                            h.meta.len(),
                         );
                         stage_hold(s, status, at, len);
                         break;
                     }
-                    s.status = h.status;
+                    s.status = http::status_of(&h);
                     s.answer_len = 0;
                     let at = h.body.as_ptr() as usize - base;
                     (h.flags & ex::flag::MORE != 0, at, h.body.len())
                 }
-                Some(ex::Record::Body { id, flags, data }) if id == s.id && s.phase == 2 => {
+                Ok(ex::Record::Body { id, flags, data }) if id == s.id && s.phase == 2 => {
                     let at = data.as_ptr() as usize - base;
                     if s.hold == 1 {
                         let len = data.len();
@@ -529,11 +571,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     }
                     (flags & ex::flag::MORE != 0, at, data.len())
                 }
-                Some(ex::Record::Credit { id, bytes }) if id == s.id && s.phase == 2 => {
+                Ok(ex::Record::Credit { id, bytes }) if id == s.id && s.phase == 2 => {
                     s.req_credit = s.req_credit.saturating_add(bytes);
                     continue;
                 }
-                Some(ex::Record::Abort { id, reason }) if id == s.id && s.phase == 2 => {
+                Ok(ex::Record::Abort { id, reason }) if id == s.id && s.phase == 2 => {
                     if s.hold == 1 {
                         s.phase = 0;
                         s.line_len = 0;
@@ -544,7 +586,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         line_push(s, b"\n");
                         break;
                     }
-                    s.status = ex::status::BAD_GATEWAY;
+                    s.status = http::status::BAD_GATEWAY;
                     s.answer_len = 0;
                     (false, 0, 0)
                 }

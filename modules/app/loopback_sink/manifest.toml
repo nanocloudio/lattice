@@ -6,7 +6,7 @@ hardware_targets = ["bcm2712", "linux"]
 # The in-repo REFERENCE implementation of the `stream.ordered_ack.sink`
 # capability, and the sink lattice's own CI runs the cdc_pump against so
 # no gate needs a broker. A PROVIDER of the fluxor exchange contract: each
-# request is a METHOD_PUBLISH exchange (target = ordering key, body = the
+# request is a PUBLISH exchange (target = ordering key, body = the
 # record). The "backend" is the module itself: a publish is durably
 # accepted the moment it is validated, and answered 200 in arrival order
 # — which trivially satisfies the capability's terms (200 = durable

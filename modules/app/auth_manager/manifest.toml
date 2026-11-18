@@ -26,12 +26,14 @@ content_type = "OctetStream"
 name = "auth_decision"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Generic decision request to substrate rbac.
 [[ports]]
 name = "decision_request"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Decision response from rbac.
 [[ports]]
@@ -43,6 +45,7 @@ content_type = "OctetStream"
 name = "audit"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Module-scope telemetry. Output index 3 (auth_decision,
 # decision_request, audit, metrics). Wired to the observe collector; a

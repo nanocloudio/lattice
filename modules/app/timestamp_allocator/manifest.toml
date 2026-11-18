@@ -45,6 +45,7 @@ content_type = "OctetStream"
 name = "lease_grant"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # High-water advance proposals into the consensus path. A proposal
 # emitted here is NOT usable until it returns on `committed_state`.
@@ -54,6 +55,7 @@ name = "propose_out"
 index = 1
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

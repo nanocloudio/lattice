@@ -115,6 +115,10 @@ const FS_UNLINK: u32 = crate::abi::registry::fs::UNLINK;
 const FS_FSYNC_NAME: u32 = crate::abi::registry::fs::FSYNC_NAME;
 /// FS capability-discovery opcode + bits (`fs.rs::{CAPS, caps}`).
 const FS_CAPS: u32 = crate::abi::registry::fs::CAPS;
+/// `FS_SEEK`'s argument: exactly `[offset u64 LE]`.
+const FS_SEEK_ARG_LEN: usize = 8;
+/// `FS_STAT`'s answer: exactly `[size u64][mtime u64][ino u64][nlink u32][0 u32]`.
+const FS_STAT_LEN: usize = 32;
 /// `last_errno` after `list` overflowed its table: a sentinel, not a
 /// provider errno (those are small negatives).
 const FS_E_LIST_OVERFLOW: i32 = -1000;
@@ -535,7 +539,16 @@ impl FsRunStorage {
         }
         let sys = self.sys();
         // SAFETY: closing a descriptor this backend opened and owns.
-        unsafe { (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0) };
+        unsafe {
+            (sys.provider_call)(
+                fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
     }
 
     /// Raw errno of the most recent failed provider call (0 if the
@@ -627,7 +640,9 @@ impl FsRunStorage {
             let sys = self.sys();
             // SAFETY: `buf` is a valid 4-byte output buffer for the
             // duration of the call, per the CAPS wire shape.
-            let rc = unsafe { (sys.provider_call)(-1, FS_CAPS, buf.as_mut_ptr(), 4) };
+            let rc = unsafe {
+                (sys.provider_call)(-1, FS_CAPS, buf.as_mut_ptr(), 4, core::ptr::null_mut(), 0)
+            };
             if is_wait(rc) {
                 return self.again(rc);
             }
@@ -654,7 +669,16 @@ impl FsRunStorage {
         let sys = self.sys();
         // SAFETY: `path[..plen]` is a valid UTF-8 path buffer for the
         // duration of the call; FS_OPEN reads it and returns an fd.
-        let fd = unsafe { (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen) };
+        let fd = unsafe {
+            (sys.provider_call)(
+                -1,
+                FS_OPEN,
+                path.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if fd >= 0 {
             self.close_fd(fd);
             return Ok(true);
@@ -681,10 +705,6 @@ impl FsRunStorage {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize, StorageError> {
-        let Ok(at) = u32::try_from(offset) else {
-            self.last_errno.set(-27);
-            return Err(StorageError::IoFault);
-        };
         let mut p = [0u8; 256];
         let Some(dst) = p.get_mut(..path.len()) else {
             return Err(StorageError::IoFault);
@@ -694,7 +714,16 @@ impl FsRunStorage {
         }
         let sys = self.sys();
         // SAFETY: `p` holds the path for the duration of the call.
-        let fd = unsafe { (sys.provider_call)(-1, FS_OPEN, p.as_mut_ptr(), path.len()) };
+        let fd = unsafe {
+            (sys.provider_call)(
+                -1,
+                FS_OPEN,
+                p.as_mut_ptr(),
+                path.len(),
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if fd < 0 {
             if is_wait(fd) || fd == FS_E_NFILE {
                 return self.again(fd);
@@ -706,15 +735,29 @@ impl FsRunStorage {
                 StorageError::IoFault
             });
         }
-        let seek = at.to_le_bytes();
-        // SAFETY: `fd` from FS_OPEN; a 4-byte LE position; `out` is valid
+        let seek = offset.to_le_bytes();
+        // SAFETY: `fd` from FS_OPEN; an 8-byte LE position; `out` is valid
         // for writes of its length.
         let n = unsafe {
-            let rc = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+            let rc = (sys.provider_call)(
+                fd,
+                FS_SEEK,
+                seek.as_ptr() as *mut u8,
+                FS_SEEK_ARG_LEN,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc < 0 {
                 rc
             } else {
-                (sys.provider_call)(fd, FS_READ, out.as_mut_ptr(), out.len())
+                (sys.provider_call)(
+                    fd,
+                    FS_READ,
+                    core::ptr::null_mut(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
             }
         };
         self.close_fd(fd);
@@ -818,7 +861,16 @@ impl FsRunStorage {
             let plen = self.encode_path(kind, id, &mut path);
             let sys = self.sys();
             // SAFETY: valid path buffer; OPEN_CREATE returns a write fd.
-            let fd = unsafe { (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen) };
+            let fd = unsafe {
+                (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
             if is_wait(fd) || fd == FS_E_NFILE {
                 if fd == FS_E_INPROGRESS {
                     self.inflight = me;
@@ -839,21 +891,29 @@ impl FsRunStorage {
         }
         if self.slots.get(i).is_some_and(|w| w.sized == 0) {
             let fd = self.slots.get(i).map_or(-1, |w| w.fd);
-            // FS_STAT output: [size:u64][mtime:u64], or the narrow
-            // [size:u32][mtime:u32] — the answer says which.
-            let mut stat = [0u8; 16];
+            // FS_STAT answers one record:
+            // [size u64][mtime u64][ino u64][nlink u32][0 u32].
+            let mut stat = [0u8; FS_STAT_LEN];
             let sys = self.sys();
-            // SAFETY: 16-byte stat output buffer per the contract shape.
-            let rc = unsafe { (sys.provider_call)(fd, FS_STAT, stat.as_mut_ptr(), 16) };
+            // SAFETY: the record-sized stat output buffer per the contract shape.
+            let rc = unsafe {
+                (sys.provider_call)(
+                    fd,
+                    FS_STAT,
+                    stat.as_mut_ptr(),
+                    FS_STAT_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
             if is_wait(rc) {
                 // Kept open: the size is asked again next time.
                 return self.again(rc);
             }
             let len = match rc {
-                16 => u64::from_le_bytes([
+                0 => u64::from_le_bytes([
                     stat[0], stat[1], stat[2], stat[3], stat[4], stat[5], stat[6], stat[7],
                 ]),
-                8 => u64::from(u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]])),
                 _ => {
                     self.last_errno.set(if rc < 0 { rc } else { -5 });
                     self.close_slot(i);
@@ -944,7 +1004,16 @@ impl RunStorage for FsRunStorage {
         let plen = self.encode_path(kind, id, &mut path);
         let sys = self.sys();
         // SAFETY: valid path buffer; OPEN_CREATE creates the file.
-        let fd = unsafe { (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen) };
+        let fd = unsafe {
+            (sys.provider_call)(
+                -1,
+                FS_OPEN_CREATE,
+                path.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if is_wait(fd) || fd == FS_E_NFILE {
             // The probe said missing and nothing else creates our names,
             // so the create asked again skips it (see above). ENFILE moved
@@ -1002,7 +1071,16 @@ impl RunStorage for FsRunStorage {
         let sys = self.sys();
         // SAFETY: fd from open_for_write; FSYNC takes no arg. Asked again
         // after EINPROGRESS this is the byte-identical request.
-        let rc = unsafe { (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) };
+        let rc = unsafe {
+            (sys.provider_call)(
+                fd,
+                FS_FSYNC,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if is_wait(rc) {
             if rc == FS_E_INPROGRESS {
                 self.inflight = me;
@@ -1038,7 +1116,16 @@ impl RunStorage for FsRunStorage {
         let sys = self.sys();
         // SAFETY: valid path buffer; FSYNC_NAME reads it. Asked again after
         // EINPROGRESS this is the byte-identical request.
-        let rc = unsafe { (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_mut_ptr(), plen) };
+        let rc = unsafe {
+            (sys.provider_call)(
+                -1,
+                FS_FSYNC_NAME,
+                path.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if is_wait(rc) {
             if rc == FS_E_INPROGRESS {
                 self.inflight = me;
@@ -1089,7 +1176,16 @@ impl RunStorage for FsRunStorage {
         let mut tb = [0u8; 8];
         // SAFETY: fd from open_for_write; FSYNC_SUBMIT writes an 8-byte
         // ticket into `tb` per the fs contract wire shape.
-        let rc = unsafe { (sys.provider_call)(fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8) };
+        let rc = unsafe {
+            (sys.provider_call)(
+                fd,
+                FS_FSYNC_SUBMIT,
+                tb.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if is_wait(rc) {
             // No fence slot free yet (or no fence could be opened without
             // waiting): nothing was opened; ask again.
@@ -1133,7 +1229,16 @@ impl RunStorage for FsRunStorage {
         let mut tb = ticket.to_le_bytes();
         // SAFETY: fd holds the ticket; FSYNC_POLL reads the 8-byte
         // ticket from `tb`.
-        let rc = unsafe { (sys.provider_call)(fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8) };
+        let rc = unsafe {
+            (sys.provider_call)(
+                fd,
+                FS_FSYNC_POLL,
+                tb.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         match rc {
             FS_FENCE_DURABLE => {
                 if let Some(w) = self.slots.get_mut(i) {
@@ -1162,10 +1267,6 @@ impl RunStorage for FsRunStorage {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize, StorageError> {
-        if offset > u64::from(u32::MAX) {
-            self.last_errno.set(-27);
-            return Err(StorageError::IoFault);
-        }
         let sys = self.sys();
         let code = kind_code(kind);
         // Reuse an already-open descriptor if we hold one. This is the
@@ -1181,7 +1282,16 @@ impl RunStorage for FsRunStorage {
                 let mut path = [0u8; PATH_MAX];
                 let plen = self.encode_path(kind, id, &mut path);
                 // SAFETY: valid path buffer; FS_OPEN returns a read fd.
-                let fd = unsafe { (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen) };
+                let fd = unsafe {
+                    (sys.provider_call)(
+                        -1,
+                        FS_OPEN,
+                        path.as_mut_ptr(),
+                        plen,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                };
                 self.opens.set(self.opens.get().wrapping_add(1));
                 if fd < 0 {
                     if is_wait(fd) || fd == FS_E_NFILE {
@@ -1212,16 +1322,34 @@ impl RunStorage for FsRunStorage {
                 fd
             }
         };
-        let seek = (offset as u32).to_le_bytes();
-        // SAFETY: fd is open for read; 4-byte LE seek position.
-        let rc = unsafe { (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) };
+        let seek = offset.to_le_bytes();
+        // SAFETY: fd is open for read; 8-byte LE seek position.
+        let rc = unsafe {
+            (sys.provider_call)(
+                fd,
+                FS_SEEK,
+                seek.as_ptr() as *mut u8,
+                FS_SEEK_ARG_LEN,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         let n = if rc < 0 {
             rc
         } else {
             // SAFETY: `out` is valid for writes of its length. A short
             // count is what the provider had cached; the caller asks for
             // the rest.
-            unsafe { (sys.provider_call)(fd, FS_READ, out.as_mut_ptr(), out.len()) }
+            unsafe {
+                (sys.provider_call)(
+                    fd,
+                    FS_READ,
+                    core::ptr::null_mut(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
         };
         self.reads.set(self.reads.get().wrapping_add(1));
         if is_wait(n) {
@@ -1265,7 +1393,16 @@ impl RunStorage for FsRunStorage {
         let sys = self.sys();
         // SAFETY: valid path buffer; UNLINK removes by path. Asked again
         // after EINPROGRESS this is the byte-identical request.
-        let rc = unsafe { (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen) };
+        let rc = unsafe {
+            (sys.provider_call)(
+                -1,
+                FS_UNLINK,
+                path.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         if is_wait(rc) || rc == FS_E_BUSY {
             if rc == FS_E_INPROGRESS {
                 self.inflight = me;
@@ -1320,7 +1457,16 @@ impl RunStorage for FsRunStorage {
             let mut dpath = [0u8; PATH_MAX];
             let dlen = self.dir_path(&mut dpath);
             // SAFETY: valid path buffer; OPENDIR returns a dir fd.
-            let dir_fd = unsafe { (sys.provider_call)(-1, FS_OPENDIR, dpath.as_mut_ptr(), dlen) };
+            let dir_fd = unsafe {
+                (sys.provider_call)(
+                    -1,
+                    FS_OPENDIR,
+                    dpath.as_mut_ptr(),
+                    dlen,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
             if is_wait(dir_fd) || dir_fd == FS_E_NFILE {
                 return self.again(dir_fd);
             }
@@ -1347,8 +1493,16 @@ impl RunStorage for FsRunStorage {
         loop {
             // SAFETY: `buf` is a valid output buffer of READDIR_BUF
             // bytes; the provider fills whole entries only.
-            let n =
-                unsafe { (sys.provider_call)(dir_fd, FS_READDIR, buf.as_mut_ptr(), READDIR_BUF) };
+            let n = unsafe {
+                (sys.provider_call)(
+                    dir_fd,
+                    FS_READDIR,
+                    core::ptr::null_mut(),
+                    0,
+                    buf.as_mut_ptr(),
+                    READDIR_BUF,
+                )
+            };
             if is_wait(n) {
                 // The cursor did not move: the walk stands here, with
                 // what it found already in `out`, and continues when the
@@ -1470,19 +1624,27 @@ impl FsRunStorage {
         } else {
             (at.unwrap_or(w.len), 0usize)
         };
-        if start > u64::from(u32::MAX) - len as u64 || len > u32::MAX as usize {
-            // The 4-byte FS_SEEK arg caps files at 4 GiB — far beyond
-            // any bounded run/manifest, but fail closed regardless.
+        if start.checked_add(len as u64).is_none() {
+            // A write past the u64 FS_SEEK range: fail closed.
             self.last_errno.set(-27); // EFBIG-shaped: hard
             return Err(StorageError::IoFault);
         }
         let fd = w.fd;
         while done < len {
-            let seek = ((start + done as u64) as u32).to_le_bytes();
+            let seek = (start + done as u64).to_le_bytes();
             let sys = self.sys();
-            // SAFETY: fd from open_for_write; seek arg is a 4-byte LE
-            // position per the WAL's established FS_SEEK usage.
-            let rc = unsafe { (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) };
+            // SAFETY: fd from open_for_write; seek arg is an 8-byte LE
+            // position per the FS_SEEK wire shape.
+            let rc = unsafe {
+                (sys.provider_call)(
+                    fd,
+                    FS_SEEK,
+                    seek.as_ptr() as *mut u8,
+                    FS_SEEK_ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
             let rest = data.get(done..).unwrap_or(&[]);
             let moved = if rc < 0 {
                 rc
@@ -1490,7 +1652,16 @@ impl FsRunStorage {
                 // SAFETY: `rest` is valid for reads of its length;
                 // FS_WRITE copies it out before returning (the provider
                 // never keeps a pointer into it).
-                unsafe { (sys.provider_call)(fd, FS_WRITE, rest.as_ptr() as *mut u8, rest.len()) }
+                unsafe {
+                    (sys.provider_call)(
+                        fd,
+                        FS_WRITE,
+                        core::ptr::null_mut(),
+                        0,
+                        rest.as_ptr() as *mut u8,
+                        rest.len(),
+                    )
+                }
             };
             if is_wait(moved) || moved == 0 {
                 // Nothing more moved now. What did move is the

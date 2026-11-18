@@ -25,7 +25,7 @@
 //!
 //! # Request
 //!
-//! Method POST; `target` empty; headers ignored; body = exactly one
+//! Op CALL, verb 0; `target` empty; meta ignored; body = exactly one
 //! STRUCTURED command, little-endian:
 //!
 //! ```text
@@ -38,21 +38,21 @@
 //!
 //! # Answer
 //!
-//! One answer per request, no content type, no headers:
+//! One answer per request, no meta:
 //!
-//! | Status | Reply | Body |
+//! | Outcome | Reply | Body |
 //! |---|---|---|
-//! | 200 | `+OK` simple string | the text, without `+` and CRLF (`OK`) |
-//! | 200 | `:N` integer | the decimal digits as sent (`42`, `-1`) |
-//! | 200 | `$n` bulk string | the `n` data bytes |
-//! | 200 | `$-1` nil | empty |
-//! | 200 | `*N` array | the whole RESP reply, header included, verbatim |
-//! | 400 | `-ERR …` error | the error text, without `-` and CRLF (`ERR unknown command …`) |
-//! | 400 | — | another method, a non-empty target, a body that is not exactly one structured command |
-//! | 413 | — | a body over 4096 bytes, or a command whose RESP form exceeds 8192 bytes |
-//! | 502 | — | the server could not be reached, or refused AUTH, before the link was ever up (the `-ERR` text as the body when AUTH was refused); or a reply over 8192 bytes (the connection is closed) |
-//! | 503 | — | four requests already held, or draining |
-//! | 504 | — | no reply within 15 s (the connection is closed; the command's effect is unknown) |
+//! | OK | `+OK` simple string | the text, without `+` and CRLF (`OK`) |
+//! | OK | `:N` integer | the decimal digits as sent (`42`, `-1`) |
+//! | OK | `$n` bulk string | the `n` data bytes |
+//! | OK | `$-1` nil | empty |
+//! | OK | `*N` array | the whole RESP reply, header included, verbatim |
+//! | REFUSED | `-ERR …` error | the error text, without `-` and CRLF (`ERR unknown command …`) |
+//! | REFUSED | — | another op or a verb, a non-empty target, a body that is not exactly one structured command |
+//! | TOO_LARGE | — | a body over 4096 bytes, or a command whose RESP form exceeds 8192 bytes |
+//! | UNAVAILABLE | — | the server could not be reached, or refused AUTH, before the link was ever up (the `-ERR` text as the body when AUTH was refused); or a reply over 8192 bytes (the connection is closed) |
+//! | BUSY | — | four requests already held, or draining |
+//! | TIMEOUT | — | no reply within 15 s (the connection is closed; the command's effect is unknown) |
 //!
 //! The body streams under the requester's response credit.
 //!
@@ -103,7 +103,7 @@ use authority::{Authority, PORT_REDIS};
 
 #[path = "../../common/query_exchange.rs"]
 mod query_exchange;
-use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::exchange::{op, outcome, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 use abi::contracts::net::net_proto::{
@@ -208,7 +208,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: RedisState }
+fluxor_rt::module_facts! {
+    state: RedisState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = NET_BUF],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -259,7 +262,7 @@ pub extern "C" fn module_new(
         s.completed = 0;
         s.errors = 0;
         s.reconnects = 0;
-        s.desk.reset(METHOD_POST, 0);
+        s.desk.reset(op::CALL, 0);
         s.outbox = ExchangeOutbox::new();
         parse_tlv(s, params, params_len);
         if !s.authority.adopt(PORT_REDIS) {
@@ -291,13 +294,13 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 unsafe fn close_conn(s: &mut RedisState) {
     let sys = &*s.syscalls;
     if s.conn_id != 0 {
-        let close = s.conn_id.to_le_bytes();
+        let close = abi::contracts::net::net_proto::close(s.conn_id, false);
         net_write_frame(
             sys,
             s.net_out,
             NET_CMD_CLOSE,
             close.as_ptr(),
-            CONN_ID_LEN,
+            close.len(),
             s.nbuf.as_mut_ptr(),
             NET_BUF,
         );
@@ -312,7 +315,7 @@ unsafe fn close_conn(s: &mut RedisState) {
 /// The session failed or dropped. After the link was up this is a LINK DOWN
 /// (every request held is dropped for the requester to re-issue) and the
 /// module reconnects on its own; before it ever came up nothing was
-/// reported, so the request being performed is answered 502 here, with the
+/// reported, so the request being performed is answered `UNAVAILABLE` here, with the
 /// first `text_len` bytes of `result` as the body.
 unsafe fn connection_lost(s: &mut RedisState, now: u64, text_len: usize) {
     close_conn(s);
@@ -333,7 +336,7 @@ unsafe fn connection_lost(s: &mut RedisState, now: u64, text_len: usize) {
         return;
     }
     if s.has_cmd == 1 {
-        s.desk.finish(status::BAD_GATEWAY, text_len.min(REPLY_BUF));
+        s.desk.finish(outcome::UNAVAILABLE, text_len.min(REPLY_BUF));
         s.has_cmd = 0;
     }
 }
@@ -377,7 +380,7 @@ unsafe fn feed(s: &mut RedisState, sys: &SyscallTable, ev: Ev, now: u64) {
     match action {
         Act::Connect => {
             let mut payload = [0u8; CONNECT_TO_MAX];
-            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            let n = s.authority.connect_record(&mut payload, s.tag);
             if n > 0 {
                 net_write_frame(
                     sys,
@@ -416,9 +419,9 @@ unsafe fn feed(s: &mut RedisState, sys: &SyscallTable, ev: Ev, now: u64) {
         Act::DeliverReply => {
             let (r, n) = reply_value(s);
             let code = if r.is_error() {
-                status::BAD_REQUEST
+                outcome::REFUSED
             } else {
-                status::OK
+                outcome::OK
             };
             s.desk.finish(code, n);
             s.reply_len = 0;
@@ -495,11 +498,11 @@ unsafe fn take_request(s: &mut RedisState) {
         return;
     };
     if target != 0 || structured_len(body) != Some(body.len()) {
-        s.desk.refuse(at, status::BAD_REQUEST);
+        s.desk.refuse(at, outcome::REFUSED);
         return;
     }
     if resp_cmd_structured(body, &mut s.req).is_none() {
-        s.desk.refuse(at, status::TOO_LARGE);
+        s.desk.refuse(at, outcome::TOO_LARGE);
         return;
     }
     let n = body.len();
@@ -548,8 +551,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 let pl = core::slice::from_raw_parts(payload, plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == Phase::Connecting => {
-                        if plen >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
+                        if let Some(c) = connected_parts(pl) {
+                            let (id, tag) = (c.conn_id, c.requester_tag);
                             if tag == s.tag || tag == REQUESTER_TAG_NONE {
                                 s.conn_id = id;
                                 feed(s, sys, Ev::Connected, now);
@@ -591,19 +594,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             feed(s, sys, Ev::PeerClosed, now);
                         }
                     }
-                    NET_MSG_ERROR if plen > CONN_ID_LEN => {
+                    NET_MSG_ERROR => {
                         // A tagged error is a connect-phase failure and is
                         // ours by tag alone; an untagged one belongs to an
                         // established connection and routes by conn id.
-                        let (id, _errno, tag) = error_parts(pl);
-                        let ours = if tag == REQUESTER_TAG_NONE {
-                            (s.phase == Phase::Connecting)
-                                || (s.phase != Phase::Disconnected && id == s.conn_id)
-                        } else {
-                            s.phase == Phase::Connecting && tag == s.tag
-                        };
-                        if ours {
-                            feed(s, sys, Ev::NetError, now);
+                        if let Some((id, _errno, tag)) = error_parts(pl) {
+                            let ours = if tag == REQUESTER_TAG_NONE {
+                                (s.phase == Phase::Connecting)
+                                    || (s.phase != Phase::Disconnected && id == s.conn_id)
+                            } else {
+                                s.phase == Phase::Connecting && tag == s.tag
+                            };
+                            if ours {
+                                feed(s, sys, Ev::NetError, now);
+                            }
                         }
                     }
                     _ => {}
@@ -642,11 +646,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             }
         }
 
-        // 5. Timeouts. A command the server has not answered is answered 504
+        // 5. Timeouts. A command the server has not answered is answered `TIMEOUT`
         //    and its connection closed (the next request reconnects); a
         //    connect or AUTH that stalls is a lost session.
         if s.phase == Phase::Awaiting && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
-            s.desk.finish(status::TIMEOUT, 0);
+            s.desk.finish(outcome::TIMEOUT, 0);
             s.has_cmd = 0;
             s.errors = s.errors.wrapping_add(1);
             close_conn(s);
@@ -680,7 +684,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 /// The server sent more than one reply buffer holds.
 unsafe fn overflowed(s: &mut RedisState, now: u64) {
     if s.phase == Phase::Awaiting {
-        s.desk.finish(status::BAD_GATEWAY, 0);
+        s.desk.finish(outcome::UNAVAILABLE, 0);
         s.has_cmd = 0;
         s.errors = s.errors.wrapping_add(1);
         close_conn(s);

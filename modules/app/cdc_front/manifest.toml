@@ -22,6 +22,9 @@ direction    = "input"
 content_type = "ExchangeRequest"
 buffer_size  = 16384
 max_record   = 8192
+# A subscription is an HTTP GET: the front speaks the http binding's verbs.
+[ports.facts]
+binding = ["http"]
 
 # MSG_KV_RESPONSE from the router pair's output.
 [[ports]]

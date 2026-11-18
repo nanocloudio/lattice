@@ -62,12 +62,14 @@ required = false
 name = "dialect_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Responses to the second dialect.
 [[ports]]
 name = "dialect2_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_KV_REQUEST to kv_request_router.internal_sql_in (the compute
 # ingress), stamped PROTO_INTERNAL_SQL so replies come back on compute_out.
@@ -75,6 +77,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

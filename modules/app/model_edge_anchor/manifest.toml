@@ -36,11 +36,14 @@ features = ["profile_server"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 16387
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 8192
+buffer_size = 16384
 
 [[ports]]
 name = "kv_in"
@@ -51,6 +54,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

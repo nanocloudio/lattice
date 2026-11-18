@@ -33,6 +33,7 @@ content_type = "OctetStream"
 name = "snap_ctl_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # To kv_request_router.map_update: the SPAN_BARRIER set/clear frames and
 # the cutover MSG_RANGE_MAP_UPDATE, in fence order on one channel.
@@ -40,6 +41,7 @@ content_type = "OctetStream"
 name = "map_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

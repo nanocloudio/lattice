@@ -8,14 +8,15 @@ timer_class      = "wall_clock"
 name         = "net_in"
 direction    = "input"
 content_type = "NetProto"
+accepts_record = 2048
 buffer_size  = 2048
 
 [[ports]]
 name         = "net_out"
 direction    = "output"
 content_type = "NetProto"
-buffer_size  = 2048
-max_record   = 1600
+max_record = 2048
+buffer_size = 4096
 
 [[ports]]
 name         = "status_out"

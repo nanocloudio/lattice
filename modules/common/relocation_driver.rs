@@ -10,7 +10,7 @@
 //!
 //! Lattice's `RelocatePhase` (`range_lifecycle.rs`) is a per-replica move; it
 //! maps one-to-one onto clustor's membership admin ops (`wire.rs` in
-//! `deps/clustor`, values pinned below), submitted as `MSG_ADMIN_COMMAND` to
+//! clustor's common sources, values pinned below), submitted as `MSG_ADMIN_COMMAND` to
 //! `operations.admin_requests`:
 //!
 //! ```text
@@ -40,7 +40,7 @@ pub mod range_lifecycle;
 
 use range_lifecycle::RelocatePhase;
 
-// ── clustor admin op codes (deps/clustor/modules/common/wire.rs) ──────
+// ── clustor admin op codes (clustor's common `wire.rs`) ───────────────
 //
 // Membership ops. Bodies carry a single `[replica_id:u8]`; the target Raft
 // partition is named by the admin envelope's `target_partition`, which the
@@ -150,7 +150,7 @@ pub fn advance(phase: Option<RelocatePhase>) -> Option<RelocatePhase> {
     }
 }
 
-// ── Wire contract with clustor (deps/clustor/modules/common/wire.rs) ──────
+// ── Wire contract with clustor (clustor's common `wire.rs`) ───────────────
 
 /// `CONFIG_CHANGE_MAGIC` (clustor `wire.rs`): a committed Raft entry whose
 /// body begins with this magic IS a membership change; the driver advances

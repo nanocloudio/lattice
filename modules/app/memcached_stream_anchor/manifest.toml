@@ -13,11 +13,14 @@ hardware_targets = ["bcm2712", "linux"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 9280
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 4101
+buffer_size = 8192
 
 [[ports]]
 name = "routed_in"
@@ -28,6 +31,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

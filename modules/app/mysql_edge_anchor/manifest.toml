@@ -20,17 +20,21 @@ hardware_targets = ["bcm2712", "linux"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 32768
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 8192
+buffer_size = 16384
 
 # MSG_SQL_REQUEST out to relational_executor.mysql_in.
 [[ports]]
 name = "sql_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_SQL_RESPONSE in from relational_executor.mysql_out.
 [[ports]]

@@ -41,24 +41,25 @@
 //!
 //! The pump is a REQUESTER of the fluxor SDK exchange contract
 //! (`contracts/exchange.rs`) toward any `stream.ordered_ack` provider.
-//! Each event is one METHOD_PUBLISH exchange carried whole in its request
+//! Each event is one PUBLISH exchange carried whole in its request
 //! HEAD: the exchange id is the event's ring correlation
 //! (`ExchangeId::from_u64(corr)`), `target` the ordering key
 //! (`cdc_wire::sink_msg_key`: `[table_id:u32 BE][key…]`), the body the
 //! encoded `CdcEvent` envelope, `flag::BROADCAST` on control events that
 //! must reach every ordering unit (resolved watermarks, the
-//! backfill-complete marker), `resp_credit` 0 (a sink's 200 carries no
-//! body).
+//! backfill-complete marker), op PUBLISH with verb 0, `resp_credit` 0 (a
+//! sink's OK carries no body).
 //!
 //! Every published request record is retained verbatim in a bounded ring
 //! — the in-flight window. The answer decides each entry:
 //!
-//! - 200: durably accepted; the contiguous accepted prefix folds into the
-//!   checkpoint candidate.
-//! - 5xx, or a provider ABORT: not accepted, retryable; the entry is
-//!   re-issued after a backoff (100 ms, doubling to 5 s, reset by the next
-//!   200), and nothing new is published while any re-issue is owed.
-//! - any other status: a refusal; counted, surfaced, and deliberately NOT
+//! - outcome OK: durably accepted; the contiguous accepted prefix folds into
+//!   the checkpoint candidate.
+//! - BUSY, UNAVAILABLE, TIMEOUT or FAILED, or a provider ABORT: not
+//!   accepted, retryable; the entry is re-issued after a backoff (100 ms,
+//!   doubling to 5 s, reset by the next OK), and nothing new is published
+//!   while any re-issue is owed.
+//! - any other outcome: a refusal; counted, surfaced, and deliberately NOT
 //!   skipped — the contiguous prefix stops there, so the checkpoint can
 //!   never claim the hole was delivered.
 //!
@@ -133,8 +134,8 @@ use cdc_wire::{
 };
 use compaction_floor::{RetentionClaim, CLAIM_SOURCE_WATCH, GC_CLAIM_WIRE_LEN};
 use exchange::{
-    abort, flag, link, parse_response, status, write_abort, write_request_head, ExchangeId, Record,
-    RequestHead, HDR, METHOD_PUBLISH, REQ_HEAD_FIXED,
+    abort, flag, link, op, outcome, parse_response, write_abort, write_request_head, ExchangeId,
+    Plain, Record, RequestHead, HDR, REQ_HEAD_FIXED,
 };
 use types::{
     KV_OP_CAS, KV_OP_GET, KV_OP_PUT, KV_OP_SCAN_VERSIONS, KV_OP_SNAPSHOT_VERSIONS,
@@ -644,9 +645,10 @@ impl FeedCore {
         let head = RequestHead {
             id: ExchangeId::from_u64(corr),
             flags: if broadcast { flag::BROADCAST } else { 0 },
-            method: METHOD_PUBLISH,
+            op: op::PUBLISH,
+            verb: 0,
             target: &mkey[..mklen],
-            headers: &[],
+            meta: &[],
             peer: &[],
             resp_credit: 0,
             body: &payload[..plen],
@@ -654,7 +656,7 @@ impl FeedCore {
         let slot = (self.ring_head as usize) % UNACKED_CAP;
         let record_len = {
             let entry = &mut self.ring[slot];
-            let Some(n) = write_request_head(&head, &mut entry.record) else {
+            let Some(n) = write_request_head::<Plain>(&head, &mut entry.record) else {
                 return false;
             };
             entry.corr = corr;
@@ -755,8 +757,8 @@ impl FeedCore {
     /// re-issue contract, answers advance the contiguous accepted prefix
     /// and the checkpoint candidate.
     pub fn on_response(&mut self, io: &mut impl FeedIo, now_ms: u64, record: &[u8]) {
-        match parse_response(record) {
-            Some(Record::Link { state: link::DOWN }) => {
+        match parse_response::<Plain>(record) {
+            Ok(Record::Link { state: link::DOWN }) => {
                 self.link_up = false;
                 let mut i = self.ring_tail;
                 while i != self.ring_head {
@@ -769,7 +771,7 @@ impl FeedCore {
                     i = i.wrapping_add(1);
                 }
             }
-            Some(Record::Link { state: link::UP }) => {
+            Ok(Record::Link { state: link::UP }) => {
                 if !self.link_up {
                     io.log(b"lkup", u64::from(self.state));
                 }
@@ -777,11 +779,11 @@ impl FeedCore {
                 self.retry_at_ms = 0;
                 self.reissue(io);
             }
-            Some(Record::Head(h)) => {
+            Ok(Record::Head(h)) => {
                 if h.flags & flag::MORE != 0 {
                     // A body follows that the pump never reads (it grants no
                     // response credit): end the exchange here. Best effort —
-                    // the status below is the answer either way.
+                    // the outcome below is the answer either way.
                     let mut ab = [0u8; HDR + 1];
                     if let Some(n) = write_abort(&h.id, abort::UNDELIVERABLE, &mut ab) {
                         let _ = io.ship(&mut ab[..n]);
@@ -790,7 +792,7 @@ impl FeedCore {
                 let Some(slot) = self.entry_for(&h.id) else {
                     return;
                 };
-                if h.status == status::OK {
+                if h.outcome == outcome::OK {
                     let e = &mut self.ring[slot];
                     e.acked = true;
                     e.open = false;
@@ -798,7 +800,10 @@ impl FeedCore {
                     self.m_acked = self.m_acked.wrapping_add(1);
                     self.acked_since_ck = self.acked_since_ck.wrapping_add(1);
                     self.backoff_ms = RETRY_MIN_MS;
-                } else if (500..600).contains(&h.status) {
+                } else if matches!(
+                    h.outcome,
+                    outcome::BUSY | outcome::UNAVAILABLE | outcome::TIMEOUT | outcome::FAILED
+                ) {
                     self.retry_later(slot, now_ms);
                 } else if self.ring[slot].open {
                     self.ring[slot].refused = true;
@@ -806,7 +811,7 @@ impl FeedCore {
                     self.m_refusals = self.m_refusals.wrapping_add(1);
                 }
             }
-            Some(Record::Abort { id, .. }) => {
+            Ok(Record::Abort { id, .. }) => {
                 // The provider could not finish it: retryable.
                 if let Some(slot) = self.entry_for(&id) {
                     self.retry_later(slot, now_ms);

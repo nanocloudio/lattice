@@ -29,6 +29,7 @@ content_type = "OctetStream"
 name = "relocate_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

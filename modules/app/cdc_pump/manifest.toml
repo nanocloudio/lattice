@@ -6,7 +6,7 @@ hardware_targets = ["bcm2712", "linux"]
 # The egress pump. Reads committed change-feed windows from the KV
 # surface (an ordinary anchor-pair client — no privileged read path),
 # translates versions into the versioned CDC envelope
-# (modules/common/cdc_wire.rs), publishes each event as a METHOD_PUBLISH
+# (modules/common/cdc_wire.rs), publishes each event as a PUBLISH
 # exchange to a `stream.ordered_ack` provider (it is the REQUESTER of the
 # fluxor exchange contract), and checkpoints past the contiguous prefix
 # answered 200 through the normal KV path (the generation-pointer
@@ -48,8 +48,9 @@ max_record = 8192
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
-# One METHOD_PUBLISH request record per event. Sized for four worst-case
+# One PUBLISH request record per event. Sized for four worst-case
 # records (a full 4 KiB row image, its key, and the request HEAD).
 [[ports]]
 name = "request_out"
@@ -70,6 +71,7 @@ name = "retention"
 index = 2
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

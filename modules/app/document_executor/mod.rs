@@ -1307,7 +1307,14 @@ fn arm_watchdog(exec: &mut ExecState) {
     }
     unsafe {
         let mut ms = WEDGE_TIMER_MS.to_le_bytes();
-        ((*exec.syscalls).provider_call)(exec.timer_fd, TIMER_SET, ms.as_mut_ptr(), 4);
+        ((*exec.syscalls).provider_call)(
+            exec.timer_fd,
+            TIMER_SET,
+            ms.as_mut_ptr(),
+            4,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -1316,7 +1323,14 @@ fn disarm_watchdog(exec: &mut ExecState) {
         return;
     }
     unsafe {
-        ((*exec.syscalls).provider_call)(exec.timer_fd, TIMER_CANCEL, core::ptr::null_mut(), 0);
+        ((*exec.syscalls).provider_call)(
+            exec.timer_fd,
+            TIMER_CANCEL,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 

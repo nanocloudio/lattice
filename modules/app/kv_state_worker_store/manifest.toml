@@ -241,12 +241,14 @@ gates_readiness = false  # see `commands`
 name = "responses"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Mutation events for watch_registry / watch_fanout.
 [[ports]]
 name = "mutations"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Retention claims to compaction_coordinator: this worker's
 # ACTIVE-READ claim (`MSG_RETENTION_CLAIM`), republished on a cadence
@@ -255,6 +257,7 @@ content_type = "OctetStream"
 name = "compaction_floor"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Snapshot interfaces — substrate durability drives import/export.
 [[ports]]
@@ -271,6 +274,7 @@ gates_readiness = false
 name = "snapshot_export"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -287,6 +291,7 @@ name = "lease_request"
 index = 5
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # KV expiry registrations to ttl_scheduler.
 # MSG_TTL_REGISTER `[deadline_ms:u64][key_hash:u64]`, deadline 0 =
@@ -299,6 +304,7 @@ name = "expiry_out"
 index = 6
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Install-complete ack. After a snapshot chunk stream finishes
 # installing (a span copy for an elastic split, or any snapshot
@@ -312,6 +318,7 @@ name = "install_ack_out"
 index = 7
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Chunk sweeps this worker proposes: `KV_OP_CHUNK_SWEEP` commands naming
 # the floor it saw commit (the committed GC floor on disk; unbounded on
@@ -324,6 +331,7 @@ name = "sweep_out"
 index = 8
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # The writes this worker's store provider proposes, as one replica of a
 # replicated store (`sweep_wrap` = proposal): origin entries
@@ -337,6 +345,7 @@ name = "prov_out"
 index = 9
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ─────────────────────────────────────────────────────
 # Module-scope metrics emitted on `metrics` at a ~1 s WALL-CLOCK cadence

@@ -33,12 +33,15 @@ hardware_targets = ["bcm2712", "linux"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 8646
 
 # CMD_CONNECT_TO / CMD_SEND / CMD_CLOSE to foundation/ip.
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 8646
+buffer_size = 16384
 
 # MSG_KV_REQUEST envelopes in from compute (relational_executor, a
 # model worker) — the same port shape `kv_request_router` presents.
@@ -53,6 +56,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Adapter events out to adapter_metrics.
 [[ports]]

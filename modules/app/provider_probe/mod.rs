@@ -27,33 +27,23 @@ use fluxor_rt::*;
 mod held_read;
 use held_read::{HeldRead, Read};
 
+use abi::contracts::storage::object::{write_answer, WriteAnswer};
+use abi::contracts::storage::{namespace, object};
+
 const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
 const OBJ_GET: u32 = abi::registry::storage_object::GET;
 const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
 const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
 const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 const NS_CHANGES: u32 = abi::registry::storage_namespace::CHANGES;
-const EINPROGRESS: i32 = -36;
+const EINVAL: i32 = -22;
 const ENXIO: i32 = -6;
 /// A read's "not yet": the store answers it later, and nothing may be
 /// concluded from it (never absent, never empty, never short).
 const EAGAIN: i32 = -11;
 
-/// What a write answered: decided, or not yet (ask again).
-enum WriteAnswer {
-    Decided(i32),
-    Pending,
-}
-
-fn write_answer(rc: i32) -> WriteAnswer {
-    if rc == EINPROGRESS {
-        WriteAnswer::Pending
-    } else {
-        WriteAnswer::Decided(rc)
-    }
-}
-
-const FENCE_CAP: usize = 64;
+/// A one-shot op's fence trailer.
+const FENCE_CAP: usize = abi::fence::trailer::LEN;
 const KEY_CAP: usize = 32;
 const VAL_CAP: usize = 32;
 /// LIST and CHANGES answers, and one large value read back.
@@ -220,61 +210,70 @@ unsafe fn log(sys: &SyscallTable, buf: &[u8], n: usize) {
     dev_log(sys, 2, buf.as_ptr(), n.min(buf.len()));
 }
 
-/// Ask PUT `key` = `value` (precondition ANY), the fence into `fence`.
+/// Ask PUT `key` = `value` (precondition ANY), the fence trailer into
+/// `fence`.
 unsafe fn put(
     sys: &SyscallTable,
     key: &[u8],
     value: &[u8],
     fence: &mut [u8; FENCE_CAP],
 ) -> WriteAnswer {
-    let mut arg = [0u8; 96];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p] = 0; // no content type
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(value.as_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
-    p += 8;
-    arg[p] = 0; // precondition ANY
-    arg[p + 1] = 0;
-    p += 2;
-    p += 10; // no key reference, no retention, no hold
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p))
+    let mut arg = [0u8; 2 + KEY_CAP + 15 + FENCE_CAP];
+    let req = object::put::Request {
+        key,
+        content_type: &[],
+        precondition: object::precondition::ANY,
+        etag: &[],
+        kept: object::Kept::none(),
+    };
+    let Some(n) = object::put::encode(&mut arg, &req) else {
+        return WriteAnswer::Decided(EINVAL);
+    };
+    let answer = write_answer((sys.provider_call)(
+        -1,
+        OBJ_PUT,
+        arg.as_mut_ptr(),
+        n,
+        value.as_ptr() as *mut u8,
+        value.len(),
+    ));
+    fence.copy_from_slice(&arg[n - FENCE_CAP..n]);
+    answer
 }
 
 /// The module's `provider_call`, as a held read calls it.
-fn caller(sys: &SyscallTable) -> impl FnMut(i32, u32, &mut [u8]) -> i32 + '_ {
-    move |h, op, arg: &mut [u8]| unsafe { (sys.provider_call)(h, op, arg.as_mut_ptr(), arg.len()) }
+fn caller(sys: &SyscallTable) -> impl FnMut(i32, u32, &mut [u8], &mut [u8]) -> i32 + '_ {
+    move |h, op, arg: &mut [u8], data: &mut [u8]| unsafe {
+        (sys.provider_call)(
+            h,
+            op,
+            arg.as_mut_ptr(),
+            arg.len(),
+            data.as_mut_ptr(),
+            data.len(),
+        )
+    }
 }
 
 /// The keys under `prefix` (one LIST page into `page`), or a negative
 /// errno.
 unsafe fn count_keys(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 {
-    let mut arg = [0u8; 64];
-    let mut fence = [0u8; FENCE_CAP];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    p += 2; // no cursor
-    arg[p..p + 8].copy_from_slice(&(page.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 4].copy_from_slice(&(page.len() as u32).to_le_bytes());
-    p += 4;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    let n = (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), p);
+    let mut arg = [0u8; 64 + FENCE_CAP];
+    let req = namespace::list::Request {
+        prefix,
+        cursor: &[],
+    };
+    let Some(p) = namespace::list::encode_request(&mut arg, &req) else {
+        return EINVAL;
+    };
+    let n = (sys.provider_call)(
+        -1,
+        NS_LIST,
+        arg.as_mut_ptr(),
+        p,
+        page.as_mut_ptr(),
+        page.len(),
+    );
     if n < 0 {
         return n;
     }
@@ -302,30 +301,24 @@ unsafe fn count_changes(sys: &SyscallTable, prefix: &[u8], since: u64, page: &mu
     let mut token = [0u8; 320];
     let mut tlen = 8usize;
     token[..8].copy_from_slice(&since.to_le_bytes());
-    let mut fence = [0u8; 62];
     let mut count = 0i32;
     loop {
-        let mut arg = [0u8; 64 + 320];
-        let mut p = 0usize;
-        arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-        p += 2;
-        arg[p..p + prefix.len()].copy_from_slice(prefix);
-        p += prefix.len();
-        arg[p..p + 4].copy_from_slice(&(-1i32).to_le_bytes());
-        p += 4;
-        arg[p..p + 2].copy_from_slice(&(tlen as u16).to_le_bytes());
-        p += 2;
-        arg[p..p + tlen].copy_from_slice(&token[..tlen]);
-        p += tlen;
-        arg[p..p + 8].copy_from_slice(&(page.as_mut_ptr() as u64).to_le_bytes());
-        p += 8;
-        arg[p..p + 4].copy_from_slice(&(page.len() as u32).to_le_bytes());
-        p += 4;
-        arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-        p += 8;
-        arg[p..p + 2].copy_from_slice(&(fence.len() as u16).to_le_bytes());
-        p += 2;
-        let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), p);
+        let mut arg = [0u8; 64 + 320 + FENCE_CAP];
+        let req = namespace::changes::Request {
+            prefix,
+            token: &token[..tlen],
+        };
+        let Some(p) = namespace::changes::encode_request(&mut arg, &req) else {
+            return EINVAL;
+        };
+        let n = (sys.provider_call)(
+            -1,
+            NS_CHANGES,
+            arg.as_mut_ptr(),
+            p,
+            page.as_mut_ptr(),
+            page.len(),
+        );
         // `[status][more][safe_rev u64][count u32]` records `[token_len u16][token]`.
         if n < 16 {
             return if n < 0 { n } else { -5 };
@@ -387,7 +380,8 @@ unsafe fn decided(s: &mut ProbeState, sys: &SyscallTable, rc: i32) {
     if rc == 0 {
         s.ok += 1;
         if s.fence_tag == 0 {
-            s.fence_tag = s.fence[0];
+            // `[fence_len u16][fence]`: the fence's tag byte.
+            s.fence_tag = s.fence[2];
             let mut m = [0u8; 48];
             let mut n = put_bytes(&mut m, 0, b"[probe] n");
             n = put_dec(&mut m, n, u64::from(s.node));
@@ -467,7 +461,7 @@ unsafe fn big_values_whole(s: &mut ProbeState, sys: &SyscallTable, page: &mut [u
         }
         let mut key = [0u8; KEY_CAP];
         let kn = big_key(&mut key, m);
-        let n = match s.read.step(&mut call, &mut key[..kn], page) {
+        let n = match s.read.step(&mut call, &key[..kn], page) {
             Read::Pending => {
                 s.read_node = m;
                 return None;

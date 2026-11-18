@@ -21,7 +21,7 @@
 //!
 //! # Request
 //!
-//! Method POST; `target` empty; headers ignored; body = exactly one
+//! Op CALL, verb 0; `target` empty; meta ignored; body = exactly one
 //! STRUCTURED command, little-endian:
 //!
 //! ```text
@@ -34,21 +34,21 @@
 //!
 //! # Answer
 //!
-//! One answer per request, no content type, no headers:
+//! One answer per request, no meta:
 //!
-//! | Status | Reply | Body |
+//! | Outcome | Reply | Body |
 //! |---|---|---|
-//! | 200 | `+OK` simple string | the text, without `+` and CRLF (`OK`) |
-//! | 200 | `:N` integer | the decimal digits (`42`, `-1`) |
-//! | 200 | `$n` bulk string | the `n` data bytes |
-//! | 200 | `$-1` nil | empty |
-//! | 200 | `*N` array | the whole RESP reply, header included, verbatim |
-//! | 400 | `-ERR …` error | the error text, without `-` and CRLF (`ERR unknown command 'NOPE'`) |
-//! | 400 | — | another method, a non-empty target, a body that is not exactly one structured command, a command of no arguments |
-//! | 413 | — | a body over 4096 bytes, or a command whose RESP form exceeds 8192 bytes |
-//! | 502 | — | a reply over 8192 bytes |
-//! | 503 | — | four requests already held, or draining |
-//! | 504 | — | no answer from the store within 15 s (the command's effect is unknown) |
+//! | OK | `+OK` simple string | the text, without `+` and CRLF (`OK`) |
+//! | OK | `:N` integer | the decimal digits (`42`, `-1`) |
+//! | OK | `$n` bulk string | the `n` data bytes |
+//! | OK | `$-1` nil | empty |
+//! | OK | `*N` array | the whole RESP reply, header included, verbatim |
+//! | REFUSED | `-ERR …` error | the error text, without `-` and CRLF (`ERR unknown command 'NOPE'`) |
+//! | REFUSED | — | another op or a verb, a non-empty target, a body that is not exactly one structured command, a command of no arguments |
+//! | TOO_LARGE | — | a body over 4096 bytes, or a command whose RESP form exceeds 8192 bytes |
+//! | UNAVAILABLE | — | a reply over 8192 bytes |
+//! | BUSY | — | four requests already held, or draining |
+//! | TIMEOUT | — | no answer from the store within 15 s (the command's effect is unknown) |
 //!
 //! `PING`, `ECHO` and `COMMAND` are answered by the front, as the connector
 //! answers them. A command whose meaning is a connection's state (`AUTH`,
@@ -96,7 +96,7 @@ use kv_front_core::{
 
 #[path = "../../common/query_exchange.rs"]
 mod query_exchange;
-use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::exchange::{op, outcome, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 /// Requests held at once: one performed, the rest queued in arrival order.
@@ -212,7 +212,7 @@ pub extern "C" fn module_new(
         s.env_len = 0;
         s.completed = 0;
         s.errors = 0;
-        s.desk.reset(METHOD_POST, 0);
+        s.desk.reset(op::CALL, 0);
         s.outbox = ExchangeOutbox::new();
         s.session = Session::new();
         if s.kv_in < 0 || s.kv_out < 0 {
@@ -282,11 +282,11 @@ unsafe fn read_requests(s: &mut FrontState) {
 /// `reply[..len]`, by `redis_client`'s mapping.
 fn answer_reply(s: &mut FrontState, len: usize) {
     let (code, start, end) = match kv_front_core::answer(&s.reply[..len]) {
-        Answer::Ok { start, end } => (status::OK, start, end),
-        Answer::Refused { start, end } => (status::BAD_REQUEST, start, end),
+        Answer::Ok { start, end } => (outcome::OK, start, end),
+        Answer::Refused { start, end } => (outcome::REFUSED, start, end),
         Answer::TooLarge => {
             s.errors = s.errors.wrapping_add(1);
-            (status::BAD_GATEWAY, 0, 0)
+            (outcome::UNAVAILABLE, 0, 0)
         }
     };
     let n = end - start;
@@ -379,8 +379,8 @@ unsafe fn take_request(s: &mut FrontState, now: u64) {
         }
     };
     match planned {
-        Plan::BadRequest => s.desk.refuse(at, status::BAD_REQUEST),
-        Plan::TooLarge => s.desk.refuse(at, status::TOO_LARGE),
+        Plan::BadRequest => s.desk.refuse(at, outcome::REFUSED),
+        Plan::TooLarge => s.desk.refuse(at, outcome::TOO_LARGE),
         Plan::Reply(len) => {
             s.desk.start(at);
             s.has_cmd = 1;
@@ -487,10 +487,10 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         read_answers(s);
         send_exchange(s);
 
-        // 3. A command the store has not answered in time is answered 504;
+        // 3. A command the store has not answered in time is answered `TIMEOUT`;
         //    a late answer no longer matches and is dropped.
         if s.has_cmd == 1 && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
-            s.desk.finish(status::TIMEOUT, 0);
+            s.desk.finish(outcome::TIMEOUT, 0);
             s.session.reset();
             s.has_cmd = 0;
             s.pending = 0;

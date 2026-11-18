@@ -22,12 +22,14 @@ content_type = "OctetStream"
 name = "telemetry_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Rolled-up snapshot for substrate `http_surface` (/metrics).
 [[ports]]
 name = "http_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # This module's OWN module-scope operational counters, kept
 # separate from the app-metric rollups it aggregates on telemetry_out.

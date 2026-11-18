@@ -41,12 +41,14 @@ content_type = "OctetStream"
 name = "resp_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_DOC_REQUEST (and MSG_PART parts) to document_executor.
 [[ports]]
 name = "exec_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

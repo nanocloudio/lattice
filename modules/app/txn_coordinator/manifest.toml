@@ -38,6 +38,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -50,6 +51,7 @@ content_type = "OctetStream"
 name = "result_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [observability]
 #   0 phase      1 Pending, 2 Staging, 3 Committed, 4 Aborted, 9 done

@@ -16,7 +16,10 @@
 //!
 //! Targets name the service as `/rc/<tenant hex32>/<service hex32>/…`.
 //!
-//! | Request | Headers | Body | Answer |
+//! Every request is a `CALL` under the `exchange_http` binding, its verb
+//! the method named below; request facts and answer facts are meta fields.
+//!
+//! | Request | Meta | Body | Answer |
 //! |---|---|---|---|
 //! | `POST …/publish` | `generation` (non-zero), `predecessor` (0: none), `endpoints` (each route's endpoint count — the count its manifest will carry — comma-separated in route order, one per route `0..`, at most [`ROUTES_MAX`]; empty: no route, the withdrawn form) | one item per record, the HEAD's inline body and each BODY: `[kind u8][route u8][id 16][WHR1 envelope]`, kind 1 route `route`'s route record (id ignored), 2 an endpoint of route `route`, 3 a policy of the generation (route and id ignored: a policy is keyed by its content address); the record without MORE ends the publication (a withdrawn generation's request has none) | `200` with `generation`, `revision` (the activation's) |
 //! | `POST …/declare` | `id` (hex32, the declaration's id) | the HEAD's inline body: one placed WHR1 envelope | `200` with `generation` (the record's), `revision`, `unchanged` (0/1) |
@@ -28,10 +31,10 @@
 //!
 //! | Status | When |
 //! |---|---|
-//! | 400 | another target or method, a malformed header or item, an envelope refused structurally, a record of the wrong kind, a continuation not of this snapshot's revision or service, a revision past the store |
+//! | 400 | another target, op or verb, a malformed meta field or item, an envelope refused structurally, a record of the wrong kind, a continuation not of this snapshot's revision or service, a revision past the store |
 //! | 409 | the generation is already begun, the active pointer is not at the predecessor named, or a racing publisher won the CAS; a declaration at or behind the generation held, or racing; a status for a closed stream, one whose number another status holds, or racing; a reclaim of an open stream |
 //! | 410 | a snapshot revision the store has compacted; changes after a revision it has compacted |
-//! | 413 | one revision's changes over one page; a record over 4,096 bytes or over what one routed put carries (`route_catalogue::KV_BODY_MAX`), a target or headers over their bounds, a response credit too small for one record |
+//! | 413 | one revision's changes over one page; a record over 4,096 bytes or over what one routed put carries (`route_catalogue::KV_BODY_MAX`), a target or meta over their bounds, a response credit too small for one record |
 //! | 422 | a referential gap: a route's endpoints or the policies read back are not those staged, a declared route without its route record (or a route record not declared), or a withdrawn generation with records |
 //! | 502 | the store refused an operation, or answered what cannot be read |
 //! | 503 | a request is already held (one at a time), or draining |
@@ -60,9 +63,11 @@ use super::route_catalogue::{
     DIGEST_LEN, ID_LEN, KEY_MAX, KIND_ENDPOINT, KIND_ROUTE, RECORD_MAX, ROUTES_MAX, TOKEN_MAX,
 };
 use exchange::{
-    flag, parse_request, write_credit, write_response_head, ExchangeId, Record, RequestHead,
-    ResponseHead, HDR, METHOD_GET, METHOD_POST, RECORD_MAX as EXCHANGE_RECORD_MAX, RESP_HEAD_FIXED,
+    flag, kind, meta_field_len, meta_get, op, parse_request, record_id, record_kind, write_credit,
+    write_response_head, ExchangeId, MetaWriter, Record, RequestHead, HDR, META_CONTENT_TYPE,
+    RECORD_MAX as EXCHANGE_RECORD_MAX, RESP_HEAD_FIXED,
 };
+use fluxor_abi::contracts::exchange_http::{self as http, method, Http};
 
 /// How the front reaches the store: one request at a time.
 pub trait FrontIo {
@@ -71,23 +76,28 @@ pub trait FrontIo {
 
 /// The longest target: `/rc/` and two hex ids and the longest verb.
 pub const TARGET_MAX: usize = 4 + 32 + 1 + 32 + 1 + 9;
-/// Headers a request may carry.
-pub const HEADERS_MAX: usize = 512;
+/// Meta a request may carry.
+pub const META_MAX: usize = 512;
 /// One publication item: the kind, the route, the id and the largest
 /// envelope. The request-body credit granted per item.
 pub const ITEM_HEAD: usize = 1 + 1 + ID_LEN;
 pub const ITEM_MAX: usize = ITEM_HEAD + RECORD_MAX;
 const CONTENT_TYPE: &[u8] = b"application/octet-stream";
-/// The response headers' room: a snapshot page's `revision`, `more` and a
-/// hex continuation, or `count` and a hex digest (asserted to fit, so no
-/// header is ever dropped).
-const RESP_HEADERS: usize = 512;
-const _: () = assert!(RESP_HEADERS >= (10 + 20 + 2) + (6 + 1 + 2) + (10 + 2 * TOKEN_MAX + 2));
+/// The response meta's room: the content type, then a snapshot page's
+/// `revision`, `more` and a hex continuation, or `count` and a hex digest
+/// (asserted to fit, so no field is ever dropped).
+const RESP_META: usize = 512;
+const _: () = assert!(
+    RESP_META
+        >= meta_field_len(META_CONTENT_TYPE.len(), CONTENT_TYPE.len())
+            + meta_field_len(8, 20)
+            + meta_field_len(4, 1)
+            + meta_field_len(8, 2 * TOKEN_MAX)
+);
 /// A snapshot page as the front hands it back: what one response record
-/// holds beside its head, content type and the largest headers, so a full
-/// page always fits its record.
-pub const PAGE_MAX: usize =
-    EXCHANGE_RECORD_MAX - HDR - RESP_HEAD_FIXED - CONTENT_TYPE.len() - RESP_HEADERS;
+/// holds beside its head and the largest meta, so a full page always fits
+/// its record.
+pub const PAGE_MAX: usize = EXCHANGE_RECORD_MAX - HDR - RESP_HEAD_FIXED - RESP_META;
 // A page holds the largest record; the page buffer also holds a HEAD's
 // inline publication item while the staging marker is written.
 const _: () = assert!(PAGE_MAX >= 2 + KEY_MAX + 4 + RECORD_MAX);
@@ -193,11 +203,11 @@ fn stage_item(p: &mut Publisher, data: &[u8]) -> Result<(), PublishError> {
     }
 }
 
-/// The `endpoints` header: each route's count, comma-separated in route
+/// The `endpoints` field: each route's count, comma-separated in route
 /// order (empty: no route). `None` for a malformed list or one past
 /// [`ROUTES_MAX`] routes.
-fn header_counts(headers: &[u8], out: &mut [u32; ROUTES_MAX]) -> Option<usize> {
-    let v = exchange::header(headers, b"endpoints")?;
+fn field_counts(meta: &[u8], out: &mut [u32; ROUTES_MAX]) -> Option<usize> {
+    let v = meta_get(meta, b"endpoints")?;
     if v.is_empty() {
         return Some(0);
     }
@@ -305,8 +315,16 @@ impl Front {
 
     /// One request record from the channel.
     pub fn accept(&mut self, record: &[u8], now_ms: u64) {
-        let Some(rec) = parse_request(record) else {
-            return;
+        let rec = match parse_request::<Http>(record) {
+            Ok(rec) => rec,
+            Err(_) => {
+                // A HEAD that breaks the binding's rules still names its
+                // exchange, and is owed an answer.
+                if let (Some(kind::HEAD), Some(id)) = (record_kind(record), record_id(record)) {
+                    self.refuse_head(id, http::status::BAD_REQUEST);
+                }
+                return;
+            }
         };
         match rec {
             Record::Head(h) => self.head(&h, now_ms),
@@ -345,8 +363,27 @@ impl Front {
         self.m_refused = self.m_refused.wrapping_add(1);
     }
 
+    /// Whether a new request must be refused from its own slot: one is
+    /// held, an answer is owed, or the front drains.
+    fn occupied(&self) -> bool {
+        self.kind != Kind::None || self.owed.is_some() || self.busy.is_some() || self.draining
+    }
+
+    /// Refuse a HEAD that could not be read: from the busy slot while a
+    /// request is held, else as the answer owed.
+    fn refuse_head(&mut self, id: ExchangeId, st: u16) {
+        if self.occupied() {
+            if self.busy.is_none() {
+                self.busy = Some(id);
+                self.m_refused = self.m_refused.wrapping_add(1);
+            }
+            return;
+        }
+        self.refuse(id, st);
+    }
+
     fn head(&mut self, h: &RequestHead<'_>, now_ms: u64) {
-        if self.kind != Kind::None || self.owed.is_some() || self.busy.is_some() || self.draining {
+        if self.occupied() {
             // Refused from its own slot: the held request and the answer
             // owed to it stay as they are.
             if self.busy.is_none() {
@@ -355,8 +392,8 @@ impl Front {
             }
             return;
         }
-        if h.target.len() > TARGET_MAX || h.headers.len() > HEADERS_MAX {
-            return self.refuse(h.id, status::TOO_LARGE);
+        if h.target.len() > TARGET_MAX || h.meta.len() > META_MAX {
+            return self.refuse(h.id, status::PAYLOAD_TOO_LARGE);
         }
         let Some((service, verb)) = parse_target(h.target) else {
             return self.refuse(h.id, status::BAD_REQUEST);
@@ -364,13 +401,16 @@ impl Front {
         self.service = service;
         self.id = h.id;
         self.epoch = self.epoch.wrapping_add(1);
-        match (h.method, verb) {
-            (METHOD_POST, b"publish") => {
+        if h.op != op::CALL {
+            return self.refuse(h.id, status::BAD_REQUEST);
+        }
+        match (h.verb, verb) {
+            (method::POST, b"publish") => {
                 let mut declared = [0u32; ROUTES_MAX];
                 let (Some(generation), Some(predecessor), Some(routes)) = (
-                    header_u64(h.headers, b"generation"),
-                    header_u64(h.headers, b"predecessor"),
-                    header_counts(h.headers, &mut declared),
+                    field_u64(h.meta, b"generation"),
+                    field_u64(h.meta, b"predecessor"),
+                    field_counts(h.meta, &mut declared),
                 ) else {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 };
@@ -378,7 +418,7 @@ impl Front {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 }
                 if h.body.len() > ITEM_MAX {
-                    return self.refuse(h.id, status::TOO_LARGE);
+                    return self.refuse(h.id, status::PAYLOAD_TOO_LARGE);
                 }
                 let mut publisher = [0u8; 16];
                 publisher[..h.peer.len().min(16)].copy_from_slice(&h.peer[..h.peer.len().min(16)]);
@@ -386,7 +426,7 @@ impl Front {
                     .publisher
                     .begin(service, generation, predecessor, now_ms, publisher)
                 {
-                    return self.refuse(h.id, status::BUSY);
+                    return self.refuse(h.id, status::SERVICE_UNAVAILABLE);
                 }
                 self.kind = Kind::Publish;
                 self.routes = routes;
@@ -405,16 +445,16 @@ impl Front {
                     self.request_ended = true;
                 }
             }
-            (METHOD_GET, b"snapshot") => {
-                let at = match exchange::header(h.headers, b"at") {
-                    Some(_) => match header_u64(h.headers, b"at") {
+            (method::GET, b"snapshot") => {
+                let at = match meta_get(h.meta, b"at") {
+                    Some(_) => match field_u64(h.meta, b"at") {
                         Some(at) => at,
                         None => return self.refuse(h.id, status::BAD_REQUEST),
                     },
                     None => 0,
                 };
                 let mut token = [0u8; TOKEN_MAX];
-                let tn = match exchange::header(h.headers, b"continue") {
+                let tn = match meta_get(h.meta, b"continue") {
                     Some(hex) => match unhex(hex, &mut token) {
                         Some(n) => n,
                         None => return self.refuse(h.id, status::BAD_REQUEST),
@@ -431,8 +471,8 @@ impl Front {
                     Err(_) => self.refuse(h.id, status::BAD_REQUEST),
                 }
             }
-            (METHOD_GET, b"changes") => {
-                let Some(after) = header_u64(h.headers, b"after") else {
+            (method::GET, b"changes") => {
+                let Some(after) = field_u64(h.meta, b"after") else {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 };
                 match self.changes.begin(service, after) {
@@ -445,36 +485,35 @@ impl Front {
                     Err(_) => self.refuse(h.id, status::BAD_REQUEST),
                 }
             }
-            (METHOD_POST, b"gc") => {
+            (method::POST, b"gc") => {
                 let (Some(predecessor), Some(keep), Some(retention), Some(now)) = (
-                    header_u64(h.headers, b"predecessor"),
-                    header_u64(h.headers, b"keep"),
-                    header_u64(h.headers, b"retention-ms"),
-                    header_u64(h.headers, b"now-ms"),
+                    field_u64(h.meta, b"predecessor"),
+                    field_u64(h.meta, b"keep"),
+                    field_u64(h.meta, b"retention-ms"),
+                    field_u64(h.meta, b"now-ms"),
                 ) else {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 };
                 let now = if now == 0 { now_ms } else { now };
                 if !self.gc.begin(service, predecessor, keep, retention, now) {
-                    return self.refuse(h.id, status::BUSY);
+                    return self.refuse(h.id, status::SERVICE_UNAVAILABLE);
                 }
                 self.kind = Kind::Gc;
             }
-            (METHOD_POST, b"declare") => {
-                let Some(id) = header_id(h.headers, b"id") else {
+            (method::POST, b"declare") => {
+                let Some(id) = field_id(h.meta, b"id") else {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 };
                 match self.declarer.begin(service, id, h.body) {
                     Ok(true) => self.kind = Kind::Declare,
-                    Ok(false) => self.refuse(h.id, status::BUSY),
+                    Ok(false) => self.refuse(h.id, status::SERVICE_UNAVAILABLE),
                     Err(e) => self.refuse(h.id, declare_status(e)),
                 }
             }
-            (METHOD_POST, b"status") => {
-                let (Some(operation), Some(last)) = (
-                    header_id(h.headers, b"operation"),
-                    header_u64(h.headers, b"last"),
-                ) else {
+            (method::POST, b"status") => {
+                let (Some(operation), Some(last)) =
+                    (field_id(h.meta, b"operation"), field_u64(h.meta, b"last"))
+                else {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 };
                 if last > 1 {
@@ -482,16 +521,16 @@ impl Front {
                 }
                 match self.status_log.begin(service, operation, h.body, last == 1) {
                     Ok(true) => self.kind = Kind::Status,
-                    Ok(false) => self.refuse(h.id, status::BUSY),
+                    Ok(false) => self.refuse(h.id, status::SERVICE_UNAVAILABLE),
                     Err(e) => self.refuse(h.id, status_status(e)),
                 }
             }
-            (METHOD_POST, b"reclaim") => {
-                let Some(operation) = header_id(h.headers, b"operation") else {
+            (method::POST, b"reclaim") => {
+                let Some(operation) = field_id(h.meta, b"operation") else {
                     return self.refuse(h.id, status::BAD_REQUEST);
                 };
                 if !self.reclaim.begin(service, operation) {
-                    return self.refuse(h.id, status::BUSY);
+                    return self.refuse(h.id, status::SERVICE_UNAVAILABLE);
                 }
                 self.kind = Kind::Reclaim;
             }
@@ -653,7 +692,7 @@ impl Front {
                             match e {
                                 ChangesError::Compacted => status::GONE,
                                 ChangesError::Future => status::BAD_REQUEST,
-                                ChangesError::TooLarge => status::TOO_LARGE,
+                                ChangesError::TooLarge => status::PAYLOAD_TOO_LARGE,
                                 ChangesError::Store(_) | ChangesError::Answer => {
                                     status::BAD_GATEWAY
                                 }
@@ -686,7 +725,7 @@ impl Front {
                             match e {
                                 SnapshotError::Compacted => status::GONE,
                                 SnapshotError::Future | SnapshotError::Token => status::BAD_REQUEST,
-                                SnapshotError::PageTooSmall => status::TOO_LARGE,
+                                SnapshotError::PageTooSmall => status::PAYLOAD_TOO_LARGE,
                                 SnapshotError::Store(_) | SnapshotError::Answer => {
                                     status::BAD_GATEWAY
                                 }
@@ -706,17 +745,13 @@ impl Front {
     /// next item. A record that does not fit `out` stays owed.
     pub fn next_record(&mut self, out: &mut [u8]) -> Option<usize> {
         if let Some(id) = self.busy {
-            let n = write_response_head(
-                &ResponseHead {
-                    id,
-                    flags: flag::RAISED,
-                    status: status::BUSY,
-                    content_type: CONTENT_TYPE,
-                    headers: &[],
-                    body: &[],
-                },
-                out,
-            )?;
+            let mut meta = [0u8; RESP_META];
+            let mut w = MetaWriter::new(&mut meta);
+            w.put(META_CONTENT_TYPE, CONTENT_TYPE);
+            let ml = w.finish()?;
+            let mut head = http::head(id, status::SERVICE_UNAVAILABLE, &meta[..ml], &[])?;
+            head.flags = flag::RAISED;
+            let n = write_response_head::<Http>(&head, out)?;
             self.busy = None;
             return Some(n);
         }
@@ -729,73 +764,62 @@ impl Front {
             }
             return None;
         };
-        let mut hdr = [0u8; RESP_HEADERS];
-        let mut hn = 0usize;
+        let mut meta = [0u8; RESP_META];
+        let mut w = MetaWriter::new(&mut meta);
+        w.put(META_CONTENT_TYPE, CONTENT_TYPE);
         let body: &[u8] = if st == status::OK {
             if let Some(c) = self.changes_outcome {
-                hn = header_line(&mut hdr, hn, b"revision", c.revision);
-                hn = header_line(&mut hdr, hn, b"through", c.through);
-                hn = header_line(&mut hdr, hn, b"more", u64::from(c.through < c.revision));
-                hn = header_line(&mut hdr, hn, b"changes", u64::from(c.count));
+                put_u64(&mut w, b"revision", c.revision);
+                put_u64(&mut w, b"through", c.through);
+                put_u64(&mut w, b"more", u64::from(c.through < c.revision));
+                put_u64(&mut w, b"changes", u64::from(c.count));
                 &self.page[..self.page_len]
             } else if let Some(outcome) = self.page_outcome {
-                hn = header_line(&mut hdr, hn, b"revision", self.snapshot.at_rev);
+                put_u64(&mut w, b"revision", self.snapshot.at_rev);
                 match outcome {
                     SnapshotPage::More { token_len } => {
-                        hn = header_line(&mut hdr, hn, b"more", 1);
-                        hn = header_hex(&mut hdr, hn, b"continue", &self.token[..token_len]);
+                        put_u64(&mut w, b"more", 1);
+                        put_hex(&mut w, b"continue", &self.token[..token_len]);
                     }
                     SnapshotPage::Last { count, digest } => {
-                        hn = header_line(&mut hdr, hn, b"more", 0);
-                        hn = header_line(&mut hdr, hn, b"count", u64::from(count));
-                        hn = header_hex(&mut hdr, hn, b"digest", &digest);
+                        put_u64(&mut w, b"more", 0);
+                        put_u64(&mut w, b"count", u64::from(count));
+                        put_hex(&mut w, b"digest", &digest);
                     }
                 }
                 &self.page[..self.page_len]
             } else if self.answered == Kind::Declare
                 && self.declarer.phase == DeclarePhase::Declared
             {
-                hn = header_line(&mut hdr, hn, b"generation", self.declarer.generation);
-                hn = header_line(&mut hdr, hn, b"revision", self.declarer.revision);
-                hn = header_line(
-                    &mut hdr,
-                    hn,
-                    b"unchanged",
-                    u64::from(self.declarer.unchanged),
-                );
+                put_u64(&mut w, b"generation", self.declarer.generation);
+                put_u64(&mut w, b"revision", self.declarer.revision);
+                put_u64(&mut w, b"unchanged", u64::from(self.declarer.unchanged));
                 &[]
             } else if self.answered == Kind::Status
                 && self.status_log.phase == StatusPhase::Appended
             {
-                hn = header_line(&mut hdr, hn, b"seq", self.status_log.seq);
-                hn = header_line(&mut hdr, hn, b"revision", self.status_log.revision);
+                put_u64(&mut w, b"seq", self.status_log.seq);
+                put_u64(&mut w, b"revision", self.status_log.revision);
                 &[]
             } else if self.answered == Kind::Reclaim {
-                hn = header_line(&mut hdr, hn, b"deleted", u64::from(self.reclaim.deleted));
+                put_u64(&mut w, b"deleted", u64::from(self.reclaim.deleted));
                 &[]
             } else if self.publisher.phase == PublishPhase::Activated {
-                hn = header_line(&mut hdr, hn, b"generation", self.publisher.generation);
-                hn = header_line(&mut hdr, hn, b"revision", self.publisher.revision);
+                put_u64(&mut w, b"generation", self.publisher.generation);
+                put_u64(&mut w, b"revision", self.publisher.revision);
                 &[]
             } else {
-                hn = header_line(&mut hdr, hn, b"reclaimed", u64::from(self.gc.reclaimed));
-                hn = header_line(&mut hdr, hn, b"deleted", u64::from(self.gc.deleted));
+                put_u64(&mut w, b"reclaimed", u64::from(self.gc.reclaimed));
+                put_u64(&mut w, b"deleted", u64::from(self.gc.deleted));
                 &[]
             }
         } else {
             &[]
         };
-        let n = write_response_head(
-            &ResponseHead {
-                id: self.id,
-                flags: if st == status::OK { 0 } else { flag::RAISED },
-                status: st,
-                content_type: CONTENT_TYPE,
-                headers: &hdr[..hn],
-                body,
-            },
-            out,
-        )?;
+        let ml = w.finish()?;
+        let mut head = http::head(self.id, st, &meta[..ml], body)?;
+        head.flags = if st == status::OK { 0 } else { flag::RAISED };
+        let n = write_response_head::<Http>(&head, out)?;
         self.owed = None;
         // The machines are reset for the next request.
         self.publisher = Publisher::new();
@@ -815,7 +839,7 @@ impl Front {
 fn publish_status(e: PublishError) -> u16 {
     match e {
         PublishError::Envelope(super::route_catalogue::EnvelopeError::TooLarge(_)) => {
-            status::TOO_LARGE
+            status::PAYLOAD_TOO_LARGE
         }
         PublishError::Envelope(_) | PublishError::Kind | PublishError::Sequence => {
             status::BAD_REQUEST
@@ -833,7 +857,7 @@ fn publish_status(e: PublishError) -> u16 {
 /// The status a declaration error answers.
 fn declare_status(e: DeclareError) -> u16 {
     match e {
-        DeclareError::Envelope(EnvelopeError::TooLarge(_)) => status::TOO_LARGE,
+        DeclareError::Envelope(EnvelopeError::TooLarge(_)) => status::PAYLOAD_TOO_LARGE,
         DeclareError::Envelope(_) => status::BAD_REQUEST,
         DeclareError::Stale { .. } | DeclareError::Conflict | DeclareError::Raced => {
             status::CONFLICT
@@ -845,16 +869,16 @@ fn declare_status(e: DeclareError) -> u16 {
 /// The status a status-append error answers.
 fn status_status(e: StatusError) -> u16 {
     match e {
-        StatusError::Envelope(EnvelopeError::TooLarge(_)) => status::TOO_LARGE,
+        StatusError::Envelope(EnvelopeError::TooLarge(_)) => status::PAYLOAD_TOO_LARGE,
         StatusError::Envelope(_) => status::BAD_REQUEST,
         StatusError::Closed | StatusError::Conflict | StatusError::Raced => status::CONFLICT,
         StatusError::Head | StatusError::Store(_) | StatusError::Answer => status::BAD_GATEWAY,
     }
 }
 
-/// A 32-digit hex identity header.
-fn header_id(headers: &[u8], name: &[u8]) -> Option<[u8; ID_LEN]> {
-    let v = exchange::header(headers, name)?;
+/// A 32-digit hex identity field.
+fn field_id(meta: &[u8], name: &[u8]) -> Option<[u8; ID_LEN]> {
+    let v = meta_get(meta, name)?;
     let mut id = [0u8; ID_LEN];
     if v.len() != 2 * ID_LEN || unhex(v, &mut id)? != ID_LEN {
         return None;
@@ -862,16 +886,15 @@ fn header_id(headers: &[u8], name: &[u8]) -> Option<[u8; ID_LEN]> {
     Some(id)
 }
 
-/// Statuses the exchange contract does not name.
+/// Statuses the HTTP binding does not name.
 pub mod extra_status {
-    pub const CONFLICT: u16 = 409;
     pub const GONE: u16 = 410;
     pub const UNPROCESSABLE: u16 = 422;
 }
 
 mod status {
-    pub use super::exchange::status::*;
     pub use super::extra_status::*;
+    pub use fluxor_abi::contracts::exchange_http::status::*;
 }
 
 /// `/rc/<tenant hex32>/<service hex32>/<verb>`.
@@ -899,9 +922,9 @@ fn parse_target(t: &[u8]) -> Option<(Service, &[u8])> {
     Some((s, verb))
 }
 
-/// A decimal header.
-fn header_u64(headers: &[u8], name: &[u8]) -> Option<u64> {
-    let v = exchange::header(headers, name)?;
+/// A decimal field.
+fn field_u64(meta: &[u8], name: &[u8]) -> Option<u64> {
+    let v = meta_get(meta, name)?;
     if v.is_empty() || v.len() > 20 {
         return None;
     }
@@ -935,7 +958,8 @@ pub fn unhex(hex: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(hex.len() / 2)
 }
 
-fn header_line(hdr: &mut [u8], mut at: usize, name: &[u8], value: u64) -> usize {
+/// A decimal meta field.
+fn put_u64(w: &mut MetaWriter<'_>, name: &[u8], value: u64) {
     let mut digits = [0u8; 20];
     let mut n = 0;
     let mut v = value;
@@ -947,39 +971,18 @@ fn header_line(hdr: &mut [u8], mut at: usize, name: &[u8], value: u64) -> usize 
             break;
         }
     }
-    let need = name.len() + 2 + n + 2;
-    if at + need > hdr.len() {
-        return at;
-    }
-    hdr[at..at + name.len()].copy_from_slice(name);
-    at += name.len();
-    hdr[at..at + 2].copy_from_slice(b": ");
-    at += 2;
-    for i in (0..n).rev() {
-        hdr[at] = digits[i];
-        at += 1;
-    }
-    hdr[at..at + 2].copy_from_slice(b"\r\n");
-    at + 2
+    digits[..n].reverse();
+    w.put(name, &digits[..n]);
 }
 
-fn header_hex(hdr: &mut [u8], mut at: usize, name: &[u8], bytes: &[u8]) -> usize {
+/// A lower-case hex meta field.
+fn put_hex(w: &mut MetaWriter<'_>, name: &[u8], bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let need = name.len() + 2 + 2 * bytes.len() + 2;
-    if at + need > hdr.len() {
-        return at;
-    }
-    hdr[at..at + name.len()].copy_from_slice(name);
-    at += name.len();
-    hdr[at..at + 2].copy_from_slice(b": ");
-    at += 2;
+    w.begin(name);
     for &b in bytes {
-        hdr[at] = HEX[usize::from(b >> 4)];
-        hdr[at + 1] = HEX[usize::from(b & 15)];
-        at += 2;
+        w.push(&[HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
     }
-    hdr[at..at + 2].copy_from_slice(b"\r\n");
-    at + 2
+    w.end();
 }
 
 /// Re-export for consumers that hold a page.

@@ -73,18 +73,21 @@ content_type = "OctetStream"
 name = "ctrl_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_LEASE_STATE responses out to etcd_edge_anchor.
 [[ports]]
 name = "responses"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Lease-attached-key revokes out to kv_state_worker.
 [[ports]]
 name = "revoke"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

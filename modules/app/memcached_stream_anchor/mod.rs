@@ -1707,15 +1707,14 @@ unsafe fn net_send_bind(anchor: &mut AnchorState) -> bool {
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let port = anchor.listen_port.to_le_bytes();
-    let payload = [port[0], port[1]];
+    let port = abi::contracts::net::net_proto::bind(anchor.listen_port, 0);
     let scratch = anchor.scratch.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys,
         anchor.net_out,
         NET_CMD_BIND,
-        payload.as_ptr(),
-        2,
+        port.as_ptr(),
+        port.len(),
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -1727,14 +1726,14 @@ unsafe fn net_send_close(anchor: &mut AnchorState, conn_id: u16) -> bool {
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let payload = conn_id.to_le_bytes();
+    let payload = abi::contracts::net::net_proto::close(conn_id, false);
     let scratch = anchor.scratch.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys,
         anchor.net_out,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        CONN_ID_LEN,
+        payload.len(),
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -1747,7 +1746,7 @@ unsafe fn net_send_data(anchor: &mut AnchorState, conn_id: u16, data: &[u8]) -> 
         return false;
     }
     let payload_len = CONN_ID_LEN + data.len();
-    if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
+    if payload_len + NET_FRAME_HDR > NET_OUT_MAX_RECORD {
         return false;
     }
     let id = conn_id.to_le_bytes();
@@ -1833,7 +1832,10 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = SCRATCH_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + CONN_ID_LEN + NET_CHUNK],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

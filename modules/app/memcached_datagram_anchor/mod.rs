@@ -1098,7 +1098,10 @@ unsafe fn lg_step(anchor: &mut AnchorState) {
 
 // ── Module ABI ───────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 DGRAM_IN_ACCEPTS_RECORD = ENVELOPE_HDR + RECV_BUF, out 0 DGRAM_OUT_MAX_RECORD = DG_FRAME],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

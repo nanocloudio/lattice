@@ -18,6 +18,7 @@ hardware_targets = ["bcm2712", "linux"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 8208
 
 # Local envelopes to ship: ship mode = the source worker's
 # snapshot_export stream; receive mode = the target worker's
@@ -32,6 +33,8 @@ content_type = "OctetStream"
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 8208
+buffer_size = 16384
 
 # Reassembled envelopes from the peer: ship mode = acks to the split
 # driver's ack_in; receive mode = the chunk stream to the target
@@ -40,6 +43,7 @@ content_type = "NetProto"
 name = "local_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Positional counters: shipped, delivered, dropped.
 [[ports]]

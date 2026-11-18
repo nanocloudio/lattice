@@ -49,9 +49,9 @@ use wire::{
     MSG_TS_LEASE_GRANT,
 };
 
-/// Clustor's `MSG_COMMITTED_ENTRY` opcode (see
-/// `deps/clustor/modules/sdk/wire/wire.rs`). Inlined here to avoid
-/// build-time coupling to a sibling crate's source path.
+/// Clustor's `MSG_COMMITTED_ENTRY` opcode (`wire.rs` in clustor's common
+/// sources, which `fluxor sync` stages under `target/fluxor/clustor-common/`).
+/// Inlined here to avoid build-time coupling to a sibling crate's source.
 const MSG_COMMITTED_ENTRY: u8 = 0x24;
 
 /// `[partition_id:u16 LE][term:u64 LE][index:u64 LE]` = 18 bytes before

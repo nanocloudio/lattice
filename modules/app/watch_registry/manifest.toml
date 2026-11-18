@@ -80,24 +80,28 @@ content_type = "OctetStream"
 name = "ctrl_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Replay plan emitted to fanout when a session (re)enters service.
 [[ports]]
 name = "replay_plan"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Retention floor declarations to compaction_coordinator.
 [[ports]]
 name = "retention"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Forwarded events to fanout.
 [[ports]]
 name = "events_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

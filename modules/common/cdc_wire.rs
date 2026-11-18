@@ -1,7 +1,7 @@
 //! The CDC event envelope a `cdc_pump` publishes.
 //!
 //! This file owns the ENVELOPE and nothing else. The transport it rides —
-//! a METHOD_PUBLISH exchange toward a `stream.ordered_ack` provider — is
+//! a PUBLISH exchange toward a `stream.ordered_ack` provider — is
 //! the fluxor SDK exchange contract, NOT a lattice file: its source is
 //! `modules/sdk/contracts/exchange.rs` in the fluxor repo
 //! (`deps/fluxor/modules/sdk/contracts/exchange.rs` in this checkout), and
@@ -69,7 +69,7 @@
 //! What follows is the CDC-specific reading of that surface — what a pump
 //! puts in a publish and what it does with the answer.
 //!
-//! One event is one METHOD_PUBLISH exchange whose request HEAD carries
+//! One event is one PUBLISH exchange whose request HEAD carries
 //! it whole: `target` = the sink message key below, body = the envelope.
 //! Answers: 200 = durably accepted by the backend at the strongest level
 //! its configuration offers; 5xx = not accepted, retryable; any other

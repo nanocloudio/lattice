@@ -138,12 +138,14 @@ content_type = "OctetStream"
 name = "responses"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Mutation events for watch_registry / watch_fanout.
 [[ports]]
 name = "mutations"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Retention claims to compaction_coordinator: this worker's
 # ACTIVE-READ claim (`MSG_RETENTION_CLAIM`), republished on a cadence
@@ -152,6 +154,7 @@ content_type = "OctetStream"
 name = "compaction_floor"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Snapshot interfaces — substrate durability drives import/export.
 [[ports]]
@@ -163,6 +166,7 @@ content_type = "OctetStream"
 name = "snapshot_export"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -179,6 +183,7 @@ name = "lease_request"
 index = 5
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # KV expiry registrations to ttl_scheduler.
 # MSG_TTL_REGISTER `[deadline_ms:u64][key_hash:u64]`, deadline 0 =
@@ -191,6 +196,7 @@ name = "expiry_out"
 index = 6
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Install-complete ack: MSG_APP_SNAPSHOT_INSTALLED
 # `[partition_id:u16][index:u64]` once the store holds an install's
@@ -204,6 +210,7 @@ name = "install_ack_out"
 index = 7
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Chunk sweeps this worker proposes: `KV_OP_CHUNK_SWEEP` commands naming
 # the floor it saw commit (the committed GC floor on disk; unbounded on
@@ -216,6 +223,7 @@ name = "sweep_out"
 index = 8
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ─────────────────────────────────────────────────────
 # Module-scope metrics emitted on `metrics` at a ~1 s WALL-CLOCK cadence

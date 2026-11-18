@@ -881,7 +881,7 @@ unsafe fn handle_wire_data(client: &mut ClientState, data: &[u8]) {
 /// its slot would leak the table across a flapping link.
 unsafe fn drop_connection(client: &mut ClientState) {
     if client.conn_id != NO_CONN {
-        let payload = client.conn_id.to_le_bytes();
+        let payload = abi::contracts::net::net_proto::close(client.conn_id, false);
         let scratch = client.scratch.as_mut_ptr();
         let sys = client.syscalls;
         if !sys.is_null() && client.net_out >= 0 {
@@ -890,7 +890,7 @@ unsafe fn drop_connection(client: &mut ClientState) {
                 client.net_out,
                 NET_CMD_CLOSE,
                 payload.as_ptr(),
-                CONN_ID_LEN,
+                payload.len(),
                 scratch,
                 SCRATCH_BUF_SIZE,
             );
@@ -938,7 +938,7 @@ unsafe fn dial(client: &mut ClientState) {
     }
     let mut payload = [0u8; CONNECT_TO_MAX];
     let n = match client.peer(client.peer_idx) {
-        Some(peer) => peer.connect_record(&mut payload, Some(client.tag)),
+        Some(peer) => peer.connect_record(&mut payload, client.tag),
         None => {
             client.peer_idx = 0;
             return;
@@ -1021,8 +1021,8 @@ unsafe fn dispatch_net_frame(client: &mut ClientState, msg_type: u8, payload: &[
         NET_MSG_CONNECTED => {
             // `net_out` is broadcast: claim only the dial that carries
             // our tag.
-            if client.conn_id == NO_CONN && payload.len() >= CONN_ID_LEN {
-                let (new_id, tag) = connected_parts(payload);
+            if let Some(c) = connected_parts(payload).filter(|_| client.conn_id == NO_CONN) {
+                let (new_id, tag) = (c.conn_id, c.requester_tag);
                 if tag == client.tag || tag == REQUESTER_TAG_NONE {
                     client.conn_id = new_id;
                     client.recv_len = 0;
@@ -1053,8 +1053,7 @@ unsafe fn dispatch_net_frame(client: &mut ClientState, msg_type: u8, payload: &[
             // A tagged error is a failed dial and is ours by tag alone;
             // an untagged one names an established connection by conn
             // id.
-            if payload.len() > CONN_ID_LEN {
-                let (id, _errno, tag) = error_parts(payload);
+            if let Some((id, _errno, tag)) = error_parts(payload) {
                 if client.conn_id == NO_CONN {
                     if tag == client.tag || tag == REQUESTER_TAG_NONE {
                         // The redial period's rotation moves past the
@@ -1085,7 +1084,10 @@ unsafe fn lost_connection(client: &mut ClientState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: ClientState }
+fluxor_rt::module_facts! {
+    state: ClientState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = SCRATCH_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = SCRATCH_BUF_SIZE],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

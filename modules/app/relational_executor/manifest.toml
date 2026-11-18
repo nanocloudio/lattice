@@ -81,6 +81,7 @@ max_record = 28675
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -93,6 +94,7 @@ content_type = "OctetStream"
 name = "txn_submit_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ─────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.
@@ -127,5 +129,5 @@ bounds_us = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000,
 
 [[observability.instrument.dimension]]
 key    = "db.operation.name"
-domain = "enum"
+kind   = "enum"
 values = ["select", "insert", "update", "delete", "ddl"]

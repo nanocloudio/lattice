@@ -47,6 +47,7 @@ content_type = "OctetStream"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -60,6 +61,7 @@ content_type = "OctetStream"
 name = "exec_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [observability]
 #   0 surveys          completed all-range surveys

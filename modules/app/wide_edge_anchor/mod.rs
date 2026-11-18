@@ -81,6 +81,10 @@ use wire::{MSG_KV_REQUEST, MSG_KV_RESPONSE};
 const MAX_CONNS: usize = 8;
 const RECV_BUF: usize = 8192;
 const SEND_BUF: usize = 8192;
+/// The most reply bytes one `CMD_SEND` carries: an 8192-byte frame, which
+/// `net_out` declares as its `max_record`; a slot's bytes leave in chunks
+/// of this size.
+const NET_CHUNK: usize = 8192 - NET_FRAME_HDR - CONN_ID_LEN;
 const SCRATCH_BUF: usize = 16384;
 const SLOT_FREE: u16 = 0xFFFF;
 const DEFAULT_LISTEN_PORT: u16 = 9042;
@@ -269,7 +273,7 @@ unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8])
         return false;
     }
     let payload_len = CONN_ID_LEN + data.len();
-    if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
+    if payload_len + NET_FRAME_HDR > NET_OUT_MAX_RECORD {
         return false;
     }
     let id = conn_id.to_le_bytes();
@@ -295,14 +299,13 @@ unsafe fn net_bind(anchor: &mut AnchorState) -> bool {
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let port = anchor.listen_port.to_le_bytes();
+    let port = abi::contracts::net::net_proto::bind(anchor.listen_port, 0);
     let scratch = anchor.scratch.as_mut_ptr();
     *scratch = NET_CMD_BIND;
-    *scratch.add(1) = 2;
+    *scratch.add(1) = port.len() as u8;
     *scratch.add(2) = 0;
-    *scratch.add(NET_FRAME_HDR) = port[0];
-    *scratch.add(NET_FRAME_HDR + 1) = port[1];
-    let total = NET_FRAME_HDR + 2;
+    core::ptr::copy_nonoverlapping(port.as_ptr(), scratch.add(NET_FRAME_HDR), port.len());
+    let total = NET_FRAME_HDR + port.len();
     ((*sys).channel_write)(anchor.net_out, scratch, total) == total as i32
 }
 
@@ -319,15 +322,24 @@ fn send_to_slot(anchor: &mut AnchorState, idx: usize, data: &[u8]) {
 }
 
 fn flush_slot(anchor: &mut AnchorState, idx: usize) {
-    let (conn_id, len) = (anchor.slots[idx].conn_id, anchor.slots[idx].send_len);
-    if len == 0 {
-        return;
-    }
-    let mut buf = [0u8; SEND_BUF];
-    buf[..len].copy_from_slice(&anchor.slots[idx].send[..len]);
-    let sent = unsafe { net_send(anchor, NET_CMD_SEND, conn_id, &buf[..len]) };
-    if sent {
-        anchor.slots[idx].send_len = 0;
+    // A frame at a time; what the channel has no room for waits in the
+    // slot for a later step.
+    while anchor.slots[idx].send_len > 0 {
+        let conn_id = anchor.slots[idx].conn_id;
+        let n = anchor.slots[idx].send_len.min(NET_CHUNK);
+        let mut buf = [0u8; NET_CHUNK];
+        buf[..n].copy_from_slice(&anchor.slots[idx].send[..n]);
+        if !unsafe { net_send(anchor, NET_CMD_SEND, conn_id, &buf[..n]) } {
+            return;
+        }
+        let s = &mut anchor.slots[idx];
+        let rest = s.send_len - n;
+        let mut k = 0;
+        while k < rest {
+            s.send[k] = s.send[n + k];
+            k += 1;
+        }
+        s.send_len = rest;
     }
 }
 
@@ -2131,7 +2143,12 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
             if payload.len() >= CONN_ID_LEN {
                 let new_id = conn_id(payload);
                 if anchor.alloc_slot(new_id).is_none() {
-                    let _ = net_send(anchor, NET_CMD_CLOSE, new_id, &[]);
+                    let _ = net_send(
+                        anchor,
+                        NET_CMD_CLOSE,
+                        new_id,
+                        &[abi::contracts::net::net_proto::CLOSE_ORDERLY],
+                    );
                 }
             }
         }
@@ -2167,7 +2184,10 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
 
 // ── Module ABI ───────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = ENVELOPE_HDR + SCRATCH_BUF, out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + CONN_ID_LEN + NET_CHUNK],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -2267,7 +2287,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
         if anchor.slots[idx].state == S_CLOSING {
             let conn = anchor.slots[idx].conn_id;
-            let _ = unsafe { net_send(anchor, NET_CMD_CLOSE, conn, &[]) };
+            let _ = unsafe {
+                net_send(
+                    anchor,
+                    NET_CMD_CLOSE,
+                    conn,
+                    &[abi::contracts::net::net_proto::CLOSE_ORDERLY],
+                )
+            };
             anchor.free_slot(idx);
             continue;
         }

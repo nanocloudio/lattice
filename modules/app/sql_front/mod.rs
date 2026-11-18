@@ -19,24 +19,24 @@
 //!
 //! # Request
 //!
-//! Method POST; `target` empty; headers ignored; body = the SQL text of one
+//! Op CALL, verb 0; `target` empty; meta ignored; body = the SQL text of one
 //! statement (1..=4096 bytes, no NUL byte). The body may arrive inline in
 //! the HEAD or in BODY records (the module grants the credit for the rest at
 //! once).
 //!
 //! # Answer
 //!
-//! One answer per request, no content type, no headers:
+//! One answer per request, no meta:
 //!
-//! | Status | When | Body |
+//! | Outcome | When | Body |
 //! |---|---|---|
-//! | 200 | the statement completed — for a write, it is applied (durable as the graph's store is durable) | the first column of every row as PostgreSQL text, in row order, joined by `\n` (0x0A); no trailing separator; a NULL first column contributes no row; a statement with no rows answers an empty body |
-//! | 400 | the executor refused the statement | the message text `pg_edge_anchor` sends for it (`relation does not exist`, `duplicate key value violates primary key`, …) |
-//! | 400 | another method, a non-empty target, an empty body, a NUL in the body | empty |
-//! | 413 | a body over 4096 bytes, a target over 64, headers over 256 | empty |
-//! | 502 | a result set over 8192 bytes (refused whole, never truncated), or an executor answer that does not decode | empty |
-//! | 503 | four requests already held, or draining | empty |
-//! | 504 | the executor did not answer within 15 s (the statement's effect is unknown) | empty |
+//! | OK | the statement completed — for a write, it is applied (durable as the graph's store is durable) | the first column of every row as PostgreSQL text, in row order, joined by `\n` (0x0A); no trailing separator; a NULL first column contributes no row; a statement with no rows answers an empty body |
+//! | REFUSED | the executor refused the statement | the message text `pg_edge_anchor` sends for it (`relation does not exist`, `duplicate key value violates primary key`, …) |
+//! | REFUSED | another op or a verb, a non-empty target, an empty body, a NUL in the body | empty |
+//! | TOO_LARGE | a body over 4096 bytes, a target over 64, meta over 256 | empty |
+//! | UNAVAILABLE | a result set over 8192 bytes (refused whole, never truncated), or an executor answer that does not decode | empty |
+//! | BUSY | four requests already held, or draining | empty |
+//! | TIMEOUT | the executor did not answer within 15 s (the statement's effect is unknown) | empty |
 //!
 //! The body streams under the requester's response credit. Statements are
 //! performed one at a time in arrival order, on one executor session, so a
@@ -76,7 +76,7 @@ use sql_answer::{sql_exec, Answer, ANSWER_MAX};
 
 #[path = "../../common/query_exchange.rs"]
 mod query_exchange;
-use query_exchange::exchange::{status, METHOD_POST, RECORD_MAX};
+use query_exchange::exchange::{op, outcome, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 /// Longest SQL text one request carries (`pg_client`'s).
@@ -181,7 +181,7 @@ pub extern "C" fn module_new(
         s.req_len = 0;
         s.completed = 0;
         s.errors = 0;
-        s.desk.reset(METHOD_POST, 0);
+        s.desk.reset(op::CALL, 0);
         s.outbox = ExchangeOutbox::new();
         if s.sql_in < 0 || s.sql_out < 0 {
             let m = b"[sql_front] refusing to construct: sql_in and sql_out must both be wired to relational_executor";
@@ -288,7 +288,7 @@ unsafe fn take_request(s: &mut FrontState, now: u64) {
         }
     };
     let Some(n) = encoded else {
-        s.desk.refuse(at, status::BAD_REQUEST);
+        s.desk.refuse(at, outcome::REFUSED);
         return;
     };
     s.req[0] = MSG_SQL_REQUEST;
@@ -330,11 +330,11 @@ unsafe fn read_answers(s: &mut FrontState) {
             continue;
         }
         let (code, n) = match sql_answer::answer(&s.resp[..len], &mut s.result) {
-            Answer::Rows(n) => (status::OK, n),
-            Answer::Refused(n) => (status::BAD_REQUEST, n),
+            Answer::Rows(n) => (outcome::OK, n),
+            Answer::Refused(n) => (outcome::REFUSED, n),
             Answer::TooLarge | Answer::Undecodable => {
                 s.errors = s.errors.wrapping_add(1);
-                (status::BAD_GATEWAY, 0)
+                (outcome::UNAVAILABLE, 0)
             }
         };
         s.desk.finish(code, n);
@@ -365,9 +365,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         read_answers(s);
 
         // 3. A statement the executor has not answered in time is answered
-        //    504; its late answer no longer matches and is dropped.
+        //    `TIMEOUT`; its late answer no longer matches and is dropped.
         if s.has_query == 1 && now.wrapping_sub(s.started_ms) > REPLY_TIMEOUT_MS {
-            s.desk.finish(status::TIMEOUT, 0);
+            s.desk.finish(outcome::TIMEOUT, 0);
             s.has_query = 0;
             s.pending = 0;
             s.errors = s.errors.wrapping_add(1);

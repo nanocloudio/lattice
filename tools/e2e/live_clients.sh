@@ -38,7 +38,7 @@ run_graph() {
   wait "$pid" 2>/dev/null
   out=$(cat "$t")
   rm -f "$t"
-  printf '%s' "${out##*config.bin$'\n'}"
+  printf '%s' "${out#*node.img modules=*$'\n'}"
 }
 want() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac }
 
@@ -57,7 +57,7 @@ run_graph_timed() {
   wait "$pid" 2>/dev/null
   out=$(cat "$t")
   rm -f "$t"
-  printf '%s' "${out##*config.bin$'\n'}"
+  printf '%s' "${out#*node.img modules=*$'\n'}"
 }
 
 redis() {

@@ -79,7 +79,7 @@ use envelope::{read_envelope, Inbox, ENVELOPE_HDR};
 
 use abi::contracts::net::net_proto::{
     conn_id, CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_SEND as NET_CMD_SEND,
-    CONN_ID_LEN, MAX_CMD_DATA, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    CONN_ID_LEN, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
 use pg::relational::LogicalType;
@@ -101,16 +101,11 @@ const RECV_BUF: usize = 8192;
 /// Per-slot send buffer. Sized for one result-set response plus framing.
 const SEND_BUF: usize = 32768;
 
-/// The most reply bytes one `CMD_SEND` carries: the net contract's
-/// `MAX_CMD_DATA`, and no more than one channel frame holds beside the
-/// connection id. A result set larger than that goes out as several
+/// The most reply bytes one `CMD_SEND` carries: what one channel frame
+/// holds beside the connection id. A result set larger than that goes out as several
 /// sends; one frame past its channel could never be written, and the
 /// session would stall on it.
-const NET_CHUNK: usize = if MAX_CMD_DATA < wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN {
-    MAX_CMD_DATA
-} else {
-    wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN
-};
+const NET_CHUNK: usize = wire::FRAME_PAYLOAD_MAX - CONN_ID_LEN;
 
 /// Envelope scratch. Must hold the largest `MSG_SQL_RESPONSE`.
 const SCRATCH_BUF: usize = 32768;
@@ -894,7 +889,7 @@ unsafe fn net_send(anchor: &mut AnchorState, cmd: u8, conn_id: u16, data: &[u8])
         return false;
     }
     let payload_len = CONN_ID_LEN + data.len();
-    if payload_len + NET_FRAME_HDR > SCRATCH_BUF {
+    if payload_len + NET_FRAME_HDR > NET_OUT_MAX_RECORD {
         return false;
     }
     let id = conn_id.to_le_bytes();
@@ -920,14 +915,14 @@ unsafe fn net_bind(anchor: &mut AnchorState) -> bool {
     if sys.is_null() || anchor.net_out < 0 {
         return false;
     }
-    let port = anchor.listen_port.to_le_bytes();
+    let port = abi::contracts::net::net_proto::bind(anchor.listen_port, 0);
     let scratch = anchor.scratch.as_mut_ptr();
     net_write_frame(
         &*sys,
         anchor.net_out,
         NET_CMD_BIND,
         port.as_ptr(),
-        2,
+        port.len(),
         scratch,
         SCRATCH_BUF,
     ) > 0
@@ -965,7 +960,12 @@ unsafe fn dispatch_net(anchor: &mut AnchorState, msg_type: u8, payload: &[u8]) {
             if payload.len() >= CONN_ID_LEN {
                 let new_id = conn_id(payload);
                 if anchor.alloc_slot(new_id).is_none() {
-                    let _ = net_send(anchor, NET_CMD_CLOSE, new_id, &[]);
+                    let _ = net_send(
+                        anchor,
+                        NET_CMD_CLOSE,
+                        new_id,
+                        &[abi::contracts::net::net_proto::CLOSE_ORDERLY],
+                    );
                 }
             }
         }
@@ -1041,7 +1041,12 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
         // Close only after the buffer has drained, so a FATAL error
         // message actually reaches the client before the socket goes.
         if state == S_CLOSING && anchor.slots[i].send_len == 0 {
-            let _ = net_send(anchor, NET_CMD_CLOSE, conn_id, &[]);
+            let _ = net_send(
+                anchor,
+                NET_CMD_CLOSE,
+                conn_id,
+                &[abi::contracts::net::net_proto::CLOSE_ORDERLY],
+            );
             anchor.free_slot(i);
         }
         i += 1;
@@ -1050,7 +1055,10 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = SCRATCH_BUF, out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + CONN_ID_LEN + NET_CHUNK],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

@@ -30,18 +30,21 @@ content_type = "OctetStream"
 name = "throttle_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Disconnect signals out to anchors (noisy neighbour).
 [[ports]]
 name = "disconnect_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Per-tenant quota decision fed to kv_request_router.
 [[ports]]
 name = "quota_decision"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"

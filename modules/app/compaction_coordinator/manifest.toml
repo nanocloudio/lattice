@@ -51,6 +51,7 @@ content_type = "OctetStream"
 name = "retention_floor_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 [[ports]]
 name = "metrics"
@@ -65,6 +66,7 @@ content_type = "OctetStream"
 name = "gc_floor_propose"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ──────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.

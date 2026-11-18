@@ -32,12 +32,15 @@ capabilities = ["transport.anchor.stream.secure"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 9248
 
 # NET_CMD_BIND / NET_CMD_SEND / NET_CMD_CLOSE back to foundation/ip.
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+max_record = 4101
+buffer_size = 8192
 
 # MSG_KV_REQUEST envelopes out to kv_request_router for any command
 # that isn't handled inline (GET, SET, DEL, INCR, … and the rest).
@@ -47,6 +50,7 @@ content_type = "NetProto"
 name = "kv_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # MSG_KV_RESPONSE envelopes in from kv_request_router. The anchor
 # looks up the originating slot by `corr_id`, RESP-encodes the
@@ -61,6 +65,7 @@ content_type = "OctetStream"
 name = "auth_request"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # Auth decisions from auth_manager.
 [[ports]]
@@ -106,12 +111,14 @@ content_type = "OctetStream"
 name = "pubsub_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # The standby pub/sub worker (two-worker handoff graphs).
 [[ports]]
 name = "pubsub_out2"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
 
 # ── Observability ────────────────────────────────────────────────────
 # Module-scope counters emitted on `metrics` at a coarse step cadence.

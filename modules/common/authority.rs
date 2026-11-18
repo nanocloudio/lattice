@@ -12,7 +12,7 @@
 // The SDK contract, through the module's own `abi` mount.
 pub use crate::abi::contracts::net::net_proto;
 
-use net_proto::{write_connect_to, RequesterTag, Target, SOCK_TYPE_STREAM};
+use net_proto::{write_connect_to, ConnectTo, RequesterTag, Target, SOCK_TYPE_STREAM};
 
 /// Longest authority a connector keeps. A 63-byte label with a port,
 /// or a bracketed IPv6 literal with a port, fits; a longer name is
@@ -96,15 +96,24 @@ impl Authority {
     }
 
     /// Compose the `CMD_CONNECT_TO` payload for this authority into
-    /// `buf`, tagged with `tag` when given. `0` when the authority was
-    /// never adopted or `buf` cannot hold the record.
-    pub fn connect_record(&self, buf: &mut [u8], tag: Option<RequesterTag>) -> usize {
+    /// `buf`, tagged with `tag` and asking no sideband. `0` when the
+    /// authority was never adopted or `buf` cannot hold the record.
+    pub fn connect_record(&self, buf: &mut [u8], tag: RequesterTag) -> usize {
         if !self.is_set() {
             return 0;
         }
         let Some((target, _)) = Target::parse(self.text()) else {
             return 0;
         };
-        write_connect_to(buf, SOCK_TYPE_STREAM, self.port, &target, tag)
+        write_connect_to(
+            buf,
+            &ConnectTo {
+                sock_type: SOCK_TYPE_STREAM,
+                flags: 0,
+                port: self.port,
+                target,
+                requester_tag: tag,
+            },
+        )
     }
 }

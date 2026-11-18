@@ -9,11 +9,11 @@
 //! feature is scripted link loss (`linkdown_every`) so the pump's
 //! re-issue path is exercised in CI rather than trusted.
 //!
-//! Request: METHOD_PUBLISH; `target` = the ordering key (1..=512 bytes,
-//! or any length with `flag::BROADCAST`); body = the record (up to 8192
-//! bytes). Answer: 200 with an empty body on acceptance; 400 for another
-//! method or flag, or an empty target without BROADCAST; 413 past a
-//! bound; 503 when both collecting slots are taken.
+//! Request: op PUBLISH, verb 0; `target` = the ordering key (1..=512
+//! bytes, or any length with `flag::BROADCAST`); body = the record (up to
+//! 8192 bytes). Answer: outcome OK with an empty body on acceptance;
+//! REFUSED for another op or flag, or an empty target without BROADCAST;
+//! TOO_LARGE past a bound; BUSY when both collecting slots are taken.
 
 #![no_std]
 #![allow(
@@ -38,7 +38,7 @@ mod cdc_wire;
 
 #[path = "../../common/query_exchange.rs"]
 mod query_exchange;
-use query_exchange::exchange::{flag, status, KEY_MAX, METHOD_PUBLISH, PAYLOAD_MAX, RECORD_MAX};
+use query_exchange::exchange::{flag, op, outcome, KEY_MAX, PAYLOAD_MAX, RECORD_MAX};
 use query_exchange::QueryDesk;
 
 #[path = "../../common/telemetry.rs"]
@@ -128,7 +128,7 @@ impl SinkState {
         self.m_violations = 0;
         self.max_resolved = 0;
         self.step_ctr = 0;
-        self.desk.reset(METHOD_PUBLISH, flag::BROADCAST);
+        self.desk.reset(op::PUBLISH, flag::BROADCAST);
         // The backend is the module itself: up from the start, and LINK
         // reports only a change, so nothing is written for it.
         self.desk.link_up();
@@ -306,7 +306,7 @@ unsafe fn deliver(s: &mut SinkState, sys: &SyscallTable) {
         let broadcast = r.flags & flag::BROADCAST != 0;
         if r.target.is_empty() && !broadcast {
             // No ordering key: a refusal, never a silent drop.
-            s.desk.refuse(at, status::BAD_REQUEST);
+            s.desk.refuse(at, outcome::REFUSED);
             s.m_refused = s.m_refused.wrapping_add(1);
             continue;
         }
@@ -324,7 +324,7 @@ unsafe fn deliver(s: &mut SinkState, sys: &SyscallTable) {
         body[..body_len].copy_from_slice(r.body);
         s.desk.start(at);
         check_envelope(s, sys, &target[..tl], &body[..body_len]);
-        s.desk.finish(status::OK, 0);
+        s.desk.finish(outcome::OK, 0);
         s.m_acked = s.m_acked.wrapping_add(1);
         flush_answers(s, sys);
         if s.linkdown_every != 0 {

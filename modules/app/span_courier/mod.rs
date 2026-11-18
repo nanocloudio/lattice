@@ -230,7 +230,10 @@ unsafe fn deliver_stream(s: &mut CourierState, sys: &SyscallTable, bytes: &[u8])
     }
 }
 
-fluxor_rt::module_facts! { state: CourierState }
+fluxor_rt::module_facts! {
+    state: CourierState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = NET_BUF],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -293,14 +296,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
     // Receive mode: one BIND at boot.
     if s.mode == MODE_RECEIVE && s.bound == 0 {
-        let port = s.listen_port.to_le_bytes();
+        let port = abi::contracts::net::net_proto::bind(s.listen_port, 0);
         unsafe {
             net_write_frame(
                 sys,
                 s.net_out,
                 NET_CMD_BIND,
                 port.as_ptr(),
-                2,
+                port.len(),
                 s.nbuf.as_mut_ptr(),
                 NET_BUF,
             );
@@ -314,7 +317,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         && s.net_out >= 0
     {
         let mut payload = [0u8; CONNECT_TO_MAX];
-        let n = s.authority.connect_record(&mut payload, Some(s.tag));
+        let n = s.authority.connect_record(&mut payload, s.tag);
         if n > 0 {
             unsafe {
                 net_write_frame(
@@ -344,12 +347,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // Claim only our own dial: the NET provider fans
                 // `net_out` to every consumer, and the tag says whose
                 // connection this is.
-                let claimed = if plen >= CONN_ID_LEN {
-                    let (cid, tag) = connected_parts(&s.nbuf[..plen]);
-                    (tag == s.tag || tag == REQUESTER_TAG_NONE).then_some(cid)
-                } else {
-                    None
-                };
+                let claimed = connected_parts(&s.nbuf[..plen])
+                    .filter(|c| c.requester_tag == s.tag || c.requester_tag == REQUESTER_TAG_NONE)
+                    .map(|c| c.conn_id);
                 if let Some(cid) = claimed {
                     s.conn_id = cid;
                     s.connected = 1;
@@ -416,8 +416,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // A tagged error is a failed dial and is ours by tag
                 // alone; an untagged one names an established
                 // connection by conn id.
-                if plen > CONN_ID_LEN {
-                    let (cid, _errno, tag) = error_parts(&s.nbuf[..plen]);
+                if let Some((cid, _errno, tag)) = error_parts(&s.nbuf[..plen]) {
                     let ours = if s.connected == 1 {
                         tag == REQUESTER_TAG_NONE && cid == s.conn_id
                     } else {

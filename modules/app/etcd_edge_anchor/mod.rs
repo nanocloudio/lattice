@@ -329,6 +329,11 @@ const HPACK_SCRATCH_LEN: usize = 4096;
 /// Scratch for NET_CMD frames and KV envelopes: an op body built from a
 /// whole request body.
 const SCRATCH_BUF_SIZE: usize = STREAM_BODY_MAX + 64;
+/// The most reply bytes one `CMD_SEND` carries, whatever the scratch
+/// holds: `net_out` declares the frame as its `max_record`, and a frame
+/// the net channel cannot take whole would stall the connection.
+const NET_CHUNK: usize = 4096;
+const _: () = assert!(NET_CHUNK + NET_FRAME_HDR + CONN_ID_LEN <= SCRATCH_BUF_SIZE);
 
 /// One inbound envelope of the KV or watch path: the worker's largest
 /// answer (8192 bytes) behind the router's head and fence tail, or the
@@ -7147,15 +7152,14 @@ unsafe fn net_send_bind_pic(anchor: &mut AnchorState) -> bool {
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let port = anchor.listen_port.to_le_bytes();
-    let payload = [port[0], port[1]];
+    let port = abi::contracts::net::net_proto::bind(anchor.listen_port, 0);
     let scratch = anchor.scratch.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys,
         out_chan,
         NET_CMD_BIND,
-        payload.as_ptr(),
-        2,
+        port.as_ptr(),
+        port.len(),
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -7168,14 +7172,14 @@ unsafe fn net_send_close_pic(anchor: &mut AnchorState, conn_id: u16) -> bool {
     if sys.is_null() || out_chan < 0 {
         return false;
     }
-    let payload = conn_id.to_le_bytes();
+    let payload = abi::contracts::net::net_proto::close(conn_id, false);
     let scratch = anchor.scratch.as_mut_ptr();
     let wrote = net_write_frame(
         &*sys,
         out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        CONN_ID_LEN,
+        payload.len(),
         scratch,
         SCRATCH_BUF_SIZE,
     );
@@ -7266,12 +7270,6 @@ unsafe fn flush_slots(anchor: &mut AnchorState) {
         // net_send_data_pic_from_frame stages through anchor.scratch, so
         // each chunk is copied to frame_payload first (idle between
         // poll_net_in and the next process_one_frame).
-        // 4 KiB a send, whatever the scratch holds: a frame the net
-        // channel cannot take whole (its buffer, the net contract's
-        // `MAX_CMD_DATA`) is never taken, and the connection would stall
-        // on it — which a response larger than the old scratch did.
-        const NET_CHUNK: usize = 4096;
-        const _: () = assert!(NET_CHUNK + NET_FRAME_HDR + CONN_ID_LEN <= SCRATCH_BUF_SIZE);
         let mut sent = 0usize;
         while sent < send_len {
             let n = (send_len - sent).min(NET_CHUNK);
@@ -7331,7 +7329,7 @@ unsafe fn net_send_data_pic_from_frame(
         return false;
     }
     let payload_len = CONN_ID_LEN + data_len;
-    if payload_len + NET_FRAME_HDR > SCRATCH_BUF_SIZE {
+    if payload_len + NET_FRAME_HDR > NET_OUT_MAX_RECORD {
         return false;
     }
     let id = conn_id.to_le_bytes();
@@ -7353,7 +7351,10 @@ unsafe fn net_send_data_pic_from_frame(
 
 // ── Module ABI ────────────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: AnchorState }
+fluxor_rt::module_facts! {
+    state: AnchorState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = SCRATCH_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_FRAME_HDR + CONN_ID_LEN + NET_CHUNK],
+}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
