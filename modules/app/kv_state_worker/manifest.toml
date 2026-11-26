@@ -15,10 +15,8 @@ hardware_targets = ["bcm2712", "linux"]
 # `state_store` param selects the physical materialization provider at
 # graph construction — 0 = bounded in-memory table (default), 1 = the
 # ordered disk provider over the Fluxor FS contract. The `fs` resource
-# claim below is a capability GRANT (required for the runtime contract
-# gate when `state_store = 1`); it does not force an FS provider into
-# memory-only compositions — graphs without one build and run
-# unchanged, exactly as durability's volatile variant does.
+# claim below holds only when `state_store = 1` (disk): a memory-only
+# composition needs no FS provider.
 
 #
 # ⚠ STEP DEADLINE — REQUIRED IN ANY BARE-METAL `state_store = 1` GRAPH.
@@ -59,6 +57,7 @@ hardware_targets = ["bcm2712", "linux"]
 [[resources]]
 requires_contract = "fs"
 access = "write"
+when = { state_store = ["disk"] }
 
 # Capacity profiles (docs/architecture/route_catalogue.md "Profiles"):
 # `pi5` is the default (unsuffixed) artefact, `rp2350` and `server` the

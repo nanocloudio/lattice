@@ -372,9 +372,10 @@ pub trait Backend {
             durable: false,
         }
     }
-    /// The module occupancy whose call is being served (`CALLER_MODULE`:
-    /// `[idx u16][0][generation u32]`, which may be all zero — module 0,
-    /// generation 0); `None` when there is none.
+    /// The module occupancy whose call is being served (the first 8 bytes
+    /// of `CALLER_MODULE`'s 12-byte record: `[idx u16][0][generation u32]`,
+    /// which may be all zero — module 0, generation 0); `None` when there
+    /// is none.
     fn module(&self) -> Option<[u8; 8]> {
         None
     }

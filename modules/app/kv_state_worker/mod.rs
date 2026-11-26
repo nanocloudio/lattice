@@ -3810,7 +3810,21 @@ impl store_provider::Backend for WorkerBackend<'_> {
     }
 
     fn module(&self) -> Option<[u8; 8]> {
-        self.query(-1, CALLER_MODULE, [0; 8])
+        // `[idx u16][0 u16][generation u32][type hash u32]`: the kernel
+        // refuses a buffer shorter than the whole record. The occupancy is
+        // its first 8 bytes, the record `MODULE_LIVE` takes.
+        let mut rec = [0u8; CALLER_MODULE_LEN];
+        // SAFETY: the worker's syscall table; `rec` is writable for its length.
+        let rc = unsafe {
+            ((*self.worker.syscalls).provider_query)(-1, CALLER_MODULE, rec.as_mut_ptr(), rec.len())
+        };
+        // All zero is a record too: module 0 at generation 0.
+        if rc < CALLER_MODULE_LEN as i32 {
+            return None;
+        }
+        let mut occupancy = [0u8; 8];
+        occupancy.copy_from_slice(&rec[..8]);
+        Some(occupancy)
     }
 
     fn module_live(&self, module: [u8; 8]) -> bool {
@@ -3896,6 +3910,9 @@ const CALLER_OWNER: u32 = abi::kernel_abi::query_key::CALLER_OWNER;
 /// occupancy, and whether one still stands.
 #[cfg(feature = "store_provider")]
 const CALLER_MODULE: u32 = abi::kernel_abi::query_key::CALLER_MODULE;
+/// The length of the record `CALLER_MODULE` writes.
+#[cfg(feature = "store_provider")]
+const CALLER_MODULE_LEN: usize = 12;
 #[cfg(feature = "store_provider")]
 const MODULE_LIVE: u32 = abi::kernel_abi::query_key::MODULE_LIVE;
 /// `internal::reconfigure::OWNER_RELEASED`, and its `[slot][0][generation]`
@@ -3910,21 +3927,8 @@ const POOL_SAMPLE: u32 = abi::registry::resource::POOL_SAMPLE;
 #[cfg(feature = "store_provider")]
 const LEDGER_DENY: u32 = abi::registry::resource::LEDGER_DENY;
 #[cfg(feature = "store_provider")]
-const POOL_STORE_SUBS: u16 = 0x000A;
+const POOL_STORE_SUBS: u16 = abi::contracts::resource::POOL_STORE_SUBS;
 
-#[cfg(feature = "store_provider")]
-impl WorkerBackend<'_> {
-    /// An 8-byte record from `provider_query(handle, key)`, or `None` when
-    /// the kernel answers none.
-    fn query(&self, handle: i32, key: u32, mut rec: [u8; 8]) -> Option<[u8; 8]> {
-        // SAFETY: the worker's syscall table; 8 writable bytes.
-        let rc = unsafe {
-            ((*self.worker.syscalls).provider_query)(handle, key, rec.as_mut_ptr(), rec.len())
-        };
-        // All zero is a record too: module 0 at generation 0.
-        (rc >= rec.len() as i32).then_some(rec)
-    }
-}
 /// `kernel_abi::RANDOM_FILL`.
 #[cfg(feature = "store_provider")]
 const RANDOM_FILL: u32 = abi::registry::kernel::RANDOM_FILL;
